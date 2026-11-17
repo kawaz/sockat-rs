@@ -1,6 +1,6 @@
 # DR-0001: sun_path を超える socket のパスに届く経路と、試す順番
 
-- Status: Accepted (経路と試す順番、相対パスの作り方、Windows を対象外にすることは kawaz 指示 2026-11-18。/proc が無い時の fork、symlink の置き場に /tmp を足すことは kawaz 裁定 2026-11-18。symlink の名前、fork の経路の権限、FreeBSD の扱いは統括の裁定 2026-11-18。connect が fork の経路を通ったことを知る手段を足すことは kawaz 裁定 2026-11-18。tokio・観測の仕組みは実装側の判断で、残りは「未確定」)、0.1.0 で実装済み (fork を知る手段は未実装)
+- Status: Accepted (経路と試す順番、相対パスの作り方、Windows を対象外にすることは kawaz 指示 2026-11-18。/proc が無い時の fork、symlink の置き場に /tmp を足すことは kawaz 裁定 2026-11-18。symlink の名前、fork の経路の権限、FreeBSD の扱いは統括の裁定 2026-11-18。設定を持つ connect の型 (ブロックしない、fork を試さない、子の pid) を足すことは kawaz 裁定 2026-11-18。tokio・観測の仕組みは実装側の判断で、残りは「未確定」)、0.1.0 で実装済み (設定を持つ connect は未実装)
 - Date: 2026-11-18
 
 ## Context
@@ -132,7 +132,7 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 ### 8. どの経路を通ったかは利用者に見せない
 
 - 経路 (`Route`) は crate 内の値で、公開 API は捨てる
-- ただし、connect が fork の経路を通ると、サーバから見える peer の pid がすぐに終わる子の pid になる (Linux の `SO_PEERCRED` は変わらず、macOS の `LOCAL_PEERPID` は親が send するまで)。peer の pid を監査と突き合わせる用途のために、`connect` とは別に、サーバに見える子の pid も返す connect を足す (kawaz 裁定 2026-11-18、0.1.0 の次の版)。返すのは経路の名前でなく、結果としてサーバに見えるもの (pid) なので、経路は見せないままである。bind は子が bind するだけで listen は親がするので、手当ては要らない
+- ただし、connect が fork の経路を通ると、サーバから見える peer の pid がすぐに終わる子の pid になる (Linux の `SO_PEERCRED` は変わらず、macOS の `LOCAL_PEERPID` は親が send するまで)。peer の pid を監査と突き合わせる用途のために、`connect` とは別に、設定を持つ connect の型を 1 つ足す (kawaz 裁定 2026-11-18、0.1.0 の次の版)。設定は「ブロックしない」(Linux で相手の backlog が満杯の時に待たず `EAGAIN` を返す。tokio の connect と同じ) と「fork の経路を試さない」(他の経路が使えなければエラー)、出力は stream と、fork の経路を通った時にサーバに見える子の pid。設定と出力は独立した軸なので、関数を足すと組み合わせの数だけ増える。型 1 つにまとめた。返すのは経路の名前でなく、結果としてサーバに見えるもの (pid) なので、経路は見せないままである。bind は子が bind するだけで listen は親がするので、手当ては要らない
 - 試験は crate 内の単体試験 (`src/tests.rs`) に置き、各経路の関数を直接呼んで強制する。macOS の経路の順番の分岐 (広げた sockaddr を受け付けないカーネル、symlink の置き場の候補) は、環境を読む部分を値 (`Config`) にして試験から差し替える。Linux の /proc の有無は、/proc の場所 (`/proc/self/fd`) を経路の順番の関数の引数にし、試験は何も無い場所や空のディレクトリを渡して /proc の無い環境の代わりにする (本物の /proc には触らない)。feature も cfg(test) 専用の公開口も要らない
 
 ### 9. カーネルが返すアドレスは元のパスではない
@@ -160,5 +160,5 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 
 ## 未確定
 
-- 決定 8 の、子の pid も返す connect の形 (docs/QUESTIONS.md の SK-Q5。ブロックしない connect の要望と合わせて決める)
+- 決定 8 の設定を持つ connect の型の名前と、fork を試さない時のエラーの種類
 - Android は compile もしていない。macOS 以外の Apple OS は iOS の clippy (試験コード込み) だけ確かめた
