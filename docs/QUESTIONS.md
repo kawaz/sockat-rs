@@ -17,33 +17,25 @@
 
 ## 裁定待ち
 
-### SK-Q4 connect が fork の経路を通ったことを、利用者が知る手段をどう作るか
+### SK-Q5 ブロックしない connect と、子の pid を返す connect (SK-Q4 の裁定) を、どんな形の API で足すか
 
-fork の経路で connect すると、サーバから見える peer の pid が、すぐに終了する子の pid になる。
-- Linux の `SO_PEERCRED` では、この pid がずっと変わらない。
-- macOS の `LOCAL_PEERPID` では、親が send するまで子の pid のままになる。
+足す機能は 2 つある。
 
-サーバが peer のプロセス情報を監査と突き合わせるような用途では、これが問題になりうる (kawaz 2026-11-18)。fork の経路を通るのは、細い条件が重なった時だけである (Linux では `/proc` が無い時、macOS では a〜c の経路が全部使えない時)。
+1. **ブロックしない connect** (llm-gateway からの要望、2026-11-18)
+   - 今の `connect` は、Linux では相手の backlog が満杯の間ずっと待つ。macOS はすぐに `ECONNREFUSED` を返す (どちらも実機で確認)
+   - tokio の connect は非ブロッキングのソケットで connect するので、満杯ならすぐに `EAGAIN` が返る
+   - llm-gateway は `spawn_blocking` で包んでいる。そのため、待ち続ける connect が blocking pool に残り、runtime を落とす時に待たされる
+   - 非ブロッキングのソケットで connect すれば、tokio と同じく `EAGAIN` がすぐに返る (Linux で実機確認)。Unix ソケットの connect は途中で止まらず、すぐに結果が出る。返す stream は非ブロッキングのままなので、そのまま `tokio::net::UnixStream::from_std` に渡せる
+2. **子の pid も返す connect** (SK-Q4 の裁定: `connect` とは別に足す、次の版で)
 
-bind の側には手当てが要らない。fork の経路でも、子がするのは bind だけで、listen は親がする。
+この 2 つは独立した軸である。1 つは入力の設定 (ブロックするか) で、もう 1 つは出力 (サーバに見える子の pid) である。別々の関数で足すと、組み合わせの数だけ関数が増える。
 
-関係: [DR-0001](decisions/DR-0001-long-socket-path-routes.md) 決定 8 (「経路は公開 API に出さない」)
+関係: [DR-0001](decisions/DR-0001-long-socket-path-routes.md) 決定 6・8
 
-#### α: 知る手段の形
-
-- [ ] a: `connect` はそのまま残し、fork した子の pid を一緒に返す connect の関数を別に足す (統括推し)
-  - 返すのは経路の名前でなく、結果として起きたこと (サーバに見える pid) である。なので決定 8 とぶつからない
-  - 利用者はこの pid をログに残して、サーバ側の監査と突き合わせられる
-- [ ] b: fork の経路を禁止するオプションを足す。fork が要る場面ではエラーにする
-  - 「ずれるくらいなら失敗したい」用途に向く
-  - 「とにかくやり遂げる」という主目的には沿わない
-- [ ] c: `log` crate で記録する
-  - API は増えない
-  - 依存が 1 つ増える
-  - 利用者がロガーを設定していないと見えない
-
-#### β: いつ入れるか
-
-- [ ] a: 0.1.0 はこのまま publish し、次の版で足す (統括推し)
-  - 関数を足すだけなので、後から入れても既存の利用者を壊さない
-- [ ] b: 0.1.0 に入れてから publish する
+- [ ] a: 設定を持つ connect の型を 1 つ足し、`connect` はそのまま残す (統括推し)
+  - 例: `sockat::Connect::new().nonblocking(true).connect(path)` が、stream とサーバに見える子の pid (fork でなければ `None`) を返す
+  - 後から設定を足しても関数は増えない
+- [ ] b: 関数を 2 つ足す (`connect_nonblocking(path)` と、子の pid も返す connect)
+  - 今の 2 つの機能だけなら一番短い
+  - 「ブロックせず、かつ pid も知りたい」は、どちらの関数でも満たせない
+- [ ] c: ブロックしない connect だけを関数で足し、子の pid の手段は改めて考える
