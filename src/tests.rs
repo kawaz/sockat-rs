@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::path;
-use crate::route::{self, DIRECT_MAX, Route};
-use crate::sys::{self, Op, SockAddr};
+use crate::route::{self, ConnectOptions, DIRECT_MAX, Request, Route};
+use crate::sys::{self, SockAddr};
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -106,6 +106,12 @@ fn ping(listener: OwnedFd, client: OwnedFd) {
     assert_eq!(&buf, b"pong");
 }
 
+/// A bind: what `sockat::bind` does.
+const BIND: Request = Request::Bind;
+
+/// A blocking connect that may fork: what `sockat::connect` does.
+const CONNECT: Request = Request::Connect(ConnectOptions::DEFAULT);
+
 fn errno(e: &io::Error) -> Option<i32> {
     e.raw_os_error()
 }
@@ -164,7 +170,7 @@ fn child_make_stale_socket() {
         return;
     }
     let p = env_path("SOCKAT_CHILD_PATH");
-    route::run(Op::Bind, &p).unwrap();
+    route::run(BIND, &p).unwrap();
 }
 
 fn in_child() -> bool {
@@ -173,6 +179,170 @@ fn in_child() -> bool {
 
 fn env_path(key: &str) -> PathBuf {
     PathBuf::from(std::env::var_os(key).unwrap_or_else(|| panic!("{key} not set")))
+}
+
+// ---------------------------------------------------------------------------
+// helpers for the connect options (Linux and Apple, where the tests run)
+// ---------------------------------------------------------------------------
+
+/// A connect that does not block (and may fork).
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+const CONNECT_NB: Request = Request::Connect(ConnectOptions {
+    nonblocking: true,
+    fork: true,
+});
+
+/// What a nonblocking connect answers while the listener's backlog is full
+/// (Linux: `EAGAIN`, where a blocking connect waits for room; macOS:
+/// `ECONNREFUSED`, as a blocking connect does).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const FULL_BACKLOG: i32 = libc::EAGAIN;
+#[cfg(target_vendor = "apple")]
+const FULL_BACKLOG: i32 = libc::ECONNREFUSED;
+
+/// One socket path reached one fixed way: the route order of the platform
+/// with its inputs (`/proc` place, `Config`) chosen so that one route is
+/// taken. Called with what to do there.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+type Way = std::sync::Arc<dyn Fn(Request) -> io::Result<(OwnedFd, Route)> + Send + Sync>;
+
+/// Whether a route is the one a [`Way`] must take.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+type Want = fn(Route) -> bool;
+
+/// Run `f` on another thread and return its result, failing the test if it
+/// has not returned within 10 seconds.
+///
+/// The calls run through this must return at once (a nonblocking connect to a
+/// full backlog). Should one block instead, as a blocking connect on Linux
+/// does until the listener accepts, the test fails here rather than hanging
+/// until a runner kills it (plain `cargo test`, which `just test-linux` runs,
+/// never does). The 10 seconds only stand for "never returns": a call that
+/// returns does so within microseconds, so it is no estimate of a duration.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn at_once<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(v) => v,
+        Err(RecvTimeoutError::Timeout) => panic!("the call blocked"),
+        Err(RecvTimeoutError::Disconnected) => panic!("the call panicked (see above)"),
+    }
+}
+
+/// Whether `fd` is `O_NONBLOCK`.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn nonblocking(fd: &OwnedFd) -> bool {
+    use std::os::fd::AsFd;
+    sys::is_nonblocking(fd.as_fd()).unwrap()
+}
+
+/// The pid the server's peer-credential query names for `server` (an accepted
+/// stream): `SO_PEERCRED` on Linux, `LOCAL_PEERPID` on macOS.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn peer_pid(server: &UnixStream) -> libc::pid_t {
+    use std::os::fd::AsFd;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    return sys::peer_cred_pid(server.as_fd()).unwrap();
+    #[cfg(target_vendor = "apple")]
+    return sys::local_peer_pid(server.as_fd()).unwrap();
+}
+
+/// Check the nonblocking connect of `way`, whose route must satisfy `want`.
+/// `what` names the route in failure messages.
+///
+/// * The blocking connect (what `sockat::connect` does) is unchanged: it
+///   returns a socket that is not `O_NONBLOCK`.
+/// * With room in the backlog, a nonblocking connect succeeds at once on the
+///   same route and returns an `O_NONBLOCK` socket: a read with nothing to
+///   read answers `WouldBlock` instead of waiting, and data flows both ways.
+/// * With the backlog shrunk to 1 and filled, a nonblocking connect fails at
+///   once with [`FULL_BACKLOG`] (a blocking one would wait on Linux), within
+///   a few attempts (Linux lets backlog + 1 connections wait, macOS 1), and
+///   keeps failing that way while it stays full. Every connect that got in
+///   meanwhile is `O_NONBLOCK` too.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn check_nonblocking_connect(way: &Way, want: Want, what: &str) {
+    use std::os::fd::AsFd;
+    let (l, r) = way(BIND).unwrap();
+    assert!(want(r), "{what}: bind {r:?}");
+    let listener = UnixListener::from(l);
+
+    let (c, r) = way(CONNECT).unwrap();
+    assert!(want(r), "{what}: blocking {r:?}");
+    assert!(
+        !nonblocking(&c),
+        "{what}: a blocking connect stays blocking"
+    );
+    drop(listener.accept().unwrap());
+
+    let w = way.clone();
+    let (c, r) = at_once(move || w(CONNECT_NB)).unwrap();
+    assert!(want(r), "{what}: nonblocking {r:?}");
+    assert!(nonblocking(&c), "{what}: not O_NONBLOCK");
+    let mut c = UnixStream::from(c);
+    let (mut s, _) = listener.accept().unwrap();
+    let mut buf = [0u8; 4];
+    let e = c.read(&mut buf).unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "{what}: {e}");
+    c.write_all(b"ping").unwrap();
+    s.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"ping");
+    // A Unix stream write lands in the peer's receive queue before it
+    // returns, so the client's read finds the data without waiting.
+    s.write_all(b"pong").unwrap();
+    c.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"pong");
+
+    sys::relisten(listener.as_fd(), 1).unwrap();
+    let mut queued = Vec::new();
+    let full = loop {
+        assert!(queued.len() < 16, "{what}: the backlog never filled");
+        let w = way.clone();
+        match at_once(move || w(CONNECT_NB)) {
+            Ok((c, r)) => {
+                assert!(want(r), "{what}: {r:?}");
+                assert!(nonblocking(&c), "{what}: not O_NONBLOCK");
+                queued.push(c);
+            }
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        !queued.is_empty(),
+        "{what}: nothing got in before it was full"
+    );
+    assert_eq!(errno(&full), Some(FULL_BACKLOG), "{what}: {full}");
+    let w = way.clone();
+    let e = at_once(move || w(CONNECT_NB)).unwrap_err();
+    assert_eq!(errno(&e), Some(FULL_BACKLOG), "{what}: {e}");
+}
+
+/// Check the child's pid that `way` reports for a connect, blocking and not:
+/// when it forks (`forks`), the pid is that of the child, which is what the
+/// server's peer-credential query names right after the connect (and not
+/// this process); otherwise there is none, and the server names this
+/// process.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn check_child_pid(way: &Way, forks: bool, what: &str) {
+    let me = std::process::id() as libc::pid_t;
+    let (l, _) = way(BIND).unwrap();
+    let listener = UnixListener::from(l);
+    for req in [CONNECT, CONNECT_NB] {
+        let (_c, r) = way(req).unwrap();
+        let (s, _) = listener.accept().unwrap();
+        let seen = peer_pid(&s);
+        if forks {
+            assert_eq!(r.child(), Some(seen), "{what} {req:?}: {r:?}");
+            assert_ne!(seen, me, "{what} {req:?}");
+        } else {
+            assert_eq!(r.child(), None, "{what} {req:?}: {r:?}");
+            assert_eq!(seen, me, "{what} {req:?}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -187,9 +357,9 @@ fn env_path(key: &str) -> PathBuf {
 fn a_path_of_100_bytes_goes_to_std_unchanged_and_101_does_not() {
     let t = tmp();
     let at_limit = nest(t.path(), DIRECT_MAX, "s.sock");
-    let (l, r) = route::run(Op::Bind, &at_limit).unwrap();
+    let (l, r) = route::run(BIND, &at_limit).unwrap();
     assert_eq!(r, Route::Direct);
-    let (c, r) = route::run(Op::Connect, &at_limit).unwrap();
+    let (c, r) = route::run(CONNECT, &at_limit).unwrap();
     assert_eq!(r, Route::Direct);
     ping(l, c);
     // std's own view of the bound address is the path itself on this route.
@@ -201,10 +371,10 @@ fn a_path_of_100_bytes_goes_to_std_unchanged_and_101_does_not() {
 
     let t = tmp();
     let over = nest(t.path(), DIRECT_MAX + 1, "s.sock");
-    let (l, r) = route::run(Op::Bind, &over).unwrap();
+    let (l, r) = route::run(BIND, &over).unwrap();
     assert_ne!(r, Route::Direct);
     assert!(is_socket(&over));
-    let (c, _) = route::run(Op::Connect, &over).unwrap();
+    let (c, _) = route::run(CONNECT, &over).unwrap();
     ping(l, c);
 }
 
@@ -217,9 +387,9 @@ fn long_paths_bind_at_the_given_path_and_accept_connections() {
     for total in [101, 150, 253, 254, 300, 600] {
         let t = tmp();
         let p = nest(t.path(), total, "s.sock");
-        let (l, _) = route::run(Op::Bind, &p).unwrap();
+        let (l, _) = route::run(BIND, &p).unwrap();
         assert!(is_socket(&p), "{total}");
-        let (c, _) = route::run(Op::Connect, &p).unwrap();
+        let (c, _) = route::run(CONNECT, &p).unwrap();
         ping(l, c);
     }
 }
@@ -236,21 +406,21 @@ fn long_path_failures_are_the_kernels_errors() {
         let p = nest(t.path(), total, "s.sock");
 
         let missing_dir = p.parent().unwrap().join("nope").join("s.sock");
-        let e = route::run(Op::Bind, &missing_dir).unwrap_err();
+        let e = route::run(BIND, &missing_dir).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ENOENT), "{total}: bind {e}");
-        let e = route::run(Op::Connect, &missing_dir).unwrap_err();
+        let e = route::run(CONNECT, &missing_dir).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ENOENT), "{total}: connect {e}");
 
-        let e = route::run(Op::Connect, &p).unwrap_err();
+        let e = route::run(CONNECT, &p).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ENOENT), "{total}: no socket {e}");
 
-        let (_l, _) = route::run(Op::Bind, &p).unwrap();
-        let e = route::run(Op::Bind, &p).unwrap_err();
+        let (_l, _) = route::run(BIND, &p).unwrap();
+        let e = route::run(BIND, &p).unwrap_err();
         assert_eq!(errno(&e), Some(libc::EADDRINUSE), "{total}: {e}");
 
         let stale = p.with_file_name("stale.sock");
         stale_socket(&stale);
-        let e = route::run(Op::Connect, &stale).unwrap_err();
+        let e = route::run(CONNECT, &stale).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ECONNREFUSED), "{total}: {e}");
     }
 }
@@ -265,7 +435,7 @@ fn a_file_name_too_long_for_any_route_is_enametoolong() {
     let t = tmp();
     let name = "n".repeat(254);
     let p = t.path().join(&name);
-    for op in [Op::Bind, Op::Connect] {
+    for op in [BIND, CONNECT] {
         let e = route::run(op, &p).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{op:?}: {e}");
     }
@@ -289,11 +459,37 @@ fn long_paths_without_a_file_name_or_with_nul_are_invalid_input() {
     let mut nul = dir.join("a").into_os_string();
     nul.push("\0b");
     for bad in [slash, dot, nul] {
-        for op in [Op::Bind, Op::Connect] {
+        for op in [BIND, CONNECT] {
             let e = route::run(op, Path::new(&bad)).unwrap_err();
             assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{bad:?} {op:?}");
         }
     }
+}
+
+// The crate-level connect with options, as the public API will use it: a long
+// path (200 bytes: the /proc route on Linux, the widened sockaddr on macOS,
+// neither of which forks) connects with no child's pid, blocking with the
+// default options and O_NONBLOCK with `nonblocking`. The route-by-route checks
+// are in the platform sections.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[test]
+fn connect_with_returns_the_stream_as_asked_and_no_pid_without_a_fork() {
+    use std::os::fd::AsFd;
+    let t = tmp();
+    let p = nest(t.path(), 200, "s.sock");
+    let listener = crate::bind(&p).unwrap();
+    for nb in [false, true] {
+        let options = ConnectOptions {
+            nonblocking: nb,
+            ..ConnectOptions::DEFAULT
+        };
+        let (c, child) = crate::connect_with(&p, options).unwrap();
+        assert_eq!(child, None);
+        assert_eq!(sys::is_nonblocking(c.as_fd()).unwrap(), nb);
+        drop(listener.accept().unwrap());
+    }
+    let c = crate::connect(&p).unwrap();
+    assert!(!sys::is_nonblocking(c.as_fd()).unwrap());
 }
 
 // The fork route (forced here; the last resort on macOS and on Linux without
@@ -308,9 +504,9 @@ fn the_fork_route_binds_and_connects_through_the_shared_socket() {
     let p = nest(t.path(), 400, "s.sock");
     let (dir, name) = path::split(&p).unwrap();
     let addr = SockAddr::standard(name).unwrap();
-    let l = route::fork_op(Op::Bind, dir, &addr).unwrap();
+    let l = route::fork_op(BIND, dir, &addr).unwrap().0;
     assert!(is_socket(&p));
-    let c = route::fork_op(Op::Connect, dir, &addr).unwrap();
+    let c = route::fork_op(CONNECT, dir, &addr).unwrap().0;
     assert_eq!(std::env::current_dir().unwrap(), cwd);
     ping(l, c);
 }
@@ -326,19 +522,19 @@ fn the_fork_route_reports_the_childs_errno() {
     let (dir, name) = path::split(&p).unwrap();
     let addr = SockAddr::standard(name).unwrap();
 
-    let e = route::fork_op(Op::Connect, dir, &addr).unwrap_err();
+    let e = route::fork_op(CONNECT, dir, &addr).unwrap_err();
     assert_eq!(errno(&e), Some(libc::ENOENT), "{e}");
 
-    let e = route::fork_op(Op::Bind, &dir.join("nope"), &addr).unwrap_err();
+    let e = route::fork_op(BIND, &dir.join("nope"), &addr).unwrap_err();
     assert_eq!(errno(&e), Some(libc::ENOENT), "{e}");
 
-    let _l = route::fork_op(Op::Bind, dir, &addr).unwrap();
-    let e = route::fork_op(Op::Bind, dir, &addr).unwrap_err();
+    let _l = route::fork_op(BIND, dir, &addr).unwrap().0;
+    let e = route::fork_op(BIND, dir, &addr).unwrap_err();
     assert_eq!(errno(&e), Some(libc::EADDRINUSE), "{e}");
 
     stale_socket(&dir.join("stale.sock"));
     let stale = SockAddr::standard(OsStr::new("stale.sock")).unwrap();
-    let e = route::fork_op(Op::Connect, dir, &stale).unwrap_err();
+    let e = route::fork_op(CONNECT, dir, &stale).unwrap_err();
     assert_eq!(errno(&e), Some(libc::ECONNREFUSED), "{e}");
 }
 
@@ -367,14 +563,14 @@ fn child_fork_with_sigchld_ignored() {
     let p = env_path("SOCKAT_CHILD_PATH");
     let (dir, name) = path::split(&p).unwrap();
     let addr = SockAddr::standard(name).unwrap();
-    let l = route::fork_op(Op::Bind, dir, &addr).unwrap();
+    let l = route::fork_op(BIND, dir, &addr).unwrap().0;
     assert!(is_socket(&p));
-    let c = route::fork_op(Op::Connect, dir, &addr).unwrap();
+    let c = route::fork_op(CONNECT, dir, &addr).unwrap().0;
     ping(l, c);
     // A failed connect cannot be told apart by errno any more, but it is still
     // a failure.
     let missing = SockAddr::standard(OsStr::new("missing.sock")).unwrap();
-    assert!(route::fork_op(Op::Connect, dir, &missing).is_err());
+    assert!(route::fork_op(CONNECT, dir, &missing).is_err());
 }
 
 // Routes run concurrently from many threads must not disturb other threads'
@@ -409,15 +605,15 @@ fn concurrent_routes_never_change_the_cwd() {
                 for round in 0..10 {
                     let t = tmp();
                     let p = nest(t.path(), [150, 300, 600][(i + round) % 3], "s.sock");
-                    let (l, _) = route::run(Op::Bind, &p).unwrap();
-                    let (c, _) = route::run(Op::Connect, &p).unwrap();
+                    let (l, _) = route::run(BIND, &p).unwrap();
+                    let (c, _) = route::run(CONNECT, &p).unwrap();
                     ping(l, c);
                     let (dir, _) = path::split(&p).unwrap();
                     let fp = dir.join("f.sock");
                     let faddr = SockAddr::standard(OsStr::new("f.sock")).unwrap();
-                    let l = route::fork_op(Op::Bind, dir, &faddr).unwrap();
+                    let l = route::fork_op(BIND, dir, &faddr).unwrap().0;
                     assert!(is_socket(&fp));
-                    let c = route::fork_op(Op::Connect, dir, &faddr).unwrap();
+                    let c = route::fork_op(CONNECT, dir, &faddr).unwrap().0;
                     ping(l, c);
                 }
             })
@@ -452,10 +648,10 @@ mod linux {
         for total in [101, 300, 1000] {
             let t = tmp();
             let p = nest(t.path(), total, "s.sock");
-            let (l, r) = route::run(Op::Bind, &p).unwrap();
+            let (l, r) = route::run(BIND, &p).unwrap();
             assert_eq!(r, Route::ProcFd, "{total}");
             assert!(is_socket(&p));
-            let (c, r) = route::run(Op::Connect, &p).unwrap();
+            let (c, r) = route::run(CONNECT, &p).unwrap();
             assert_eq!(r, Route::ProcFd);
             ping(l, c);
         }
@@ -469,7 +665,7 @@ mod linux {
     fn local_addr_reports_the_proc_spelling_not_the_path() {
         let t = tmp();
         let p = nest(t.path(), 200, "s.sock");
-        let (l, _) = route::run(Op::Bind, &p).unwrap();
+        let (l, _) = route::run(BIND, &p).unwrap();
         let l = UnixListener::from(l);
         let addr = l.local_addr().unwrap();
         let shown = addr.as_pathname().unwrap();
@@ -485,7 +681,7 @@ mod linux {
     fn a_file_name_that_does_not_fit_behind_proc_is_enametoolong() {
         let t = tmp();
         let p = t.path().join("n".repeat(95));
-        let e = linux::run(Op::Bind, &p, Path::new(linux::PROC_SELF_FD)).unwrap_err();
+        let e = linux::run(BIND, &p, Path::new(linux::PROC_SELF_FD)).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{e}");
     }
 
@@ -518,18 +714,18 @@ mod linux {
             let proc = no_proc(t.path(), empty);
             for (total, name) in [(101, "s.sock"), (300, "s.sock"), (1000, "s.sock")] {
                 let p = nest(t.path(), total, name);
-                let (l, r) = linux::run(Op::Bind, &p, &proc).unwrap();
-                assert_eq!(r, Route::Fork, "{total} {empty}");
+                let (l, r) = linux::run(BIND, &p, &proc).unwrap();
+                assert!(matches!(r, Route::Fork { .. }), "{r:?} {total} {empty}");
                 assert!(is_socket(&p));
-                let (c, r) = linux::run(Op::Connect, &p, &proc).unwrap();
-                assert_eq!(r, Route::Fork);
+                let (c, r) = linux::run(CONNECT, &p, &proc).unwrap();
+                assert!(matches!(r, Route::Fork { .. }), "{r:?}");
                 ping(l, c);
             }
             let p = t.path().join("n".repeat(95));
-            let (l, r) = linux::run(Op::Bind, &p, &proc).unwrap();
-            assert_eq!(r, Route::Fork);
+            let (l, r) = linux::run(BIND, &p, &proc).unwrap();
+            assert!(matches!(r, Route::Fork { .. }), "{r:?}");
             assert!(is_socket(&p));
-            let (c, _) = linux::run(Op::Connect, &p, &proc).unwrap();
+            let (c, _) = linux::run(CONNECT, &p, &proc).unwrap();
             ping(l, c);
         }
     }
@@ -546,18 +742,18 @@ mod linux {
         let proc = no_proc(t.path(), false);
         let p = nest(t.path(), 300, "s.sock");
         let missing_dir = p.parent().unwrap().join("nope").join("s.sock");
-        for op in [Op::Bind, Op::Connect] {
+        for op in [BIND, CONNECT] {
             let e = linux::run(op, &missing_dir, &proc).unwrap_err();
             assert_eq!(errno(&e), Some(libc::ENOENT), "{op:?} {e}");
         }
-        let e = linux::run(Op::Connect, &p, &proc).unwrap_err();
+        let e = linux::run(CONNECT, &p, &proc).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ENOENT), "{e}");
-        let (_l, _) = linux::run(Op::Bind, &p, &proc).unwrap();
-        let e = linux::run(Op::Bind, &p, &proc).unwrap_err();
+        let (_l, _) = linux::run(BIND, &p, &proc).unwrap();
+        let e = linux::run(BIND, &p, &proc).unwrap_err();
         assert_eq!(errno(&e), Some(libc::EADDRINUSE), "{e}");
         let stale = p.with_file_name("stale.sock");
         stale_socket(&stale);
-        let e = linux::run(Op::Connect, &stale, &proc).unwrap_err();
+        let e = linux::run(CONNECT, &stale, &proc).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ECONNREFUSED), "{e}");
     }
 
@@ -571,10 +767,10 @@ mod linux {
         let t = tmp();
         let proc = no_proc(t.path(), false);
         let p = nest(t.path(), 300, "s.sock");
-        let (l, _) = linux::run(Op::Bind, &p, &proc).unwrap();
+        let (l, _) = linux::run(BIND, &p, &proc).unwrap();
         let l = UnixListener::from(l);
-        let (c, r) = linux::run(Op::Connect, &p, &proc).unwrap();
-        assert_eq!(r, Route::Fork);
+        let (c, r) = linux::run(CONNECT, &p, &proc).unwrap();
+        assert!(matches!(r, Route::Fork { .. }), "{r:?}");
         let mut c = UnixStream::from(c);
         let (mut s, _) = l.accept().unwrap();
         let child = sys::peer_cred_pid(s.as_fd()).unwrap();
@@ -584,7 +780,7 @@ mod linux {
         s.read_exact(&mut b).unwrap();
         assert_eq!(sys::peer_cred_pid(s.as_fd()).unwrap(), child);
 
-        let (_c, r) = linux::run(Op::Connect, &p, Path::new(linux::PROC_SELF_FD)).unwrap();
+        let (_c, r) = linux::run(CONNECT, &p, Path::new(linux::PROC_SELF_FD)).unwrap();
         assert_eq!(r, Route::ProcFd);
         let (s, _) = l.accept().unwrap();
         assert_eq!(sys::peer_cred_pid(s.as_fd()).unwrap(), me);
@@ -601,8 +797,8 @@ mod linux {
         let p = nest(t.path(), 300, "s.sock");
         let (dir, name) = path::split(&p).unwrap();
         let addr = SockAddr::standard(name).unwrap();
-        let l = UnixListener::from(route::fork_op(Op::Bind, dir, &addr).unwrap());
-        let mut c = UnixStream::from(route::fork_op(Op::Connect, dir, &addr).unwrap());
+        let l = UnixListener::from(route::fork_op(BIND, dir, &addr).unwrap().0);
+        let mut c = UnixStream::from(route::fork_op(CONNECT, dir, &addr).unwrap().0);
         let (mut s, _) = l.accept().unwrap();
         let me = std::process::id() as libc::pid_t;
         let before = sys::peer_cred_pid(s.as_fd()).unwrap();
@@ -613,10 +809,124 @@ mod linux {
         assert_eq!(sys::peer_cred_pid(s.as_fd()).unwrap(), before);
 
         // The /proc route connects from this process itself.
-        let (c2, _) = route::run(Op::Connect, &p).unwrap();
+        let (c2, _) = route::run(CONNECT, &p).unwrap();
         let (s2, _) = l.accept().unwrap();
         assert_eq!(sys::peer_cred_pid(s2.as_fd()).unwrap(), me);
         drop(c2);
+    }
+
+    /// The three Linux routes, each a [`Way`] to its own socket path under
+    /// `t`: the path itself (100 bytes), /proc (300 bytes), and the fork route
+    /// (300 bytes, with /proc made to look absent). With the route each must
+    /// take.
+    fn ways(t: &Path) -> [(&'static str, Way, Want); 3] {
+        let proc = Path::new(linux::PROC_SELF_FD).to_path_buf();
+        let none = no_proc(t, false);
+        let direct = nest(t, 100, "direct.sock");
+        let via_proc = nest(t, 300, "proc.sock");
+        let forked = nest(t, 300, "fork.sock");
+        let (p1, p2) = (proc.clone(), proc);
+        [
+            (
+                "Direct",
+                std::sync::Arc::new(move |req| linux::run(req, &direct, &p1)),
+                |r| r == Route::Direct,
+            ),
+            (
+                "ProcFd",
+                std::sync::Arc::new(move |req| linux::run(req, &via_proc, &p2)),
+                |r| r == Route::ProcFd,
+            ),
+            (
+                "Fork",
+                std::sync::Arc::new(move |req| linux::run(req, &forked, &none)),
+                |r| matches!(r, Route::Fork { .. }),
+            ),
+        ]
+    }
+
+    // A nonblocking connect must not wait on a full backlog on any route
+    // (the blocking one does, on Linux: it sleeps until the listener
+    // accepts). Each route makes its socket O_NONBLOCK before connecting: the
+    // path itself and /proc on sockat's own socket rather than std's (std
+    // cannot connect a nonblocking socket), the fork route in the parent
+    // before the fork, so the child's connect is nonblocking through the open
+    // file description they share. See check_nonblocking_connect for what is
+    // checked on each.
+    #[test]
+    fn a_nonblocking_connect_fails_at_once_on_a_full_backlog_on_every_route() {
+        let t = tmp();
+        for (what, way, want) in ways(t.path()) {
+            check_nonblocking_connect(&way, want, what);
+        }
+    }
+
+    // DR-0001 decision 8: the connect reports the pid the server will see as
+    // the peer when that is not this process. Only the fork route connects
+    // from another process (the child, whose pid SO_PEERCRED keeps); the path
+    // itself and /proc connect from this process and report no pid.
+    #[test]
+    fn only_the_fork_route_reports_the_childs_pid_and_it_is_the_servers_peer() {
+        let t = tmp();
+        for (what, way, _) in ways(t.path()) {
+            check_child_pid(&way, what == "Fork", what);
+        }
+    }
+
+    // With forking ruled out, a path only the fork route reaches (here: no
+    // /proc) fails with ENAMETOOLONG, the error of a plain connect to a path
+    // too long for sun_path, and nothing happens: no connection reaches the
+    // listener (its accept would block) and nothing is created next to the
+    // socket. Blocking or not makes no difference. The other routes are not
+    // affected: with /proc the same path connects through it, and a short path
+    // goes as is. A real failure stays what it is: a missing directory is
+    // ENOENT (opening it comes before the fork route is chosen).
+    #[test]
+    fn without_fork_a_path_that_needs_it_is_enametoolong_and_nothing_is_made() {
+        let t = tmp();
+        let none = no_proc(t.path(), false);
+        let p = nest(t.path(), 300, "s.sock");
+        let (l, _) = linux::run(BIND, &p, Path::new(linux::PROC_SELF_FD)).unwrap();
+        let listener = UnixListener::from(l);
+        listener.set_nonblocking(true).unwrap();
+        let dir = p.parent().unwrap();
+        let before: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        for nonblocking in [false, true] {
+            let req = Request::Connect(ConnectOptions {
+                nonblocking,
+                fork: false,
+            });
+            let e = linux::run(req, &p, &none).unwrap_err();
+            assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{nonblocking}: {e}");
+            let e = listener.accept().unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "a connection got in");
+
+            let missing = dir.join("nope").join("s.sock");
+            let e = linux::run(req, &missing, &none).unwrap_err();
+            assert_eq!(errno(&e), Some(libc::ENOENT), "{nonblocking}: {e}");
+
+            let (_c, r) = linux::run(req, &p, Path::new(linux::PROC_SELF_FD)).unwrap();
+            assert_eq!(r, Route::ProcFd);
+            drop(listener.accept().unwrap());
+        }
+        let after: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after);
+
+        let short = nest(t.path(), 100, "short.sock");
+        let (l, _) = route::run(BIND, &short).unwrap();
+        let req = Request::Connect(ConnectOptions {
+            nonblocking: false,
+            fork: false,
+        });
+        let (c, r) = linux::run(req, &short, &none).unwrap();
+        assert_eq!(r, Route::Direct);
+        ping(l, c);
     }
 }
 
@@ -630,7 +940,7 @@ mod apple {
     use crate::route::apple::{
         self, Config, LINK_PREFIX, LINK_RANDOM_LEN, Relative, SymlinkOutcome, TempLink,
     };
-    use crate::sys::WIDE_PATH_MAX;
+    use crate::sys::{Op, WIDE_PATH_MAX};
     use std::ffi::OsString;
     use std::os::fd::AsFd;
     use std::os::unix::ffi::OsStrExt;
@@ -687,14 +997,14 @@ mod apple {
         assert_eq!(WIDE_PATH_MAX, 253);
         let t = tmp();
         let p = nest(t.path(), 253, "s.sock");
-        let l = apple::wide_op(Op::Bind, &p).unwrap();
+        let l = apple::wide_op(BIND, &p).unwrap();
         assert!(is_socket(&p));
-        let c = apple::wide_op(Op::Connect, &p).unwrap();
+        let c = apple::wide_op(CONNECT, &p).unwrap();
         ping(l, c);
 
         let t = tmp();
         let p = nest(t.path(), 254, "s.sock");
-        let e = apple::wide_op(Op::Bind, &p).unwrap_err();
+        let e = apple::wide_op(BIND, &p).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ENAMETOOLONG));
     }
 
@@ -706,7 +1016,7 @@ mod apple {
     fn local_addr_of_a_widened_bind_is_truncated() {
         let t = tmp();
         let p = nest(t.path(), 200, "s.sock");
-        let l = UnixListener::from(apple::wide_op(Op::Bind, &p).unwrap());
+        let l = UnixListener::from(apple::wide_op(BIND, &p).unwrap());
         let addr = l.local_addr().unwrap();
         let shown = addr.as_pathname().unwrap();
         assert_ne!(shown, p.as_path());
@@ -735,10 +1045,10 @@ mod apple {
         let p = cwd.join(nest(rel_base, rel_len, "s.sock"));
         assert!(path::len(&p) > DIRECT_MAX);
         let c = cfg(&[Path::new("/nonexistent")], true);
-        let (l, r) = apple::run(Op::Bind, &p, &c).unwrap();
+        let (l, r) = apple::run(BIND, &p, &c).unwrap();
         assert_eq!(r, Route::Relative);
         assert!(is_socket(&p));
-        let (cl, r) = apple::run(Op::Connect, &p, &c).unwrap();
+        let (cl, r) = apple::run(CONNECT, &p, &c).unwrap();
         assert_eq!(r, Route::Relative);
         ping(l, cl);
     }
@@ -753,10 +1063,10 @@ mod apple {
             let t = tmp();
             let p = nest(t.path(), total, "s.sock");
             let c = cfg(&[Path::new("/nonexistent")], true);
-            let (l, r) = apple::run(Op::Bind, &p, &c).unwrap();
+            let (l, r) = apple::run(BIND, &p, &c).unwrap();
             assert_eq!(r, Route::Wide, "{total}");
             assert!(is_socket(&p));
-            let (cl, r) = apple::run(Op::Connect, &p, &c).unwrap();
+            let (cl, r) = apple::run(CONNECT, &p, &c).unwrap();
             assert_eq!(r, Route::Wide);
             ping(l, cl);
         }
@@ -772,10 +1082,10 @@ mod apple {
         let p = cwd.join(nest(rel_base, 240, "s.sock"));
         assert!(path::len(&p) > WIDE_PATH_MAX);
         let c = cfg(&[Path::new("/nonexistent")], true);
-        let (l, r) = apple::run(Op::Bind, &p, &c).unwrap();
+        let (l, r) = apple::run(BIND, &p, &c).unwrap();
         assert_eq!(r, Route::WideRelative);
         assert!(is_socket(&p));
-        let (cl, r) = apple::run(Op::Connect, &p, &c).unwrap();
+        let (cl, r) = apple::run(CONNECT, &p, &c).unwrap();
         assert_eq!(r, Route::WideRelative);
         ping(l, cl);
     }
@@ -801,10 +1111,10 @@ mod apple {
         ] {
             let c = cfg(&[base], true);
             let p = p.with_file_name(name);
-            let (l, r) = apple::run(Op::Bind, &p, &c).unwrap();
+            let (l, r) = apple::run(BIND, &p, &c).unwrap();
             assert_eq!(r, want);
             assert!(is_socket(&p));
-            let (cl, r) = apple::run(Op::Connect, &p, &c).unwrap();
+            let (cl, r) = apple::run(CONNECT, &p, &c).unwrap();
             assert_eq!(r, want);
             ping(l, cl);
             assert_empty(base);
@@ -823,12 +1133,12 @@ mod apple {
         let base = nest(b.path(), 250, "base");
         std::fs::create_dir(&base).unwrap();
         let c = cfg(&[&base], true);
-        let (l, r) = apple::run(Op::Bind, &p, &c).unwrap();
-        assert_eq!(r, Route::Fork);
+        let (l, r) = apple::run(BIND, &p, &c).unwrap();
+        assert!(matches!(r, Route::Fork { .. }), "{r:?}");
         assert!(is_socket(&p));
         assert_empty(&base);
-        let (cl, r) = apple::run(Op::Connect, &p, &c).unwrap();
-        assert_eq!(r, Route::Fork);
+        let (cl, r) = apple::run(CONNECT, &p, &c).unwrap();
+        assert!(matches!(r, Route::Fork { .. }), "{r:?}");
         ping(l, cl);
     }
 
@@ -846,20 +1156,28 @@ mod apple {
         let b = tmp();
         let long_base = nest(b.path(), 150, "base");
         std::fs::create_dir(&long_base).unwrap();
-        let cases: [(&[&Path], Route); 4] = [
-            (&[short_base.path()], Route::Symlink),
-            (&[long_base.as_path()], Route::Fork),
-            (&[Path::new("/nonexistent")], Route::Fork),
-            (&[], Route::Fork),
+        // `true`: the fork route, `false`: the symlink route.
+        let cases: [(&[&Path], bool); 4] = [
+            (&[short_base.path()], false),
+            (&[long_base.as_path()], true),
+            (&[Path::new("/nonexistent")], true),
+            (&[], true),
         ];
-        for (i, (base, want)) in cases.into_iter().enumerate() {
+        let way = |r: Route, forked: bool| {
+            if forked {
+                matches!(r, Route::Fork { .. })
+            } else {
+                r == Route::Symlink
+            }
+        };
+        for (i, (base, forked)) in cases.into_iter().enumerate() {
             let p = p.with_file_name(format!("{i}.sock"));
             let c = cfg(base, false);
-            let (l, r) = apple::run(Op::Bind, &p, &c).unwrap();
-            assert_eq!(r, want, "{base:?}");
+            let (l, r) = apple::run(BIND, &p, &c).unwrap();
+            assert!(way(r, forked), "{base:?} {r:?}");
             assert!(is_socket(&p));
-            let (cl, r) = apple::run(Op::Connect, &p, &c).unwrap();
-            assert_eq!(r, want);
+            let (cl, r) = apple::run(CONNECT, &p, &c).unwrap();
+            assert!(way(r, forked), "{base:?} {r:?}");
             ping(l, cl);
         }
         assert_empty(short_base.path());
@@ -874,15 +1192,15 @@ mod apple {
         let t = tmp();
         let name = "n".repeat(150);
         let p = nest(t.path(), 600, &name);
-        let (l, r) = apple::run(Op::Bind, &p, &cfg(&[], true)).unwrap();
-        assert_eq!(r, Route::Fork);
+        let (l, r) = apple::run(BIND, &p, &cfg(&[], true)).unwrap();
+        assert!(matches!(r, Route::Fork { .. }), "{r:?}");
         assert!(is_socket(&p));
-        let (c, r) = apple::run(Op::Connect, &p, &cfg(&[], true)).unwrap();
-        assert_eq!(r, Route::Fork);
+        let (c, r) = apple::run(CONNECT, &p, &cfg(&[], true)).unwrap();
+        assert!(matches!(r, Route::Fork { .. }), "{r:?}");
         ping(l, c);
 
         let q = p.with_file_name("m".repeat(150));
-        let e = apple::run(Op::Bind, &q, &cfg(&[], false)).unwrap_err();
+        let e = apple::run(BIND, &q, &cfg(&[], false)).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{e}");
     }
 
@@ -896,13 +1214,13 @@ mod apple {
         let p = nest(t.path(), 600, "s.sock");
         let base = tmp();
         let c = cfg(&[base.path()], true);
-        let (_l, _) = apple::run(Op::Bind, &p, &c).unwrap();
-        let e = apple::run(Op::Bind, &p, &c).unwrap_err();
+        let (_l, _) = apple::run(BIND, &p, &c).unwrap();
+        let e = apple::run(BIND, &p, &c).unwrap_err();
         assert_eq!(errno(&e), Some(libc::EADDRINUSE), "{e}");
         let missing = p.parent().unwrap().join("nope/s.sock");
-        let e = apple::run(Op::Bind, &missing, &c).unwrap_err();
+        let e = apple::run(BIND, &missing, &c).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ENOENT), "{e}");
-        let e = apple::run(Op::Connect, &p.with_file_name("x.sock"), &c).unwrap_err();
+        let e = apple::run(CONNECT, &p.with_file_name("x.sock"), &c).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ENOENT), "{e}");
         assert_empty(base.path());
     }
@@ -996,11 +1314,11 @@ mod apple {
         let _restore = unreadable(&dir);
 
         let c = cfg(&[], true);
-        let (l, r) = apple::run(Op::Bind, &p, &c).unwrap();
-        assert_eq!(r, Route::Fork);
+        let (l, r) = apple::run(BIND, &p, &c).unwrap();
+        assert!(matches!(r, Route::Fork { .. }), "{r:?}");
         assert!(is_socket(&p));
-        let (cl, r) = apple::run(Op::Connect, &p, &c).unwrap();
-        assert_eq!(r, Route::Fork);
+        let (cl, r) = apple::run(CONNECT, &p, &c).unwrap();
+        assert!(matches!(r, Route::Fork { .. }), "{r:?}");
         ping(l, cl);
     }
 
@@ -1024,7 +1342,7 @@ mod apple {
     fn a_kernel_refusing_o_search_on_a_directory_falls_back_to_o_rdonly() {
         let refused = |code| Err(io::Error::from_raw_os_error(code));
         let fork_in = |op, dir: &OwnedFd, addr: &SockAddr| {
-            let sock = sys::socket().unwrap();
+            let sock = sys::socket(false).unwrap();
             sys::op_in_dir_forked(op, sock.as_fd(), dir.as_fd(), addr)?;
             if op == Op::Bind {
                 sys::listen(sock.as_fd()).unwrap();
@@ -1052,7 +1370,7 @@ mod apple {
         let _restore = unreadable(&locked);
         // The premise: the fork route as it is (O_SEARCH) binds there.
         let addr = SockAddr::standard(OsStr::new("s.sock")).unwrap();
-        let _l = route::fork_op(Op::Bind, &locked, &addr).unwrap();
+        let _l = route::fork_op(BIND, &locked, &addr).unwrap().0;
         for code in [libc::EISDIR, libc::EINVAL] {
             let e = route::search_or_read_only(&locked, refused(code)).unwrap_err();
             assert_eq!(errno(&e), Some(libc::EACCES), "{code}: {e}");
@@ -1069,7 +1387,7 @@ mod apple {
         let file = t.path().join("file");
         std::fs::write(&file, b"").unwrap();
         for base in [Path::new("/nonexistent"), file.as_path()] {
-            let out = apple::symlink_route(Op::Bind, base, dir, name, true);
+            let out = apple::symlink_route(BIND, base, dir, name, true);
             assert!(matches!(out, SymlinkOutcome::Unusable), "{base:?}");
         }
         assert!(!is_socket(&p));
@@ -1136,10 +1454,10 @@ mod apple {
 
         mark_untouched(&long_base);
         let c = cfg(&[&long_base, first.path()], true);
-        let (l, r) = apple::run(Op::Bind, &p, &c).unwrap();
+        let (l, r) = apple::run(BIND, &p, &c).unwrap();
         assert_eq!(r, Route::Symlink);
         assert!(is_socket(&p));
-        let (cl, r) = apple::run(Op::Connect, &p, &c).unwrap();
+        let (cl, r) = apple::run(CONNECT, &p, &c).unwrap();
         assert_eq!(r, Route::Symlink);
         ping(l, cl);
         assert_untouched(&long_base);
@@ -1148,9 +1466,9 @@ mod apple {
         mark_untouched(second.path());
         let q = p.with_file_name("q.sock");
         let c = cfg(&[first.path(), second.path()], true);
-        let (l, r) = apple::run(Op::Bind, &q, &c).unwrap();
+        let (l, r) = apple::run(BIND, &q, &c).unwrap();
         assert_eq!(r, Route::Symlink);
-        let (cl, _) = apple::run(Op::Connect, &q, &c).unwrap();
+        let (cl, _) = apple::run(CONNECT, &q, &c).unwrap();
         ping(l, cl);
         assert_untouched(second.path());
         assert_empty(first.path());
@@ -1171,10 +1489,10 @@ mod apple {
         for (i, bad) in [missing, file.as_path()].into_iter().enumerate() {
             let p = p.with_file_name(format!("{i}.sock"));
             let c = cfg(&[bad, good.path()], true);
-            let (l, r) = apple::run(Op::Bind, &p, &c).unwrap();
+            let (l, r) = apple::run(BIND, &p, &c).unwrap();
             assert_eq!(r, Route::Symlink, "{bad:?}");
             assert!(is_socket(&p));
-            let (cl, r) = apple::run(Op::Connect, &p, &c).unwrap();
+            let (cl, r) = apple::run(CONNECT, &p, &c).unwrap();
             assert_eq!(r, Route::Symlink);
             ping(l, cl);
         }
@@ -1182,9 +1500,9 @@ mod apple {
 
         let p = p.with_file_name("fork.sock");
         let c = cfg(&[missing, file.as_path()], true);
-        let (l, r) = apple::run(Op::Bind, &p, &c).unwrap();
-        assert_eq!(r, Route::Fork);
-        let (cl, _) = apple::run(Op::Connect, &p, &c).unwrap();
+        let (l, r) = apple::run(BIND, &p, &c).unwrap();
+        assert!(matches!(r, Route::Fork { .. }), "{r:?}");
+        let (cl, _) = apple::run(CONNECT, &p, &c).unwrap();
         ping(l, cl);
     }
 
@@ -1201,16 +1519,16 @@ mod apple {
         let first = tmp();
         let second = tmp();
         let c = cfg(&[first.path(), second.path()], true);
-        let (_l, r) = apple::run(Op::Bind, &p, &c).unwrap();
+        let (_l, r) = apple::run(BIND, &p, &c).unwrap();
         assert_eq!(r, Route::Symlink);
         mark_untouched(second.path());
 
-        let e = apple::run(Op::Bind, &p, &c).unwrap_err();
+        let e = apple::run(BIND, &p, &c).unwrap_err();
         assert_eq!(errno(&e), Some(libc::EADDRINUSE), "{e}");
         let missing = p.parent().unwrap().join("nope/s.sock");
-        let e = apple::run(Op::Bind, &missing, &c).unwrap_err();
+        let e = apple::run(BIND, &missing, &c).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ENOENT), "{e}");
-        let e = apple::run(Op::Connect, &p.with_file_name("x.sock"), &c).unwrap_err();
+        let e = apple::run(CONNECT, &p.with_file_name("x.sock"), &c).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ENOENT), "{e}");
 
         assert_untouched(second.path());
@@ -1249,7 +1567,7 @@ mod apple {
             return;
         }
         let p = env_path("SOCKAT_CHILD_PATH");
-        let (_l, route) = route::run(Op::Bind, &p).unwrap();
+        let (_l, route) = route::run(BIND, &p).unwrap();
         println!("sockat-child: {route:?}");
     }
 
@@ -1265,8 +1583,8 @@ mod apple {
         let p = nest(t.path(), 400, "s.sock");
         let (dir, name) = path::split(&p).unwrap();
         let addr = SockAddr::standard(name).unwrap();
-        let l = UnixListener::from(route::fork_op(Op::Bind, dir, &addr).unwrap());
-        let mut c = UnixStream::from(route::fork_op(Op::Connect, dir, &addr).unwrap());
+        let l = UnixListener::from(route::fork_op(BIND, dir, &addr).unwrap().0);
+        let mut c = UnixStream::from(route::fork_op(CONNECT, dir, &addr).unwrap().0);
         let (mut s, _) = l.accept().unwrap();
         let before = sys::local_peer_pid(s.as_fd()).unwrap();
         assert_ne!(before, me);
@@ -1277,10 +1595,178 @@ mod apple {
 
         // The widened route connects from this process itself.
         let wp = nest(t.path(), 200, "w.sock");
-        let wl = UnixListener::from(apple::wide_op(Op::Bind, &wp).unwrap());
-        let _wc = apple::wide_op(Op::Connect, &wp).unwrap();
+        let wl = UnixListener::from(apple::wide_op(BIND, &wp).unwrap());
+        let _wc = apple::wide_op(CONNECT, &wp).unwrap();
         let (ws, _) = wl.accept().unwrap();
         assert_eq!(sys::local_peer_pid(ws.as_fd()).unwrap(), me);
+    }
+
+    // ----- connect options (nonblocking, the child's pid, no fork) -----
+
+    /// Places and directories one [`ways`] call works in, removed at the end of
+    /// the test.
+    struct Dirs {
+        t: tempfile::TempDir,
+        below_cwd: tempfile::TempDir,
+        short_base: tempfile::TempDir,
+        long_base_dir: tempfile::TempDir,
+    }
+
+    impl Dirs {
+        fn new() -> Self {
+            Self {
+                t: tmp(),
+                below_cwd: tmp_below_cwd(),
+                short_base: tmp(),
+                long_base_dir: tmp(),
+            }
+        }
+    }
+
+    /// The seven Apple routes, each a [`Way`] to its own socket path, with the
+    /// route each must take: the path itself (100 bytes); the relative
+    /// spelling of a path below the cwd (99 bytes relative); the widened
+    /// sockaddr (200 bytes under /tmp); the widened sockaddr with the relative
+    /// spelling (240 bytes relative, over 253 absolute); the symlink under a
+    /// short place (plain sockaddr) and under a 150-byte place (widened); and
+    /// the fork route (600 bytes, no place for a symlink). Same inputs as the
+    /// route-order tests above use to force each route.
+    fn ways(d: &Dirs) -> Vec<(&'static str, Way, Want)> {
+        let t = d.t.path();
+        let cwd = std::env::current_dir().unwrap();
+        let rel_base = d.below_cwd.path().strip_prefix(&cwd).unwrap();
+        let long_base = nest(d.long_base_dir.path(), 150, "base");
+        std::fs::create_dir_all(&long_base).unwrap();
+        let none = Path::new("/nonexistent");
+        let cases: Vec<(&'static str, PathBuf, Config, Want)> = vec![
+            (
+                "Direct",
+                nest(t, 100, "direct.sock"),
+                cfg(&[none], true),
+                |r| r == Route::Direct,
+            ),
+            (
+                "Relative",
+                cwd.join(nest(rel_base, 99, "rel.sock")),
+                cfg(&[none], true),
+                |r| r == Route::Relative,
+            ),
+            ("Wide", nest(t, 200, "wide.sock"), cfg(&[none], true), |r| {
+                r == Route::Wide
+            }),
+            (
+                "WideRelative",
+                cwd.join(nest(rel_base, 240, "wrel.sock")),
+                cfg(&[none], true),
+                |r| r == Route::WideRelative,
+            ),
+            (
+                "Symlink",
+                nest(t, 600, "sym.sock"),
+                cfg(&[d.short_base.path()], true),
+                |r| r == Route::Symlink,
+            ),
+            (
+                "SymlinkWide",
+                nest(t, 600, "symw.sock"),
+                cfg(&[&long_base], true),
+                |r| r == Route::SymlinkWide,
+            ),
+            ("Fork", nest(t, 600, "fork.sock"), cfg(&[], true), |r| {
+                matches!(r, Route::Fork { .. })
+            }),
+        ];
+        cases
+            .into_iter()
+            .map(|(what, p, c, want)| {
+                let way: Way = std::sync::Arc::new(move |req| apple::run(req, &p, &c));
+                (what, way, want)
+            })
+            .collect()
+    }
+
+    // A nonblocking connect must come back at once and stay O_NONBLOCK on
+    // every route. On macOS a full backlog already fails at once with
+    // ECONNREFUSED for a blocking connect too, so what differs is the socket
+    // that comes back; the routes that hand a plain sockaddr to std (the path
+    // itself, the relative spelling, the symlink) must use sockat's own
+    // socket for it (std cannot connect a nonblocking socket), and the fork
+    // route must make the parent's socket O_NONBLOCK before the fork. See
+    // check_nonblocking_connect for what is checked on each.
+    #[test]
+    fn a_nonblocking_connect_fails_at_once_on_a_full_backlog_on_every_route() {
+        let d = Dirs::new();
+        for (what, way, want) in ways(&d) {
+            check_nonblocking_connect(&way, want, what);
+        }
+        assert_empty(d.short_base.path());
+    }
+
+    // DR-0001 decision 8: the connect reports the pid the server will see as
+    // the peer when that is not this process. Only the fork route connects
+    // from another process (the child; LOCAL_PEERPID names it until this
+    // process sends); every other route connects from this process and
+    // reports no pid.
+    #[test]
+    fn only_the_fork_route_reports_the_childs_pid_and_it_is_the_servers_peer() {
+        let d = Dirs::new();
+        for (what, way, _) in ways(&d) {
+            check_child_pid(&way, what == "Fork", what);
+        }
+    }
+
+    // With forking ruled out, a path only the fork route reaches (600 bytes,
+    // so neither relative nor widened; the only place for a symlink too long
+    // for the path through it) fails with ENAMETOOLONG, the error of a plain
+    // connect to a path too long for sun_path, and nothing happens: no
+    // connection reaches the listener (its accept would block), nothing is
+    // created in the place for the symlink (its mtime is unchanged) or next to
+    // the socket. Blocking or not makes no difference. The other routes are
+    // not affected: with a short place the same path connects through the
+    // symlink. A real failure stays what it is: a missing directory is ENOENT
+    // (opening it comes before the fork route is chosen).
+    #[test]
+    fn without_fork_a_path_that_needs_it_is_enametoolong_and_nothing_is_made() {
+        let t = tmp();
+        let p = nest(t.path(), 600, "s.sock");
+        let b = tmp();
+        let long_base = nest(b.path(), 250, "base");
+        std::fs::create_dir(&long_base).unwrap();
+        let short_base = tmp();
+        let (l, _) = apple::run(BIND, &p, &cfg(&[], true)).unwrap();
+        let listener = UnixListener::from(l);
+        listener.set_nonblocking(true).unwrap();
+        let dir = p.parent().unwrap();
+        let list = || -> Vec<_> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect()
+        };
+        let before = list();
+        mark_untouched(&long_base);
+        let no_place = cfg(&[&long_base], true);
+        for nonblocking in [false, true] {
+            let req = Request::Connect(ConnectOptions {
+                nonblocking,
+                fork: false,
+            });
+            let e = apple::run(req, &p, &no_place).unwrap_err();
+            assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{nonblocking}: {e}");
+            let e = listener.accept().unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "a connection got in");
+
+            let missing = dir.join("nope").join("s.sock");
+            let e = apple::run(req, &missing, &cfg(&[], true)).unwrap_err();
+            assert_eq!(errno(&e), Some(libc::ENOENT), "{nonblocking}: {e}");
+
+            let (_c, r) = apple::run(req, &p, &cfg(&[short_base.path()], true)).unwrap();
+            assert_eq!(r, Route::Symlink);
+            drop(listener.accept().unwrap());
+        }
+        assert_untouched(&long_base);
+        assert_eq!(before, list());
+        assert_empty(short_base.path());
     }
 
     // ----- the relative spelling (route 3a / 3b) -----
@@ -1318,7 +1804,7 @@ mod apple {
         let rel = Relative::new(&p, dir)
             .map(|r| r.path.display().to_string())
             .unwrap_or_else(|| "-".into());
-        let (_l, route) = apple::run(Op::Bind, &p, &cfg(&[], true)).unwrap();
+        let (_l, route) = apple::run(BIND, &p, &cfg(&[], true)).unwrap();
         println!("sockat-child: {route:?} {rel}");
     }
 
@@ -1502,7 +1988,7 @@ mod apple {
         let e = rel
             .run(|q| {
                 std::env::set_current_dir(&two).unwrap();
-                route::std_op(Op::Bind, q)
+                route::plain_op(BIND, q)
             })
             .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::Other, "{e}");
@@ -1523,7 +2009,7 @@ mod apple {
         let e = rel
             .run(|q| {
                 std::env::set_current_dir(&two).unwrap();
-                route::std_op(Op::Connect, q)
+                route::plain_op(CONNECT, q)
             })
             .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::Other, "{e}");

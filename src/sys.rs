@@ -8,10 +8,12 @@
 //!   hold the "widened" form whose `sun_path` runs past the 104 bytes of
 //!   `struct sockaddr_un`, up to `SOCK_MAXADDRLEN` (255) bytes in total.
 //! * [`socket`] / [`bind`] / [`connect`] / [`listen`] — a stream socket set up the
-//!   same way std sets up the sockets behind `UnixListener` / `UnixStream`.
+//!   same way std sets up the sockets behind `UnixListener` / `UnixStream`
+//!   (optionally `O_NONBLOCK`, which std cannot connect with).
 //! * [`op_in_dir_forked`] — bind / connect relative to a directory fd in a forked
 //!   child that `fchdir`s (the last resort on Apple targets, on Linux without
-//!   /proc, and on Unix targets without a dirfd-relative primitive).
+//!   /proc, and on Unix targets without a dirfd-relative primitive); returns the
+//!   child's pid.
 //! * `op_at` — `bindat(2)` / `connectat(2)` (FreeBSD).
 
 // FreeBSD reaches long paths through bindat / connectat, so the fork route is
@@ -157,13 +159,19 @@ fn cvt(rc: libc::c_int) -> io::Result<libc::c_int> {
 /// A new `AF_UNIX` / `SOCK_STREAM` socket, set up like the ones std creates:
 /// close-on-exec everywhere, and `SO_NOSIGPIPE` on Apple targets (std sets it
 /// there so a write to a closed peer returns `EPIPE` instead of raising
-/// SIGPIPE).
-pub(crate) fn socket() -> io::Result<OwnedFd> {
+/// SIGPIPE). `nonblocking` makes it `O_NONBLOCK` as well.
+pub(crate) fn socket(nonblocking: bool) -> io::Result<OwnedFd> {
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
     {
+        let nonblock = if nonblocking { libc::SOCK_NONBLOCK } else { 0 };
         // SAFETY: plain syscall; the returned fd is owned by the OwnedFd below.
-        let fd =
-            cvt(unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) })?;
+        let fd = cvt(unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC | nonblock,
+                0,
+            )
+        })?;
         // SAFETY: `fd` is a fresh fd nobody else owns.
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
@@ -175,6 +183,12 @@ pub(crate) fn socket() -> io::Result<OwnedFd> {
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         // SAFETY: fcntl on an fd we own.
         cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) })?;
+        if nonblocking {
+            // SAFETY: fcntl on an fd we own.
+            let flags = cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) })?;
+            // SAFETY: fcntl on an fd we own.
+            cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) })?;
+        }
         #[cfg(target_vendor = "apple")]
         {
             let one: libc::c_int = 1;
@@ -193,14 +207,12 @@ pub(crate) fn socket() -> io::Result<OwnedFd> {
     }
 }
 
-#[cfg(target_vendor = "apple")]
 /// `bind(2)`.
 pub(crate) fn bind(sock: BorrowedFd<'_>, addr: &SockAddr) -> io::Result<()> {
     // SAFETY: `addr` points to `addr.len` initialised bytes for the call.
     cvt(unsafe { libc::bind(sock.as_raw_fd(), addr.as_ptr(), addr.len) }).map(drop)
 }
 
-#[cfg(target_vendor = "apple")]
 /// `connect(2)`.
 ///
 /// Like std's `UnixStream::connect`, an `EINTR` is returned as is rather than
@@ -234,7 +246,6 @@ pub(crate) fn listen(sock: BorrowedFd<'_>) -> io::Result<()> {
     cvt(unsafe { libc::listen(sock.as_raw_fd(), BACKLOG) }).map(drop)
 }
 
-#[cfg(target_vendor = "apple")]
 /// `bind(2)` or `connect(2)` on `sock` with `addr`.
 pub(crate) fn op(op: Op, sock: BorrowedFd<'_>, addr: &SockAddr) -> io::Result<()> {
     match op {
@@ -291,12 +302,18 @@ fn is_connected(sock: BorrowedFd<'_>) -> io::Result<bool> {
 /// (`SIGCHLD` set to `SIG_IGN`, or a `waitpid(-1)` elsewhere in the process;
 /// `waitpid` then fails with `ECHILD`), the outcome is read off the socket
 /// itself: bound / connected means success.
+///
+/// On success it returns the child's pid: the process that made the call, and
+/// so the one a server's peer-credential query names for a connect (Linux's
+/// `SO_PEERCRED` for good, macOS's `LOCAL_PEERPID` until this process sends).
+/// The child has exited by then (or was reaped elsewhere); the pid is a record
+/// of who connected, not a process to signal.
 pub(crate) fn op_in_dir_forked(
     op: Op,
     sock: BorrowedFd<'_>,
     dir: BorrowedFd<'_>,
     addr: &SockAddr,
-) -> io::Result<()> {
+) -> io::Result<libc::pid_t> {
     let sock_raw = sock.as_raw_fd();
     let dir_raw = dir.as_raw_fd();
     let addr_ptr = addr.as_ptr();
@@ -338,7 +355,7 @@ pub(crate) fn op_in_dir_forked(
         let err = io::Error::last_os_error();
         match err.raw_os_error() {
             Some(libc::EINTR) => continue,
-            Some(libc::ECHILD) => return outcome_from_socket(op, sock),
+            Some(libc::ECHILD) => return outcome_from_socket(op, sock).map(|()| pid),
             _ => return Err(err),
         }
     }
@@ -348,7 +365,7 @@ pub(crate) fn op_in_dir_forked(
         ));
     }
     match libc::WEXITSTATUS(status) {
-        0 => Ok(()),
+        0 => Ok(pid),
         code => Err(io::Error::from_raw_os_error(code)),
     }
 }
@@ -467,4 +484,28 @@ pub(crate) fn ignore_sigchld() {
     unsafe {
         libc::signal(libc::SIGCHLD, libc::SIG_IGN);
     }
+}
+
+/// Whether `fd` is `O_NONBLOCK`. Test-only (the connect option tests run on
+/// Linux and Apple).
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "android", target_vendor = "apple")
+))]
+pub(crate) fn is_nonblocking(fd: BorrowedFd<'_>) -> io::Result<bool> {
+    // SAFETY: fcntl F_GETFL on a borrowed fd.
+    let flags = cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) })?;
+    Ok(flags & libc::O_NONBLOCK != 0)
+}
+
+/// `listen(2)` again with `backlog`, which both Linux and XNU apply to a
+/// socket that is already listening. Test-only: shrinks the backlog of a
+/// listener so it can be filled.
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "android", target_vendor = "apple")
+))]
+pub(crate) fn relisten(sock: BorrowedFd<'_>, backlog: libc::c_int) -> io::Result<()> {
+    // SAFETY: plain syscall on a borrowed fd.
+    cvt(unsafe { libc::listen(sock.as_raw_fd(), backlog) }).map(drop)
 }

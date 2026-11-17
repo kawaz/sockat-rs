@@ -10,7 +10,87 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
 use crate::path;
-use crate::sys::{self, Op};
+use crate::sys::{self, Op, SockAddr};
+
+/// How a connect is made. [`ConnectOptions::DEFAULT`] is what
+/// `sockat::connect` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConnectOptions {
+    /// Make the socket `O_NONBLOCK` before connecting, on every route, and
+    /// leave it so.
+    ///
+    /// A full backlog then fails the connect at once instead of waiting for
+    /// room: Linux answers `EAGAIN` (where a blocking connect waits), macOS
+    /// `ECONNREFUSED` (as a blocking connect does).
+    ///
+    /// A Unix-domain connect completes or fails within the call even on a
+    /// nonblocking socket: neither Linux nor XNU ever answers `EINPROGRESS`
+    /// for it (checked on Linux 7.2 and macOS 26.5 with 200000 nonblocking
+    /// connects against a listener with a small backlog: only success and
+    /// `EAGAIN` / `ECONNREFUSED`; neither `net/unix/af_unix.c` nor XNU's
+    /// `uipc_usrreq.c` produces it, the latter marking the socket connected
+    /// before `connect(2)` looks for a connect still in progress). Should a
+    /// kernel ever answer `EINPROGRESS`, it is returned as the error it is and
+    /// the socket is closed, rather than handing back a stream that is not
+    /// connected yet.
+    pub(crate) nonblocking: bool,
+    /// Whether the fork route may be taken. Without it, a path that only the
+    /// fork route can reach is an error ([`fork_ruled_out`]) and nothing is
+    /// created or connected; every other route, and its real failures, stay
+    /// as they are.
+    pub(crate) fork: bool,
+}
+
+impl ConnectOptions {
+    /// What `sockat::connect` does: block like std, and fork when nothing
+    /// else reaches the path.
+    pub(crate) const DEFAULT: Self = Self {
+        nonblocking: false,
+        fork: true,
+    };
+}
+
+/// What to do at a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Request {
+    /// Bind and listen, as `sockat::bind` does.
+    Bind,
+    /// Connect, as the options say.
+    Connect(ConnectOptions),
+}
+
+impl Request {
+    /// The system call this comes down to.
+    fn op(self) -> Op {
+        match self {
+            Request::Bind => Op::Bind,
+            Request::Connect(_) => Op::Connect,
+        }
+    }
+
+    /// Whether the socket is made `O_NONBLOCK` before the call.
+    fn nonblocking(self) -> bool {
+        matches!(self, Request::Connect(o) if o.nonblocking)
+    }
+
+    /// Whether the fork route may be taken.
+    #[cfg(any(test, not(target_os = "freebsd")))]
+    fn may_fork(self) -> bool {
+        match self {
+            Request::Bind => true,
+            Request::Connect(o) => o.fork,
+        }
+    }
+}
+
+/// The error for a path that only the fork route reaches, when the options
+/// rule the fork route out: `ENAMETOOLONG`, the error of a plain connect to a
+/// path longer than `sun_path`. That is what the path is once every other way
+/// around the limit is too long or unavailable (on Linux: no /proc).
+#[cfg(any(test, not(target_os = "freebsd")))]
+fn fork_ruled_out() -> io::Error {
+    io::Error::from_raw_os_error(libc::ENAMETOOLONG)
+}
 
 /// A path of at most this many bytes is handed to std as is.
 ///
@@ -19,16 +99,21 @@ use crate::sys::{self, Op};
 /// takes the plain route does not depend on the platform it runs on.
 pub(crate) const DIRECT_MAX: usize = 100;
 
-/// Which way a bind / connect went. Only the tests read it; the public API
-/// drops it (users are not meant to care).
+/// Which way a bind / connect went. The public API does not show it (users
+/// are not meant to care); what it may show is its consequence for the peer,
+/// [`Route::child`].
+///
+/// "In the plain sockaddr" means through std, except for a nonblocking
+/// connect, which std cannot make: that one is sockat's own socket, set up as
+/// std's, with the same address bytes ([`plain_op`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Route {
-    /// The path itself, through std.
+    /// The path itself, in the plain sockaddr.
     Direct,
-    /// `/proc/self/fd/<dirfd>/<name>`, through std (Linux).
+    /// `/proc/self/fd/<dirfd>/<name>`, in the plain sockaddr (Linux).
     #[cfg(any(target_os = "linux", target_os = "android"))]
     ProcFd,
-    /// The path spelled relative to the cwd, through std (Apple).
+    /// The path spelled relative to the cwd, in the plain sockaddr (Apple).
     #[cfg(target_vendor = "apple")]
     Relative,
     /// The path itself in a widened `sockaddr_un` (Apple).
@@ -37,7 +122,8 @@ pub(crate) enum Route {
     /// The relative spelling in a widened `sockaddr_un` (Apple).
     #[cfg(target_vendor = "apple")]
     WideRelative,
-    /// Through a short temporary symlink to the directory, through std (Apple).
+    /// Through a short temporary symlink to the directory, in the plain
+    /// sockaddr (Apple).
     #[cfg(target_vendor = "apple")]
     Symlink,
     /// Through a temporary symlink, in a widened `sockaddr_un` (Apple).
@@ -49,32 +135,71 @@ pub(crate) enum Route {
     /// A forked child that `fchdir`s into the directory (on Linux, only
     /// without /proc).
     #[cfg(not(target_os = "freebsd"))]
-    Fork,
+    Fork {
+        /// The pid of the child that made the call ([`sys::op_in_dir_forked`]).
+        child: libc::pid_t,
+    },
+}
+
+impl Route {
+    /// The pid of the forked child that made the call, when the route forked
+    /// (`None` otherwise).
+    ///
+    /// For a connect, this is the pid a server's peer-credential query names
+    /// instead of the calling process: Linux's `SO_PEERCRED` for the life of
+    /// the connection, macOS's `LOCAL_PEERPID` until the caller sends
+    /// (DR-0001 decision 8).
+    pub(crate) fn child(self) -> Option<libc::pid_t> {
+        match self {
+            #[cfg(not(target_os = "freebsd"))]
+            Route::Fork { child } => Some(child),
+            _ => None,
+        }
+    }
 }
 
 /// Bind or connect a stream socket to `path`, trying the routes in order.
-pub(crate) fn run(op: Op, path: &Path) -> io::Result<(OwnedFd, Route)> {
+pub(crate) fn run(req: Request, path: &Path) -> io::Result<(OwnedFd, Route)> {
     #[cfg(target_vendor = "apple")]
-    return apple::run(op, path, &apple::Config::from_env());
+    return apple::run(req, path, &apple::Config::from_env());
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    return linux::run(op, path, Path::new(linux::PROC_SELF_FD));
+    return linux::run(req, path, Path::new(linux::PROC_SELF_FD));
     #[cfg(target_os = "freebsd")]
-    return freebsd::run(op, path);
+    return freebsd::run(req, path);
     #[cfg(not(any(
         target_vendor = "apple",
         target_os = "linux",
         target_os = "android",
         target_os = "freebsd"
     )))]
-    return other::run(op, path);
+    return other::run(req, path);
 }
 
-/// Bind (and listen) or connect through std with `path` as is.
-pub(crate) fn std_op(op: Op, path: &Path) -> io::Result<OwnedFd> {
-    match op {
-        Op::Bind => UnixListener::bind(path).map(OwnedFd::from),
-        Op::Connect => UnixStream::connect(path).map(OwnedFd::from),
+/// Bind (and listen) or connect with `path` as is, in the plain sockaddr.
+///
+/// A bind and a blocking connect go to std unchanged. std cannot make a
+/// nonblocking connect (`UnixStream::connect` creates and connects its socket
+/// in one call), so that one is made on sockat's own socket, set up as std's
+/// ([`sys::socket`]) plus `O_NONBLOCK`, with the same address bytes std would
+/// build ([`SockAddr::standard`]).
+pub(crate) fn plain_op(req: Request, path: &Path) -> io::Result<OwnedFd> {
+    match req {
+        Request::Bind => UnixListener::bind(path).map(OwnedFd::from),
+        Request::Connect(o) if !o.nonblocking => UnixStream::connect(path).map(OwnedFd::from),
+        Request::Connect(_) => raw_op(req, &SockAddr::standard(path.as_os_str())?),
     }
+}
+
+/// Bind (and listen) or connect a fresh socket (`O_NONBLOCK` for a
+/// nonblocking connect) to `addr`.
+pub(crate) fn raw_op(req: Request, addr: &SockAddr) -> io::Result<OwnedFd> {
+    use std::os::fd::AsFd;
+    let sock = sys::socket(req.nonblocking())?;
+    sys::op(req.op(), sock.as_fd(), addr)?;
+    if req == Request::Bind {
+        sys::listen(sock.as_fd())?;
+    }
+    Ok(sock)
 }
 
 /// Open `dir` to use as the base of a relative bind / connect.
@@ -148,8 +273,10 @@ pub(crate) fn search_or_read_only(
     }
 }
 
-/// Bind (and listen) or connect a fresh socket to `name` inside `dir` from a
-/// forked child that `fchdir`s into `dir` ([`sys::op_in_dir_forked`]).
+/// Bind (and listen) or connect a fresh socket (`O_NONBLOCK` for a
+/// nonblocking connect) to `name` inside `dir` from a forked child that
+/// `fchdir`s into `dir` ([`sys::op_in_dir_forked`]). Returns the socket and
+/// the child's pid.
 ///
 /// `addr` holds `name` (built by the caller, which knows which address forms
 /// the target accepts).
@@ -157,27 +284,46 @@ pub(crate) fn search_or_read_only(
     test,
     not(any(target_os = "linux", target_os = "android", target_os = "freebsd"))
 ))]
-pub(crate) fn fork_op(op: Op, dir: &Path, addr: &sys::SockAddr) -> io::Result<OwnedFd> {
+pub(crate) fn fork_op(
+    req: Request,
+    dir: &Path,
+    addr: &SockAddr,
+) -> io::Result<(OwnedFd, libc::pid_t)> {
     use std::os::fd::AsFd;
-    fork_in(op, open_dir(dir)?.as_fd(), addr)
+    fork_in(req, open_dir(dir)?.as_fd(), addr)
 }
 
 /// [`fork_op`] with the directory already opened by [`open_dir`].
+///
+/// When `req` rules the fork route out, this is where it ends, with
+/// [`fork_ruled_out`]: before any socket is created, and after the directory
+/// was opened, so a missing or unreadable directory still comes out as the
+/// real error it is.
+///
+/// The socket is made `O_NONBLOCK` here, before the fork, so the child's
+/// connect runs on a nonblocking socket: the flag belongs to the open file
+/// description that parent and child share.
 #[cfg(any(test, not(target_os = "freebsd")))]
-fn fork_in(op: Op, dir: std::os::fd::BorrowedFd<'_>, addr: &sys::SockAddr) -> io::Result<OwnedFd> {
+fn fork_in(
+    req: Request,
+    dir: std::os::fd::BorrowedFd<'_>,
+    addr: &SockAddr,
+) -> io::Result<(OwnedFd, libc::pid_t)> {
     use std::os::fd::AsFd;
-    let sock = sys::socket()?;
-    sys::op_in_dir_forked(op, sock.as_fd(), dir, addr)?;
-    if op == Op::Bind {
+    if !req.may_fork() {
+        return Err(fork_ruled_out());
+    }
+    let sock = sys::socket(req.nonblocking())?;
+    let child = sys::op_in_dir_forked(req.op(), sock.as_fd(), dir, addr)?;
+    if req == Request::Bind {
         sys::listen(sock.as_fd())?;
     }
-    Ok(sock)
+    Ok((sock, child))
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) mod linux {
     use super::*;
-    use crate::sys::SockAddr;
     use std::ffi::OsStr;
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
     use std::path::PathBuf;
@@ -187,7 +333,8 @@ pub(crate) mod linux {
 
     /// Linux: the path itself when it is short, otherwise
     /// `/proc/self/fd/<dirfd>/<name>` with the directory opened `O_PATH`, or,
-    /// when there is no /proc, the fork route.
+    /// when there is no /proc, the fork route (`ENAMETOOLONG` when the
+    /// connect options rule it out).
     ///
     /// The kernel resolves the `/proc/self/fd/<n>` magic link to the directory
     /// the fd refers to, so the socket is created in (or looked up in) that
@@ -201,19 +348,22 @@ pub(crate) mod linux {
     ///
     /// `proc_self_fd` is [`PROC_SELF_FD`] outside the tests, which point it
     /// elsewhere to stand in for a system without /proc.
-    pub(crate) fn run(op: Op, path: &Path, proc_self_fd: &Path) -> io::Result<(OwnedFd, Route)> {
+    pub(crate) fn run(
+        req: Request,
+        path: &Path,
+        proc_self_fd: &Path,
+    ) -> io::Result<(OwnedFd, Route)> {
         if path::len(path) <= DIRECT_MAX {
-            return std_op(op, path).map(|fd| (fd, Route::Direct));
+            return plain_op(req, path).map(|fd| (fd, Route::Direct));
         }
         let (dir, name) = path::split(path)?;
         let dir = open_dir(dir)?;
         match proc_spelling(dir.as_fd(), name, proc_self_fd)? {
             // `dir` stays open until the call returns (dropped at the end of
             // scope), so the spelling keeps naming it.
-            Some(via) => std_op(op, &via).map(|fd| (fd, Route::ProcFd)),
-            None => {
-                fork_in(op, dir.as_fd(), &SockAddr::standard(name)?).map(|fd| (fd, Route::Fork))
-            }
+            Some(via) => plain_op(req, &via).map(|fd| (fd, Route::ProcFd)),
+            None => fork_in(req, dir.as_fd(), &SockAddr::standard(name)?)
+                .map(|(fd, child)| (fd, Route::Fork { child })),
         }
     }
 
@@ -247,21 +397,20 @@ pub(crate) mod linux {
 #[cfg(target_os = "freebsd")]
 pub(crate) mod freebsd {
     use super::*;
-    use crate::sys::SockAddr;
     use std::os::fd::AsFd;
 
     /// FreeBSD: the path itself when it is short, otherwise `bindat(2)` /
     /// `connectat(2)` with the file name relative to the directory fd.
-    pub(crate) fn run(op: Op, path: &Path) -> io::Result<(OwnedFd, Route)> {
+    pub(crate) fn run(req: Request, path: &Path) -> io::Result<(OwnedFd, Route)> {
         if path::len(path) <= DIRECT_MAX {
-            return std_op(op, path).map(|fd| (fd, Route::Direct));
+            return plain_op(req, path).map(|fd| (fd, Route::Direct));
         }
         let (dir, name) = path::split(path)?;
         let addr = SockAddr::standard(name)?;
         let dir = open_dir(dir)?;
-        let sock = sys::socket()?;
-        sys::op_at(op, sock.as_fd(), dir.as_fd(), &addr)?;
-        if op == Op::Bind {
+        let sock = sys::socket(req.nonblocking())?;
+        sys::op_at(req.op(), sock.as_fd(), dir.as_fd(), &addr)?;
+        if req == Request::Bind {
             sys::listen(sock.as_fd())?;
         }
         Ok((sock, Route::At))
@@ -276,26 +425,24 @@ pub(crate) mod freebsd {
 )))]
 mod other {
     use super::*;
-    use crate::sys::SockAddr;
 
     /// Other Unix targets: the path itself when it is short, otherwise the
-    /// fork route (the only primitive POSIX alone guarantees).
-    pub(crate) fn run(op: Op, path: &Path) -> io::Result<(OwnedFd, Route)> {
+    /// fork route (the only primitive POSIX alone guarantees; `ENAMETOOLONG`
+    /// when the connect options rule it out).
+    pub(crate) fn run(req: Request, path: &Path) -> io::Result<(OwnedFd, Route)> {
         if path::len(path) <= DIRECT_MAX {
-            return std_op(op, path).map(|fd| (fd, Route::Direct));
+            return plain_op(req, path).map(|fd| (fd, Route::Direct));
         }
         let (dir, name) = path::split(path)?;
         let addr = SockAddr::standard(name)?;
-        fork_op(op, dir, &addr).map(|fd| (fd, Route::Fork))
+        fork_op(req, dir, &addr).map(|(fd, child)| (fd, Route::Fork { child }))
     }
 }
 
 #[cfg(target_vendor = "apple")]
 pub(crate) mod apple {
     use super::*;
-    use crate::sys::SockAddr;
     use std::ffi::OsStr;
-    use std::os::fd::AsFd;
     use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
 
@@ -348,32 +495,35 @@ pub(crate) mod apple {
     /// 4. a short symlink to the socket's directory under the first of
     ///    `TMPDIR` and `/tmp` ([`Config::tmp_bases`]) where the path through
     ///    it fits and the symlink can be created;
-    /// 5. a forked child that `fchdir`s into the directory.
+    /// 5. a forked child that `fchdir`s into the directory, unless the
+    ///    connect options rule it out (then `ENAMETOOLONG`).
     ///
     /// A failure of a route ends the search with that error, except where it
     /// shows that the route itself cannot be used (the kernel refusing the
     /// widened form, the symlink not being creatable); then the next route (or
     /// the next place for the symlink) is tried.
-    pub(crate) fn run(op: Op, path: &Path, cfg: &Config) -> io::Result<(OwnedFd, Route)> {
+    pub(crate) fn run(req: Request, path: &Path, cfg: &Config) -> io::Result<(OwnedFd, Route)> {
         if path::len(path) <= DIRECT_MAX {
-            return std_op(op, path).map(|fd| (fd, Route::Direct));
+            return plain_op(req, path).map(|fd| (fd, Route::Direct));
         }
         let (dir, name) = path::split(path)?;
         let rel = Relative::new(path, dir);
 
         if let Some(rel) = rel.as_ref().filter(|r| path::len(&r.path) <= DIRECT_MAX) {
-            return rel.run(|p| std_op(op, p)).map(|fd| (fd, Route::Relative));
+            return rel
+                .run(|p| plain_op(req, p))
+                .map(|fd| (fd, Route::Relative));
         }
 
         let mut wide = cfg.wide;
         if wide {
             let attempt = if path::len(path) <= WIDE_PATH_MAX {
-                Some(wide_op(op, path).map(|fd| (fd, Route::Wide)))
+                Some(wide_op(req, path).map(|fd| (fd, Route::Wide)))
             } else {
                 rel.as_ref()
                     .filter(|r| path::len(&r.path) <= WIDE_PATH_MAX)
                     .map(|rel| {
-                        rel.run(|p| wide_op(op, p))
+                        rel.run(|p| wide_op(req, p))
                             .map(|fd| (fd, Route::WideRelative))
                     })
             };
@@ -386,7 +536,7 @@ pub(crate) mod apple {
         }
 
         for base in &cfg.tmp_bases {
-            match symlink_route(op, base, dir, name, wide) {
+            match symlink_route(req, base, dir, name, wide) {
                 SymlinkOutcome::Done(done) => return done,
                 SymlinkOutcome::WideRefused => wide = false,
                 SymlinkOutcome::Unusable => {}
@@ -399,23 +549,13 @@ pub(crate) mod apple {
             Err(e) if wide && e.raw_os_error() == Some(libc::ENAMETOOLONG) => SockAddr::wide(name)?,
             addr => addr?,
         };
-        fork_op(op, dir, &addr).map(|fd| (fd, Route::Fork))
-    }
-
-    /// Bind (and listen) or connect a fresh socket to `addr`.
-    pub(crate) fn raw_op(op: Op, addr: &SockAddr) -> io::Result<OwnedFd> {
-        let sock = sys::socket()?;
-        sys::op(op, sock.as_fd(), addr)?;
-        if op == Op::Bind {
-            sys::listen(sock.as_fd())?;
-        }
-        Ok(sock)
+        fork_op(req, dir, &addr).map(|(fd, child)| (fd, Route::Fork { child }))
     }
 
     /// Bind (and listen) or connect a fresh socket to `path` in a widened
     /// `sockaddr_un`.
-    pub(crate) fn wide_op(op: Op, path: &Path) -> io::Result<OwnedFd> {
-        raw_op(op, &SockAddr::wide(path.as_os_str())?)
+    pub(crate) fn wide_op(req: Request, path: &Path) -> io::Result<OwnedFd> {
+        raw_op(req, &SockAddr::wide(path.as_os_str())?)
     }
 
     /// Whether an error from a widened-address call means the kernel does not
@@ -578,7 +718,7 @@ pub(crate) mod apple {
     /// left under `base` once the symlink is removed, which happens when this
     /// returns (including on panic) whatever the outcome.
     pub(crate) fn symlink_route(
-        op: Op,
+        req: Request,
         base: &Path,
         dir: &Path,
         name: &OsStr,
@@ -602,9 +742,9 @@ pub(crate) mod apple {
         };
         let via = link.path.join(name);
         if path::len(&via) <= DIRECT_MAX {
-            SymlinkOutcome::Done(std_op(op, &via).map(|fd| (fd, Route::Symlink)))
+            SymlinkOutcome::Done(plain_op(req, &via).map(|fd| (fd, Route::Symlink)))
         } else {
-            match wide_op(op, &via) {
+            match wide_op(req, &via) {
                 Err(e) if refuses_wide(&e) => SymlinkOutcome::WideRefused,
                 done => SymlinkOutcome::Done(done.map(|fd| (fd, Route::SymlinkWide))),
             }

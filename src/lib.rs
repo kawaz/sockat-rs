@@ -147,7 +147,7 @@ mod tests;
 /// name alone is too long to reach; `InvalidInput` for a path that does not end
 /// with a file name or contains a NUL byte.
 pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
-    route::run(sys::Op::Bind, path.as_ref()).map(|(fd, _)| UnixListener::from(fd))
+    route::run(route::Request::Bind, path.as_ref()).map(|(fd, _)| UnixListener::from(fd))
 }
 
 /// Connect to the socket at `path`, like [`UnixStream::connect`] but for a path
@@ -163,5 +163,29 @@ pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
 /// name alone is too long to reach; `InvalidInput` for a path that does not end
 /// with a file name or contains a NUL byte.
 pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
-    route::run(sys::Op::Connect, path.as_ref()).map(|(fd, _)| UnixStream::from(fd))
+    connect_with(path.as_ref(), route::ConnectOptions::DEFAULT).map(|(stream, _)| stream)
+}
+
+/// Connect to the socket at `path` as `options` say, and also return the pid
+/// of the forked child that made the connect when the fork route was taken
+/// (`None` on every other route).
+///
+/// That pid is what the server's peer-credential query names instead of this
+/// process: Linux's `SO_PEERCRED` for the life of the connection, macOS's
+/// `LOCAL_PEERPID` until this process sends (DR-0001 decision 8). The child
+/// has already exited.
+///
+/// The options are [`route::ConnectOptions`]: whether the socket is
+/// `O_NONBLOCK` (on every route, and still so when returned), and whether the
+/// fork route may be taken. [`connect`] is this with
+/// [`route::ConnectOptions::DEFAULT`].
+///
+/// The backend of the connect type with these options that DR-0001 decision 8
+/// adds to the public API (its name is still open).
+pub(crate) fn connect_with(
+    path: &Path,
+    options: route::ConnectOptions,
+) -> io::Result<(UnixStream, Option<libc::pid_t>)> {
+    route::run(route::Request::Connect(options), path)
+        .map(|(fd, route)| (UnixStream::from(fd), route.child()))
 }
