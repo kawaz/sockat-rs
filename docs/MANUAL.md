@@ -48,7 +48,7 @@ Tried in this order; the first that can be used binds / connects.
 
 1. **The path relative to the cwd** (if at most 100 bytes). If the path is below the cwd (`getcwd`, or a `$PWD` that names the same directory as the cwd), the prefix is cut off. Otherwise both sides are resolved to real paths and the spelling climbs with `..`
 2. **A widened sockaddr** (up to 253 bytes). XNU takes an address whose `sun_path` runs past 104 bytes, up to 255 bytes in total. The path itself, or failing that the relative spelling
-3. **Through a short symlink.** A symlink `${TMPDIR:-/tmp}/tmp.XXXXXXXXXX` → the socket's directory is created, the bind / connect goes through it, and it is removed right away
+3. **Through a short symlink.** A symlink `${TMPDIR:-/tmp}/sockat.XXXXXXXXXX` → the socket's directory is created, the bind / connect goes through it, and it is removed right away
 4. **Fork.** A child that `fchdir`s into the directory's fd binds / connects by the file name alone
 
 When a way actually fails (`ENOENT`, `EADDRINUSE`, ...), that error is returned and the next way is not tried. The next way is tried only when a way cannot be used at all (too long, the symlink cannot be created, ...).
@@ -87,7 +87,7 @@ When a client connects through the fork route (macOS step 4, other Unix), the pe
 
 ### The forked child briefly holds copies of every fd
 
-As with any fork, the child holds copies of all file descriptors of the process until it exits. A socket or pipe another thread closes at that moment stays open until then (the peer sees EOF slightly later; a closed listener can still take a connection). The fork route also opens the directory `O_RDONLY`, so it needs read permission on the directory.
+As with any fork, the child holds copies of all file descriptors of the process until it exits. A socket or pipe another thread closes at that moment stays open until then (the peer sees EOF slightly later; a closed listener can still take a connection). On macOS the fork route opens the directory `O_SEARCH`, so it needs the same permissions as a plain bind / connect (search, plus write for bind). The fork route on other Unix and FreeBSD's bindat open it `O_RDONLY` and need read permission on the directory as well.
 
 ### The directory is looked up slightly before the call
 
@@ -99,7 +99,7 @@ Before using a relative spelling it is checked to name the same directory, and a
 
 ### A symlink can be left behind (macOS)
 
-If the process dies between creating and removing the symlink, `${TMPDIR:-/tmp}/tmp.XXXXXXXXXX` (pointing to the socket's directory) is left. A relative `TMPDIR` disables the symlink route.
+If the process dies between creating and removing the symlink, `${TMPDIR:-/tmp}/sockat.XXXXXXXXXX` (pointing to the socket's directory) is left. The `sockat.` prefix tells it apart as sockat's. A relative `TMPDIR` disables the symlink route.
 
 ## Errors
 

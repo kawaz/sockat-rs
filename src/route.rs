@@ -78,9 +78,19 @@ pub(crate) fn std_op(op: Op, path: &Path) -> io::Result<OwnedFd> {
 
 /// Open `dir` to use as the base of a relative bind / connect.
 ///
-/// `O_RDONLY | O_DIRECTORY`, so the fork route needs read permission on the
-/// directory (search and write permission are what a plain bind needs). Linux
-/// uses `O_PATH` instead, which needs neither.
+/// Apple: `O_SEARCH`, which needs only search permission on the directory,
+/// the same as a plain bind / connect through the path (bind also needs write
+/// permission, checked by the bind itself). An `O_SEARCH` directory fd can be
+/// `fchdir`ed into (checked on macOS 26.5: a mode 0300 directory, which
+/// `O_RDONLY` cannot open, binds fine). A kernel that does not take `O_SEARCH`
+/// on a directory answers `EISDIR` (as it does for `O_EXEC` alone) or
+/// `EINVAL`; then the directory is opened `O_RDONLY`, which needs read
+/// permission.
+///
+/// Other targets: `O_RDONLY | O_DIRECTORY`, so the fork route and `bindat`
+/// need read permission on the directory. Linux's own route opens the
+/// directory `O_PATH` instead (see `linux::proc_fd`); there only the tests come
+/// here.
 #[cfg_attr(
     any(target_os = "linux", target_os = "android"),
     allow(
@@ -89,11 +99,29 @@ pub(crate) fn std_op(op: Op, path: &Path) -> io::Result<OwnedFd> {
     )
 )]
 fn open_dir(dir: &Path) -> io::Result<OwnedFd> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY)
-        .open(dir)
-        .map(OwnedFd::from)
+    let read_only = || {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(dir)
+            .map(OwnedFd::from)
+    };
+    #[cfg(target_vendor = "apple")]
+    {
+        // `read(true)` is O_RDONLY (0), so the access mode is O_SEARCH's own
+        // O_EXEC bit; std keeps custom flags outside O_ACCMODE.
+        match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_SEARCH)
+            .open(dir)
+        {
+            Ok(f) => Ok(OwnedFd::from(f)),
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EISDIR | libc::EINVAL)) => read_only(),
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    read_only()
 }
 
 /// Bind (and listen) or connect a fresh socket to `name` inside `dir` from a
@@ -484,11 +512,15 @@ pub(crate) mod apple {
         Unusable,
     }
 
-    /// Length of the random part of the symlink name (`tmp.XXXXXXXXXX`).
-    const LINK_RANDOM_LEN: usize = 10;
+    /// What the symlink name starts with, so a link left behind by a process
+    /// that died is recognisable as sockat's.
+    pub(crate) const LINK_PREFIX: &str = "sockat.";
 
-    /// Bind / connect through `<base>/tmp.XXXXXXXXXX/<name>`, where the
-    /// symlink `tmp.XXXXXXXXXX` points to the socket's directory.
+    /// Length of the random part of the symlink name (`sockat.XXXXXXXXXX`).
+    pub(crate) const LINK_RANDOM_LEN: usize = 10;
+
+    /// Bind / connect through `<base>/sockat.XXXXXXXXXX/<name>`, where the
+    /// symlink `sockat.XXXXXXXXXX` points to the socket's directory.
     ///
     /// The length of the path through the symlink is checked before anything
     /// is created. The symlink is a link to the directory, so the kernel
@@ -503,7 +535,7 @@ pub(crate) mod apple {
         wide: bool,
     ) -> SymlinkOutcome {
         let limit = if wide { WIDE_PATH_MAX } else { DIRECT_MAX };
-        let placeholder = format!("tmp.{}", "X".repeat(LINK_RANDOM_LEN));
+        let placeholder = format!("{LINK_PREFIX}{}", "X".repeat(LINK_RANDOM_LEN));
         if path::len(&base.join(placeholder).join(name)) > limit {
             return SymlinkOutcome::Unusable;
         }
@@ -538,25 +570,28 @@ pub(crate) mod apple {
         /// How many names to try before giving up. Each try is a fresh random
         /// name from 62^10 possibilities, so exhausting this means something
         /// other than bad luck (for example a base that refuses every name).
-        const ATTEMPTS: usize = 16;
+        pub(crate) const ATTEMPTS: usize = 16;
 
-        /// Create `<base>/tmp.XXXXXXXXXX` pointing to `target`.
+        /// Create `<base>/sockat.XXXXXXXXXX` pointing to `target`, with a
+        /// fresh random name for each try.
+        pub(crate) fn create(base: &Path, target: &Path) -> io::Result<Self> {
+            Self::create_named(base, target, random_name)
+        }
+
+        /// Create a symlink under `base` pointing to `target`, named by
+        /// `next_name` (called once per try).
         ///
         /// `symlink(2)` fails with `EEXIST` instead of replacing an existing
         /// entry, which is the `O_EXCL` of symlinks: the link that is created is
         /// always one nobody else had, and a name already taken (by anyone) is
-        /// skipped.
-        pub(crate) fn create(base: &Path, target: &Path) -> io::Result<Self> {
-            const ALPHABET: &[u8; 62] =
-                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        /// skipped for the next one. Any other error ends the attempt.
+        pub(crate) fn create_named(
+            base: &Path,
+            target: &Path,
+            mut next_name: impl FnMut() -> String,
+        ) -> io::Result<Self> {
             for _ in 0..Self::ATTEMPTS {
-                let mut random = [0u8; LINK_RANDOM_LEN];
-                sys::random_bytes(&mut random);
-                let mut name = String::from("tmp.");
-                // 256 is not a multiple of 62, so this is slightly biased; the
-                // name only has to be hard to collide with, not uniform.
-                name.extend(random.iter().map(|b| ALPHABET[*b as usize % 62] as char));
-                let path = base.join(name);
+                let path = base.join(next_name());
                 match std::os::unix::fs::symlink(target, &path) {
                     Ok(()) => return Ok(Self { path }),
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -568,6 +603,19 @@ pub(crate) mod apple {
                 "could not find a free name for a temporary symlink",
             ))
         }
+    }
+
+    /// `sockat.` followed by [`LINK_RANDOM_LEN`] random letters and digits.
+    fn random_name() -> String {
+        const ALPHABET: &[u8; 62] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut random = [0u8; LINK_RANDOM_LEN];
+        sys::random_bytes(&mut random);
+        let mut name = String::from(LINK_PREFIX);
+        // 256 is not a multiple of 62, so this is slightly biased; the name only
+        // has to be hard to collide with, not uniform.
+        name.extend(random.iter().map(|b| ALPHABET[*b as usize % 62] as char));
+        name
     }
 
     impl Drop for TempLink {

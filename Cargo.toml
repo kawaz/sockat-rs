@@ -10,6 +10,10 @@ description = "Bind and connect Unix domain sockets whose path is longer than su
 keywords = ["unix", "socket", "sun_path", "uds"]
 categories = ["os::unix-apis", "network-programming"]
 readme = "README.md"
+# What goes into the published crate: the code and what docs.rs / crates.io
+# show. Repository tooling (CI, justfile, agent rules) and the design docs stay
+# in the repository.
+include = ["src/**", "README.md", "LICENSE", "Cargo.toml"]
 
 [dependencies]
 libc = "0.2"

@@ -1,6 +1,6 @@
 # DR-0001: sun_path を超える socket のパスに届く経路と、試す順番
 
-- Status: Accepted (経路と試す順番、相対パスの作り方、Windows を対象外にすることは kawaz 指示 2026-11-18。FreeBSD・tokio・観測の仕組みは実装側の判断で、残りは「未確定」)、実装済み (未公開)
+- Status: Accepted (経路と試す順番、相対パスの作り方、Windows を対象外にすることは kawaz 指示 2026-11-18。symlink の名前、fork の経路の権限、FreeBSD の扱いは統括の裁定 2026-11-18。tokio・観測の仕組みは実装側の判断で、残りは「未確定」)、実装済み (未公開)
 - Date: 2026-11-18
 
 ## Context
@@ -45,7 +45,7 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 |---|---|---|
 | a | cwd からの相対パスを std に渡す | 相対パスが 100 バイト以内 |
 | b | 広げた sockaddr (後述) で元のパス、無理なら相対パス | どちらかが 253 バイト以内 |
-| c | `${TMPDIR:-/tmp}/tmp.XXXXXXXXXX` → ソケットのディレクトリ、の symlink を経由する | symlink を通したパスが 100 (b が使えるなら 253) 以内 |
+| c | `${TMPDIR:-/tmp}/sockat.XXXXXXXXXX` → ソケットのディレクトリ、の symlink を経由する | symlink を通したパスが 100 (b が使えるなら 253) 以内 |
 | d | ディレクトリの fd に `fchdir` した子を fork する | 上が全部使えない時 |
 
 **経路の失敗をどう扱うか。** 経路が実際に bind / connect した結果のエラー (`ENOENT`、`EADDRINUSE`、`ECONNREFUSED` 等) はそこで返し、次の経路を試さない。次へ進むのは、その経路自体が使えないと分かった時だけである (広げた sockaddr をカーネルが受け付けない、symlink が作れない、長さが足りない)。理由: 本当の失敗を次の経路でやり直すと、同じエラーを遅れて返すか、別の場所にソケットを作る。
@@ -75,12 +75,12 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 #### c. 短い symlink を経由する
 
 - 置き場は `${TMPDIR:-/tmp}`。`TMPDIR` が空か未設定なら `/tmp`。相対パスの `TMPDIR` は cwd に依存するので、この経路を使わない
-- 何かを作る前に、`<置き場>/tmp.XXXXXXXXXX/<ファイル名>` の長さを確かめる。100 以内なら std に、b が使えるなら 253 以内で広げた sockaddr に渡す
+- 何かを作る前に、`<置き場>/sockat.XXXXXXXXXX/<ファイル名>` の長さを確かめる。100 以内なら std に、b が使えるなら 253 以内で広げた sockaddr に渡す
 - symlink はソケットのディレクトリへのリンクにする。カーネルはリンクを辿ってディレクトリ側にソケットを作るので、socket の実体は元のディレクトリにでき、置き場には何も残らない (試験で実機確認)
-- 名前は `tmp.` に乱数 10 文字 (英数 62 種、`arc4random_buf`)。`symlink(2)` は既存の名前を置き換えずに `EEXIST` で失敗するので、これが symlink の `O_EXCL` になる。`EEXIST` なら名前を引き直す (16 回まで)
+- 名前は `sockat.` に乱数 10 文字 (英数 62 種、`arc4random_buf`)。`symlink(2)` は既存の名前を置き換えずに `EEXIST` で失敗するので、これが symlink の `O_EXCL` になる。`EEXIST` なら名前を引き直す (16 回まで。使い切ったら c は使えないとみなし d に進む)。名前の生成を差し替えて、衝突した名前を飛ばすこと、既存のものに触らないこと、回数で打ち切ることを試験した
 - bind / connect が成功しても失敗しても、戻る時に symlink を消す (panic でも消す)。消すのに失敗しても無視する (ソケットは既にできていて、失敗させても symlink は戻らない)
 - symlink を作れない時 (置き場が無い、書けない、サンドボックス) は d に進む
-- symlink を作ってから bind / connect するまでの間は、symlink の置き換えに対して安全とみなす: `/tmp` は sticky で他人は消せず、macOS の `$TMPDIR` は本人専用。プロセスが途中で死ぬと symlink が残る。名前が `tmp.` で始まるので、一時ファイルの掃除に拾われる
+- symlink を作ってから bind / connect するまでの間は、symlink の置き換えに対して安全とみなす: `/tmp` は sticky で他人は消せず、macOS の `$TMPDIR` は本人専用。プロセスが途中で死ぬと symlink が残る。名前が `sockat.` で始まるので、sockat の残骸と分かる (統括の裁定。一時ファイルの掃除に拾わせるための `tmp.` より、持ち主が分かることを取った)
 
 #### d. fork した子に `fchdir` させる (hyoui DR-0041 決定 5 を引き継ぐ)
 
@@ -97,11 +97,12 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 
 - **connect した pid がサーバから子に見える。** macOS の `LOCAL_PEERPID` は子の pid を返し、親が send すると親の pid に変わる (試験 `local_peerpid_of_a_forked_connect_names_the_child_until_the_client_sends` で実機確認)。uid / gid はどちらでも同じ
 - **子は一瞬、プロセスの全 fd の複製を持つ** (fork の性質)。その間に他のスレッドが閉じたソケットやパイプは、子が終わるまで開いたままになる。閉じた listener の backlog にさらに接続が入りうる。試験でこれを踏んだ (並行する試験の fork が、別の試験の閉じたはずの listener を生かしていた)
-- ディレクトリを `O_RDONLY` で開くので、ディレクトリの読み取り権限が要る (通常の bind は検索と書き込みの権限で足りる)
+- macOS ではディレクトリを `O_SEARCH` で開く。検索権限だけで開け、その fd に `fchdir` できる (macOS 26.5.2 で確認: 読み取り権限の無い mode 0300 のディレクトリは `O_RDONLY` では `EACCES` で開けないが、`O_SEARCH` なら開けて bind できる。mode 0100 では通常の bind と同じく bind が `EACCES`。`O_EXEC` 単独ではディレクトリに `EISDIR`)。なので通常の bind / connect と同じ権限で足りる。`O_SEARCH` をディレクトリに受け付けない古いカーネルは `EISDIR` / `EINVAL` を返すとみなし、その時は `O_RDONLY` で開き直す (この分岐は手元のカーネルでは通らない)
+- 他の Unix の fork と FreeBSD の `bindat` はディレクトリを `O_RDONLY` で開くので、読み取り権限も要る
 
 ### 4. FreeBSD は `bindat(2)` / `connectat(2)`、それ以外の Unix は fork
 
-- FreeBSD 10 以降には、ディレクトリの fd を基準にする `bindat` / `connectat` がある。Linux の /proc と同じく、fd を基準にファイル名で bind / connect でき、cwd も一時ファイルも fork も要らない。これを使う
+- FreeBSD 10 以降には、ディレクトリの fd を基準にする `bindat` / `connectat` がある。Linux の /proc と同じく、fd を基準にファイル名で bind / connect でき、cwd も一時ファイルも fork も要らない。これを使う (統括の裁定。初回の CI で落ちたら、fork に倒さずに原因を直す)
   - libc crate に宣言が無いので、FreeBSD の `<sys/socket.h>` の宣言を自前で書く
   - 広げた sockaddr は FreeBSD では使わない。libuv が #5047 の後に「FreeBSD で uv_pipe_bind が壊れた」(#5134) と報告されており、XNU と同じ前提は置けない
 - NetBSD / OpenBSD / illumos など、ディレクトリの fd を基準にする primitive が無い Unix は、100 バイトを超えたら fork する (POSIX だけで成り立つ手がこれしか無い)。macOS の a〜c は、試せる環境が無いので入れない
@@ -154,9 +155,7 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 
 ## 未確定
 
-- Linux で /proc が無い時に fork に倒すか (今はエラー。fork すると `SO_PEERCRED` の pid が子になる)
-- `TMPDIR` が長すぎる時に `/tmp` も試すか (今は `${TMPDIR:-/tmp}` の 1 か所だけ。この作業をしたセッションのように `TMPDIR` が 100 を超える環境では、symlink の経路は広げた sockaddr 頼みになる)
-- symlink の名前を `tmp.` で始めるか、sockat のものと分かる名前にするか (今は指示どおり `tmp.XXXXXXXXXX`)
-- fork の経路でディレクトリの読み取り権限を要らなくするか (macOS の `O_SEARCH` で開けるかは未検証)
+- Linux で /proc が無い時に fork に倒すか (docs/QUESTIONS.md の SK-Q1。今はエラー。fork すると `SO_PEERCRED` の pid が子になる)
+- `TMPDIR` が長すぎる時に `/tmp` も試すか (docs/QUESTIONS.md の SK-Q2。今は `${TMPDIR:-/tmp}` の 1 か所だけ。この作業をしたセッションのように `TMPDIR` が 100 を超える環境では、symlink の経路は広げた sockaddr 頼みになる)
 - FreeBSD の `bindat` / `connectat` は compile の確認だけで、実機で動かしていない。CI の FreeBSD の job (VM) が初回の確認になる
-- Android と、macOS 以外の Apple OS (iOS 等) は compile もしていない
+- Android は compile もしていない。macOS 以外の Apple OS は iOS の clippy (試験コード込み) だけ確かめた

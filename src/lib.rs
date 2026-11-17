@@ -74,11 +74,12 @@
 //!   it exits a moment later, so a socket or pipe another thread closes during
 //!   that moment stays open until then (a peer sees the EOF slightly later; a
 //!   listener closed meanwhile can still accept a connection into its backlog).
-//!   The fork route also needs read permission on the socket's directory (it
-//!   opens it with `O_RDONLY`), where a plain bind needs only search and write
-//!   permission.
+//!   On macOS the fork route opens the socket's directory `O_SEARCH`, so it
+//!   needs no more permission than a plain bind / connect; on other Unix
+//!   targets it (and FreeBSD's `bindat`) opens it `O_RDONLY` and needs read
+//!   permission on the directory as well.
 //! * **A temporary symlink can be left behind** (macOS) if the process dies
-//!   between creating and removing it. It is named `tmp.XXXXXXXXXX` under
+//!   between creating and removing it. It is named `sockat.XXXXXXXXXX` under
 //!   `${TMPDIR:-/tmp}` and points to the socket's directory.
 //!
 //! # Errors

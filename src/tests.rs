@@ -526,7 +526,9 @@ mod linux {
 #[cfg(target_vendor = "apple")]
 mod apple {
     use super::*;
-    use crate::route::apple::{self, Config, Relative, SymlinkOutcome, TempLink};
+    use crate::route::apple::{
+        self, Config, LINK_PREFIX, LINK_RANDOM_LEN, Relative, SymlinkOutcome, TempLink,
+    };
     use crate::sys::WIDE_PATH_MAX;
     use std::ffi::OsString;
     use std::os::fd::AsFd;
@@ -652,7 +654,7 @@ mod apple {
     }
 
     // Route order 3c: over 253 bytes both ways goes through a symlink
-    // `<base>/tmp.XXXXXXXXXX` to the socket's directory. With a short base the
+    // `<base>/sockat.XXXXXXXXXX` to the socket's directory. With a short base the
     // path through the link fits the plain sockaddr (Symlink); with a base too
     // long for that it needs the widened form (SymlinkWide). Either way the
     // socket is created in the real directory (the link is to the directory,
@@ -684,7 +686,7 @@ mod apple {
 
     // The symlink route checks the length through the link before creating
     // anything: a base so long that even the widened form cannot carry
-    // `<base>/tmp.XXXXXXXXXX/<name>` is skipped without touching the base, and
+    // `<base>/sockat.XXXXXXXXXX/<name>` is skipped without touching the base, and
     // the fork route takes over.
     #[test]
     fn a_base_too_long_for_the_symlink_route_falls_back_to_fork() {
@@ -793,7 +795,8 @@ mod apple {
         assert_ne!(a.path, b.path);
         for l in [&a.path, &b.path] {
             let n = l.file_name().unwrap().to_string_lossy().into_owned();
-            assert!(n.starts_with("tmp.") && n.len() == 14, "{n}");
+            assert!(n.starts_with(LINK_PREFIX), "{n}");
+            assert_eq!(n.len(), LINK_PREFIX.len() + LINK_RANDOM_LEN, "{n}");
             assert_eq!(std::fs::read_link(l).unwrap(), target.path());
         }
         drop(a);
@@ -803,6 +806,90 @@ mod apple {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left, vec![OsString::from("keep")]);
+    }
+
+    // A name that is already taken (by anything: a file, another link) is
+    // skipped for the next name, and the existing entry is left as it was:
+    // symlink(2) fails with EEXIST rather than replacing it. The names come from
+    // a stand-in generator here so the collision is certain.
+    #[test]
+    fn a_taken_symlink_name_is_skipped_for_the_next_one() {
+        let base = tmp();
+        let target = tmp();
+        let taken = format!("{LINK_PREFIX}AAAAAAAAAA");
+        let free = format!("{LINK_PREFIX}BBBBBBBBBB");
+        std::fs::write(base.path().join(&taken), b"keep").unwrap();
+        let mut names = vec![taken.clone(), free.clone()].into_iter();
+        let mut calls = 0;
+        let link = TempLink::create_named(base.path(), target.path(), || {
+            calls += 1;
+            names.next().unwrap()
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(link.path, base.path().join(&free));
+        assert_eq!(std::fs::read_link(&link.path).unwrap(), target.path());
+        assert_eq!(std::fs::read(base.path().join(&taken)).unwrap(), b"keep");
+        drop(link);
+        assert!(!base.path().join(&free).exists());
+    }
+
+    // When every name tried is taken, the attempt ends after a bounded number
+    // of tries with AlreadyExists (the symlink route then counts as unusable
+    // and the fork route takes over); it does not loop forever and touches
+    // nothing.
+    #[test]
+    fn running_out_of_symlink_names_is_an_error_after_a_bounded_number_of_tries() {
+        let base = tmp();
+        let target = tmp();
+        let taken = format!("{LINK_PREFIX}AAAAAAAAAA");
+        std::fs::write(base.path().join(&taken), b"keep").unwrap();
+        let mut calls = 0;
+        let e = TempLink::create_named(base.path(), target.path(), || {
+            calls += 1;
+            taken.clone()
+        })
+        .err()
+        .unwrap();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(calls, TempLink::ATTEMPTS);
+        assert_eq!(std::fs::read(base.path().join(&taken)).unwrap(), b"keep");
+    }
+
+    // The fork route opens the directory O_SEARCH on Apple, which needs only
+    // search permission, like a plain bind / connect by path. A directory of
+    // mode 0300 (write + search, no read) cannot be opened O_RDONLY, yet the
+    // fork route binds and connects in it. Without O_SEARCH the long path would
+    // fail where a short one in the same directory works.
+    #[test]
+    fn the_fork_route_does_not_need_read_permission_on_the_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Restore<'a>(&'a Path);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                // TempDir needs to list the directory to remove it.
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let t = tmp();
+        let p = nest(t.path(), 400, "s.sock");
+        let dir = p.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let _restore = Restore(&dir);
+        let e = std::fs::File::open(&dir).unwrap_err();
+        assert_eq!(
+            errno(&e),
+            Some(libc::EACCES),
+            "the premise: no read permission"
+        );
+
+        let c = cfg(None, true);
+        let (l, r) = apple::run(Op::Bind, &p, &c).unwrap();
+        assert_eq!(r, Route::Fork);
+        assert!(is_socket(&p));
+        let (cl, r) = apple::run(Op::Connect, &p, &c).unwrap();
+        assert_eq!(r, Route::Fork);
+        ping(l, cl);
     }
 
     // A base the link cannot be created in (missing, or a file) makes the

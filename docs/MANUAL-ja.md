@@ -48,7 +48,7 @@ server.read_exact(&mut buf)?;
 
 1. **cwd からの相対パス** (100 バイト以内なら)。パスが cwd (`getcwd`、または cwd と同じディレクトリを指す `$PWD`) の下にあれば前を削る。そうでなければ両方を実パスに揃えて `..` で上る綴りを作る
 2. **広げた sockaddr** (253 バイトまで)。XNU は `sun_path` が 104 バイトを超えるアドレスを 255 バイトまで受け付ける。元のパス、無理なら相対パス
-3. **短い symlink 経由**。`${TMPDIR:-/tmp}/tmp.XXXXXXXXXX` → ソケットのディレクトリ、の symlink を作り、それを通したパスで bind / connect して、すぐ消す
+3. **短い symlink 経由**。`${TMPDIR:-/tmp}/sockat.XXXXXXXXXX` → ソケットのディレクトリ、の symlink を作り、それを通したパスで bind / connect して、すぐ消す
 4. **fork**。ディレクトリの fd に `fchdir` した子が、ファイル名だけで bind / connect する
 
 ある方法が実際に失敗した時 (`ENOENT`、`EADDRINUSE` 等) は、そのエラーを返して次を試さない。次へ進むのは、その方法自体が使えない時 (長さが足りない、symlink が作れない等) だけ。
@@ -87,7 +87,7 @@ fork の経路 (macOS の 4、その他の Unix) で connect すると、サー�
 
 ### fork した子は一瞬、全 fd の複製を持つ
 
-fork の性質として、子は終了するまでプロセスの全 fd の複製を持つ。その瞬間に他のスレッドが閉じたソケットやパイプは、子が終わるまで開いたままになる (相手が EOF を見るのが少し遅れる。閉じた listener がさらに接続を受けうる)。また fork の経路はディレクトリを `O_RDONLY` で開くので、ディレクトリの読み取り権限が要る。
+fork の性質として、子は終了するまでプロセスの全 fd の複製を持つ。その瞬間に他のスレッドが閉じたソケットやパイプは、子が終わるまで開いたままになる (相手が EOF を見るのが少し遅れる。閉じた listener がさらに接続を受けうる)。fork の経路は、macOS ではディレクトリを `O_SEARCH` で開くので、通常の bind / connect と同じ権限 (検索、bind なら書き込みも) で足りる。他の Unix の fork と FreeBSD の bindat は `O_RDONLY` で開くので、ディレクトリの読み取り権限も要る。
 
 ### ディレクトリは呼ぶ少し前に引かれる
 
@@ -99,7 +99,7 @@ Linux・相対パス・bindat・fork の経路は、ディレクトリを先に�
 
 ### symlink が残ることがある (macOS)
 
-symlink を作ってから消すまでの間にプロセスが死ぬと、`${TMPDIR:-/tmp}/tmp.XXXXXXXXXX` (ソケットのディレクトリを指す) が残る。`TMPDIR` が相対パスの時は symlink の経路を使わない。
+symlink を作ってから消すまでの間にプロセスが死ぬと、`${TMPDIR:-/tmp}/sockat.XXXXXXXXXX` (ソケットのディレクトリを指す) が残る。名前が `sockat.` で始まるので、sockat の残骸と分かる。`TMPDIR` が相対パスの時は symlink の経路を使わない。
 
 ## エラー
 
