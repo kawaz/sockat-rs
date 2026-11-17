@@ -30,8 +30,8 @@
 //!
 //! | Platform | Way |
 //! |---|---|
-//! | Linux, Android | `/proc/self/fd/<dirfd>/<name>`, with the directory opened `O_PATH` |
-//! | macOS (Apple) | in order: the path relative to the cwd; a widened `sockaddr_un` carrying up to 253 bytes; a short symlink to the directory under `${TMPDIR:-/tmp}`; a forked child that `fchdir`s into the directory |
+//! | Linux, Android | `/proc/self/fd/<dirfd>/<name>`, with the directory opened `O_PATH`; without `/proc`, a forked child that `fchdir`s into the directory |
+//! | macOS (Apple) | in order: the path relative to the cwd; a widened `sockaddr_un` carrying up to 253 bytes; a short symlink to the directory under `TMPDIR`, or failing that `/tmp`; a forked child that `fchdir`s into the directory |
 //! | FreeBSD | `bindat(2)` / `connectat(2)` with the directory fd |
 //! | other Unix | a forked child that `fchdir`s into the directory |
 //!
@@ -49,13 +49,14 @@
 //!   bare file name, and on macOS possibly truncated. Keep the path you passed
 //!   to [`bind`] / [`connect`] and use that (for example to remove the socket
 //!   file with [`std::fs::remove_file`], which has no length limit).
-//! * **The peer process may be a short-lived child** (macOS and other Unix,
-//!   when the fork route is taken). When a client connects through the fork
-//!   route, the server's peer-credential queries can report the child's pid: on
-//!   macOS `LOCAL_PEERPID` reports the child until the client process itself
-//!   sends on the socket, then the client's pid. The uid and gid are the
-//!   client's either way. Linux never forks (its `SO_PEERCRED` would keep the
-//!   child's pid forever).
+//! * **The peer process may be a short-lived child** (macOS, Linux without
+//!   `/proc`, and other Unix, when the fork route is taken). When a client
+//!   connects through the fork route, the server's peer-credential queries can
+//!   report the child's pid: on macOS `LOCAL_PEERPID` reports the child until
+//!   the client process itself sends on the socket, then the client's pid; on
+//!   Linux without `/proc`, `SO_PEERCRED` keeps reporting the child's pid for
+//!   the life of the connection, after the child has exited. The uid and gid
+//!   are the client's either way. Linux with `/proc` never forks.
 //! * **The directory is resolved slightly earlier than the call.** The /proc,
 //!   relative, `bindat` and fork routes look the directory up first (open it, or
 //!   resolve it to a real path) and then bind / connect by the file name. If a
@@ -74,13 +75,13 @@
 //!   it exits a moment later, so a socket or pipe another thread closes during
 //!   that moment stays open until then (a peer sees the EOF slightly later; a
 //!   listener closed meanwhile can still accept a connection into its backlog).
-//!   On macOS the fork route opens the socket's directory `O_SEARCH`, so it
-//!   needs no more permission than a plain bind / connect; on other Unix
-//!   targets it (and FreeBSD's `bindat`) opens it `O_RDONLY` and needs read
-//!   permission on the directory as well.
+//!   On macOS the fork route opens the socket's directory `O_SEARCH` and on
+//!   Linux `O_PATH`, so it needs no more permission than a plain bind /
+//!   connect; on other Unix targets it (and FreeBSD's `bindat`) opens it
+//!   `O_RDONLY` and needs read permission on the directory as well.
 //! * **A temporary symlink can be left behind** (macOS) if the process dies
 //!   between creating and removing it. It is named `sockat.XXXXXXXXXX` under
-//!   `${TMPDIR:-/tmp}` and points to the socket's directory.
+//!   `TMPDIR` or `/tmp` and points to the socket's directory.
 //!
 //! # Errors
 //!

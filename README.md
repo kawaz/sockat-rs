@@ -19,8 +19,8 @@ std's `UnixListener::bind` / `UnixStream::connect` refuse a path that does not f
 
 | Platform | Way |
 |---|---|
-| Linux / Android | open the directory `O_PATH` and pass `/proc/self/fd/<fd>/<name>` |
-| macOS | in order: the path relative to the cwd → a widened sockaddr carrying up to 253 bytes → through a short symlink under `${TMPDIR:-/tmp}` → a forked child that `fchdir`s into the directory |
+| Linux / Android | open the directory `O_PATH` and pass `/proc/self/fd/<fd>/<name>` (without `/proc`, a forked child that `fchdir`s into the directory) |
+| macOS | in order: the path relative to the cwd → a widened sockaddr carrying up to 253 bytes → through a short symlink under `TMPDIR` or `/tmp` → a forked child that `fchdir`s into the directory |
 | FreeBSD | `bindat(2)` / `connectat(2)` |
 | other Unix | a forked child that `fchdir`s into the directory |
 | Windows | not supported |
@@ -30,7 +30,7 @@ None of these changes the calling process's cwd, and all of them work in multi-t
 ## What differs from std for a long path
 
 - `local_addr()` / `peer_addr()` do not return the path (they return the spelling actually handed to the kernel). Keep the path yourself
-- On the fork route, the pid the server sees for the connecting side is briefly the child's
+- On the fork route, the pid the server sees for the connecting side is the child's (on macOS until the client sends, on Linux without `/proc` for good)
 - Details in [docs/MANUAL.md](./docs/MANUAL.md)
 
 ## Async runtimes

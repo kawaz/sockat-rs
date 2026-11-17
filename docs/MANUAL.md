@@ -40,7 +40,9 @@ A path over 100 bytes is reached as follows, per platform. None of these changes
 
 ### Linux / Android
 
-The directory is opened `O_PATH` and `/proc/self/fd/<fd>/<file name>` is passed to std. The directory part has no length limit. `/proc` is required.
+The directory is opened `O_PATH` and `/proc/self/fd/<fd>/<file name>` is passed to std. The directory part has no length limit.
+
+Without `/proc` (a chroot or a minimal container with nothing mounted on `/proc`), the bind / connect is done by fork, as on other Unix. Only then do the side effects of fork (below) apply. When the `/proc` route actually fails, that error is returned; it is not retried by fork.
 
 ### macOS
 
@@ -48,10 +50,10 @@ Tried in this order; the first that can be used binds / connects.
 
 1. **The path relative to the cwd** (if at most 100 bytes). If the path is below the cwd (`getcwd`, or a `$PWD` that names the same directory as the cwd), the prefix is cut off. Otherwise both sides are resolved to real paths and the spelling climbs with `..`
 2. **A widened sockaddr** (up to 253 bytes). XNU takes an address whose `sun_path` runs past 104 bytes, up to 255 bytes in total. The path itself, or failing that the relative spelling
-3. **Through a short symlink.** A symlink `${TMPDIR:-/tmp}/sockat.XXXXXXXXXX` → the socket's directory is created, the bind / connect goes through it, and it is removed right away
+3. **Through a short symlink.** A symlink `<place>/sockat.XXXXXXXXXX` → the socket's directory is created, the bind / connect goes through it, and it is removed right away. The places tried are `TMPDIR` (when absolute), then `/tmp`; the first one where the path through the symlink fits and the symlink can be created is used (when `TMPDIR` is too deep to shorten the path, `/tmp` is used)
 4. **Fork.** A child that `fchdir`s into the directory's fd binds / connects by the file name alone
 
-When a way actually fails (`ENOENT`, `EADDRINUSE`, ...), that error is returned and the next way is not tried. The next way is tried only when a way cannot be used at all (too long, the symlink cannot be created, ...).
+When a way actually fails (`ENOENT`, `EADDRINUSE`, ...), that error is returned and the next way is not tried. The next way is tried only when a way cannot be used at all (too long, the symlink cannot be created, ...). The same goes for the places for the symlink: a bind / connect through one place that fails is not tried again through the next.
 
 ### FreeBSD
 
@@ -83,11 +85,11 @@ Keep the original path yourself and use that.
 
 ### On the fork route the connecting pid is the child's
 
-When a client connects through the fork route (macOS step 4, other Unix), the peer the server sees is a short-lived child. On macOS `LOCAL_PEERPID` reports the child's pid, and the client's pid after the client has sent something. The uid / gid are the client's either way. Linux never forks.
+When a client connects through the fork route (macOS step 4, Linux without `/proc`, other Unix), the peer the server sees is a short-lived child. On macOS `LOCAL_PEERPID` reports the child's pid, and the client's pid after the client has sent something. On Linux without `/proc`, `SO_PEERCRED` keeps reporting the child's pid after the child has exited (sending does not change it). The uid / gid are the client's either way. Linux with `/proc` never forks.
 
 ### The forked child briefly holds copies of every fd
 
-As with any fork, the child holds copies of all file descriptors of the process until it exits. A socket or pipe another thread closes at that moment stays open until then (the peer sees EOF slightly later; a closed listener can still take a connection). On macOS the fork route opens the directory `O_SEARCH`, so it needs the same permissions as a plain bind / connect (search, plus write for bind). The fork route on other Unix and FreeBSD's bindat open it `O_RDONLY` and need read permission on the directory as well.
+As with any fork, the child holds copies of all file descriptors of the process until it exits. A socket or pipe another thread closes at that moment stays open until then (the peer sees EOF slightly later; a closed listener can still take a connection). On macOS the fork route opens the directory `O_SEARCH`, so it needs the same permissions as a plain bind / connect (search, plus write for bind). On Linux the fork route enters the directory opened `O_PATH`, as the `/proc` route does, and needs only search permission. The fork route on other Unix and FreeBSD's bindat open it `O_RDONLY` and need read permission on the directory as well.
 
 ### The directory is looked up slightly before the call
 
@@ -99,7 +101,7 @@ Before using a relative spelling it is checked to name the same directory, and a
 
 ### A symlink can be left behind (macOS)
 
-If the process dies between creating and removing the symlink, `${TMPDIR:-/tmp}/sockat.XXXXXXXXXX` (pointing to the socket's directory) is left. The `sockat.` prefix tells it apart as sockat's. A relative `TMPDIR` disables the symlink route.
+If the process dies between creating and removing the symlink, `sockat.XXXXXXXXXX` (pointing to the socket's directory) is left under `TMPDIR` or `/tmp`. The `sockat.` prefix tells it apart as sockat's. A relative `TMPDIR` is not used for it (`/tmp` still is).
 
 ## Errors
 
@@ -109,10 +111,9 @@ If the process dies between creating and removing the symlink, `${TMPDIR:-/tmp}/
 | nothing to connect to | `ENOENT` |
 | a file already exists at the bind path | `EADDRINUSE` |
 | a socket file nobody listens on | `ECONNREFUSED` |
-| the file name alone fits no route (over about 90 bytes on Linux, 253 on macOS) | `ENAMETOOLONG` |
+| the file name alone fits no route (over about 90 bytes on Linux (107 without `/proc`), 253 on macOS) | `ENAMETOOLONG` |
 | a path not ending in a name (`dir/`, `dir/.`, `..`), a path containing NUL | `InvalidInput` |
 | the cwd changed during the relative route (macOS) | `Other` |
-| no `/proc` on Linux | an error saying `/proc` is needed |
 
 Errors are `std::io::Error`; for OS errors `raw_os_error()` gives the errno.
 

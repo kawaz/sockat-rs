@@ -40,7 +40,9 @@ server.read_exact(&mut buf)?;
 
 ### Linux / Android
 
-ディレクトリを `O_PATH` で開き、`/proc/self/fd/<fd>/<ファイル名>` を std に渡す。ディレクトリ部分の長さに上限は無い。`/proc` が要る。
+ディレクトリを `O_PATH` で開き、`/proc/self/fd/<fd>/<ファイル名>` を std に渡す。ディレクトリ部分の長さに上限は無い。
+
+`/proc` が無い時 (`/proc` を mount していない chroot や最小のコンテナ) は、その他の Unix と同じ fork で bind / connect する。この時だけ fork の副作用 (後述) が乗る。`/proc` の経路で実際に失敗した時は、fork でやり直さずにそのエラーを返す。
 
 ### macOS
 
@@ -48,10 +50,10 @@ server.read_exact(&mut buf)?;
 
 1. **cwd からの相対パス** (100 バイト以内なら)。パスが cwd (`getcwd`、または cwd と同じディレクトリを指す `$PWD`) の下にあれば前を削る。そうでなければ両方を実パスに揃えて `..` で上る綴りを作る
 2. **広げた sockaddr** (253 バイトまで)。XNU は `sun_path` が 104 バイトを超えるアドレスを 255 バイトまで受け付ける。元のパス、無理なら相対パス
-3. **短い symlink 経由**。`${TMPDIR:-/tmp}/sockat.XXXXXXXXXX` → ソケットのディレクトリ、の symlink を作り、それを通したパスで bind / connect して、すぐ消す
+3. **短い symlink 経由**。`<置き場>/sockat.XXXXXXXXXX` → ソケットのディレクトリ、の symlink を作り、それを通したパスで bind / connect して、すぐ消す。置き場は `TMPDIR` (絶対パスの時)、`/tmp` の順に試し、symlink を通したパスが収まって symlink を作れた最初の場所を使う (`TMPDIR` が深くて短くならない時は `/tmp` を使う)
 4. **fork**。ディレクトリの fd に `fchdir` した子が、ファイル名だけで bind / connect する
 
-ある方法が実際に失敗した時 (`ENOENT`、`EADDRINUSE` 等) は、そのエラーを返して次を試さない。次へ進むのは、その方法自体が使えない時 (長さが足りない、symlink が作れない等) だけ。
+ある方法が実際に失敗した時 (`ENOENT`、`EADDRINUSE` 等) は、そのエラーを返して次を試さない。次へ進むのは、その方法自体が使えない時 (長さが足りない、symlink が作れない等) だけ。symlink の置き場も同じで、ある置き場を通した bind / connect が失敗したら、次の置き場では試さない。
 
 ### FreeBSD
 
@@ -83,11 +85,11 @@ fork (macOS の 4 と同じ)。
 
 ### fork の経路では、connect 側の pid が子に見える
 
-fork の経路 (macOS の 4、その他の Unix) で connect すると、サーバから見える peer は短命の子になる。macOS の `LOCAL_PEERPID` は子の pid を返し、クライアントが send した後はクライアントの pid を返す。uid / gid はどちらでもクライアントのもの。Linux は fork しない。
+fork の経路 (macOS の 4、`/proc` の無い Linux、その他の Unix) で connect すると、サーバから見える peer は短命の子になる。macOS の `LOCAL_PEERPID` は子の pid を返し、クライアントが send した後はクライアントの pid を返す。`/proc` の無い Linux の `SO_PEERCRED` は、子が終了した後もずっと子の pid を返す (クライアントが send しても変わらない)。uid / gid はどちらでもクライアントのもの。`/proc` のある Linux は fork しない。
 
 ### fork した子は一瞬、全 fd の複製を持つ
 
-fork の性質として、子は終了するまでプロセスの全 fd の複製を持つ。その瞬間に他のスレッドが閉じたソケットやパイプは、子が終わるまで開いたままになる (相手が EOF を見るのが少し遅れる。閉じた listener がさらに接続を受けうる)。fork の経路は、macOS ではディレクトリを `O_SEARCH` で開くので、通常の bind / connect と同じ権限 (検索、bind なら書き込みも) で足りる。他の Unix の fork と FreeBSD の bindat は `O_RDONLY` で開くので、ディレクトリの読み取り権限も要る。
+fork の性質として、子は終了するまでプロセスの全 fd の複製を持つ。その瞬間に他のスレッドが閉じたソケットやパイプは、子が終わるまで開いたままになる (相手が EOF を見るのが少し遅れる。閉じた listener がさらに接続を受けうる)。fork の経路は、macOS ではディレクトリを `O_SEARCH` で開くので、通常の bind / connect と同じ権限 (検索、bind なら書き込みも) で足りる。Linux の fork は `/proc` の経路と同じく `O_PATH` で開いたディレクトリに入るので、検索権限で足りる。他の Unix の fork と FreeBSD の bindat は `O_RDONLY` で開くので、ディレクトリの読み取り権限も要る。
 
 ### ディレクトリは呼ぶ少し前に引かれる
 
@@ -99,7 +101,7 @@ Linux・相対パス・bindat・fork の経路は、ディレクトリを先に�
 
 ### symlink が残ることがある (macOS)
 
-symlink を作ってから消すまでの間にプロセスが死ぬと、`${TMPDIR:-/tmp}/sockat.XXXXXXXXXX` (ソケットのディレクトリを指す) が残る。名前が `sockat.` で始まるので、sockat の残骸と分かる。`TMPDIR` が相対パスの時は symlink の経路を使わない。
+symlink を作ってから消すまでの間にプロセスが死ぬと、`TMPDIR` か `/tmp` の下に `sockat.XXXXXXXXXX` (ソケットのディレクトリを指す) が残る。名前が `sockat.` で始まるので、sockat の残骸と分かる。`TMPDIR` が相対パスの時は `TMPDIR` には作らない (`/tmp` は使う)。
 
 ## エラー
 
@@ -109,10 +111,9 @@ symlink を作ってから消すまでの間にプロセスが死ぬと、`${TMP
 | connect 先が無い | `ENOENT` |
 | bind 先に既にファイルがある | `EADDRINUSE` |
 | 誰も listen していないソケットファイル | `ECONNREFUSED` |
-| ファイル名だけでどの経路にも収まらない (Linux でおよそ 90、macOS で 253 バイト超) | `ENAMETOOLONG` |
+| ファイル名だけでどの経路にも収まらない (Linux でおよそ 90 (`/proc` が無い時は 107)、macOS で 253 バイト超) | `ENAMETOOLONG` |
 | 名前で終わらないパス (`dir/`、`dir/.`、`..`)、NUL を含むパス | `InvalidInput` |
 | 相対パスの経路の途中で cwd が変わった (macOS) | `Other` |
-| Linux で `/proc` が無い | `/proc` が要ると言うエラー |
 
 エラーは `std::io::Error` で、OS のエラーは `raw_os_error()` で errno を取れる。
 

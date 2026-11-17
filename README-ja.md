@@ -19,8 +19,8 @@ std の `UnixListener::bind` / `UnixStream::connect` は `sun_path` に収まら
 
 | プラットフォーム | 方法 |
 |---|---|
-| Linux / Android | ディレクトリを `O_PATH` で開き、`/proc/self/fd/<fd>/<名前>` で渡す |
-| macOS | 順に試す: cwd からの相対パス → 253 バイトまで入る広げた sockaddr → `${TMPDIR:-/tmp}` の短い symlink 経由 → ディレクトリに `fchdir` した子を fork |
+| Linux / Android | ディレクトリを `O_PATH` で開き、`/proc/self/fd/<fd>/<名前>` で渡す (`/proc` が無ければ、ディレクトリに `fchdir` した子を fork) |
+| macOS | 順に試す: cwd からの相対パス → 253 バイトまで入る広げた sockaddr → `TMPDIR` か `/tmp` の短い symlink 経由 → ディレクトリに `fchdir` した子を fork |
 | FreeBSD | `bindat(2)` / `connectat(2)` |
 | 他の Unix | ディレクトリに `fchdir` した子を fork |
 | Windows | 対象外 |
@@ -30,7 +30,7 @@ std の `UnixListener::bind` / `UnixStream::connect` は `sun_path` に収まら
 ## 長いパスで std と違う点
 
 - `local_addr()` / `peer_addr()` は元のパスを返さない (実際にカーネルに渡した綴りを返す)。元のパスは自分で持っておく
-- fork の経路では、サーバから見える connect 側の pid が一時的に子になる
+- fork の経路では、サーバから見える connect 側の pid が子になる (macOS ではクライアントが send するまで、`/proc` の無い Linux ではずっと)
 - 詳しくは [docs/MANUAL-ja.md](./docs/MANUAL-ja.md)
 
 ## async ランタイム

@@ -46,8 +46,9 @@ pub(crate) enum Route {
     /// `bindat(2)` / `connectat(2)` on the directory fd (FreeBSD).
     #[cfg(target_os = "freebsd")]
     At,
-    /// A forked child that `fchdir`s into the directory.
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+    /// A forked child that `fchdir`s into the directory (on Linux, only
+    /// without /proc).
+    #[cfg(not(target_os = "freebsd"))]
     Fork,
 }
 
@@ -56,7 +57,7 @@ pub(crate) fn run(op: Op, path: &Path) -> io::Result<(OwnedFd, Route)> {
     #[cfg(target_vendor = "apple")]
     return apple::run(op, path, &apple::Config::from_env());
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    return linux::run(op, path);
+    return linux::run(op, path, Path::new(linux::PROC_SELF_FD));
     #[cfg(target_os = "freebsd")]
     return freebsd::run(op, path);
     #[cfg(not(any(
@@ -87,18 +88,21 @@ pub(crate) fn std_op(op: Op, path: &Path) -> io::Result<OwnedFd> {
 /// `EINVAL`; then the directory is opened `O_RDONLY`, which needs read
 /// permission.
 ///
+/// Linux: `O_PATH | O_DIRECTORY`, which needs only search permission. The fd
+/// serves both the /proc route (`/proc/self/fd/<fd>` names the directory) and
+/// the fork route (`fchdir(2)` takes an `O_PATH` directory fd since Linux 3.5).
+///
 /// Other targets: `O_RDONLY | O_DIRECTORY`, so the fork route and `bindat`
-/// need read permission on the directory. Linux's own route opens the
-/// directory `O_PATH` instead (see `linux::proc_fd`); there only the tests come
-/// here.
-#[cfg_attr(
-    any(target_os = "linux", target_os = "android"),
-    allow(
-        dead_code,
-        reason = "Linux opens the directory with O_PATH; the tests use this"
-    )
-)]
+/// need read permission on the directory.
 fn open_dir(dir: &Path) -> io::Result<OwnedFd> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+            .open(dir)
+            .map(OwnedFd::from)
+    }
     #[cfg(target_vendor = "apple")]
     {
         // `read(true)` is O_RDONLY (0), so the access mode is O_SEARCH's own
@@ -110,11 +114,12 @@ fn open_dir(dir: &Path) -> io::Result<OwnedFd> {
             .map(OwnedFd::from);
         search_or_read_only(dir, searched)
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
     open_read_only(dir)
 }
 
 /// Open `dir` `O_RDONLY | O_DIRECTORY` (needs read permission).
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn open_read_only(dir: &Path) -> io::Result<OwnedFd> {
     OpenOptions::new()
         .read(true)
@@ -154,9 +159,15 @@ pub(crate) fn search_or_read_only(
 ))]
 pub(crate) fn fork_op(op: Op, dir: &Path, addr: &sys::SockAddr) -> io::Result<OwnedFd> {
     use std::os::fd::AsFd;
+    fork_in(op, open_dir(dir)?.as_fd(), addr)
+}
+
+/// [`fork_op`] with the directory already opened by [`open_dir`].
+#[cfg(any(test, not(target_os = "freebsd")))]
+fn fork_in(op: Op, dir: std::os::fd::BorrowedFd<'_>, addr: &sys::SockAddr) -> io::Result<OwnedFd> {
+    use std::os::fd::AsFd;
     let sock = sys::socket()?;
-    let dir = open_dir(dir)?;
-    sys::op_in_dir_forked(op, sock.as_fd(), dir.as_fd(), addr)?;
+    sys::op_in_dir_forked(op, sock.as_fd(), dir, addr)?;
     if op == Op::Bind {
         sys::listen(sock.as_fd())?;
     }
@@ -166,53 +177,70 @@ pub(crate) fn fork_op(op: Op, dir: &Path, addr: &sys::SockAddr) -> io::Result<Ow
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) mod linux {
     use super::*;
-    use std::ffi::OsString;
-    use std::os::fd::AsRawFd;
+    use crate::sys::SockAddr;
+    use std::ffi::OsStr;
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+    use std::path::PathBuf;
+
+    /// Where the kernel lists the fds of the calling process.
+    pub(crate) const PROC_SELF_FD: &str = "/proc/self/fd";
 
     /// Linux: the path itself when it is short, otherwise
-    /// `/proc/self/fd/<dirfd>/<name>` with the directory opened `O_PATH`.
+    /// `/proc/self/fd/<dirfd>/<name>` with the directory opened `O_PATH`, or,
+    /// when there is no /proc, the fork route.
     ///
     /// The kernel resolves the `/proc/self/fd/<n>` magic link to the directory
     /// the fd refers to, so the socket is created in (or looked up in) that
-    /// directory without ever changing the cwd. Nothing else is tried: this
-    /// route has no length limit on the directory, needs no temporary file and
-    /// no fork, and works in multi-threaded processes.
-    pub(crate) fn run(op: Op, path: &Path) -> io::Result<(OwnedFd, Route)> {
+    /// directory without ever changing the cwd. This route has no length limit
+    /// on the directory, needs no temporary file and no fork, and works in
+    /// multi-threaded processes. The fork route is taken only when
+    /// `<proc_self_fd>/<dirfd>` is not there (no /proc mounted, as in some
+    /// chroots and minimal containers): the route itself cannot be used then.
+    /// What a bind / connect through /proc returns is the result, never
+    /// retried on the fork route.
+    ///
+    /// `proc_self_fd` is [`PROC_SELF_FD`] outside the tests, which point it
+    /// elsewhere to stand in for a system without /proc.
+    pub(crate) fn run(op: Op, path: &Path, proc_self_fd: &Path) -> io::Result<(OwnedFd, Route)> {
         if path::len(path) <= DIRECT_MAX {
             return std_op(op, path).map(|fd| (fd, Route::Direct));
         }
-        proc_fd(op, path).map(|fd| (fd, Route::ProcFd))
+        let (dir, name) = path::split(path)?;
+        let dir = open_dir(dir)?;
+        match proc_spelling(dir.as_fd(), name, proc_self_fd)? {
+            // `dir` stays open until the call returns (dropped at the end of
+            // scope), so the spelling keeps naming it.
+            Some(via) => std_op(op, &via).map(|fd| (fd, Route::ProcFd)),
+            None => {
+                fork_in(op, dir.as_fd(), &SockAddr::standard(name)?).map(|fd| (fd, Route::Fork))
+            }
+        }
     }
 
-    pub(crate) fn proc_fd(op: Op, path: &Path) -> io::Result<OwnedFd> {
-        let (dir, name) = path::split(path)?;
-        let dir = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
-            .open(dir)?;
-        let fd_dir = format!("/proc/self/fd/{}", dir.as_raw_fd());
-        let mut via = OsString::from(&fd_dir);
-        via.push("/");
-        via.push(name);
-        let via = Path::new(&via);
-        if path::len(via) >= sys::SUN_PATH_CAP {
-            // The file name alone is too long to fit even behind the shortest
-            // directory spelling there is.
+    /// `<proc_self_fd>/<dir>/<name>`, or `None` when `<proc_self_fd>/<dir>`
+    /// cannot be looked up (no /proc). Without that check a bind / connect
+    /// through the spelling would fail with `ENOENT`, which reads as "the
+    /// directory does not exist" although it does.
+    ///
+    /// # Errors
+    ///
+    /// `ENAMETOOLONG` when the spelling does not fit `sun_path`: the file name
+    /// alone is too long to fit even behind the shortest directory spelling
+    /// there is.
+    fn proc_spelling(
+        dir: BorrowedFd<'_>,
+        name: &OsStr,
+        proc_self_fd: &Path,
+    ) -> io::Result<Option<PathBuf>> {
+        let fd_dir = proc_self_fd.join(dir.as_raw_fd().to_string());
+        if std::fs::metadata(&fd_dir).is_err() {
+            return Ok(None);
+        }
+        let via = fd_dir.join(name);
+        if path::len(&via) >= sys::SUN_PATH_CAP {
             return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
         }
-        // Without /proc the bind / connect below would fail with ENOENT, which
-        // reads as "the directory does not exist" although it does.
-        if let Err(e) = std::fs::metadata(&fd_dir) {
-            return Err(io::Error::new(
-                e.kind(),
-                format!(
-                    "binding / connecting a socket path longer than {DIRECT_MAX} bytes needs /proc \
-                     ({fd_dir}: {e})"
-                ),
-            ));
-        }
-        // `dir` stays open until the call returns (dropped at the end of scope).
-        std_op(op, via)
+        Ok(Some(via))
     }
 }
 
@@ -277,10 +305,9 @@ pub(crate) mod apple {
     /// the tests can vary it without touching the process environment.
     #[derive(Debug, Clone)]
     pub(crate) struct Config {
-        /// Where the temporary symlink goes: `${TMPDIR:-/tmp}`. `None` when
-        /// `TMPDIR` is set to a relative path (it would depend on the cwd),
-        /// which skips the symlink route.
-        pub(crate) tmp_base: Option<PathBuf>,
+        /// Where the temporary symlink may go, in the order tried: `TMPDIR`
+        /// when it is set to an absolute path, then `/tmp`.
+        pub(crate) tmp_bases: Vec<PathBuf>,
         /// Whether to try the widened `sockaddr_un` at all. Always `true`
         /// outside the tests, which turn it off to stand in for a kernel that
         /// refuses the widened form.
@@ -292,18 +319,20 @@ pub(crate) mod apple {
             Self::from_tmpdir(std::env::var_os("TMPDIR"))
         }
 
-        /// The configuration for a `TMPDIR` of `tmpdir`: `${TMPDIR:-/tmp}`,
-        /// except that a relative value disables the symlink route.
+        /// The configuration for a `TMPDIR` of `tmpdir`: `TMPDIR`, then
+        /// `/tmp`. An unset or empty `TMPDIR` leaves `/tmp` alone; a relative
+        /// one is left out (the link's place would depend on the cwd); one
+        /// that is `/tmp` itself is tried once.
         pub(crate) fn from_tmpdir(tmpdir: Option<std::ffi::OsString>) -> Self {
-            let tmp_base = match tmpdir {
-                Some(t) if !t.is_empty() => {
-                    let t = PathBuf::from(t);
-                    t.is_absolute().then_some(t)
-                }
-                _ => Some(PathBuf::from("/tmp")),
-            };
+            let tmp = Path::new("/tmp");
+            let mut tmp_bases: Vec<PathBuf> = tmpdir
+                .map(PathBuf::from)
+                .filter(|t| t.is_absolute() && t != tmp)
+                .into_iter()
+                .collect();
+            tmp_bases.push(tmp.to_path_buf());
             Self {
-                tmp_base,
+                tmp_bases,
                 wide: true,
             }
         }
@@ -316,13 +345,15 @@ pub(crate) mod apple {
     ///    [`DIRECT_MAX`] bytes;
     /// 3. a widened `sockaddr_un` with the path itself, or failing that with
     ///    the relative spelling, when one of them is at most 253 bytes;
-    /// 4. a short symlink to the socket's directory under `${TMPDIR:-/tmp}`;
+    /// 4. a short symlink to the socket's directory under the first of
+    ///    `TMPDIR` and `/tmp` ([`Config::tmp_bases`]) where the path through
+    ///    it fits and the symlink can be created;
     /// 5. a forked child that `fchdir`s into the directory.
     ///
     /// A failure of a route ends the search with that error, except where it
     /// shows that the route itself cannot be used (the kernel refusing the
-    /// widened form, the symlink not being creatable); then the next route is
-    /// tried.
+    /// widened form, the symlink not being creatable); then the next route (or
+    /// the next place for the symlink) is tried.
     pub(crate) fn run(op: Op, path: &Path, cfg: &Config) -> io::Result<(OwnedFd, Route)> {
         if path::len(path) <= DIRECT_MAX {
             return std_op(op, path).map(|fd| (fd, Route::Direct));
@@ -354,7 +385,7 @@ pub(crate) mod apple {
             }
         }
 
-        if let Some(base) = &cfg.tmp_base {
+        for base in &cfg.tmp_bases {
             match symlink_route(op, base, dir, name, wide) {
                 SymlinkOutcome::Done(done) => return done,
                 SymlinkOutcome::WideRefused => wide = false,

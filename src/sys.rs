@@ -10,20 +10,13 @@
 //! * [`socket`] / [`bind`] / [`connect`] / [`listen`] — a stream socket set up the
 //!   same way std sets up the sockets behind `UnixListener` / `UnixStream`.
 //! * [`op_in_dir_forked`] — bind / connect relative to a directory fd in a forked
-//!   child that `fchdir`s (the last resort on Apple targets and on Unix targets
-//!   without a dirfd-relative primitive).
+//!   child that `fchdir`s (the last resort on Apple targets, on Linux without
+//!   /proc, and on Unix targets without a dirfd-relative primitive).
 //! * `op_at` — `bindat(2)` / `connectat(2)` (FreeBSD).
 
-// Linux reaches long paths through /proc with std alone, and FreeBSD through
-// bindat / connectat, so most of this file is used there only by the tests
-// (which also exercise the fork route on Linux).
-#![cfg_attr(
-    all(
-        not(test),
-        any(target_os = "linux", target_os = "android", target_os = "freebsd")
-    ),
-    allow(dead_code)
-)]
+// FreeBSD reaches long paths through bindat / connectat, so the fork route is
+// used there only by the tests.
+#![cfg_attr(all(not(test), target_os = "freebsd"), allow(dead_code))]
 
 use std::ffi::OsStr;
 use std::io;
