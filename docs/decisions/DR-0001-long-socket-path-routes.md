@@ -59,7 +59,7 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 2. **1 で 100 バイト以内にならない時だけ、両方を実パスに揃えて `..` で上る。** ソケットのディレクトリを `realpath(3)` で実パスにし、`getcwd` の実パス (macOS で `cd /var` すると `/private/var` が返る) との差から、`..` で上ってから下る綴りを作る。両方が実パスなら、どの `..` も実ディレクトリから上るので、カーネルの解決と一致する
    - 書かれたままのパスで比べると、`/var` と `/private/var` のように片方が symlink 経由だと共通部分を見落とす。パスの途中の symlink の先で `..` を使うと、symlink の先の親に着いてしまう
 
-2 つのうち短い方を使う。使う前に、相対パスのディレクトリと元のディレクトリの `(st_dev, st_ino)` が同じことを確かめる (cwd が消されている、他のスレッドが変えた、を弾く)。bind / connect の後に cwd の `(st_dev, st_ino)` が変わっていないことも確かめ、変わっていたら結果を捨ててエラーにする。
+2 つのうち短い方を使う。使う前に、相対パスのディレクトリと元のディレクトリの `(st_dev, st_ino)` が同じことを確かめる (cwd が消されている、他のスレッドが変えた、を弾く)。bind / connect の後に cwd の `(st_dev, st_ino)` が変わっていないことも確かめ、変わっていたら結果を捨ててエラーにする (試験は bind / connect を行う関数の中で cwd を変えて、他のスレッドの代わりにする)。
 
 - 相対パスは呼んだ時点の cwd に依存し、cwd はプロセスの全スレッドで共有される。他のスレッドが途中で `chdir` すると、別のディレクトリで bind / connect したことになる。上の事後確認で見えるのは、その間に cwd が変わったままの場合だけで、変えて戻した場合は見えない。保証の範囲は「bind / connect の間に cwd を変えないプロセス」で、doc にそう書く
 - 事後確認で弾いた bind が作ったソケットファイルは消さない。どこにできたかが分からないので、消そうとすると別のファイルを消しうる
@@ -97,7 +97,7 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 
 - **connect した pid がサーバから子に見える。** macOS の `LOCAL_PEERPID` は子の pid を返し、親が send すると親の pid に変わる (試験 `local_peerpid_of_a_forked_connect_names_the_child_until_the_client_sends` で実機確認)。uid / gid はどちらでも同じ
 - **子は一瞬、プロセスの全 fd の複製を持つ** (fork の性質)。その間に他のスレッドが閉じたソケットやパイプは、子が終わるまで開いたままになる。閉じた listener の backlog にさらに接続が入りうる。試験でこれを踏んだ (並行する試験の fork が、別の試験の閉じたはずの listener を生かしていた)
-- macOS ではディレクトリを `O_SEARCH` で開く。検索権限だけで開け、その fd に `fchdir` できる (macOS 26.5.2 で確認: 読み取り権限の無い mode 0300 のディレクトリは `O_RDONLY` では `EACCES` で開けないが、`O_SEARCH` なら開けて bind できる。mode 0100 では通常の bind と同じく bind が `EACCES`。`O_EXEC` 単独ではディレクトリに `EISDIR`)。なので通常の bind / connect と同じ権限で足りる。`O_SEARCH` をディレクトリに受け付けない古いカーネルは `EISDIR` / `EINVAL` を返すとみなし、その時は `O_RDONLY` で開き直す (この分岐は手元のカーネルでは通らない)
+- macOS ではディレクトリを `O_SEARCH` で開く。検索権限だけで開け、その fd に `fchdir` できる (macOS 26.5.2 で確認: 読み取り権限の無い mode 0300 のディレクトリは `O_RDONLY` では `EACCES` で開けないが、`O_SEARCH` なら開けて bind できる。mode 0100 では通常の bind と同じく bind が `EACCES`。`O_EXEC` 単独ではディレクトリに `EISDIR`)。なので通常の bind / connect と同じ権限で足りる。`O_SEARCH` をディレクトリに受け付けない古いカーネルは `EISDIR` / `EINVAL` を返すとみなし、その時は `O_RDONLY` で開き直す (この分岐は手元のカーネルでは通らないので、試験では `O_SEARCH` で開いた結果を値として差し替えて通す)
 - 他の Unix の fork と FreeBSD の `bindat` はディレクトリを `O_RDONLY` で開くので、読み取り権限も要る
 
 ### 4. FreeBSD は `bindat(2)` / `connectat(2)`、それ以外の Unix は fork

@@ -99,29 +99,48 @@ pub(crate) fn std_op(op: Op, path: &Path) -> io::Result<OwnedFd> {
     )
 )]
 fn open_dir(dir: &Path) -> io::Result<OwnedFd> {
-    let read_only = || {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY)
-            .open(dir)
-            .map(OwnedFd::from)
-    };
     #[cfg(target_vendor = "apple")]
     {
         // `read(true)` is O_RDONLY (0), so the access mode is O_SEARCH's own
         // O_EXEC bit; std keeps custom flags outside O_ACCMODE.
-        match OpenOptions::new()
+        let searched = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_SEARCH)
             .open(dir)
-        {
-            Ok(f) => Ok(OwnedFd::from(f)),
-            Err(e) if matches!(e.raw_os_error(), Some(libc::EISDIR | libc::EINVAL)) => read_only(),
-            Err(e) => Err(e),
-        }
+            .map(OwnedFd::from);
+        search_or_read_only(dir, searched)
     }
     #[cfg(not(target_vendor = "apple"))]
-    read_only()
+    open_read_only(dir)
+}
+
+/// Open `dir` `O_RDONLY | O_DIRECTORY` (needs read permission).
+fn open_read_only(dir: &Path) -> io::Result<OwnedFd> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(dir)
+        .map(OwnedFd::from)
+}
+
+/// Keep the outcome of opening `dir` `O_SEARCH`, unless it is the answer of a
+/// kernel that does not take `O_SEARCH` on a directory (`EISDIR` or
+/// `EINVAL`); then open `dir` `O_RDONLY` instead. Any other error (`ENOENT`,
+/// `EACCES`, ...) is the real outcome and is returned as is.
+///
+/// The outcome is taken as a value so the tests can stand in for such a
+/// kernel, which the running one is not.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn search_or_read_only(
+    dir: &Path,
+    searched: io::Result<OwnedFd>,
+) -> io::Result<OwnedFd> {
+    match searched {
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EISDIR | libc::EINVAL)) => {
+            open_read_only(dir)
+        }
+        searched => searched,
+    }
 }
 
 /// Bind (and listen) or connect a fresh socket to `name` inside `dir` from a

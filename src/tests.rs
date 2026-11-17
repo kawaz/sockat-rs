@@ -546,6 +546,32 @@ mod apple {
         p.components().any(|c| c == Component::ParentDir)
     }
 
+    /// Gives a directory back mode 0700 on drop.
+    struct RestoreMode<'a>(&'a Path);
+
+    impl Drop for RestoreMode<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            // TempDir needs to list the directory to remove it.
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    /// Make `dir` mode 0300 (write + search, no read) until the guard drops,
+    /// and check that it can no longer be opened `O_RDONLY`.
+    fn unreadable(dir: &Path) -> RestoreMode<'_> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let restore = RestoreMode(dir);
+        let e = std::fs::File::open(dir).unwrap_err();
+        assert_eq!(
+            errno(&e),
+            Some(libc::EACCES),
+            "the premise: no read permission"
+        );
+        restore
+    }
+
     fn assert_empty(dir: &Path) {
         let left: Vec<_> = std::fs::read_dir(dir).unwrap().collect();
         assert!(left.is_empty(), "left behind in {dir:?}: {left:?}");
@@ -863,25 +889,10 @@ mod apple {
     // fail where a short one in the same directory works.
     #[test]
     fn the_fork_route_does_not_need_read_permission_on_the_directory() {
-        use std::os::unix::fs::PermissionsExt;
-        struct Restore<'a>(&'a Path);
-        impl Drop for Restore<'_> {
-            fn drop(&mut self) {
-                // TempDir needs to list the directory to remove it.
-                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
-            }
-        }
         let t = tmp();
         let p = nest(t.path(), 400, "s.sock");
         let dir = p.parent().unwrap().to_path_buf();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
-        let _restore = Restore(&dir);
-        let e = std::fs::File::open(&dir).unwrap_err();
-        assert_eq!(
-            errno(&e),
-            Some(libc::EACCES),
-            "the premise: no read permission"
-        );
+        let _restore = unreadable(&dir);
 
         let c = cfg(None, true);
         let (l, r) = apple::run(Op::Bind, &p, &c).unwrap();
@@ -890,6 +901,61 @@ mod apple {
         let (cl, r) = apple::run(Op::Connect, &p, &c).unwrap();
         assert_eq!(r, Route::Fork);
         ping(l, cl);
+    }
+
+    // A kernel that does not take O_SEARCH on a directory answers EISDIR (as
+    // macOS does for O_EXEC alone) or EINVAL. The fork route must then still
+    // work, by opening the directory O_RDONLY instead, rather than fail on a
+    // directory it could use. The running kernel takes O_SEARCH, so its
+    // refusal is stood in for by handing that answer to search_or_read_only,
+    // and the fd it returns is used the way fork_op uses it. Checked:
+    //
+    // * EISDIR and EINVAL give an fd that the forked child fchdirs into, and
+    //   the socket it binds is in that directory and accepts a connection made
+    //   the same way;
+    // * the fd really comes from O_RDONLY: a mode 0300 directory, which
+    //   O_SEARCH opens, now fails with EACCES (and that is the error returned,
+    //   not swallowed);
+    // * any other error from the O_SEARCH open is the real outcome and is
+    //   returned without trying O_RDONLY: an EACCES for a readable directory
+    //   stays EACCES (falling back would hide a real permission failure).
+    #[test]
+    fn a_kernel_refusing_o_search_on_a_directory_falls_back_to_o_rdonly() {
+        let refused = |code| Err(io::Error::from_raw_os_error(code));
+        let fork_in = |op, dir: &OwnedFd, addr: &SockAddr| {
+            let sock = sys::socket().unwrap();
+            sys::op_in_dir_forked(op, sock.as_fd(), dir.as_fd(), addr)?;
+            if op == Op::Bind {
+                sys::listen(sock.as_fd()).unwrap();
+            }
+            io::Result::Ok(sock)
+        };
+
+        let t = tmp();
+        let dir = t.path();
+        for code in [libc::EISDIR, libc::EINVAL] {
+            let name = format!("{code}.sock");
+            let addr = SockAddr::standard(OsStr::new(&name)).unwrap();
+            let fd = route::search_or_read_only(dir, refused(code)).unwrap();
+            let l = fork_in(Op::Bind, &fd, &addr).unwrap();
+            assert!(is_socket(&dir.join(&name)), "{code}");
+            let c = fork_in(Op::Connect, &fd, &addr).unwrap();
+            ping(l, c);
+        }
+
+        let e = route::search_or_read_only(dir, refused(libc::EACCES)).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::EACCES), "{e}");
+
+        let locked = t.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let _restore = unreadable(&locked);
+        // The premise: the fork route as it is (O_SEARCH) binds there.
+        let addr = SockAddr::standard(OsStr::new("s.sock")).unwrap();
+        let _l = route::fork_op(Op::Bind, &locked, &addr).unwrap();
+        for code in [libc::EISDIR, libc::EINVAL] {
+            let e = route::search_or_read_only(&locked, refused(code)).unwrap_err();
+            assert_eq!(errno(&e), Some(libc::EACCES), "{code}: {e}");
+        }
     }
 
     // A base the link cannot be created in (missing, or a file) makes the
@@ -1114,5 +1180,92 @@ mod apple {
         assert!(rel.starts_with("../abc/"), "{rel}");
         assert!(is_socket(&p));
         assert!(!cwd.join("c").exists());
+    }
+
+    // The relative spelling is resolved against the cwd at the moment of the
+    // bind / connect, and the cwd is shared by every thread, so another thread
+    // that changes it in between sends the call to another directory. When the
+    // cwd is still changed afterwards, Relative::run must notice and turn the
+    // result into an error even though the call itself succeeded: a listener
+    // in the wrong directory or a stream to the wrong server must not reach
+    // the caller as if it were at the path they gave.
+    //
+    // The change is made from inside the call (the closure chdirs before it
+    // binds / connects), standing in for another thread. Two directories with
+    // the same subtree make the wrong directory one where the call succeeds:
+    //
+    // * bind: the error comes back, the socket file is in the other directory
+    //   and is left there (where it went is not known to Relative::run, so it
+    //   must not remove anything), and nothing appears at the given path;
+    // * connect: the error comes back, and the stream that did connect to a
+    //   listener in the other directory is closed, which that listener sees as
+    //   end of file.
+    //
+    // Runs in a child process because it changes the cwd.
+    #[test]
+    fn a_cwd_changed_during_a_relative_bind_or_connect_discards_the_result() {
+        let t = tmp();
+        let one = t.path().join("one");
+        let two = t.path().join("two");
+        let p = nest_tail(&one, 90, "s.sock");
+        assert!(path::len(&p) > DIRECT_MAX);
+        let sub = p.strip_prefix(&one).unwrap().to_path_buf();
+        std::fs::create_dir_all(two.join(sub.parent().unwrap())).unwrap();
+        run_child(
+            "tests::apple::child_relative_with_the_cwd_changed_midway",
+            &one,
+            &[
+                ("PWD", one.as_os_str()),
+                ("SOCKAT_CHILD_PATH", p.as_os_str()),
+                ("SOCKAT_CHILD_OTHER", two.as_os_str()),
+            ],
+        );
+        assert!(!is_socket(&p));
+        assert!(is_socket(&two.join(&sub)));
+    }
+
+    #[test]
+    fn child_relative_with_the_cwd_changed_midway() {
+        if !in_child() {
+            return;
+        }
+        let p = env_path("SOCKAT_CHILD_PATH");
+        let one = std::env::current_dir().unwrap();
+        let two = env_path("SOCKAT_CHILD_OTHER");
+        let (dir, _) = path::split(&p).unwrap();
+        let rel = Relative::new(&p, dir).unwrap();
+        assert!(!has_dotdot(&rel.path), "{:?}", rel.path);
+
+        let e = rel
+            .run(|q| {
+                std::env::set_current_dir(&two).unwrap();
+                route::std_op(Op::Bind, q)
+            })
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Other, "{e}");
+        assert_eq!(errno(&e), None, "{e}");
+        assert!(is_socket(&two.join(&rel.path)));
+        assert!(!is_socket(&p));
+
+        // A listener in the other directory, at the same relative spelling.
+        let c = p.with_file_name("c.sock");
+        let (c_dir, _) = path::split(&c).unwrap();
+        let c_rel = rel.path.with_file_name("c.sock");
+        let listener = UnixListener::bind(&c_rel).unwrap();
+        assert!(is_socket(&two.join(&c_rel)));
+        std::env::set_current_dir(&one).unwrap();
+        let rel = Relative::new(&c, c_dir).unwrap();
+        assert_eq!(rel.path, c_rel);
+
+        let e = rel
+            .run(|q| {
+                std::env::set_current_dir(&two).unwrap();
+                route::std_op(Op::Connect, q)
+            })
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Other, "{e}");
+        let (mut server, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 1];
+        assert_eq!(server.read(&mut buf).unwrap(), 0, "the client is closed");
     }
 }
