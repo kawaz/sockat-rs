@@ -226,3 +226,44 @@ fn long_path_errors_through_the_public_api() {
         std::io::ErrorKind::InvalidInput
     );
 }
+
+// A long path needs no more permission on the socket's directory than std's
+// bind / connect of a short path: search and write, not read. On Linux the
+// /proc route opens the directory O_PATH, which takes no permission at all on
+// the directory itself, so a directory without read permission (mode 0300)
+// must work at any length. Root bypasses permission checks, so under root
+// (as in `just test-linux`, docker) the test cannot tell anything and says so;
+// the GitHub Actions runner is not root, which is where it bites.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn a_directory_without_read_permission_is_enough_on_linux() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let t = tempfile::Builder::new()
+        .prefix("sockat-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    if std::fs::metadata(t.path()).unwrap().uid() == 0 {
+        eprintln!("skipped: running as root, which bypasses the permission under test");
+        return;
+    }
+    let p = nest(t.path(), 400, "s.sock");
+    let dir = p.parent().unwrap().to_path_buf();
+    // Put the mode back whatever happens, so the temporary directory can be
+    // removed.
+    struct Restore(PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _restore = Restore(dir.clone());
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+    // The premise: the directory really cannot be read.
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap_err().raw_os_error(),
+        Some(libc::EACCES)
+    );
+    let listener = sockat::bind(&p).unwrap();
+    let mut client = sockat::connect(&p).unwrap();
+    ping(&listener, &mut client);
+}
