@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # A hanging test fails within nextest's slow-timeout (.config/nextest.toml);
+    # this is only the outer bound so a hang never burns the default 6h.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The routes differ per OS (Linux: /proc; macOS: relative / widened
+        # sockaddr / symlink / fork), so each OS runs the whole suite.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v3
+      - uses: taiki-e/install-action@nextest
+      # just ci = check (fmt + clippy + unsafe confinement) + test.
+      # The same entry point as locally, so the checks match.
+      - run: just ci
+
+  freebsd:
+    name: Test (FreeBSD VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      # FreeBSD reaches long paths with bindat(2) / connectat(2), which only a
+      # FreeBSD kernel can exercise.
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: pkg install -y rust
+          run: cargo test
+
+  cross-check:
+    name: Cross check (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The fork-only route (no dirfd primitive) and the BSD sockaddr layout.
+        target: [x86_64-unknown-netbsd, x86_64-unknown-freebsd, aarch64-apple-ios]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+      - run: cargo clippy --target ${{ matrix.target }} --all-targets -- -D warnings
+
+  msrv:
+    name: MSRV check (rust-version = 1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - run: cargo check
+
+  audit:
+    name: cargo-audit (RUSTSEC advisories)
+    runs-on: ubuntu-latest
+    # rustsec/audit-check creates a check run, which needs checks:write.
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
