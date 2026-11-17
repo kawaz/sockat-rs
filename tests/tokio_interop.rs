@@ -1,6 +1,6 @@
 //! The async-runtime recipe from the crate docs, run for real with tokio: the
-//! std sockets from sockat are switched to non-blocking and adopted by
-//! `tokio::net`. tokio is only a dev-dependency; the crate itself does not
+//! listener from sockat is switched to non-blocking, the stream comes from
+//! `connect_nonblocking` already so, and both are adopted by `tokio::net`. tokio is only a dev-dependency; the crate itself does not
 //! depend on any runtime.
 
 use std::os::unix::ffi::OsStrExt;
@@ -21,8 +21,11 @@ fn long_path(base: &Path, total: usize) -> PathBuf {
 
 // A listener and a client on a path far beyond sun_path, both adopted by
 // tokio, exchange data in both directions. tokio's `from_std` leaves putting
-// the socket in non-blocking mode to the caller, so the recipe in the docs
-// includes `set_nonblocking(true)`; this test follows the recipe verbatim.
+// the socket in non-blocking mode to the caller: the recipe in the docs calls
+// `set_nonblocking(true)` on the listener, and connects with
+// `connect_nonblocking`, which returns a non-blocking stream and does not
+// wait on the runtime's thread (no `spawn_blocking`). This test follows the
+// recipe verbatim.
 #[tokio::test]
 async fn std_sockets_from_sockat_are_adopted_by_tokio() {
     let t = tempfile::Builder::new()
@@ -35,12 +38,7 @@ async fn std_sockets_from_sockat_are_adopted_by_tokio() {
     listener.set_nonblocking(true).unwrap();
     let listener = tokio::net::UnixListener::from_std(listener).unwrap();
 
-    let p = path.clone();
-    let client = tokio::task::spawn_blocking(move || sockat::connect(&p))
-        .await
-        .unwrap()
-        .unwrap();
-    client.set_nonblocking(true).unwrap();
+    let client = sockat::connect_nonblocking(&path).unwrap();
     let mut client = tokio::net::UnixStream::from_std(client).unwrap();
 
     let (mut server, _) = listener.accept().await.unwrap();

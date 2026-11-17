@@ -11,10 +11,11 @@
 //!   same way std sets up the sockets behind `UnixListener` / `UnixStream`
 //!   (optionally `O_NONBLOCK`, which std cannot connect with).
 //! * [`op_in_dir_forked`] — bind / connect relative to a directory fd in a forked
-//!   child that `fchdir`s (the last resort on Apple targets, on Linux without
-//!   /proc, and on Unix targets without a dirfd-relative primitive); returns the
-//!   child's pid.
+//!   child that `fchdir`s (the last resort on every target but FreeBSD, and on
+//!   Linux only without /proc); returns the child's pid.
 //! * `op_at` — `bindat(2)` / `connectat(2)` (FreeBSD).
+//! * `random_bytes` — the random part of the temporary symlink's name.
+//! * `effective_uid` — the owner a safe place for the temporary symlink may have.
 
 // FreeBSD reaches long paths through bindat / connectat, so the fork route is
 // used there only by the tests.
@@ -429,12 +430,77 @@ pub(crate) fn op_at(
     cvt(rc).map(drop)
 }
 
-/// Fill `buf` with random bytes from the kernel (`arc4random_buf(3)`, which
-/// never fails and never blocks).
-#[cfg(target_vendor = "apple")]
-pub(crate) fn random_bytes(buf: &mut [u8]) {
+/// The effective uid of this process (`geteuid(2)`, which cannot fail).
+#[cfg(not(target_os = "freebsd"))]
+pub(crate) fn effective_uid() -> libc::uid_t {
+    // SAFETY: plain syscall without arguments; it always succeeds.
+    unsafe { libc::geteuid() }
+}
+
+/// Fill `buf` with random bytes from the system's secure generator:
+/// `arc4random_buf(3)`, which never fails and never blocks.
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "illumos"
+))]
+pub(crate) fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
     // SAFETY: writes exactly `buf.len()` bytes into `buf`.
-    unsafe { libc::arc4random_buf(buf.as_mut_ptr().cast(), buf.len()) }
+    unsafe { libc::arc4random_buf(buf.as_mut_ptr().cast(), buf.len()) };
+    Ok(())
+}
+
+/// Fill `buf` with random bytes from the kernel: `getrandom(2)` with no flags
+/// (the urandom source; it waits only while the kernel's pool is not yet
+/// initialised, early in boot).
+///
+/// Made through `syscall(2)` rather than the C library's `getrandom`, which
+/// glibc has only since 2.25 and bionic since API 28; the system call itself
+/// is there since Linux 3.17. On an older kernel this fails with `ENOSYS`.
+/// `EINTR` and a short read are retried.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let rest = &mut buf[filled..];
+        // SAFETY: the kernel writes at most `rest.len()` bytes into `rest`.
+        let n = unsafe {
+            libc::syscall(
+                libc::SYS_getrandom,
+                rest.as_mut_ptr(),
+                rest.len(),
+                0 as libc::c_uint,
+            )
+        };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+        filled += n as usize;
+    }
+    Ok(())
+}
+
+/// Fill `buf` with random bytes from `/dev/urandom`: on the remaining Unix
+/// targets, which are not checked for a C-library generator one by one.
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "illumos",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd"
+)))]
+pub(crate) fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")?.read_exact(buf)
 }
 
 /// `LOCAL_PEERPID` of a connected socket (Apple). Test-only: used to record

@@ -6,7 +6,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-#[cfg(any(test, target_vendor = "apple"))]
+#[cfg(any(test, not(target_os = "freebsd")))]
 use std::path::{Component, PathBuf};
 
 /// Length of `path` in bytes, which is what `sun_path` limits.
@@ -58,7 +58,7 @@ pub(crate) fn split(path: &Path) -> io::Result<(&Path, &OsStr)> {
 /// it resolves through the same symlinks `target` does. Returns `None` when
 /// `prefix` is not a proper prefix (including `target == prefix`, which leaves
 /// no file name).
-#[cfg(any(test, target_vendor = "apple"))]
+#[cfg(any(test, not(target_os = "freebsd")))]
 pub(crate) fn below(target: &Path, prefix: &Path) -> Option<PathBuf> {
     if !target.is_absolute() || !prefix.is_absolute() {
         return None;
@@ -84,7 +84,7 @@ pub(crate) fn below(target: &Path, prefix: &Path) -> Option<PathBuf> {
 ///
 /// Returns `None` when either path is not absolute, or when `target` is `cwd`
 /// itself or one of its ancestors (there would be no file name left).
-#[cfg(any(test, target_vendor = "apple"))]
+#[cfg(any(test, not(target_os = "freebsd")))]
 pub(crate) fn relative(target: &Path, cwd: &Path) -> Option<PathBuf> {
     if !target.is_absolute() || !cwd.is_absolute() {
         return None;

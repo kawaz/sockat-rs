@@ -1,4 +1,4 @@
-//! The public API as a user sees it: `sockat::bind` / `sockat::connect` with
+//! The public API as a user sees it: `sockat::bind` and the four connects with
 //! paths of any length, on whatever route the platform picks. Which route ran
 //! is deliberately not observable here (the route-forcing tests live in the
 //! crate's unit tests).
@@ -73,6 +73,82 @@ fn bind_and_connect_work_at_any_length() {
             assert!(!is_socket(&p));
         }
     }
+}
+
+// The four connects in an ordinary environment (a writable /tmp, the socket
+// under a temporary directory with a short file name): every length is
+// reached without forking on every platform (DR-0001: the symlink route under
+// /tmp takes any directory depth), so the two connects that may fork report
+// no child's pid, and the two that may not connect as well. The nonblocking
+// ones hand back a stream that does not wait: a read with nothing to read is
+// WouldBlock.
+#[test]
+fn in_an_ordinary_environment_no_connect_forks() {
+    let t = tempfile::Builder::new()
+        .prefix("sockat-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    for total in [101, 253, 400, 1000] {
+        let p = nest(t.path(), total, &format!("{total}.sock"));
+        let listener = sockat::bind(&p).unwrap();
+
+        let mut c = sockat::connect(&p).unwrap();
+        ping(&listener, &mut c);
+
+        let mut c = sockat::connect_nonblocking(&p).unwrap();
+        let mut buf = [0u8; 1];
+        let e = c.read(&mut buf).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{total}");
+        drop(listener.accept().unwrap());
+
+        let (mut c, child) = sockat::connect_any(&p).unwrap();
+        assert_eq!(child, None, "{total}");
+        ping(&listener, &mut c);
+
+        let (mut c, child) = sockat::connect_any_nonblocking(&p).unwrap();
+        assert_eq!(child, None, "{total}");
+        let e = c.read(&mut buf).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{total}");
+    }
+}
+
+// A path that only the fork route reaches (every target but Linux, where /proc
+// reaches it, and FreeBSD, where connectat does): the file name is too long to
+// fit any sockaddr behind /tmp/sockat.XXXXXXXXXX/ (over 77 bytes for the plain
+// sockaddr; on macOS over 230 for the widened one) but fits the fork route's,
+// and the path is far from the cwd. `bind` forks to create it. `connect` and
+// `connect_nonblocking` do not fork, so for them the path is too long, as for
+// std: ENAMETOOLONG. `connect_any` and `connect_any_nonblocking` fork and
+// report the child's pid, which is not this process's.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+#[test]
+fn a_path_only_the_fork_route_reaches_needs_connect_any() {
+    #[cfg(target_vendor = "apple")]
+    const NAME_LEN: usize = 240;
+    #[cfg(not(target_vendor = "apple"))]
+    const NAME_LEN: usize = 90;
+    let t = tempfile::Builder::new()
+        .prefix("sockat-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let p = nest(t.path(), 600, &"n".repeat(NAME_LEN));
+    let listener = sockat::bind(&p).unwrap();
+    assert!(is_socket(&p));
+    for e in [
+        sockat::connect(&p).unwrap_err(),
+        sockat::connect_nonblocking(&p).unwrap_err(),
+    ] {
+        assert_eq!(e.raw_os_error(), Some(libc::ENAMETOOLONG), "{e}");
+    }
+    let me = std::process::id();
+    let (mut c, child) = sockat::connect_any(&p).unwrap();
+    assert!(child.is_some_and(|pid| pid != me), "{child:?}");
+    ping(&listener, &mut c);
+    let (mut c, child) = sockat::connect_any_nonblocking(&p).unwrap();
+    assert!(child.is_some_and(|pid| pid != me), "{child:?}");
+    let mut buf = [0u8; 1];
+    let e = c.read(&mut buf).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
 }
 
 // Short paths are std's business: sockat hands them over unchanged, so what

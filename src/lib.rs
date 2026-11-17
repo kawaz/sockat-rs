@@ -8,10 +8,12 @@
 //! (macOS's `$TMPDIR` alone is about 50 bytes; test harnesses and sandboxes nest
 //! further) run into it easily.
 //!
-//! [`bind`] and [`connect`] take a path of any length. A path of at most 100
-//! bytes is handed to std unchanged, so short paths behave exactly as with std.
-//! A longer path is reached another way, chosen per platform; the socket file is
-//! always created at (or looked up at) the path given.
+//! Use [`bind`] and [`connect`] where you would use std's, and
+//! [`connect_nonblocking`] in async code. They take a path of any length. A
+//! path of at most 100 bytes is handed to std unchanged, so short paths behave
+//! exactly as with std. A longer path is reached another way, chosen per
+//! platform; the socket file is always created at (or looked up at) the path
+//! given.
 //!
 //! ```no_run
 //! use std::io::{Read, Write};
@@ -26,19 +28,47 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 //!
+//! [`connect`] (and [`connect_nonblocking`]) try every way the platform has
+//! up to the short symlink under `TMPDIR` or `/tmp`, so in an ordinary
+//! environment they reach a long path whatever its directory depth, as long as
+//! the file name itself is not unusually long. That is all most programs need.
+//!
+//! # The exception: `connect_any`
+//!
+//! Beyond the symlink, the only way left is the fork route: a forked child
+//! that `fchdir`s into the socket's directory makes the call. That is not what
+//! a connect is expected to do: the peer pid the server sees is then that of
+//! a process that has already exited. So [`connect`] and [`connect_nonblocking`] never fork:
+//! where only the fork route would reach the path, they fail with
+//! `ENAMETOOLONG`, as any connect to a path too long for `sun_path` does.
+//!
+//! [`connect_any`] and [`connect_any_nonblocking`] are for the rare
+//! environment where even that happens (Linux without `/proc` and without a
+//! safe temporary directory, a Unix with neither a dirfd-relative connect nor
+//! a usable temporary directory, a file name too long for the symlink) and
+//! the connection is wanted at the cost of the fork's side effects. They fork
+//! as the last resort and then also return the forked child's pid, the peer
+//! pid the server sees. [`bind`] forks as a last resort too; the child only binds and the
+//! listen is done by the calling process, so the listener is unaffected.
+//!
 //! # How a long path is reached
 //!
 //! | Platform | Way |
 //! |---|---|
-//! | Linux, Android | `/proc/self/fd/<dirfd>/<name>`, with the directory opened `O_PATH`; without `/proc`, a forked child that `fchdir`s into the directory |
-//! | macOS (Apple) | in order: the path relative to the cwd; a widened `sockaddr_un` carrying up to 253 bytes; a short symlink to the directory under `TMPDIR`, or failing that `/tmp`; a forked child that `fchdir`s into the directory |
+//! | Linux, Android | `/proc/self/fd/<dirfd>/<name>`, with the directory opened `O_PATH`; without `/proc`, the order of other Unix below |
 //! | FreeBSD | `bindat(2)` / `connectat(2)` with the directory fd |
-//! | other Unix | a forked child that `fchdir`s into the directory |
+//! | macOS (Apple) | in order: the path relative to the cwd; a widened `sockaddr_un` carrying up to 253 bytes; a short symlink to the directory under `TMPDIR`, or failing that `/tmp`; the fork route |
+//! | other Unix (NetBSD, OpenBSD, illumos, ...) | in order: the path relative to the cwd; a short symlink to the directory under `TMPDIR`, or failing that `/tmp`; the fork route |
+//!
+//! The symlink is created only in a place where no other user can replace it
+//! before the bind / connect through it: a sticky directory owned by root or
+//! the calling user (as `/tmp` is), or a directory of the calling user's that
+//! group and others cannot write to. Other places are passed over.
 //!
 //! None of these changes the working directory of the calling process, and all
 //! of them can be used from multi-threaded programs. Windows is not supported
-//! (the crate is Unix-only). The design and the reasons
-//! for the order are in `docs/decisions/DR-0001` of the repository.
+//! (the crate is Unix-only). The design and the reasons for the order are in
+//! `docs/decisions/DR-0001` of the repository.
 //!
 //! # What differs from std for a long path
 //!
@@ -47,24 +77,25 @@
 //!   report what was actually handed to the kernel: a relative path, a
 //!   `/proc/self/fd/...` path, a temporary symlink that no longer exists, or a
 //!   bare file name, and on macOS possibly truncated. Keep the path you passed
-//!   to [`bind`] / [`connect`] and use that (for example to remove the socket
+//!   to [`bind`] / the connects and use that (for example to remove the socket
 //!   file with [`std::fs::remove_file`], which has no length limit).
-//! * **The peer process may be a short-lived child** (macOS, Linux without
-//!   `/proc`, and other Unix, when the fork route is taken). When a client
-//!   connects through the fork route, the server's peer-credential queries can
-//!   report the child's pid: on macOS `LOCAL_PEERPID` reports the child until
-//!   the client process itself sends on the socket, then the client's pid; on
-//!   Linux without `/proc`, `SO_PEERCRED` keeps reporting the child's pid for
-//!   the life of the connection, after the child has exited. The uid and gid
-//!   are the client's either way. Linux with `/proc` never forks.
+//! * **The peer pid the server sees can be that of an exited process**
+//!   ([`connect_any`] and [`connect_any_nonblocking`], when they take the fork
+//!   route): the forked child that made the connect and exited. The socket
+//!   itself belongs to the caller and works as usual. The uid and gid the
+//!   server sees are the caller's. On macOS (`LOCAL_PEERPID`) the server sees
+//!   the caller's pid once the caller sends on the socket; on Linux
+//!   (`SO_PEERCRED`) it stays the exited child's. The number of an exited pid
+//!   may be reused by another process later. The child's pid is returned so it
+//!   can be told apart.
 //! * **The directory is resolved slightly earlier than the call.** The /proc,
 //!   relative, `bindat` and fork routes look the directory up first (open it, or
 //!   resolve it to a real path) and then bind / connect by the file name. If a
 //!   directory along the path is renamed or a symlink along it is repointed in
 //!   between, the socket goes to (or is looked up in) the directory as it was
 //!   when looked up, not as it is at the moment of the call.
-//! * **The relative route depends on the working directory** (macOS). The path
-//!   is spelled relative to the cwd only after checking that the spelling names
+//! * **The relative route depends on the working directory.** The path is
+//!   spelled relative to the cwd only after checking that the spelling names
 //!   the same directory, and the cwd is checked again afterwards; if another
 //!   thread changed it in between, the result is discarded and an error is
 //!   returned. Programs that change the cwd while other threads bind / connect
@@ -79,17 +110,19 @@
 //!   Linux `O_PATH`, so it needs no more permission than a plain bind /
 //!   connect; on other Unix targets it (and FreeBSD's `bindat`) opens it
 //!   `O_RDONLY` and needs read permission on the directory as well.
-//! * **A temporary symlink can be left behind** (macOS) if the process dies
-//!   between creating and removing it. It is named `sockat.XXXXXXXXXX` under
-//!   `TMPDIR` or `/tmp` and points to the socket's directory.
+//! * **A temporary symlink can be left behind** if the process dies between
+//!   creating and removing it. It is named `sockat.XXXXXXXXXX` under `TMPDIR`
+//!   or `/tmp` and points to the socket's directory.
 //!
 //! # Errors
 //!
 //! The errors are those of `bind(2)`, `listen(2)` and `connect(2)` (and of
 //! opening the directory) as [`std::io::Error`]s, for example `ENOENT` for a
 //! missing directory or socket, `EADDRINUSE` for an existing file,
-//! `ECONNREFUSED` for a socket nobody listens on. When no way can reach the
-//! path, which happens when the file name alone is too long, the error is
+//! `ECONNREFUSED` for a socket nobody listens on, `EAGAIN` for a full backlog
+//! on a nonblocking connect (Linux). When no way can reach the path, which
+//! happens when the file name alone is too long (or, for [`connect`] and
+//! [`connect_nonblocking`], when only the fork route would), the error is
 //! `ENAMETOOLONG`. A path that does not end with a file name (`dir/`, `dir/.`,
 //! `..`) or that contains a NUL byte is an `InvalidInput` error.
 //!
@@ -104,16 +137,16 @@
 //! listener.set_nonblocking(true)?;
 //! let listener = tokio::net::UnixListener::from_std(listener)?;
 //!
-//! let stream = sockat::connect(&path)?;
-//! stream.set_nonblocking(true)?;
+//! let stream = sockat::connect_nonblocking(&path)?;
 //! let stream = tokio::net::UnixStream::from_std(stream)?;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! [`bind`] and [`connect`] block like std's. A local `connect(2)` returns at
-//! once unless the listener's backlog is full; to keep even that off the
-//! runtime's worker threads, call [`connect`] inside `spawn_blocking`.
+//! [`connect_nonblocking`] does not wait (a Unix-domain connect completes or
+//! fails within the call) and returns the stream still nonblocking, so it can
+//! be called on the runtime's worker threads directly. [`bind`] has nothing to
+//! wait for.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
@@ -125,6 +158,8 @@ use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
+use route::ConnectOptions;
+
 mod path;
 mod route;
 mod sys;
@@ -135,10 +170,12 @@ mod tests;
 /// Create a socket bound to `path` and listening on it, like
 /// [`UnixListener::bind`] but for a path of any length.
 ///
-/// A path of at most 100 bytes goes to [`UnixListener::bind`] unchanged. The
-/// socket file is created at `path` either way, and is not removed when the
-/// listener is dropped (as with std). See the [crate documentation](crate) for
-/// what differs for a long path.
+/// A path of at most 100 bytes goes to [`UnixListener::bind`] unchanged. A
+/// longer path is reached by the ways the platform has, forking as a last
+/// resort (see the [crate documentation](crate)): the forked child only binds,
+/// and the listen is done by this process, so the listener is this process's
+/// like any other. The socket file is created at `path` either way, and is not
+/// removed when the listener is dropped (as with std).
 ///
 /// # Errors
 ///
@@ -151,41 +188,122 @@ pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
 }
 
 /// Connect to the socket at `path`, like [`UnixStream::connect`] but for a path
-/// of any length.
+/// of any length, without forking. Use it wherever std's would be used.
 ///
-/// A path of at most 100 bytes goes to [`UnixStream::connect`] unchanged. See
-/// the [crate documentation](crate) for what differs for a long path.
+/// A path of at most 100 bytes goes to [`UnixStream::connect`] unchanged. A
+/// longer path is reached by every way the platform has up to the short
+/// symlink under `TMPDIR` or `/tmp` (see the [crate documentation](crate)), so
+/// in an ordinary environment it is reached at any directory depth, and the
+/// connection is always made by this process. Only in a rare environment
+/// where nothing but the fork route would reach the path is the error
+/// `ENAMETOOLONG`, as for any connect to a path too long for `sun_path`
+/// ([`connect_any`] is for that case).
+///
+/// The stream blocks, like std's. In async code use [`connect_nonblocking`].
 ///
 /// # Errors
 ///
 /// The errors of `connect(2)`, for example `ENOENT` when nothing is at `path`
-/// and `ECONNREFUSED` when nobody listens on it; `ENAMETOOLONG` when the file
-/// name alone is too long to reach; `InvalidInput` for a path that does not end
-/// with a file name or contains a NUL byte.
+/// and `ECONNREFUSED` when nobody listens on it; `ENAMETOOLONG` when no way but
+/// the fork route reaches the path (or none at all does); `InvalidInput` for a
+/// path that does not end with a file name or contains a NUL byte.
 pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
-    connect_with(path.as_ref(), route::ConnectOptions::DEFAULT).map(|(stream, _)| stream)
+    connect_with(
+        path.as_ref(),
+        ConnectOptions {
+            nonblocking: false,
+            fork: false,
+        },
+    )
+    .map(|(stream, _)| stream)
 }
 
-/// Connect to the socket at `path` as `options` say, and also return the pid
-/// of the forked child that made the connect when the fork route was taken
-/// (`None` on every other route).
+/// [`connect`] on a nonblocking socket: the connect does not wait, and the
+/// stream it returns is still nonblocking (ready for
+/// `tokio::net::UnixStream::from_std` as it is).
 ///
-/// That pid is what the server's peer-credential query names instead of this
-/// process: Linux's `SO_PEERCRED` for the life of the connection, macOS's
-/// `LOCAL_PEERPID` until this process sends (DR-0001 decision 8). The child
-/// has already exited.
+/// A Unix-domain connect completes or fails within the call, so there is
+/// nothing to wait for afterwards. When the listener's backlog is full the
+/// connect fails at once: `EAGAIN` on Linux (where a blocking connect waits for
+/// room), `ECONNREFUSED` on macOS (as a blocking connect does).
 ///
-/// The options are [`route::ConnectOptions`]: whether the socket is
-/// `O_NONBLOCK` (on every route, and still so when returned), and whether the
-/// fork route may be taken. [`connect`] is this with
-/// [`route::ConnectOptions::DEFAULT`].
+/// # Errors
 ///
-/// The backend of the connect type with these options that DR-0001 decision 8
-/// adds to the public API (its name is still open).
+/// Those of [`connect`], and `EAGAIN` for a full backlog on Linux.
+pub fn connect_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
+    connect_with(
+        path.as_ref(),
+        ConnectOptions {
+            nonblocking: true,
+            fork: false,
+        },
+    )
+    .map(|(stream, _)| stream)
+}
+
+/// [`connect`], forking when nothing else reaches the path, and the pid the
+/// server sees as the peer when it is not this process.
+///
+/// Use [`connect`] (or [`connect_nonblocking`]) unless it fails with
+/// `ENAMETOOLONG` in an environment you have to support: it reaches a long
+/// path in any ordinary environment. This is for the rare one where only the
+/// fork route does (Linux without `/proc` and without a safe temporary
+/// directory, a Unix with neither a dirfd-relative connect nor a usable
+/// temporary directory, a file name too long for the symlink), when the
+/// connection is wanted at the cost of the fork's side effects.
+///
+/// The fork route connects from a forked child that `fchdir`s into the
+/// socket's directory and exits at once. The second value is `Some(pid)` of
+/// that child when the fork route was taken, and `None` on every other route
+/// (the connection was made by this process).
+///
+/// After the fork route, the peer pid the server sees is that of the child, a
+/// process that has already exited. The stream itself belongs to this process
+/// and works as usual. The uid and gid the server sees are this process's. On
+/// macOS (`LOCAL_PEERPID`) the server sees this process's pid once it sends on
+/// the stream; on Linux (`SO_PEERCRED`) it stays the exited child's. The
+/// number of an exited pid may be reused by another process later: the pid
+/// returned is a record of who connected, not a process to signal.
+///
+/// # Errors
+///
+/// Those of [`connect`], except that a path only the fork route reaches is
+/// connected rather than `ENAMETOOLONG`.
+pub fn connect_any<P: AsRef<Path>>(path: P) -> io::Result<(UnixStream, Option<u32>)> {
+    connect_with(
+        path.as_ref(),
+        ConnectOptions {
+            nonblocking: false,
+            fork: true,
+        },
+    )
+}
+
+/// [`connect_any`] on a nonblocking socket, as [`connect_nonblocking`] is to
+/// [`connect`]. Like [`connect_any`], only for the rare environment where
+/// [`connect_nonblocking`] cannot reach the path. On the fork route the socket is made nonblocking before the
+/// fork, so the child's connect does not wait either.
+///
+/// # Errors
+///
+/// Those of [`connect_any`], and `EAGAIN` for a full backlog on Linux.
+pub fn connect_any_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<(UnixStream, Option<u32>)> {
+    connect_with(
+        path.as_ref(),
+        ConnectOptions {
+            nonblocking: true,
+            fork: true,
+        },
+    )
+}
+
+/// The four connects: block or not, fork or not ([`ConnectOptions`]). Returns the stream and the
+/// pid of the forked child that made the connect when the fork route was
+/// taken (`None` on every other route; always `None` without `fork`).
 pub(crate) fn connect_with(
     path: &Path,
-    options: route::ConnectOptions,
-) -> io::Result<(UnixStream, Option<libc::pid_t>)> {
+    options: ConnectOptions,
+) -> io::Result<(UnixStream, Option<u32>)> {
     route::run(route::Request::Connect(options), path)
         .map(|(fd, route)| (UnixStream::from(fd), route.child()))
 }

@@ -12,12 +12,11 @@ use std::path::Path;
 use crate::path;
 use crate::sys::{self, Op, SockAddr};
 
-/// How a connect is made. [`ConnectOptions::DEFAULT`] is what
-/// `sockat::connect` does.
+/// How a connect is made. The four public connects are its four values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConnectOptions {
     /// Make the socket `O_NONBLOCK` before connecting, on every route, and
-    /// leave it so.
+    /// leave it so (`connect_nonblocking`, `connect_any_nonblocking`).
     ///
     /// A full backlog then fails the connect at once instead of waiting for
     /// room: Linux answers `EAGAIN` (where a blocking connect waits), macOS
@@ -34,26 +33,18 @@ pub(crate) struct ConnectOptions {
     /// the socket is closed, rather than handing back a stream that is not
     /// connected yet.
     pub(crate) nonblocking: bool,
-    /// Whether the fork route may be taken. Without it, a path that only the
-    /// fork route can reach is an error ([`fork_ruled_out`]) and nothing is
-    /// created or connected; every other route, and its real failures, stay
-    /// as they are.
+    /// Whether the fork route may be taken (`connect_any`,
+    /// `connect_any_nonblocking`). Without it, a path that only the fork route
+    /// can reach is an error ([`fork_ruled_out`]) and nothing is created or
+    /// connected; every other route, and its real failures, stay as they are.
     pub(crate) fork: bool,
-}
-
-impl ConnectOptions {
-    /// What `sockat::connect` does: block like std, and fork when nothing
-    /// else reaches the path.
-    pub(crate) const DEFAULT: Self = Self {
-        nonblocking: false,
-        fork: true,
-    };
 }
 
 /// What to do at a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Request {
-    /// Bind and listen, as `sockat::bind` does.
+    /// Bind and listen, as `sockat::bind` does (forking when nothing else
+    /// reaches the path).
     Bind,
     /// Connect, as the options say.
     Connect(ConnectOptions),
@@ -86,7 +77,7 @@ impl Request {
 /// The error for a path that only the fork route reaches, when the options
 /// rule the fork route out: `ENAMETOOLONG`, the error of a plain connect to a
 /// path longer than `sun_path`. That is what the path is once every other way
-/// around the limit is too long or unavailable (on Linux: no /proc).
+/// around the limit is too long or unavailable.
 #[cfg(any(test, not(target_os = "freebsd")))]
 fn fork_ruled_out() -> io::Error {
     io::Error::from_raw_os_error(libc::ENAMETOOLONG)
@@ -113,8 +104,8 @@ pub(crate) enum Route {
     /// `/proc/self/fd/<dirfd>/<name>`, in the plain sockaddr (Linux).
     #[cfg(any(target_os = "linux", target_os = "android"))]
     ProcFd,
-    /// The path spelled relative to the cwd, in the plain sockaddr (Apple).
-    #[cfg(target_vendor = "apple")]
+    /// The path spelled relative to the cwd, in the plain sockaddr.
+    #[cfg(not(target_os = "freebsd"))]
     Relative,
     /// The path itself in a widened `sockaddr_un` (Apple).
     #[cfg(target_vendor = "apple")]
@@ -123,8 +114,8 @@ pub(crate) enum Route {
     #[cfg(target_vendor = "apple")]
     WideRelative,
     /// Through a short temporary symlink to the directory, in the plain
-    /// sockaddr (Apple).
-    #[cfg(target_vendor = "apple")]
+    /// sockaddr.
+    #[cfg(not(target_os = "freebsd"))]
     Symlink,
     /// Through a temporary symlink, in a widened `sockaddr_un` (Apple).
     #[cfg(target_vendor = "apple")]
@@ -132,8 +123,7 @@ pub(crate) enum Route {
     /// `bindat(2)` / `connectat(2)` on the directory fd (FreeBSD).
     #[cfg(target_os = "freebsd")]
     At,
-    /// A forked child that `fchdir`s into the directory (on Linux, only
-    /// without /proc).
+    /// A forked child that `fchdir`s into the directory.
     #[cfg(not(target_os = "freebsd"))]
     Fork {
         /// The pid of the child that made the call ([`sys::op_in_dir_forked`]).
@@ -143,36 +133,73 @@ pub(crate) enum Route {
 
 impl Route {
     /// The pid of the forked child that made the call, when the route forked
-    /// (`None` otherwise).
+    /// (`None` otherwise), as the `u32` that `std::process::id` uses.
     ///
     /// For a connect, this is the pid a server's peer-credential query names
     /// instead of the calling process: Linux's `SO_PEERCRED` for the life of
     /// the connection, macOS's `LOCAL_PEERPID` until the caller sends
     /// (DR-0001 decision 8).
-    pub(crate) fn child(self) -> Option<libc::pid_t> {
+    pub(crate) fn child(self) -> Option<u32> {
         match self {
+            // `fork(2)` hands the parent the child's pid, which is positive.
             #[cfg(not(target_os = "freebsd"))]
-            Route::Fork { child } => Some(child),
+            Route::Fork { child } => u32::try_from(child).ok(),
             _ => None,
         }
     }
 }
 
 /// Bind or connect a stream socket to `path`, trying the routes in order.
+///
+/// A path of at most [`DIRECT_MAX`] bytes goes as is, before anything else is
+/// looked at (the environment included).
 pub(crate) fn run(req: Request, path: &Path) -> io::Result<(OwnedFd, Route)> {
-    #[cfg(target_vendor = "apple")]
-    return apple::run(req, path, &apple::Config::from_env());
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    return linux::run(req, path, Path::new(linux::PROC_SELF_FD));
+    if path::len(path) <= DIRECT_MAX {
+        return plain_op(req, path).map(|fd| (fd, Route::Direct));
+    }
     #[cfg(target_os = "freebsd")]
-    return freebsd::run(req, path);
-    #[cfg(not(any(
-        target_vendor = "apple",
-        target_os = "linux",
-        target_os = "android",
-        target_os = "freebsd"
-    )))]
-    return other::run(req, path);
+    return freebsd::run_long(req, path);
+    #[cfg(not(target_os = "freebsd"))]
+    return run_long(req, path, &posix::Config::from_env());
+}
+
+/// The routes for a path longer than [`DIRECT_MAX`], with what they read from
+/// the environment given as `cfg` (the tests pass their own).
+///
+/// Linux: `/proc/self/fd/<dirfd>/<name>` with the directory opened `O_PATH`;
+/// when there is no /proc, the POSIX order ([`posix::run`]) with that
+/// directory fd for the fork route. Every other target but FreeBSD: the POSIX
+/// order.
+///
+/// The kernel resolves the `/proc/self/fd/<n>` magic link to the directory the
+/// fd refers to, so the socket is created in (or looked up in) that directory
+/// without ever changing the cwd. That route has no length limit on the
+/// directory, needs no temporary file and no fork, and works in multi-threaded
+/// processes, so with /proc nothing else is tried. The POSIX order is taken
+/// only when `<proc_self_fd>/<dirfd>` is not there (no /proc mounted, as in
+/// some chroots and minimal containers): the route itself cannot be used
+/// then. What a bind / connect through /proc returns is the result, never
+/// retried on another route.
+#[cfg(not(target_os = "freebsd"))]
+pub(crate) fn run_long(
+    req: Request,
+    path: &Path,
+    cfg: &posix::Config,
+) -> io::Result<(OwnedFd, Route)> {
+    let (dir, name) = path::split(path)?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::AsFd;
+        let opened = open_dir(dir)?;
+        // `opened` stays open until this returns (dropped at the end of
+        // scope), so the /proc spelling keeps naming it.
+        match linux::proc_spelling(opened.as_fd(), name, &cfg.proc_self_fd)? {
+            Some(via) => plain_op(req, &via).map(|fd| (fd, Route::ProcFd)),
+            None => posix::run(req, path, dir, name, Some(opened.as_fd()), cfg),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    posix::run(req, path, dir, name, None, cfg)
 }
 
 /// Bind (and listen) or connect with `path` as is, in the plain sockaddr.
@@ -280,10 +307,7 @@ pub(crate) fn search_or_read_only(
 ///
 /// `addr` holds `name` (built by the caller, which knows which address forms
 /// the target accepts).
-#[cfg(any(
-    test,
-    not(any(target_os = "linux", target_os = "android", target_os = "freebsd"))
-))]
+#[cfg(any(test, not(target_os = "freebsd")))]
 pub(crate) fn fork_op(
     req: Request,
     dir: &Path,
@@ -325,47 +349,11 @@ fn fork_in(
 pub(crate) mod linux {
     use super::*;
     use std::ffi::OsStr;
-    use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+    use std::os::fd::{AsRawFd, BorrowedFd};
     use std::path::PathBuf;
 
     /// Where the kernel lists the fds of the calling process.
     pub(crate) const PROC_SELF_FD: &str = "/proc/self/fd";
-
-    /// Linux: the path itself when it is short, otherwise
-    /// `/proc/self/fd/<dirfd>/<name>` with the directory opened `O_PATH`, or,
-    /// when there is no /proc, the fork route (`ENAMETOOLONG` when the
-    /// connect options rule it out).
-    ///
-    /// The kernel resolves the `/proc/self/fd/<n>` magic link to the directory
-    /// the fd refers to, so the socket is created in (or looked up in) that
-    /// directory without ever changing the cwd. This route has no length limit
-    /// on the directory, needs no temporary file and no fork, and works in
-    /// multi-threaded processes. The fork route is taken only when
-    /// `<proc_self_fd>/<dirfd>` is not there (no /proc mounted, as in some
-    /// chroots and minimal containers): the route itself cannot be used then.
-    /// What a bind / connect through /proc returns is the result, never
-    /// retried on the fork route.
-    ///
-    /// `proc_self_fd` is [`PROC_SELF_FD`] outside the tests, which point it
-    /// elsewhere to stand in for a system without /proc.
-    pub(crate) fn run(
-        req: Request,
-        path: &Path,
-        proc_self_fd: &Path,
-    ) -> io::Result<(OwnedFd, Route)> {
-        if path::len(path) <= DIRECT_MAX {
-            return plain_op(req, path).map(|fd| (fd, Route::Direct));
-        }
-        let (dir, name) = path::split(path)?;
-        let dir = open_dir(dir)?;
-        match proc_spelling(dir.as_fd(), name, proc_self_fd)? {
-            // `dir` stays open until the call returns (dropped at the end of
-            // scope), so the spelling keeps naming it.
-            Some(via) => plain_op(req, &via).map(|fd| (fd, Route::ProcFd)),
-            None => fork_in(req, dir.as_fd(), &SockAddr::standard(name)?)
-                .map(|(fd, child)| (fd, Route::Fork { child })),
-        }
-    }
 
     /// `<proc_self_fd>/<dir>/<name>`, or `None` when `<proc_self_fd>/<dir>`
     /// cannot be looked up (no /proc). Without that check a bind / connect
@@ -377,7 +365,7 @@ pub(crate) mod linux {
     /// `ENAMETOOLONG` when the spelling does not fit `sun_path`: the file name
     /// alone is too long to fit even behind the shortest directory spelling
     /// there is.
-    fn proc_spelling(
+    pub(crate) fn proc_spelling(
         dir: BorrowedFd<'_>,
         name: &OsStr,
         proc_self_fd: &Path,
@@ -399,12 +387,9 @@ pub(crate) mod freebsd {
     use super::*;
     use std::os::fd::AsFd;
 
-    /// FreeBSD: the path itself when it is short, otherwise `bindat(2)` /
+    /// FreeBSD, for a path longer than [`DIRECT_MAX`]: `bindat(2)` /
     /// `connectat(2)` with the file name relative to the directory fd.
-    pub(crate) fn run(req: Request, path: &Path) -> io::Result<(OwnedFd, Route)> {
-        if path::len(path) <= DIRECT_MAX {
-            return plain_op(req, path).map(|fd| (fd, Route::Direct));
-        }
+    pub(crate) fn run_long(req: Request, path: &Path) -> io::Result<(OwnedFd, Route)> {
         let (dir, name) = path::split(path)?;
         let addr = SockAddr::standard(name)?;
         let dir = open_dir(dir)?;
@@ -417,48 +402,65 @@ pub(crate) mod freebsd {
     }
 }
 
-#[cfg(not(any(
-    target_vendor = "apple",
-    target_os = "linux",
-    target_os = "android",
-    target_os = "freebsd"
-)))]
-mod other {
-    use super::*;
-
-    /// Other Unix targets: the path itself when it is short, otherwise the
-    /// fork route (the only primitive POSIX alone guarantees; `ENAMETOOLONG`
-    /// when the connect options rule it out).
-    pub(crate) fn run(req: Request, path: &Path) -> io::Result<(OwnedFd, Route)> {
-        if path::len(path) <= DIRECT_MAX {
-            return plain_op(req, path).map(|fd| (fd, Route::Direct));
-        }
-        let (dir, name) = path::split(path)?;
-        let addr = SockAddr::standard(name)?;
-        fork_op(req, dir, &addr).map(|(fd, child)| (fd, Route::Fork { child }))
-    }
-}
-
+/// The widened `sockaddr_un` that XNU takes (Apple).
 #[cfg(target_vendor = "apple")]
 pub(crate) mod apple {
     use super::*;
+
+    /// Bind (and listen) or connect a fresh socket to `path` in a widened
+    /// `sockaddr_un`.
+    pub(crate) fn wide_op(req: Request, path: &Path) -> io::Result<OwnedFd> {
+        raw_op(req, &SockAddr::wide(path.as_os_str())?)
+    }
+
+    /// Whether an error from a widened-address call means the kernel does not
+    /// take the widened form (as opposed to a real outcome such as `ENOENT`,
+    /// `EADDRINUSE` or `ECONNREFUSED`). XNU reports an address it will not take
+    /// with `EINVAL`, or `ENAMETOOLONG` for one longer than `SOCK_MAXADDRLEN`.
+    pub(crate) fn refuses_wide(e: &io::Error) -> bool {
+        matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENAMETOOLONG))
+    }
+}
+
+/// The routes that need nothing but POSIX (plus, on Apple, the widened
+/// `sockaddr_un`), tried in order on every target without a dirfd-relative
+/// primitive: Apple, NetBSD, OpenBSD, illumos and the other Unix targets, and
+/// Linux without /proc (DR-0001 decision 3).
+#[cfg(not(target_os = "freebsd"))]
+pub(crate) mod posix {
+    use super::*;
     use std::ffi::OsStr;
+    use std::os::fd::BorrowedFd;
     use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
 
+    #[cfg(target_vendor = "apple")]
     use crate::sys::WIDE_PATH_MAX;
 
-    /// What the Apple route order reads from the environment, made explicit so
-    /// the tests can vary it without touching the process environment.
+    /// The longest spelling a sockaddr carries on this target: the widened
+    /// form's 253 bytes on Apple, [`DIRECT_MAX`] elsewhere.
+    #[cfg(target_vendor = "apple")]
+    const SPELLING_MAX: usize = WIDE_PATH_MAX;
+    #[cfg(not(target_vendor = "apple"))]
+    const SPELLING_MAX: usize = DIRECT_MAX;
+
+    /// What the route order reads from the environment, made explicit so the
+    /// tests can vary it without touching the process environment.
     #[derive(Debug, Clone)]
     pub(crate) struct Config {
         /// Where the temporary symlink may go, in the order tried: `TMPDIR`
         /// when it is set to an absolute path, then `/tmp`.
         pub(crate) tmp_bases: Vec<PathBuf>,
-        /// Whether to try the widened `sockaddr_un` at all. Always `true`
-        /// outside the tests, which turn it off to stand in for a kernel that
-        /// refuses the widened form.
+        /// Whether to try the widened `sockaddr_un` at all (Apple). Always
+        /// `true` outside the tests, which turn it off to stand in for a
+        /// kernel that refuses the widened form.
+        #[cfg(target_vendor = "apple")]
         pub(crate) wide: bool,
+        /// Where the kernel lists the fds of the process (Linux):
+        /// [`linux::PROC_SELF_FD`] outside the tests, which point it
+        /// elsewhere to stand in for a system without /proc.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        pub(crate) proc_self_fd: PathBuf,
     }
 
     impl Config {
@@ -480,33 +482,42 @@ pub(crate) mod apple {
             tmp_bases.push(tmp.to_path_buf());
             Self {
                 tmp_bases,
+                #[cfg(target_vendor = "apple")]
                 wide: true,
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                proc_self_fd: PathBuf::from(linux::PROC_SELF_FD),
             }
         }
     }
 
-    /// Apple: try, in order (DR-0001 decision 3):
+    /// Try, in order (DR-0001 decision 3), for a path longer than
+    /// [`DIRECT_MAX`] whose directory part is `dir` and file name `name`:
     ///
-    /// 1. the path itself, when it is at most [`DIRECT_MAX`] bytes;
-    /// 2. the path spelled relative to the cwd, when that is at most
+    /// 1. the path spelled relative to the cwd, when that is at most
     ///    [`DIRECT_MAX`] bytes;
-    /// 3. a widened `sockaddr_un` with the path itself, or failing that with
-    ///    the relative spelling, when one of them is at most 253 bytes;
-    /// 4. a short symlink to the socket's directory under the first of
+    /// 2. (Apple) a widened `sockaddr_un` with the path itself, or failing
+    ///    that with the relative spelling, when one of them is at most 253
+    ///    bytes;
+    /// 3. a short symlink to the socket's directory under the first of
     ///    `TMPDIR` and `/tmp` ([`Config::tmp_bases`]) where the path through
-    ///    it fits and the symlink can be created;
-    /// 5. a forked child that `fchdir`s into the directory, unless the
-    ///    connect options rule it out (then `ENAMETOOLONG`).
+    ///    it fits (in the plain sockaddr, or on Apple the widened one) and the
+    ///    symlink can be created;
+    /// 4. a forked child that `fchdir`s into the directory (`opened` when the
+    ///    caller has it open already, as Linux does), unless the request rules
+    ///    it out (then `ENAMETOOLONG`).
     ///
     /// A failure of a route ends the search with that error, except where it
     /// shows that the route itself cannot be used (the kernel refusing the
     /// widened form, the symlink not being creatable); then the next route (or
     /// the next place for the symlink) is tried.
-    pub(crate) fn run(req: Request, path: &Path, cfg: &Config) -> io::Result<(OwnedFd, Route)> {
-        if path::len(path) <= DIRECT_MAX {
-            return plain_op(req, path).map(|fd| (fd, Route::Direct));
-        }
-        let (dir, name) = path::split(path)?;
+    pub(crate) fn run(
+        req: Request,
+        path: &Path,
+        dir: &Path,
+        name: &OsStr,
+        opened: Option<BorrowedFd<'_>>,
+        cfg: &Config,
+    ) -> io::Result<(OwnedFd, Route)> {
         let rel = Relative::new(path, dir);
 
         if let Some(rel) = rel.as_ref().filter(|r| path::len(&r.path) <= DIRECT_MAX) {
@@ -515,55 +526,55 @@ pub(crate) mod apple {
                 .map(|fd| (fd, Route::Relative));
         }
 
+        #[cfg(target_vendor = "apple")]
         let mut wide = cfg.wide;
+        #[cfg(target_vendor = "apple")]
         if wide {
             let attempt = if path::len(path) <= WIDE_PATH_MAX {
-                Some(wide_op(req, path).map(|fd| (fd, Route::Wide)))
+                Some(apple::wide_op(req, path).map(|fd| (fd, Route::Wide)))
             } else {
                 rel.as_ref()
                     .filter(|r| path::len(&r.path) <= WIDE_PATH_MAX)
                     .map(|rel| {
-                        rel.run(|p| wide_op(req, p))
+                        rel.run(|p| apple::wide_op(req, p))
                             .map(|fd| (fd, Route::WideRelative))
                     })
             };
             match attempt {
                 None => {}
                 Some(Ok(done)) => return Ok(done),
-                Some(Err(e)) if refuses_wide(&e) => wide = false,
+                Some(Err(e)) if apple::refuses_wide(&e) => wide = false,
                 Some(Err(e)) => return Err(e),
             }
         }
 
         for base in &cfg.tmp_bases {
-            match symlink_route(req, base, dir, name, wide) {
+            #[cfg(target_vendor = "apple")]
+            let limit = if wide { WIDE_PATH_MAX } else { DIRECT_MAX };
+            #[cfg(not(target_vendor = "apple"))]
+            let limit = DIRECT_MAX;
+            match symlink_route(req, base, dir, name, limit) {
                 SymlinkOutcome::Done(done) => return done,
+                #[cfg(target_vendor = "apple")]
                 SymlinkOutcome::WideRefused => wide = false,
                 SymlinkOutcome::Unusable => {}
             }
         }
 
-        // The plain sockaddr for the file name, or the widened one for a name
-        // too long for it when the kernel takes that.
+        // The plain sockaddr for the file name, or on Apple the widened one
+        // for a name too long for it when the kernel takes that.
+        #[cfg(target_vendor = "apple")]
         let addr = match SockAddr::standard(name) {
             Err(e) if wide && e.raw_os_error() == Some(libc::ENAMETOOLONG) => SockAddr::wide(name)?,
             addr => addr?,
         };
-        fork_op(req, dir, &addr).map(|(fd, child)| (fd, Route::Fork { child }))
-    }
-
-    /// Bind (and listen) or connect a fresh socket to `path` in a widened
-    /// `sockaddr_un`.
-    pub(crate) fn wide_op(req: Request, path: &Path) -> io::Result<OwnedFd> {
-        raw_op(req, &SockAddr::wide(path.as_os_str())?)
-    }
-
-    /// Whether an error from a widened-address call means the kernel does not
-    /// take the widened form (as opposed to a real outcome such as `ENOENT`,
-    /// `EADDRINUSE` or `ECONNREFUSED`). XNU reports an address it will not take
-    /// with `EINVAL`, or `ENAMETOOLONG` for one longer than `SOCK_MAXADDRLEN`.
-    fn refuses_wide(e: &io::Error) -> bool {
-        matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENAMETOOLONG))
+        #[cfg(not(target_vendor = "apple"))]
+        let addr = SockAddr::standard(name)?;
+        let (fd, child) = match opened {
+            Some(opened) => fork_in(req, opened, &addr)?,
+            None => fork_op(req, dir, &addr)?,
+        };
+        Ok((fd, Route::Fork { child }))
     }
 
     /// A relative spelling of an absolute socket path, checked to name the
@@ -619,10 +630,10 @@ pub(crate) mod apple {
         ///    than the directory the path names.
         ///
         /// The shorter result is kept. `None` when `path` is not absolute, the
-        /// cwd cannot be read, neither way gives a spelling of at most 253
-        /// bytes, or the relative directory turns out not to be the absolute
-        /// one (a cwd that was removed, or one changed meanwhile by another
-        /// thread).
+        /// cwd cannot be read, neither way gives a spelling that a sockaddr of
+        /// this target carries ([`SPELLING_MAX`]), or the relative directory
+        /// turns out not to be the absolute one (a cwd that was removed, or one
+        /// changed meanwhile by another thread).
         pub(crate) fn new(path: &Path, dir: &Path) -> Option<Self> {
             if !path.is_absolute() {
                 return None;
@@ -652,7 +663,7 @@ pub(crate) mod apple {
             }
             let rel = best?;
 
-            if path::len(&rel) > WIDE_PATH_MAX {
+            if path::len(&rel) > SPELLING_MAX {
                 return None;
             }
             let (rel_dir, _) = path::split(&rel).ok()?;
@@ -695,7 +706,8 @@ pub(crate) mod apple {
         /// The route ran; this is its result.
         Done(io::Result<(OwnedFd, Route)>),
         /// The path through the symlink needed the widened form and the kernel
-        /// refused it.
+        /// refused it (Apple).
+        #[cfg(target_vendor = "apple")]
         WideRefused,
         /// The route could not be used (too long, no usable base, symlink not
         /// creatable).
@@ -710,10 +722,14 @@ pub(crate) mod apple {
     pub(crate) const LINK_RANDOM_LEN: usize = 10;
 
     /// Bind / connect through `<base>/sockat.XXXXXXXXXX/<name>`, where the
-    /// symlink `sockat.XXXXXXXXXX` points to the socket's directory.
+    /// symlink `sockat.XXXXXXXXXX` points to the socket's directory, when that
+    /// path is at most `limit` bytes: [`DIRECT_MAX`] for the plain sockaddr,
+    /// or on Apple the widened form's 253 (a path over [`DIRECT_MAX`] then
+    /// goes in the widened form), and `base` is a place where nobody else can
+    /// replace the symlink ([`safe_base`]).
     ///
-    /// The length of the path through the symlink is checked before anything
-    /// is created. The symlink is a link to the directory, so the kernel
+    /// The length of the path through the symlink and the safety of `base` are
+    /// checked before anything is created. The symlink is a link to the directory, so the kernel
     /// creates (or looks up) the socket inside the real directory; nothing is
     /// left under `base` once the symlink is removed, which happens when this
     /// returns (including on panic) whatever the outcome.
@@ -722,11 +738,10 @@ pub(crate) mod apple {
         base: &Path,
         dir: &Path,
         name: &OsStr,
-        wide: bool,
+        limit: usize,
     ) -> SymlinkOutcome {
-        let limit = if wide { WIDE_PATH_MAX } else { DIRECT_MAX };
         let placeholder = format!("{LINK_PREFIX}{}", "X".repeat(LINK_RANDOM_LEN));
-        if path::len(&base.join(placeholder).join(name)) > limit {
+        if path::len(&base.join(placeholder).join(name)) > limit || !safe_base(base) {
             return SymlinkOutcome::Unusable;
         }
         let target = if dir.is_absolute() {
@@ -741,14 +756,44 @@ pub(crate) mod apple {
             return SymlinkOutcome::Unusable;
         };
         let via = link.path.join(name);
-        if path::len(&via) <= DIRECT_MAX {
-            SymlinkOutcome::Done(plain_op(req, &via).map(|fd| (fd, Route::Symlink)))
-        } else {
-            match wide_op(req, &via) {
-                Err(e) if refuses_wide(&e) => SymlinkOutcome::WideRefused,
+        #[cfg(target_vendor = "apple")]
+        if path::len(&via) > DIRECT_MAX {
+            return match apple::wide_op(req, &via) {
+                Err(e) if apple::refuses_wide(&e) => SymlinkOutcome::WideRefused,
                 done => SymlinkOutcome::Done(done.map(|fd| (fd, Route::SymlinkWide))),
-            }
+            };
         }
+        SymlinkOutcome::Done(plain_op(req, &via).map(|fd| (fd, Route::Symlink)))
+    }
+
+    /// Whether `base`, followed through symlinks (macOS's `/tmp` is one to
+    /// `/private/tmp`), is a directory where no other user (root aside) can
+    /// remove or rename an entry, so the symlink cannot be replaced between
+    /// its creation and the bind / connect through it ([`only_we_can_replace`]
+    /// on its mode and owner). `false` when it cannot be looked up.
+    pub(crate) fn safe_base(base: &Path) -> bool {
+        std::fs::metadata(base)
+            .is_ok_and(|m| only_we_can_replace(m.mode(), m.uid(), sys::effective_uid()))
+    }
+
+    /// Whether, in a directory of `mode` owned by `owner`, only the user `us`
+    /// and root can remove or rename the entries `us` creates:
+    ///
+    /// * **sticky** (`S_ISVTX`, as `/tmp` is) **and owned by root or `us`**:
+    ///   an entry can then be removed or renamed only by its owner, the
+    ///   directory's owner and root. The owner matters: in a sticky directory
+    ///   of another user, that user can replace anything;
+    /// * **owned by `us` with no write permission for group and others**
+    ///   (`mode & 0o022 == 0`, as a private `TMPDIR` is): nobody else can
+    ///   create, remove or rename entries there at all.
+    ///
+    /// What remains is a replacement by `us` itself or by root, which is
+    /// outside what sockat guards against.
+    pub(crate) fn only_we_can_replace(mode: u32, owner: u32, us: u32) -> bool {
+        const STICKY: u32 = 0o1000;
+        const GROUP_OR_OTHER_WRITE: u32 = 0o022;
+        let ours = owner == us || owner == 0;
+        (mode & STICKY != 0 && ours) || (owner == us && mode & GROUP_OR_OTHER_WRITE == 0)
     }
 
     /// A symlink under `base` with a random name, removed on drop.
@@ -769,7 +814,7 @@ pub(crate) mod apple {
         }
 
         /// Create a symlink under `base` pointing to `target`, named by
-        /// `next_name` (called once per try).
+        /// `next_name` (called once per try; its error ends the attempt).
         ///
         /// `symlink(2)` fails with `EEXIST` instead of replacing an existing
         /// entry, which is the `O_EXCL` of symlinks: the link that is created is
@@ -778,10 +823,10 @@ pub(crate) mod apple {
         pub(crate) fn create_named(
             base: &Path,
             target: &Path,
-            mut next_name: impl FnMut() -> String,
+            mut next_name: impl FnMut() -> io::Result<String>,
         ) -> io::Result<Self> {
             for _ in 0..Self::ATTEMPTS {
-                let path = base.join(next_name());
+                let path = base.join(next_name()?);
                 match std::os::unix::fs::symlink(target, &path) {
                     Ok(()) => return Ok(Self { path }),
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -795,17 +840,20 @@ pub(crate) mod apple {
         }
     }
 
-    /// `sockat.` followed by [`LINK_RANDOM_LEN`] random letters and digits.
-    fn random_name() -> String {
+    /// `sockat.` followed by [`LINK_RANDOM_LEN`] random letters and digits,
+    /// from the system's secure generator ([`sys::random_bytes`]; when it
+    /// fails, as `getrandom(2)` does on a Linux older than 3.17, the symlink
+    /// route cannot be used).
+    fn random_name() -> io::Result<String> {
         const ALPHABET: &[u8; 62] =
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
         let mut random = [0u8; LINK_RANDOM_LEN];
-        sys::random_bytes(&mut random);
+        sys::random_bytes(&mut random)?;
         let mut name = String::from(LINK_PREFIX);
         // 256 is not a multiple of 62, so this is slightly biased; the name only
         // has to be hard to collide with, not uniform.
         name.extend(random.iter().map(|b| ALPHABET[*b as usize % 62] as char));
-        name
+        Ok(name)
     }
 
     impl Drop for TempLink {
