@@ -105,9 +105,18 @@ check-outdated-translations: ensure-clean
 #   0 = 対象 path に変更なし → bump 不要
 #   1 = 変更あり → version bump 済みかチェックに進む
 #   その他 = VCS error (main@origin 未 track 等)
+#
+# remote にまだ main が無い (= 初回の push) 時は比べる相手が無いので通す。
+# git ls-remote --exit-code は ref が無いと 2 を返す。
 [private]
 [script]
 check-version-bumped:
+    lr=0
+    git ls-remote --exit-code origin refs/heads/main >/dev/null || lr=$?
+    if [ "$lr" = 2 ]; then
+      echo "origin に main がまだ無い (初回の push) ので version の検査を飛ばす"
+      exit 0
+    fi
     rc=0
     bump-semver vcs diff -q main@origin -- src/ || rc=$?
     case "$rc" in
