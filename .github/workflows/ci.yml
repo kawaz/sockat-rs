@@ -45,6 +45,45 @@ jobs:
           prepare: pkg install -y rust
           run: cargo test
 
+  # The Unix systems without a dirfd-relative bind / connect. They run the whole
+  # suite in a VM so the routes they share with macOS (relative path, symlink)
+  # and the fork route are exercised on their own kernels.
+  netbsd:
+    name: Test (NetBSD VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: vmactions/netbsd-vm@v1
+        with:
+          usesh: true
+          prepare: /usr/sbin/pkg_add rust
+          run: cargo test
+
+  openbsd:
+    name: Test (OpenBSD VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: vmactions/openbsd-vm@v1
+        with:
+          usesh: true
+          prepare: pkg_add rust
+          run: cargo test
+
+  illumos:
+    name: Test (illumos / OmniOS VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: vmactions/omnios-vm@v1
+        with:
+          usesh: true
+          prepare: pkg install ooce/developer/rust build-essential
+          run: cargo test
+
   cross-check:
     name: Cross check (${{ matrix.target }})
     runs-on: ubuntu-latest
