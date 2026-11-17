@@ -17,23 +17,4 @@
 
 ## 裁定待ち
 
-### SK-Q1 Linux で `/proc` が無い時にどうするか
-
-Linux は `/proc/self/fd` の経路で確定しているが、一部のコンテナや chroot では `/proc` が無い。今はエラーにしている。fork に倒すと、connect の時にサーバから見える peer pid (`SO_PEERCRED`) が終了した子の pid に固定される。関係: [DR-0001](decisions/DR-0001-long-socket-path-routes.md)
-
-- [ ] a: fork に倒す (統括推し。「全部だめなら fork」の方針に揃う。pid がずれるのは `/proc` の無い環境で connect した時だけ)
-- [ ] b: 今のままエラーにする
-
-### SK-Q2 `TMPDIR` が長すぎる時に `/tmp` も試すか
-
-macOS の symlink の経路は、今は `${TMPDIR:-/tmp}` の 1 か所だけに symlink を作る。`TMPDIR` が長いと、そこで短くならずに fork まで落ちる。
-
-- [ ] a: `TMPDIR` で短くならなければ `/tmp` も試す (統括推し。fork に落ちる場面が減る)
-- [ ] b: 今のまま `${TMPDIR:-/tmp}` だけにする
-
-### SK-Q3 GitHub に public リポ `kawaz/sockat` を作って push し、crates.io に 0.1.0 を publish してよいか
-
-作ったものはまだ手元にしかない。初版は 0.1.0、MSRV は 1.85。publish する中身は src / README / LICENSE / Cargo.toml に絞る。
-
-- [ ] a: リポ作成・push・publish まで進める (統括推し。push 後の CI で FreeBSD などの未検証分を確かめてから publish する)
-- [ ] b: リポ作成と push までにして、publish は CI を見てから改めて聞く
+(なし)
