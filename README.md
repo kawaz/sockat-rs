@@ -2,50 +2,65 @@
 
 > English | [日本語](./README-ja.md)
 
-A Rust library that binds and connects Unix domain sockets even when the path is longer than `sun_path` allows (104 bytes on macOS, 108 on Linux, NUL included).
+A Rust library that binds and connects Unix domain sockets even when the path is longer than `sun_path` allows (104 bytes on macOS and the BSDs, 108 on Linux, NUL included).
 
 ```rust
 let listener = sockat::bind("/a/very/deep/directory/.../server.sock")?;
 let stream = sockat::connect("/a/very/deep/directory/.../server.sock")?;
 ```
 
-The results are std's own `UnixListener` / `UnixStream`. A path of at most 100 bytes is handed to std unchanged, so short paths behave exactly as with std.
+## Usage
 
-In general, use `sockat::bind` / `sockat::connect` where you would use std's `bind` / `connect`. In async code, use `sockat::connect_nonblocking`, which does not wait and returns a nonblocking stream. `connect` tries every way up to a short symlink under a temporary directory, so in an ordinary environment it reaches long paths too.
+Use `sockat::bind` / `sockat::connect` where you would use std's `UnixListener::bind` / `UnixStream::connect`. In async code, use `sockat::connect_nonblocking`, which does not wait and returns a nonblocking stream.
+
+- The results are std's own `UnixListener` / `UnixStream`
+- A path of at most 100 bytes is handed to std unchanged, so short paths behave exactly as with std
+- Even for a long path, the socket file is created at the path given
+- `connect` too tries every route up to a short symlink under a temporary directory, so in an ordinary environment it reaches long paths as well
 
 ## Why
 
-std's `UnixListener::bind` / `UnixStream::connect` refuse a path that does not fit `sun_path`. The file system has no such limit, but deep temporary directories hit it quickly (macOS's `$TMPDIR` alone is about 50 bytes, and test harnesses and sandboxes nest further). The limit applies to the argument passed to `bind(2)` / `connect(2)`, so sockat hands the kernel a different, short spelling.
+std's `bind` / `connect` refuse a path that does not fit `sun_path`. The file system has no such limit, but deep temporary directories hit it quickly (macOS's `$TMPDIR` alone is about 50 bytes, and test harnesses and sandboxes nest further). The limit applies to the argument passed to `bind(2)` / `connect(2)`, so sockat hands the kernel a short spelling that names the same place.
 
 ## How a long path is reached
 
-| Platform | Way |
+A path of at most 100 bytes is handed to std unchanged on every OS. A longer path is tried on the routes below, in this order per OS, and bound / connected on the first route that can be used.
+
+| OS | Order tried |
 |---|---|
-| Linux / Android | open the directory `O_PATH` and pass `/proc/self/fd/<fd>/<name>` (without `/proc`, the order of other Unix) |
-| FreeBSD | `bindat(2)` / `connectat(2)` |
-| macOS | in order: the path relative to the cwd → a widened sockaddr carrying up to 253 bytes → through a short symlink under `TMPDIR` or `/tmp` → a forked child that `fchdir`s into the directory |
-| other Unix (NetBSD, OpenBSD, illumos, ...) | in order: the path relative to the cwd → through a short symlink under `TMPDIR` or `/tmp` → a forked child that `fchdir`s into the directory |
-| Windows | not supported |
+| Linux / Android (with `/proc`) | /proc |
+| Linux / Android (without `/proc`) | relative path → symlink → fork |
+| FreeBSD | bindat |
+| macOS | relative path → widened sockaddr → symlink → fork |
+| NetBSD / OpenBSD / illumos / other Unix | relative path → symlink → fork |
+| Windows | not supported (compile error) |
 
-None of these changes the calling process's cwd, and all of them work in multi-threaded programs. The socket file is always created at the path given. The symlink is created only in a place where no other user can replace it (a sticky directory such as `/tmp`, or one of the user's own).
+- **/proc**: open the directory and pass `/proc/self/fd/<fd>/<file name>`
+- **bindat**: `bindat(2)` / `connectat(2)`, by the file name relative to the directory fd
+- **relative path**: when the path relative to the cwd is at most 100 bytes, pass that
+- **widened sockaddr**: pass a sockaddr carrying up to 253 bytes, which the macOS kernel accepts
+- **symlink**: create a short symlink to the socket's directory under `TMPDIR` or `/tmp` and go through it. It is created only in a place where no other user can replace it, and removed at once
+- **fork**: fork a child that `fchdir`s into the directory and binds / connects by the file name alone. **Only `bind` and the `connect_any` variants try it**
 
-Only `bind` and the `connect_any` variants of the next section fork. `bind`'s child only binds and the listen is done by the caller, so nothing of the fork stays with the listener.
+None of the routes changes the calling process's cwd, so they can be used from multi-threaded programs.
+
+`connect` / `connect_nonblocking` never fork. Where only the fork route would reach the path, they return `ENAMETOOLONG`, as a plain connect to a path too long for `sun_path` does. That happens only on an OS with neither `/proc` nor `bindat`, when the path does not fit as a relative path (nor, on macOS, in the widened sockaddr) and the symlink route cannot be used either (the file name is too long, or there is no safe place to create the symlink). Even there, with a usable `/tmp` and a file name of at most 77 bytes (230 on macOS), the symlink route reaches the path at any directory depth. The length limits of each route, and where `connect` stops reaching a path, are in [docs/MANUAL.md](./docs/MANUAL.md#how-a-long-path-is-reached).
 
 ## The exception: `connect_any`
 
-`connect` / `connect_nonblocking` never fork. Where only a fork would reach the path, they return `ENAMETOOLONG`, as a plain connect to a path too long for `sun_path` does.
+`connect_any` / `connect_any_nonblocking` are only for the rare environment that hits the `ENAMETOOLONG` above, when you want the connection at the cost of the fork's side effects. When no other route can be used, they have a forked child make the connect (the child exits at once), and they also return whether they took the fork route (`(UnixStream, bool)`, `true` when they did), for example to log or warn about it.
 
-`connect_any` / `connect_any_nonblocking` are only for the rare environment where even they cannot reach the path (Linux with neither `/proc` nor a safe temporary directory, a Unix with neither a dirfd-relative connect nor a usable temporary directory, or a file name too long even for the symlink route), when you want the connection at the cost of the fork's side effects. As the last resort they have a forked child make the connect and exit, and they also return whether they took the fork route (`(UnixStream, bool)`, `true` when they did), for example to log or warn about it.
+After a connect through the fork route, the peer pid the server sees is that of a process that has already exited (the forked child). Details in [docs/MANUAL.md](./docs/MANUAL.md#the-exception-connect_any).
 
 ## What differs from std for a long path
 
-- `local_addr()` / `peer_addr()` do not return the path (they return the spelling actually handed to the kernel). Keep the path yourself
-- When the `connect_any` variants do take the fork route, the peer pid the server sees is the pid of a process that has already exited (the forked child). The socket itself belongs to the caller and works as usual. The uid / gid are the caller's. On macOS the server sees the caller's pid once the caller sends. Nothing (the process, its ppid) can be looked up from that pid, and its number may be reused by another process
-- Details in [docs/MANUAL.md](./docs/MANUAL.md)
+- `local_addr()` / `peer_addr()` do not return the path: they return the spelling handed to the kernel at bind time (a relative path, `/proc/self/fd/...`, a path through a symlink that no longer exists, ...). Keep the path yourself
+- A path longer than 100 bytes that does not end with a file name (ending in `dir/`, `dir/.`, `..`) is an `InvalidInput` error
+- The rest (the fork's side effects, the directory being looked up first, a symlink that may be left behind) is in [docs/MANUAL.md](./docs/MANUAL.md#what-differs-from-std-for-a-long-path)
 
 ## Async runtimes
 
-The only dependency is libc; no runtime is required. With tokio, convert from the std types (`connect_nonblocking` does not wait and returns a nonblocking stream):
+The only dependency is libc; no runtime is required. With tokio, convert from the std types:
 
 ```rust
 let listener = sockat::bind(&path)?;
@@ -58,7 +73,7 @@ let stream = tokio::net::UnixStream::from_std(stream)?;
 
 ## Documentation
 
-- [docs/MANUAL.md](./docs/MANUAL.md) — usage, errors, caveats
+- [docs/MANUAL.md](./docs/MANUAL.md) — usage, the routes in detail, what differs from std, errors
 - [docs/decisions/](./docs/decisions/INDEX.md) — design decisions (DRs, in Japanese)
 
 ## License

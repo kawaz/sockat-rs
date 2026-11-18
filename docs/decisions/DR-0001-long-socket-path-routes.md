@@ -1,6 +1,6 @@
 # DR-0001: sun_path を超える socket のパスに届く経路と、試す順番
 
-- Status: Accepted (経路と試す順番、相対パスの作り方、Windows を対象外にすることは kawaz 指示 2026-11-18。/proc が無い時に他の Unix と同じ順に倒すこと、symlink の置き場に /tmp を足すことは kawaz 裁定 2026-11-18。公開する connect を「fork するか」「ブロックするか」の 4 つの関数にし、fork するのは `connect_any` 系だけにすること、`connect_any` 系は pid でなく fork の経路を通ったかを返すことは kawaz 裁定 2026-11-18。相対パスと symlink の経路を macOS 以外 (dirfd 基準の primitive の無い Unix、/proc の無い Linux) にも使うことは kawaz 裁定 2026-11-18。symlink の置き場を使う前に安全か確かめることは kawaz 裁定 2026-11-18。symlink の名前、fork の経路の権限、FreeBSD の扱いは統括の裁定 2026-11-18。tokio・観測の仕組みは実装側の判断で、残りは「未確定」)、0.2.0 で実装済み
+- Status: Accepted (経路と試す順番、相対パスの作り方、Windows を対象外にすることは kawaz 指示 2026-11-18。/proc が無い時に他の Unix と同じ順に倒すこと、symlink の置き場に /tmp を足すことは kawaz 裁定 2026-11-18。公開する connect を「fork するか」「ブロックするか」の 4 つの関数にし、fork するのは `connect_any` 系だけにすること、`connect_any` 系は pid でなく fork の経路を通ったかを返すことは kawaz 裁定 2026-11-18。相対パスと symlink の経路を macOS 以外 (dirfd 基準の primitive の無い Unix、/proc の無い Linux) にも使うことは kawaz 裁定 2026-11-18。symlink の置き場を使う前に安全か確かめることは kawaz 裁定 2026-11-18。symlink の名前、fork の経路の権限、FreeBSD の扱いは統括の裁定 2026-11-18。tokio・観測の仕組みは実装側の判断で、残りは「未確定」)、0.2.1 で実装済み
 - Date: 2026-11-18
 
 ## Context
