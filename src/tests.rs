@@ -1399,11 +1399,12 @@ mod linux {
         let target = other.path().join("target.sock");
         let name = || Ok(String::from("sockat.AAAAAAAAAA"));
         let fresh = || HeldDir::make_private_dir(&bad, name).unwrap();
+        let proc = Path::new(linux::PROC_SELF_FD);
 
         let made = fresh();
         let mode_of = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode_of(&made), 0o700);
-        let held = HeldDir::hold(made.clone(), &target).unwrap();
+        let held = HeldDir::hold(made.clone(), &target, proc).unwrap();
         let link = made.join("s");
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
         drop(held);
@@ -1411,7 +1412,7 @@ mod linux {
 
         let made = fresh();
         std::fs::set_permissions(&made, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let e = HeldDir::hold(made.clone(), &target).err().unwrap();
+        let e = HeldDir::hold(made.clone(), &target, proc).err().unwrap();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
         assert_empty(&made);
         std::fs::remove_dir(&made).unwrap();
@@ -1419,7 +1420,7 @@ mod linux {
         let made = fresh();
         std::fs::remove_dir(&made).unwrap();
         std::os::unix::fs::symlink(other.path(), &made).unwrap();
-        let e = HeldDir::hold(made.clone(), &target).err().unwrap();
+        let e = HeldDir::hold(made.clone(), &target, proc).err().unwrap();
         // With O_DIRECTORY as well, Linux answers ENOTDIR for the symlink
         // (observed in docker, Linux 7.2) where O_NOFOLLOW alone would be
         // ELOOP; either is the refusal that matters here.
@@ -1439,7 +1440,7 @@ mod linux {
         let made = fresh();
         std::fs::remove_dir(&made).unwrap();
         std::fs::write(&made, b"").unwrap();
-        let e = HeldDir::hold(made.clone(), &target).err().unwrap();
+        let e = HeldDir::hold(made.clone(), &target, proc).err().unwrap();
         assert_eq!(errno(&e), Some(libc::ENOTDIR), "{e}");
         assert!(made.is_file());
         std::fs::remove_file(&made).unwrap();
@@ -1450,7 +1451,7 @@ mod linux {
         }
         let made = fresh();
         std::os::unix::fs::chown(&made, Some(65534), None).unwrap();
-        let e = HeldDir::hold(made.clone(), &target).err().unwrap();
+        let e = HeldDir::hold(made.clone(), &target, proc).err().unwrap();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
         assert_empty(&made);
         std::fs::remove_dir(&made).unwrap();
@@ -1473,7 +1474,7 @@ mod linux {
         let p = t.path().join("s.sock");
         let listener = UnixListener::bind(&p).unwrap();
 
-        let held = HeldDir::create(&bad, &p).unwrap();
+        let held = HeldDir::create(&bad, &p, Path::new(linux::PROC_SELF_FD)).unwrap();
         let moved = bad.join("moved");
         std::fs::rename(&held.path, &moved).unwrap();
         std::fs::create_dir(&held.path).unwrap();
@@ -1491,38 +1492,48 @@ mod linux {
     }
 
     // The 0700 asked for when the private directory is made is what the umask
-    // leaves of it. A umask that takes some of the owner's bits (0277 makes it
-    // 0500, without write) must not make the form fail on every call and leave
-    // a directory behind each time: only the group and other bits are judged
-    // (none, as a umask cannot add any), and the owner's are set to 0700
-    // through the fd before the symlink is created in it. So under umask 0277
-    // a connect still goes through the held directory and the place is empty
-    // afterwards. Runs in a child process because the umask is process-wide;
-    // the places and the listener are made here, with the usual umask.
+    // leaves of it. A umask that takes some of the owner's bits must not make
+    // the form fail on every call and leave a directory behind each time:
+    //
+    // * 0277 makes it 0500 (no write): only the group and other bits are
+    //   judged (none, as a umask cannot add any), and the owner's are set to
+    //   0700 through /proc/self/fd/<fd> before the symlink is created in it;
+    // * 0477 makes it 0300 (no read either): the directory is opened O_PATH,
+    //   which needs no permission on it, so it is still held and fixed.
+    //
+    // So under either umask a connect still goes through the held directory
+    // and the place is empty afterwards. Root ignores the permissions, so the
+    // missing bits only matter when this runs as another user (setpriv in
+    // docker); as root it still checks the route and the clean-up. Runs in a
+    // child process because the umask is process-wide; the places and the
+    // listener are made here, with the usual umask.
     #[test]
     fn a_umask_that_takes_the_owners_bits_does_not_stop_the_held_directory() {
-        let t = tmp();
-        let places = tmp();
-        let bad = unsafe_place(places.path(), "bad");
-        let p = t.path().join("n".repeat(95));
-        let (l, _) = route::run_long(BIND, &p, &held_cfg(&[])).unwrap();
-        let listener = UnixListener::from(l);
-        listener.set_nonblocking(true).unwrap();
-        run_child(
-            "tests::linux::child_connect_under_umask_0277",
-            Path::new("/"),
-            &[
-                ("SOCKAT_CHILD_PATH", p.as_os_str()),
-                ("SOCKAT_CHILD_OTHER", bad.as_os_str()),
-            ],
-        );
-        // The child's connection is in the backlog (its end closed since).
-        listener.accept().unwrap();
-        assert_empty(&bad);
+        for umask in ["277", "477"] {
+            let t = tmp();
+            let places = tmp();
+            let bad = unsafe_place(places.path(), "bad");
+            let p = t.path().join("n".repeat(95));
+            let (l, _) = route::run_long(BIND, &p, &held_cfg(&[])).unwrap();
+            let listener = UnixListener::from(l);
+            listener.set_nonblocking(true).unwrap();
+            run_child(
+                "tests::linux::child_connect_under_umask",
+                Path::new("/"),
+                &[
+                    ("SOCKAT_CHILD_PATH", p.as_os_str()),
+                    ("SOCKAT_CHILD_OTHER", bad.as_os_str()),
+                    ("SOCKAT_CHILD_UMASK", OsStr::new(umask)),
+                ],
+            );
+            // The child's connection is in the backlog (its end closed since).
+            listener.accept().unwrap();
+            assert_empty(&bad);
+        }
     }
 
     #[test]
-    fn child_connect_under_umask_0277() {
+    fn child_connect_under_umask() {
         use crate::route::posix::HeldDir;
         use std::os::unix::fs::PermissionsExt;
         if !in_child() {
@@ -1530,12 +1541,14 @@ mod linux {
         }
         let p = env_path("SOCKAT_CHILD_PATH");
         let bad = env_path("SOCKAT_CHILD_OTHER");
-        sys::set_umask(0o277);
-        // The premise: the directory comes out 0500.
+        let umask = std::env::var("SOCKAT_CHILD_UMASK").unwrap();
+        let umask = libc::mode_t::from_str_radix(&umask, 8).unwrap();
+        sys::set_umask(umask);
+        // The premise: the directory comes out with the owner's bits cut.
         let made =
             HeldDir::make_private_dir(&bad, || Ok(String::from("sockat.AAAAAAAAAA"))).unwrap();
         let mode = std::fs::metadata(&made).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o500);
+        assert_eq!(mode, 0o700 & !umask);
         std::fs::remove_dir(&made).unwrap();
 
         let (_c, r) = route::run_long(CONNECT, &p, &held_cfg(&[&bad])).unwrap();

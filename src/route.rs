@@ -1023,7 +1023,7 @@ pub(crate) mod posix {
     /// and after the connect whatever its outcome.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn held_route(req: Request, base: &Path, target: &Path, proc: &Path) -> SymlinkOutcome {
-        let Ok(held) = HeldDir::create(base, target) else {
+        let Ok(held) = HeldDir::create(base, target, proc) else {
             return SymlinkOutcome::Unusable;
         };
         let via = held.spelling(proc);
@@ -1060,9 +1060,10 @@ pub(crate) mod posix {
         pub(crate) const LINK: &'static std::ffi::CStr = c"s";
 
         /// Make a private directory in `base` ([`HeldDir::make_private_dir`])
-        /// and hold it with a symlink to `target` in it ([`HeldDir::hold`]).
-        pub(crate) fn create(base: &Path, target: &Path) -> io::Result<Self> {
-            Self::hold(Self::make_private_dir(base, random_name)?, target)
+        /// and hold it with a symlink to `target` in it ([`HeldDir::hold`]),
+        /// `proc` being where `/proc/self/fd` is.
+        pub(crate) fn create(base: &Path, target: &Path, proc: &Path) -> io::Result<Self> {
+            Self::hold(Self::make_private_dir(base, random_name)?, target, proc)
         }
 
         /// Create a directory of mode 0700 under `base`, named as the
@@ -1082,24 +1083,31 @@ pub(crate) mod posix {
         /// Open the directory at `path` and, if it is the one sockat made,
         /// create the symlink `s` to `target` in it.
         ///
-        /// It is opened `O_DIRECTORY | O_NOFOLLOW` (a symlink put at `path` is
-        /// refused), and what was opened must be a directory owned by the
-        /// effective uid with no permission for group and others
-        /// (`mode & 0o077 == 0`), as made by [`HeldDir::make_private_dir`]:
-        /// anything else was put there by someone else between the `mkdir`
-        /// and the `open`, and is neither used nor removed (`InvalidData`).
-        /// Only the group and other bits are judged because the umask may
-        /// have taken some of the owner's from the 0700 asked for (umask 0277
-        /// makes it 0500); the owner's are then set to 0700 through the fd
-        /// (`fchmod`), so such a umask does not leave a directory behind on
-        /// every call. The symlink is created with `symlinkat(2)` on the fd.
-        /// When `fchmod` or `symlinkat` fails, the directory is removed again
-        /// (by drop).
-        pub(crate) fn hold(path: PathBuf, target: &Path) -> io::Result<Self> {
+        /// It is opened `O_PATH | O_DIRECTORY | O_NOFOLLOW`: a symlink put at
+        /// `path` is refused, and no permission on the directory is needed to
+        /// open it. What was opened must be a directory owned by the effective
+        /// uid with no permission for group and others (`mode & 0o077 == 0`),
+        /// as made by [`HeldDir::make_private_dir`]: anything else was put
+        /// there by someone else between the `mkdir` and the `open`, and is
+        /// neither used nor removed (`InvalidData`).
+        ///
+        /// Only the group and other bits are judged because the umask may have
+        /// taken some of the owner's from the 0700 asked for (umask 0277 makes
+        /// it 0500, umask 0477 makes it 0300, without read). The owner's are
+        /// then set to 0700 by `chmod("<proc>/<fd>")`, `proc` being where
+        /// `/proc/self/fd` is: an `O_PATH` fd takes no `fchmod`, and the /proc
+        /// spelling reaches the very directory the fd holds, so nothing put at
+        /// `path` meanwhile can be changed instead. So such a umask neither
+        /// stops the form nor leaves a directory behind on every call.
+        ///
+        /// The symlink is created with `symlinkat(2)` on the fd. When the
+        /// `chmod` or `symlinkat` fails, the directory is removed again (by
+        /// drop).
+        pub(crate) fn hold(path: PathBuf, target: &Path, proc: &Path) -> io::Result<Self> {
             use std::os::fd::AsFd;
             let opened = OpenOptions::new()
                 .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
                 .open(&path)?;
             let m = opened.metadata()?;
             if !(m.is_dir() && m.uid() == sys::effective_uid() && m.mode() & 0o077 == 0) {
@@ -1113,8 +1121,10 @@ pub(crate) mod posix {
                 dir: opened,
                 linked: false,
             };
-            held.dir
-                .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+            std::fs::set_permissions(
+                held.fd_dir(proc),
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )?;
             sys::symlink_at(target, held.dir.as_fd(), Self::LINK)?;
             held.linked = true;
             Ok(held)
@@ -1122,10 +1132,15 @@ pub(crate) mod posix {
 
         /// `<proc>/<fd>/s`, `proc` being where `/proc/self/fd` is.
         pub(crate) fn spelling(&self, proc: &Path) -> PathBuf {
-            use std::os::fd::AsRawFd;
             use std::os::unix::ffi::OsStrExt;
-            proc.join(self.dir.as_raw_fd().to_string())
+            self.fd_dir(proc)
                 .join(OsStr::from_bytes(Self::LINK.to_bytes()))
+        }
+
+        /// `<proc>/<fd>`: the held directory itself, by its fd.
+        fn fd_dir(&self, proc: &Path) -> PathBuf {
+            use std::os::fd::AsRawFd;
+            proc.join(self.dir.as_raw_fd().to_string())
         }
     }
 
