@@ -226,6 +226,7 @@ d が要るのは、bind でファイル名がそれより長い時と、安全�
 
 - Android は compile もしていない。macOS 以外の Apple OS は iOS の clippy (試験コード込み) だけ確かめた
 - NetBSD・OpenBSD・illumos の振る舞いは CI の VM の試験で確かめる。手元では NetBSD・illumos の clippy (試験コード込み) まで。OpenBSD は rustup に std が無く、手元では compile も確かめていない
+- std が macOS・NetBSD・DragonFly で 253 バイトまでのパスを受け付けるようにする PR ([rust-lang/rust#161149](https://github.com/rust-lang/rust/pull/161149)、issue [#160684](https://github.com/rust-lang/rust/issues/160684)) が review 待ち (2026-11-18 時点で未 merge)。merge されたら、決定 1 の「std にそのまま渡す長さ」をそれに追従させる。ビルドに使う std の版で受け付ける長さが変わる (MSRV 1.85 の std は 103 のまま) ので、閾値を版でどう決めるかも合わせて決める
 
 ## 裁定の記録
 
