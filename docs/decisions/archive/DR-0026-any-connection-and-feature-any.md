@@ -1,11 +1,11 @@
 # DR-0026: connect_any 系の戻り値は名前付きの struct `AnyConnection`、feature 名は `any`
 
-- Status: Accepted
+- Status: Superseded by DR-0029
 - Date: 2026-11-18
 
 ## Context
 
-- `connect_any` / `connect_any_nonblocking` ([DR-0010](DR-0010-public-api.md)) は stream と「fork の経路を通ったか」を返す。組 `(UnixStream, bool)` では、2 番目が何かを doc で覚えておく必要がある
+- `connect_any` / `connect_any_nonblocking` ([DR-0010](../DR-0010-public-api.md)) は stream と「fork の経路を通ったか」を返す。組 `(UnixStream, bool)` では、2 番目が何かを doc で覚えておく必要がある
 - ハブの仕様は、戻り値を標準の stream と `forked` を持つ名前付きの型にし、形は言語の慣習で決めるとする。Rust の feature 名は `any` (ハブ [DR-0007](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0007-connect-any-is-opt-in.md))
 
 ## Decision

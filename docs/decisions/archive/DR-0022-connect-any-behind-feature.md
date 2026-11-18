@@ -1,11 +1,11 @@
 # DR-0022: connect_any 系は feature `any` の後ろに置く
 
-- Status: Accepted
+- Status: Superseded by DR-0029
 - Date: 2026-11-18
 
 ## Context
 
-- 中心の経路と予備の経路 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) で、`connect` / `connect_nonblocking` が届かない場面はほぼ無い。`connect_any` 系 ([DR-0010](DR-0010-public-api.md)) が要るのは、fork が最後の手になる環境 (中心の経路を connect に使えない NetBSD / OpenBSD / illumos、seccomp の filter が掛かり `/proc` の無い Linux、`pthread_fchdir_np` の無い Apple の OS で、予備の経路も届かない時) だけ
+- 中心の経路と予備の経路 ([DR-0027](../DR-0027-own-directory-and-fallback-routes.md)) で、`connect` / `connect_nonblocking` が届かない場面はほぼ無い。`connect_any` 系 ([DR-0010](../DR-0010-public-api.md)) が要るのは、fork が最後の手になる環境 (中心の経路を connect に使えない NetBSD / OpenBSD / illumos、seccomp の filter が掛かり `/proc` の無い Linux、`pthread_fchdir_np` の無い Apple の OS で、予備の経路も届かない時) だけ
 - 既定の API に `connect` と並んで出ていると、エディタの補完などで利用者がどちらを使うか迷う
 
 ## Decision

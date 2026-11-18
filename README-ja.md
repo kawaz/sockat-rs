@@ -18,7 +18,7 @@ std の `UnixListener::bind` / `UnixStream::connect` の代わりに `sockat::bi
 - 戻り値は std の `UnixListener` / `UnixStream` そのもの
 - std が受け付ける長さのパスは std にそのまま渡すので、std と同じに振る舞う
 - 長いパスでも、ソケットファイルは渡したパスにできる
-- `connect` も fork の手前の経路までは試すので、普通の環境では長いパスでも届く
+- `connect` も fork-direct の手前の経路までは試すので、普通の環境では長いパスでも届く
 - ソケットファイルを後で消したい時は `sockat::bind_ex` を使う。listener と、bind したファイルだけを消す `SocketFile` を返す
 
 ## なぜ要るか
@@ -34,49 +34,52 @@ std が受け付ける長さ (`sun_path` − 1) のパスは std にそのまま
 | Linux / Android / illumos | 107 バイトまで |
 | macOS / iOS / FreeBSD / NetBSD / OpenBSD | 103 バイトまで |
 
-それを超えるパスは、まず**中心の経路**で届く。自分専用のディレクトリ D (`sockat.XXXXXXXXXX`、mode 0700) を作って fd で掴み、その中に乱数の名前の symlink R (ソケットのディレクトリを指す) を作り、D の fd を基準に `R/<ファイル名>` で bind / connect して、R と D を消す。カーネルが覚える綴りは `R/<ファイル名>` で、R はもう無いので、後でどこで解決されても何にも当たらない。
+それを超えるパスは、まず**D を通す経路**で届く。自分専用のディレクトリ D (`sockat.XXXXXXXXXX`、mode 0700) を作って fd で掴み、その中に乱数の名前の symlink R (ソケットのディレクトリを指す) を作り、D の fd を基準に `R/<ファイル名>` で bind / connect して、R と D を消す。カーネルが覚える綴りは `R/<ファイル名>` で、R はもう無いので、後でどこで解決されても何にも当たらない。経路の名前は [sockat の仕様](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md) の「経路の名前」と同じ。
 
-| OS | D の fd を基準にする手段 (この順) |
+| OS | D を通す経路 (この順) |
 |---|---|
-| Linux / Android | スレッド cwd → /proc 版 → fork (bind だけ) |
-| macOS / iOS 等 Apple の OS | スレッド cwd → fork (bind だけ) |
-| FreeBSD | bindat / connectat |
+| Linux / Android | thread-cwd → proc → fork (bind だけ) |
+| macOS / iOS 等 Apple の OS | thread-cwd → fork (bind だけ) |
+| FreeBSD | at |
 | NetBSD / OpenBSD / illumos / その他の Unix | fork (bind だけ) |
 | Windows | 対象外 (compile エラー) |
 
-- **スレッド cwd**: 使い捨てのスレッドだけ cwd を D に移す (Linux は `unshare(CLONE_FS)` と `fchdir`、Apple の OS は `pthread_fchdir_np`)。副作用が無いので、どの関数も試す。seccomp の filter が掛かった Linux では使わない
-- **/proc 版**: `/proc/self/fd/<D の fd>/R/<ファイル名>` で渡す
-- **bindat / connectat**: D の fd を渡す
+- **thread-cwd**: 使い捨てのスレッドだけ cwd を D に移す (Linux は `unshare(CLONE_FS)` と `fchdir`、Apple の OS は `pthread_fchdir_np`)。副作用が無いので、どの関数も試す。seccomp の filter が掛かった Linux では使わない
+- **proc**: `/proc/self/fd/<D の fd>/R/<ファイル名>` で渡す
+- **at**: `bindat` / `connectat` に D の fd を渡す
 - **fork**: D に `fchdir` した子を fork し、子が bind する。bind の後の listen は呼び出し元がするので、相手から見える副作用が無い
-- D は `TMPDIR`、`/tmp`、ソケットのディレクトリ (`.sockat.XXXXXXXXXX`) の順に、作れた所に作る。置き場は安全でなくても深くてもよい (fd で掴む)。どこにも作れなければ、bind はソケットのディレクトリに R を作り、同じ順 (スレッド cwd → /proc 版 → fork) で試す
+- D は `TMPDIR`、`/tmp`、ソケットのディレクトリ (`.sockat.XXXXXXXXXX`) の順に、作れた所に作る。置き場は安全でなくても深くてもよい (fd で掴む)。どこにも作れなければ、bind はソケットのディレクトリに R を作り、同じ順 (thread-cwd-sockdir → proc-sockdir → fork-sockdir、FreeBSD は at-sockdir) で試す
 
-中心の経路が使えない時、connect 系だけが**予備の経路**を試す。connect の綴りはカーネルに残らないので、綴りにランダムな部品を挟まない。
+D を通す経路が使えない時、connect 系だけが**予備の経路**を試す。connect の綴りはカーネルに残らないので、綴りにランダムな部品を挟まない。
 
 | OS | 予備の経路 (この順) |
 |---|---|
-| Linux / Android (`/proc` あり) | /proc → D の中のファイルへの symlink → symlink |
-| Linux / Android (`/proc` 無し) | 相対パス → symlink |
-| macOS / iOS 等 Apple の OS | 相対パス → 広げた sockaddr → symlink |
-| FreeBSD | connectat |
-| NetBSD / OpenBSD / illumos / その他の Unix | 相対パス → symlink |
+| Linux / Android (`/proc` あり) | proc-direct → proc-held → symlink |
+| Linux / Android (`/proc` 無し) | relative → symlink |
+| macOS / iOS 等 Apple の OS | relative → widened → symlink |
+| FreeBSD | at-direct |
+| NetBSD / OpenBSD / illumos / その他の Unix | relative → symlink |
 
-- **/proc**: `/proc/self/fd/<ディレクトリの fd>/<ファイル名>` で渡す
-- **D の中のファイルへの symlink**: D の中にソケットのファイルを指す symlink を作り、`/proc/self/fd/<D の fd>/s` で渡す
-- **相対パス**: cwd からの相対パスが std にそのまま渡せる長さなら、それで渡す。パスを文字列で書き直すだけで、cwd は変えない
-- **広げた sockaddr**: macOS のカーネルが受け付ける、253 バイトまで入る sockaddr で渡す (広げた形で bind したソケットのアドレスは途中で切れ、読む側を壊すので、bind は使わない)
+- **proc-direct**: `/proc/self/fd/<ディレクトリの fd>/<ファイル名>` で渡す
+- **proc-held**: D の中にソケットのファイルを指す symlink を作り、`/proc/self/fd/<D の fd>/s` で渡す
+- **relative**: cwd からの相対パスが std にそのまま渡せる長さなら、それで渡す。パスを文字列で書き直すだけで、cwd は変えない
+- **widened**: macOS のカーネルが受け付ける、253 バイトまで入る sockaddr で渡す (広げた形で bind したソケットのアドレスは途中で切れ、読む側を壊すので、bind は使わない)
 - **symlink**: `TMPDIR` か `/tmp` の、他人が差し替えられない置き場に、ソケットのファイルを指す短い symlink を作り、それを通して渡して、すぐ消す
+- **at-direct**: `connectat` にソケットのディレクトリの fd とファイル名を渡す
 
-`connect_any` 系は、それでも届かない時に最後に fork する。どの経路も呼び出し元のプロセスとスレッドの cwd を変えないので、マルチスレッドのプログラムから使える。
+`connect_any` 系は、それでも届かない時に最後に fork する (fork-direct)。どの経路も呼び出し元のプロセスとスレッドの cwd を変えないので、マルチスレッドのプログラムから使える。
 
-`connect` / `connect_nonblocking` は fork しない。fork でしか届かない時は、パスが `sun_path` に入らない普通の connect と同じく `ENAMETOOLONG` を返す。そうなるのは、中心の経路を connect に使えず (NetBSD / OpenBSD / illumos、seccomp の filter が掛かり `/proc` の無い Linux、`pthread_fchdir_np` の無い Apple の OS)、予備の経路も届かない時だけである。`/tmp` が使えれば、`connect` はディレクトリの深さにもファイル名の長さにもよらず届く。各経路の長さの上限と、どこから届かなくなるかは [docs/MANUAL-ja.md](./docs/MANUAL-ja.md#長いパスへの届き方) にある。
+`connect` / `connect_nonblocking` は fork しない。fork でしか届かない時は、パスが `sun_path` に入らない普通の connect と同じく `ENAMETOOLONG` を返す。そうなるのは、D を通す経路を connect に使えず (NetBSD / OpenBSD / illumos、seccomp の filter が掛かり `/proc` の無い Linux、`pthread_fchdir_np` の無い Apple の OS)、予備の経路も届かない時だけである。`/tmp` が使えれば、`connect` はディレクトリの深さにもファイル名の長さにもよらず届く。各経路の長さの上限と、どこから届かなくなるかは [docs/MANUAL-ja.md](./docs/MANUAL-ja.md#長いパスへの届き方) にある。
 
-## 例外: `connect_any`
+## 例外: any 系
 
-`connect_any` / `connect_any_nonblocking` は、上の `ENAMETOOLONG` に当たるよほど珍しい環境で、fork の副作用を受け入れてでもつなぎたい時だけのもの。他の経路が使えない時は、fork した子に connect させ (子はすぐ終了する)、fork の経路を通ったかも返す (`AnyConnection { stream, forked }`、通った時に `forked` が `true`)。ログに残す・警告するなどに使える。
+`bind_any` / `connect_any` / `connect_any_nonblocking` は、既定の経路が全部使えないよほど珍しい環境で、何かを失ってでも届かせたい時だけのもの。
 
-既定では無効で、feature `any` を有効にした時だけ使える: `sockat = { version = "0.4", features = ["any"] }`
+- `bind_any`: `bind` と同じ順の後、最後に置き場 (`XDG_RUNTIME_DIR`、`TMPDIR`、`/tmp`) にソケットのディレクトリを指す symlink を作って bind する。共有の置き場 (`/tmp` 等) では、カーネルが返すアドレスの名前を他の利用者が作り直せる
+- `connect_any` / `connect_any_nonblocking`: `connect` と同じ順の後、最後に fork した子に connect させる (子はすぐ終了する)。サーバに見える peer の pid は、もう終了した子の pid になる
+- 戻り値 (`AnyListener` / `AnyConnection`) は std の listener / stream と、失ったものの並び `losses` (`respelled` / `forked` / `recreatable-spelling` / `cwd-relative`)、通った経路の名前 `route`、試して使えなかった経路の並び `skipped` (名前と理由) を持つ。失敗した時の `AnyError` も `skipped` を持ち、`io::Error` に `?` で戻る (errno はそのまま)。`route` と `skipped` は診断用で、中身を約束しない
 
-fork の経路で connect すると、サーバに見える peer の pid は、もう終了したプロセス (fork した子) の pid になる。詳しくは [docs/MANUAL-ja.md](./docs/MANUAL-ja.md#例外-connect_any)。
+既定では無効で、feature `any` を有効にした時だけ使える: `sockat = { version = "0.4", features = ["any"] }`。詳しくは [docs/MANUAL-ja.md](./docs/MANUAL-ja.md#例外-any-系)。
 
 ## 長いパスで std と違う点
 

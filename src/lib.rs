@@ -39,39 +39,42 @@
 //! # How a long path is reached
 //!
 //! A path longer than std accepts goes first through a directory of sockat's
-//! own (**the central route**), and only when that cannot be used, for a
-//! connect, through **the fallback routes**:
+//! own, D (**the routes through D**), and only when that cannot be used,
+//! for a bind through the socket's directory itself (**the form without
+//! D**), for a connect through **the fallback routes**. The routes carry the
+//! names of the [specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md):
 //!
 //! | Platform | [`bind`] | [`connect`], [`connect_nonblocking`] |
 //! |---|---|---|
-//! | Linux, Android | thread cwd, /proc, fork (all in D) | thread cwd, /proc (in D), then /proc, symlink in D, symlink |
-//! | Linux, Android without `/proc` | thread cwd, fork (in D) | thread cwd (in D), then relative path, symlink |
-//! | macOS, iOS (Apple) | thread cwd, fork (in D) | thread cwd (in D), then relative path, widened sockaddr, symlink |
-//! | FreeBSD | bindat (in D) | connectat (in D), then connectat |
-//! | NetBSD, OpenBSD, illumos, other Unix | fork (in D) | relative path, symlink |
+//! | Linux, Android | thread-cwd, proc, fork | thread-cwd, proc, then proc-direct, proc-held, symlink |
+//! | Linux, Android without `/proc` | thread-cwd, fork | thread-cwd, then relative, symlink |
+//! | macOS, iOS (Apple) | thread-cwd, fork | thread-cwd, then relative, widened, symlink |
+//! | FreeBSD | at | at, then at-direct |
+//! | NetBSD, OpenBSD, illumos, other Unix | fork | relative, symlink |
 //!
-//! `connect_any` and `connect_any_nonblocking` try what [`connect`] does, then
-//! a forked child. The first route that can be used makes the call; a real
-//! failure there (`ENOENT`, `EADDRINUSE`, `ECONNREFUSED`, ...) is the result,
-//! not a reason to try the next.
+//! `bind_any` tries what [`bind`] does, then a symlink in a place;
+//! `connect_any` and `connect_any_nonblocking` try what [`connect`] does,
+//! then a forked child (fork-direct). The first route that can be used makes
+//! the call; a real failure there (`ENOENT`, `EADDRINUSE`, `ECONNREFUSED`,
+//! ...) is the result, not a reason to try the next.
 //!
-//! **The central route.** sockat makes a directory D of mode 0700 (named
+//! **The routes through D.** sockat makes a directory D of mode 0700 (named
 //! `sockat.XXXXXXXXXX`, 10 random letters and digits) and holds it by an fd,
 //! checked to be the directory it made (owned by the calling user, no
 //! permission for group and others). In D it makes a symlink R with a random
 //! name to the real path of the socket's directory, and makes the call with
-//! `R/<file name>` relative to D's fd, by the first of these means that can be
-//! used:
+//! `R/<file name>` relative to D's fd, by the first of these routes that can
+//! be used:
 //!
-//! * **thread cwd** (Linux, Apple): a thread started for the call alone moves
+//! * **thread-cwd** (Linux, Apple): a thread started for the call alone moves
 //!   its own working directory, and no other thread's, into D
 //!   (`unshare(CLONE_FS)` then `fchdir` on Linux, `pthread_fchdir_np` on
 //!   Apple). Not used on Linux under a seccomp filter (docker's default
 //!   installs one; a filter may kill the process for `unshare`, so it is not
 //!   called then) or where `pthread_fchdir_np` is missing
-//! * **/proc** (Linux): `/proc/self/fd/<D's fd>/R/<file name>`, for a file
+//! * **proc** (Linux): `/proc/self/fd/<D's fd>/R/<file name>`, for a file
 //!   name of up to about 79 bytes
-//! * **bindat** (FreeBSD): `bindat(2)` / `connectat(2)` on D's fd
+//! * **at** (FreeBSD): `bindat(2)` / `connectat(2)` on D's fd
 //! * **fork** ([`bind`] only): a forked child that `fchdir`s into D binds and
 //!   exits; the listen is made by the calling process, so a client sees the
 //!   calling process as the server, as with any other route
@@ -80,29 +83,32 @@
 //! for a bound socket names nothing afterwards, wherever it is resolved. D goes
 //! in `TMPDIR` (or `/tmp` when it is unset), then `/tmp`, then the socket's
 //! directory (named `.sockat.XXXXXXXXXX` there). None of them needs to be
-//! safe or short: D is held by its fd. When D can be made in none of them, a
-//! bind makes R (`.sockat.XXXXXXXXXX`) beside the socket instead and tries
-//! the same means (thread cwd or bindat, /proc, fork) with
-//! `.sockat.XXXXXXXXXX/<file name>` relative to the socket's directory, and
-//! a connect goes on to the fallback routes.
+//! safe or short: D is held by its fd. A D that cannot be opened right after
+//! it is made (a umask took the owner's bits) is removed again by its name,
+//! and the next place is tried.
+//!
+//! **The form without D.** When D can be made in no place, a bind makes R
+//! (`.sockat.XXXXXXXXXX`) beside the socket instead and tries the same routes
+//! (thread-cwd-sockdir or at-sockdir, proc-sockdir, fork-sockdir) with
+//! `.sockat.XXXXXXXXXX/<file name>` relative to the socket's directory.
 //!
 //! `R/<file name>` takes 11 bytes, so a bind reaches a file name of up to 96
 //! bytes (Linux, illumos) or 92 (Apple, the BSDs); 88 / 84 without D (about
-//! 72 by the /proc version).
+//! 72 by proc-sockdir).
 //!
 //! **The fallback routes** (connects only). A connected socket is not bound,
 //! so its spelling is kept nowhere and needs no random part:
 //!
-//! * **/proc** (Linux): `/proc/self/fd/<dirfd>/<file name>`, for a file name of
-//!   up to about 90 bytes
-//! * **symlink in D** (Linux with `/proc`): D made as above, a symlink `s` in
-//!   it to the socket file, and the connect by `/proc/self/fd/<D's fd>/s`,
+//! * **proc-direct** (Linux): `/proc/self/fd/<dirfd>/<file name>`, for a file
+//!   name of up to about 90 bytes
+//! * **proc-held** (Linux with `/proc`): D made as above, a symlink `s` in it
+//!   to the socket file, and the connect by `/proc/self/fd/<D's fd>/s`,
 //!   whatever the directory depth and the file name length
-//! * **relative path**: the path spelled relative to the working directory,
-//!   when std accepts that. Only the path string is rewritten; the cwd is
-//!   never changed
-//! * **widened sockaddr** (Apple): a `sockaddr_un` carrying up to 253 bytes of
-//!   path, which XNU accepts: the path itself, or failing that the relative
+//! * **relative**: the path spelled relative to the working directory, when
+//!   std accepts that. Only the path string is rewritten; the cwd is never
+//!   changed
+//! * **widened** (Apple): a `sockaddr_un` carrying up to 253 bytes of path,
+//!   which XNU accepts: the path itself, or failing that the relative
 //!   spelling. A bind never uses it: the address of a socket bound so does not
 //!   fit `sun_path` and breaks its readers (CPython, Go's `net.FileConn`)
 //! * **symlink**: a short symlink to the socket file under `TMPDIR` or failing
@@ -111,7 +117,7 @@
 //!   user, as `/tmp` is, or a directory of the calling user's that group and
 //!   others cannot write to). Through `/tmp`, a connect is reached whatever the
 //!   directory depth and the file name length
-//! * **connectat** (FreeBSD): `connectat(2)` on the socket's directory fd with
+//! * **at-direct** (FreeBSD): `connectat(2)` on the socket's directory fd with
 //!   the file name (up to 103 bytes)
 //!
 //! None of these changes the working directory of the calling process or of
@@ -123,28 +129,32 @@
 //! [DR-0027](https://github.com/kawaz/sockat-rs/blob/main/docs/decisions/DR-0027-own-directory-and-fallback-routes.md)
 //! (in Japanese).
 //!
-//! # The exception: `connect_any`
+//! # The exception: the `any` functions
 //!
 //! [`connect`] and [`connect_nonblocking`] never fork: a connect is not
-//! expected to, and after a connect through the fork route the peer pid the
-//! server sees is that of a process that has already exited. Where only the
-//! fork route would reach the path, they fail with `ENAMETOOLONG`, as any
-//! connect to a path too long for `sun_path` does. That happens only when the
-//! central route cannot be used for a connect (no thread cwd means and no
-//! `/proc`: NetBSD, OpenBSD, illumos, Linux under a seccomp filter without
-//! `/proc`, an Apple OS without `pthread_fchdir_np`) and none of the fallback
-//! routes reaches the path (no safe place for the symlink, and the path fits
-//! neither a relative spelling nor, on Apple, the widened sockaddr).
+//! expected to, and after a connect through a fork the peer pid the server
+//! sees is that of a process that has already exited. Where only that would
+//! reach the path, they fail with `ENAMETOOLONG`, as any connect to a path
+//! too long for `sun_path` does. That happens only when the routes through D
+//! cannot be used for a connect (no thread cwd and no `/proc`: NetBSD,
+//! OpenBSD, illumos, Linux under a seccomp filter without `/proc`, an Apple
+//! OS without `pthread_fchdir_np`) and none of the fallback routes reaches the
+//! path (no safe place for the symlink, and the path fits neither a relative
+//! spelling nor, on Apple, the widened sockaddr). [`bind`] fails with
+//! `ENAMETOOLONG` where no route through D or beside the socket can be used.
 //!
-//! `connect_any` and `connect_any_nonblocking` are for that rare environment,
-//! when the connection is wanted at the cost of the fork's side effects. They
-//! take the fork route as the last resort and return the stream with whether
-//! they took it (`AnyConnection`), so that the caller can, for example, log or
-//! warn about it. They are behind the crate feature `any` (see
-//! [Features](#features)). [`bind`] takes the fork route as a last resort too;
-//! the child only binds and the listen is done by the calling process, so the
-//! listener is this process's like any other, and nothing a client can see
-//! differs.
+//! `bind_any`, `connect_any` and `connect_any_nonblocking`, behind the crate
+//! feature `any` (see [Features](#features)), are for that rare environment,
+//! when the path is wanted at the cost of something: `bind_any` binds last
+//! through a symlink to the socket's directory in a place (in a shared place
+//! such as `/tmp`, another user can make the reported address again), the
+//! `connect_any` ones connect last from a forked child. They return the
+//! listener or stream with what was given up (`Loss`), the name of the route
+//! taken and the routes passed over (`AnyListener`, `AnyConnection`), and on
+//! failure an `AnyError` that converts back into the `io::Error`. [`bind`] forks as a
+//! last resort too; the child only binds and the listen is done by the
+//! calling process, so the listener is this process's like any other, and
+//! nothing a client can see differs.
 //!
 //! # What differs from std for a long path
 //!
@@ -152,7 +162,8 @@
 //!   listener and of accepted streams, and `peer_addr()` of a connected client,
 //!   report the spelling handed to the kernel when the listener was bound
 //!   (whichever route the client took): `R/<file name>`,
-//!   `/proc/self/fd/<n>/R/<file name>` or `.sockat.XXXXXXXXXX/<file name>`. R
+//!   `/proc/self/fd/<n>/R/<file name>` or `.sockat.XXXXXXXXXX/<file name>`
+//!   (`<place>/sockat.XXXXXXXXXX/<file name>` after `bind_any`'s symlink). R
 //!   is gone by then, so removing, `stat`ing or `chmod`ing by the reported
 //!   address finds nothing rather than another file; it never names the
 //!   socket either. Keep the path you passed and use that (for example to
@@ -167,8 +178,8 @@
 //!   cannot be split into a directory and a file name and is refused before
 //!   anything is created; a shorter one goes to std and gets the kernel's error.
 //! * **The peer pid the server sees can be that of an exited process**
-//!   (`connect_any` and `connect_any_nonblocking`, when they take the fork
-//!   route): the forked child that made the connect and exited. The socket
+//!   (`connect_any` and `connect_any_nonblocking`, when they take
+//!   fork-direct): the forked child that made the connect and exited. The socket
 //!   itself belongs to the caller and works as usual. The uid and gid the
 //!   server sees are the caller's. On macOS (`LOCAL_PEERPID`) the server sees
 //!   the caller's pid once the caller sends on the socket; on Linux
@@ -190,12 +201,12 @@
 //!   `O_RDONLY` and need read permission as well.
 //! * **The directory is resolved slightly earlier than the call.** R points to
 //!   the real path of the socket's directory, taken when R is made, and the
-//!   /proc, relative, connectat and fork routes of a connect look the
-//!   directory up first. If a directory along the path is renamed or a symlink
+//!   proc-direct, relative, at-direct and fork-direct routes of a connect look
+//!   the directory up first. If a directory along the path is renamed or a symlink
 //!   along it is repointed in between, the socket goes to (or is looked up in)
 //!   the directory as it was when looked up, not as it is at the moment of the
 //!   call.
-//! * **The relative route is exposed to another thread's `chdir`.** sockat
+//! * **relative is exposed to another thread's `chdir`.** sockat
 //!   itself never changes the cwd. The path is spelled relative to the cwd only
 //!   after checking that the spelling names the same directory, and the cwd is
 //!   checked again afterwards; if another thread changed it in between, the
@@ -204,11 +215,9 @@
 //!   process anyway; sockat does not make that safe, it only detects the
 //!   visible case.
 //! * **Something can be left behind** if the process dies in the middle of a
-//!   call: D (`sockat.XXXXXXXXXX`) or the temporary symlink under `TMPDIR` or
-//!   `/tmp`, and D or R (`.sockat.XXXXXXXXXX`) in the socket's directory. On
-//!   the targets that open D `O_RDONLY` (not Linux and Apple), a umask that
-//!   takes the owner's read bit makes D impossible to open and check, and it
-//!   is left as it is.
+//!   call: D (`sockat.XXXXXXXXXX`) or the temporary symlink under
+//!   `XDG_RUNTIME_DIR`, `TMPDIR` or `/tmp`, and D or R (`.sockat.XXXXXXXXXX`)
+//!   in the socket's directory.
 //!
 //! # Removing the socket file
 //!
@@ -246,10 +255,11 @@
 //!
 //! # Features
 //!
-//! * `any` (off by default): `connect_any` and `connect_any_nonblocking`, the
-//!   connects that fork as the last resort, and `AnyConnection`, what they
-//!   return. Enabling it is the choice to accept the fork's side effects; the
-//!   other functions do not need it.
+//! * `any` (off by default): `bind_any`, `connect_any` and
+//!   `connect_any_nonblocking`, which reach the path at the cost of something
+//!   (a symlink others may make again, a fork), and `AnyListener`,
+//!   `AnyConnection`, `AnyError`, `Loss` and `Skipped`, what they return. Enabling it is the
+//!   choice to accept those costs; the other functions do not need it.
 //!
 //! ```toml
 //! [dependencies]
@@ -289,7 +299,9 @@ use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
-use route::ConnectOptions;
+#[cfg(feature = "any")]
+use route::Route;
+use route::{BindOptions, ConnectOptions, Request};
 
 mod path;
 mod route;
@@ -316,7 +328,8 @@ mod tests;
 /// std accepts that does not end with a file name, or for a path that contains
 /// a NUL byte.
 pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
-    route::run(route::Request::Bind, path.as_ref()).map(|(fd, _)| UnixListener::from(fd))
+    route::run(Request::Bind(BindOptions { symlink: false }), path.as_ref())
+        .map(|(fd, _)| UnixListener::from(fd))
 }
 
 /// [`bind`], and a [`SocketFile`] that removes the socket file later, only
@@ -441,14 +454,7 @@ fn file_id(path: &Path) -> io::Result<(u64, u64)> {
 /// (or none at all does); `InvalidInput` for a path longer than std accepts
 /// that does not end with a file name, or for a path that contains a NUL byte.
 pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
-    connect_with(
-        path.as_ref(),
-        ConnectOptions {
-            nonblocking: false,
-            fork: false,
-        },
-    )
-    .map(|(stream, _)| stream)
+    connect_with(path.as_ref(), false)
 }
 
 /// [`connect`] on a nonblocking socket: the connect does not wait, and the
@@ -464,51 +470,285 @@ pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
 ///
 /// Those of [`connect`], and `EAGAIN` for a full backlog on Linux.
 pub fn connect_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
-    connect_with(
-        path.as_ref(),
-        ConnectOptions {
-            nonblocking: true,
-            fork: false,
-        },
-    )
-    .map(|(stream, _)| stream)
+    connect_with(path.as_ref(), true)
+}
+
+#[cfg(feature = "any")]
+pub use route::Skipped;
+
+/// Available on crate feature `any` only.
+///
+/// Something an `any` function gave up, compared with std, to reach the path
+/// (the SPEC's "失うもの"). A call returns those of the route it took, as a
+/// list ([`AnyListener::losses`]); none of them implies another, and they
+/// have no order.
+///
+/// The names are promised and only ever added to (the enum is
+/// `#[non_exhaustive]`): read one you do not know as "something was given
+/// up". [`Loss::as_str`] and `Display` give the SPEC's name.
+#[cfg(feature = "any")]
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Loss {
+    /// `respelled`: the address the kernel reports for the bound socket is
+    /// not the path (see the [crate documentation](crate)). It names nothing
+    /// once the call has returned, but it can be seen by other users (Linux's
+    /// `/proc/net/unix`), and where the process's cwd is writable by others
+    /// they can make it again; remove the socket file by the path you passed,
+    /// not by the reported address. Only a bind gives this up.
+    Respelled,
+    /// `forked`: a forked child made the call, with the side effects of a
+    /// fork (see the [crate documentation](crate)). After a connect, the peer
+    /// pid the server sees is the exited child's.
+    Forked,
+    /// `recreatable-spelling`: the address the kernel reports goes through a
+    /// shared place such as `/tmp` (`bind_any`'s symlink), where another user
+    /// can make it again once sockat removed it: whatever later removes the
+    /// socket file by that address could remove a file of that user's
+    /// choosing. Remove it by the path you passed.
+    RecreatableSpelling,
+    /// `cwd-relative`: a relative path went to std as it is, so the address
+    /// the kernel keeps for the bound socket is relative to the cwd: after the
+    /// cwd changes, removing or looking up the socket by it reaches another
+    /// place. std has this risk on its own; it is reported all the same. Not
+    /// for a name in Linux's abstract namespace.
+    CwdRelative,
+}
+
+#[cfg(feature = "any")]
+impl Loss {
+    /// The SPEC's name: `"respelled"`, `"forked"`, `"recreatable-spelling"`
+    /// or `"cwd-relative"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Loss::Respelled => "respelled",
+            Loss::Forked => "forked",
+            Loss::RecreatableSpelling => "recreatable-spelling",
+            Loss::CwdRelative => "cwd-relative",
+        }
+    }
+}
+
+#[cfg(feature = "any")]
+impl std::fmt::Display for Loss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What the route `route` gave up for a bind (`bind`) or a connect to `path`
+/// (SPEC "経路の名前", the column "失うもの").
+#[cfg(feature = "any")]
+fn losses(bind: bool, route: Route, path: &Path) -> Vec<Loss> {
+    match (bind, route) {
+        (true, Route::Standard) if !path.is_absolute() && !path::is_abstract(path) => {
+            vec![Loss::CwdRelative]
+        }
+        (_, Route::Standard) => Vec::new(),
+        (true, Route::SymlinkBind { shared: true }) => {
+            vec![Loss::Respelled, Loss::RecreatableSpelling]
+        }
+        (true, r) if r.forked() => vec![Loss::Respelled, Loss::Forked],
+        (true, _) => vec![Loss::Respelled],
+        (false, r) if r.forked() => vec![Loss::Forked],
+        (false, _) => Vec::new(),
+    }
+}
+
+/// Available on crate feature `any` only.
+///
+/// What [`bind_any`] returns: the listener, what was given up to bind it,
+/// and how it was bound.
+///
+/// The fields are public so the value can be taken apart as it comes. Later
+/// versions may add fields (the struct is `#[non_exhaustive]`), so a pattern
+/// needs `..`:
+///
+/// ```no_run
+/// let path = "/a/very/long/directory/.../server.sock";
+/// let sockat::AnyListener { listener, losses, route, .. } = sockat::bind_any(path)?;
+/// if losses.contains(&sockat::Loss::RecreatableSpelling) {
+///     eprintln!("bound {path} by {route}: others can make its address again");
+/// }
+/// # drop(listener);
+/// # Ok::<(), sockat::AnyError>(())
+/// ```
+#[cfg(feature = "any")]
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct AnyListener {
+    /// The listening socket, std's own type, as [`bind`] returns it.
+    pub listener: UnixListener,
+    /// What was given up to bind it ([`Loss`]), empty when nothing was.
+    /// Branch on this.
+    pub losses: Vec<Loss>,
+    /// The name of the route that bound it (the SPEC's "経路の名前", such as
+    /// `"thread-cwd"` or `"symlink"`). For diagnostics only: routes may be
+    /// added, renamed or changed, so do not branch on it.
+    pub route: &'static str,
+    /// The routes tried before [`AnyListener::route`] and passed over, in the
+    /// order tried, each with why ([`Skipped`]). Empty for a path std took. For
+    /// diagnostics only, like [`AnyListener::route`].
+    pub skipped: Vec<Skipped>,
 }
 
 /// Available on crate feature `any` only.
 ///
 /// What [`connect_any`] and [`connect_any_nonblocking`] return: the stream,
-/// and whether the fork route was taken to connect it.
+/// what was given up to connect it, and how it was connected.
 ///
-/// The fields are public so the value can be taken apart as it comes:
+/// The fields are public so the value can be taken apart as it comes. Later
+/// versions may add fields (the struct is `#[non_exhaustive]`), so a pattern
+/// needs `..`:
 ///
 /// ```no_run
 /// let path = "/a/very/long/directory/.../server.sock";
-/// let sockat::AnyConnection { stream, forked } = sockat::connect_any(path)?;
-/// if forked {
+/// let sockat::AnyConnection { stream, losses, .. } = sockat::connect_any(path)?;
+/// if losses.contains(&sockat::Loss::Forked) {
 ///     eprintln!("connected to {path} through a forked child");
 /// }
 /// # drop(stream);
-/// # Ok::<(), std::io::Error>(())
+/// # Ok::<(), sockat::AnyError>(())
 /// ```
 #[cfg(feature = "any")]
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct AnyConnection {
     /// The connected stream, std's own type. It belongs to this process and
     /// works as usual whichever route made the connection.
     pub stream: UnixStream,
-    /// `true` when the connection was made through the fork route, by a
-    /// forked child that has exited since; `false` on every other route (the
-    /// connection was made by this process). After the fork route, the peer
-    /// pid the server sees is that of the exited child (see
-    /// [`connect_any`]); use this to note it, for example by logging or
-    /// warning about it.
-    pub forked: bool,
+    /// What was given up to connect it ([`Loss`]): [`Loss::Forked`] when a
+    /// forked child that has exited since made the connection, after which
+    /// the peer pid the server sees is that child's (see [`connect_any`]);
+    /// empty when this process made it (a connect's spelling is kept
+    /// nowhere). Branch on this.
+    pub losses: Vec<Loss>,
+    /// The name of the route that connected it, as [`AnyListener::route`].
+    pub route: &'static str,
+    /// The routes passed over before it, as [`AnyListener::skipped`].
+    pub skipped: Vec<Skipped>,
 }
 
 /// Available on crate feature `any` only.
 ///
-/// [`connect`], forking when nothing else reaches the path, and whether it
-/// did.
+/// Why an `any` function did not reach the path: the [`io::Error`], and the
+/// routes tried, for diagnostics.
+///
+/// It converts into the [`io::Error`] as it is (`From`), so `?` in a function
+/// returning [`io::Result`] works and [`io::Error::raw_os_error`] still gives
+/// the errno; the `error` field gives it without the conversion. `Display`
+/// and `source` are those of the [`io::Error`].
+///
+/// The fields are public; later versions may add fields (the struct is
+/// `#[non_exhaustive]`).
+///
+/// ```no_run
+/// let path = "/a/very/long/directory/.../server.sock";
+/// match sockat::connect_any(path) {
+///     Ok(c) => drop(c.stream),
+///     Err(e) => eprintln!("{e} (errno {:?}) after {:?}", e.error.raw_os_error(), e.skipped),
+/// }
+/// ```
+#[cfg(feature = "any")]
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct AnyError {
+    /// The error, as the plain function returns it (for example `ENOENT`, or
+    /// `ENAMETOOLONG` when no route could be used).
+    pub error: io::Error,
+    /// The name of the route that made the call and failed for real (an
+    /// existing file: `EADDRINUSE`, nobody listening: `ECONNREFUSED`, ...);
+    /// `None` when no route could be used, or the path was refused before
+    /// any was tried. For diagnostics only, as [`AnyListener::route`].
+    pub route: Option<&'static str>,
+    /// The routes tried and passed over, in the order tried, as
+    /// [`AnyListener::skipped`].
+    pub skipped: Vec<Skipped>,
+}
+
+#[cfg(feature = "any")]
+impl std::fmt::Display for AnyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+#[cfg(feature = "any")]
+impl std::error::Error for AnyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
+#[cfg(feature = "any")]
+impl From<AnyError> for io::Error {
+    fn from(e: AnyError) -> Self {
+        e.error
+    }
+}
+
+/// The [`AnyError`] of a call that did not reach the path.
+#[cfg(feature = "any")]
+fn any_error(f: route::Failed) -> AnyError {
+    AnyError {
+        error: f.error,
+        route: f.route,
+        skipped: f.skipped,
+    }
+}
+
+/// Available on crate feature `any` only.
+///
+/// [`bind`], and when no route of [`bind`] can be used, a symlink in a place
+/// to the socket's directory as the last resort, accepting what that gives
+/// up; returns what was given up and how the path was bound
+/// ([`AnyListener`]).
+///
+/// Use [`bind`] unless it fails with `ENAMETOOLONG` in an environment you have
+/// to support. The order tried is that of [`bind`], so where [`bind`] reaches
+/// the path this binds the same way. Where [`bind`] would be `ENAMETOOLONG`
+/// (sockat's own directory can be made in no place, and the socket's
+/// directory cannot be opened or R made in it), this makes a symlink
+/// `sockat.XXXXXXXXXX` (10 random letters and digits) to the real path of the
+/// socket's directory in a place, binds by
+/// `<place>/sockat.XXXXXXXXXX/<file name>`, and removes the symlink. The
+/// places are `XDG_RUNTIME_DIR` and `TMPDIR` (each when set to an absolute
+/// path) and `/tmp`: first those only this user can write to (owned by this
+/// user, without write permission for group and others), then the shared ones
+/// (sticky and owned by root or this user, as `/tmp` is). A place that is
+/// neither, or too long for the spelling, is passed over. The spelling is
+/// longer than that of [`bind`]'s routes, so it does not reach a longer file
+/// name than [`bind`] does.
+///
+/// The socket file is created at `path`, as with [`bind`], and the address
+/// the kernel reports is `<place>/sockat.XXXXXXXXXX/<file name>`. Through a
+/// shared place another user can make that name again once the symlink is
+/// gone, so whatever later removes the socket file by the reported address
+/// could remove a file of that user's choosing; remove it by the path you
+/// passed.
+///
+/// # Errors
+///
+/// Those of [`bind`], except that a path the symlink reaches is bound rather
+/// than `ENAMETOOLONG`, as an [`AnyError`] with the routes tried (it
+/// converts into the [`io::Error`] by `?`).
+#[cfg(feature = "any")]
+pub fn bind_any<P: AsRef<Path>>(path: P) -> Result<AnyListener, AnyError> {
+    let path = path.as_ref();
+    let r = route::run_reporting(Request::Bind(BindOptions { symlink: true }), path)
+        .map_err(any_error)?;
+    Ok(AnyListener {
+        listener: UnixListener::from(r.fd),
+        losses: losses(true, r.route, path),
+        route: r.route.name(),
+        skipped: r.skipped,
+    })
+}
+
+/// Available on crate feature `any` only.
+///
+/// [`connect`], forking when nothing else reaches the path, and how it
+/// connected.
 ///
 /// Use [`connect`] (or [`connect_nonblocking`]) unless it fails with
 /// `ENAMETOOLONG` in an environment you have to support: it reaches a long
@@ -520,9 +760,9 @@ pub struct AnyConnection {
 /// fork route last.
 ///
 /// The fork route connects from a forked child that `fchdir`s into the
-/// socket's directory and exits at once. [`AnyConnection::forked`] is `true`
-/// when the fork route was taken, and `false` on every other route (the
-/// connection was made by this process).
+/// socket's directory and exits at once. [`AnyConnection::losses`] holds
+/// [`Loss::Forked`] when the fork route was taken; on every other route the
+/// connection was made by this process, and nothing is given up.
 ///
 /// After the fork route, the peer pid the server sees is that of the child, a
 /// process that has already exited. The stream itself belongs to this process
@@ -536,17 +776,11 @@ pub struct AnyConnection {
 /// # Errors
 ///
 /// Those of [`connect`], except that a path only the fork route reaches is
-/// connected rather than `ENAMETOOLONG`.
+/// connected rather than `ENAMETOOLONG`, as an [`AnyError`] with the routes
+/// tried (it converts into the [`io::Error`] by `?`).
 #[cfg(feature = "any")]
-pub fn connect_any<P: AsRef<Path>>(path: P) -> io::Result<AnyConnection> {
-    connect_with(
-        path.as_ref(),
-        ConnectOptions {
-            nonblocking: false,
-            fork: true,
-        },
-    )
-    .map(|(stream, forked)| AnyConnection { stream, forked })
+pub fn connect_any<P: AsRef<Path>>(path: P) -> Result<AnyConnection, AnyError> {
+    connect_any_with(path.as_ref(), false)
 }
 
 /// Available on crate feature `any` only.
@@ -561,21 +795,31 @@ pub fn connect_any<P: AsRef<Path>>(path: P) -> io::Result<AnyConnection> {
 ///
 /// Those of [`connect_any`], and `EAGAIN` for a full backlog on Linux.
 #[cfg(feature = "any")]
-pub fn connect_any_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<AnyConnection> {
-    connect_with(
-        path.as_ref(),
-        ConnectOptions {
-            nonblocking: true,
-            fork: true,
-        },
-    )
-    .map(|(stream, forked)| AnyConnection { stream, forked })
+pub fn connect_any_nonblocking<P: AsRef<Path>>(path: P) -> Result<AnyConnection, AnyError> {
+    connect_any_with(path.as_ref(), true)
 }
 
-/// The four connects: block or not, fork or not ([`ConnectOptions`]). Returns
-/// the stream and whether the fork route was taken (always `false` without
-/// `fork`).
-pub(crate) fn connect_with(path: &Path, options: ConnectOptions) -> io::Result<(UnixStream, bool)> {
-    route::run(route::Request::Connect(options), path)
-        .map(|(fd, route)| (UnixStream::from(fd), route.forked()))
+/// The two connects that do not fork: block or not.
+fn connect_with(path: &Path, nonblocking: bool) -> io::Result<UnixStream> {
+    let options = ConnectOptions {
+        nonblocking,
+        fork: false,
+    };
+    route::run(Request::Connect(options), path).map(|(fd, _)| UnixStream::from(fd))
+}
+
+/// The two connects that may fork: block or not.
+#[cfg(feature = "any")]
+fn connect_any_with(path: &Path, nonblocking: bool) -> Result<AnyConnection, AnyError> {
+    let options = ConnectOptions {
+        nonblocking,
+        fork: true,
+    };
+    let r = route::run_reporting(Request::Connect(options), path).map_err(any_error)?;
+    Ok(AnyConnection {
+        stream: UnixStream::from(r.fd),
+        losses: losses(false, r.route, path),
+        route: r.route.name(),
+        skipped: r.skipped,
+    })
 }

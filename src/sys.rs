@@ -726,6 +726,47 @@ pub(crate) fn id_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<(u64, u64)>
     Ok((st.st_dev as u64, st.st_ino as u64))
 }
 
+/// What [`stat_at`] reports of an entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StatAt {
+    /// Whether it is a directory (`S_ISDIR`).
+    pub(crate) is_dir: bool,
+    /// The permission bits and the set-id / sticky bits (`st_mode & 0o7777`).
+    pub(crate) mode: u32,
+    /// The owner (`st_uid`).
+    pub(crate) uid: libc::uid_t,
+}
+
+/// The type, mode and owner of `name` inside the directory `dir`, without
+/// following a symlink at `name` (`fstatat(2)` with `AT_SYMLINK_NOFOLLOW`).
+pub(crate) fn stat_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<StatAt> {
+    let name = c_name(name)?;
+    // SAFETY: `stat` is plain old data; zeroed is a valid value.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `name` is NUL-terminated and lives for the call; the kernel
+    // writes at most one `stat` into `st`; `dir` is a borrowed, live fd.
+    cvt(unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    })?;
+    // `mode_t` is u16 on Apple and the BSDs, u32 elsewhere.
+    #[allow(clippy::unnecessary_cast)]
+    let mode = st.st_mode as u32;
+    #[allow(clippy::unnecessary_cast)]
+    let dir_type = libc::S_IFDIR as u32;
+    #[allow(clippy::unnecessary_cast)]
+    let type_mask = libc::S_IFMT as u32;
+    Ok(StatAt {
+        is_dir: mode & type_mask == dir_type,
+        mode: mode & 0o7777,
+        uid: st.st_uid,
+    })
+}
+
 /// `symlinkat(2)`: create the symlink `name` inside the directory `dir`,
 /// pointing to `target`. An existing `name` is `EEXIST`, never replaced.
 pub(crate) fn symlink_at(

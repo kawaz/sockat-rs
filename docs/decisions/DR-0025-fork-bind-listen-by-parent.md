@@ -27,7 +27,7 @@
 ## 理由
 
 - listen した側が peer の資格情報の持ち主になる。子に listen させると、クライアントは死んだプロセスを相手と見る
-- sockat-rs でも確かめた (2026-11-18、macOS 26.5 と Linux の docker): 試験 `a_client_sees_this_process_as_the_server_of_a_fork_route_bind` は、クライアント側の `LOCAL_PEERPID` / `SO_PEERCRED` が accept の前、送受信の前、送受信の後のどれも親の pid であることを確かめる。子に listen させ親の listen を外すと、どちらの OS でも accept の前の時点で子の pid が見えて落ちる
+- sockat-rs でも確かめた (2026-11-18、macOS 26.5 と Linux の docker): 試験 `a_client_sees_this_process_as_the_server_of_a_bind_by_fork` は、クライアント側の `LOCAL_PEERPID` / `SO_PEERCRED` が accept の前、送受信の前、送受信の後のどれも親の pid であることを確かめる。子に listen させ親の listen を外すと、どちらの OS でも accept の前の時点で子の pid が見えて落ちる
 
 ## 却下した案
 

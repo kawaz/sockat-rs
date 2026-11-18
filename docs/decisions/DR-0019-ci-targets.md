@@ -18,7 +18,7 @@
 | msrv | Rust 1.85 | `cargo check --all-features` |
 | audit | RUSTSEC | cargo-audit |
 
-- 試験・clippy・check は `--all-features` で回す (feature `any` の関数も試験する。[DR-0022](DR-0022-connect-any-behind-feature.md))
+- 試験・clippy・check は `--all-features` で回す (feature `any` の関数も試験する。[DR-0029](DR-0029-any-functions.md))
 - 試験は nextest で回し、試験 1 本の slow-timeout を 60 秒 × 3 にする (`.config/nextest.toml`)。CI で nextest が無ければ失敗させる
 - job の `timeout-minutes` は外側の上限
 - 手元では `just test` (macOS) と `just test-linux` (docker で Linux) の両方で回す

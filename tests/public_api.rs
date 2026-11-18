@@ -98,7 +98,8 @@ fn bind_and_connect_work_at_any_length() {
 // without forking on every platform (through sockat's own directory in /tmp,
 // or on the targets without a central means for a connect the symlink under
 // /tmp, both whatever the directory depth), so the two connects that may fork
-// report that they did not, and the two that may not connect as well. The
+// report that they gave up nothing (no fork; a connect's spelling is kept
+// nowhere), and the two that may not connect as well. The
 // nonblocking ones hand back a stream that does not wait: a read with nothing
 // to read is WouldBlock.
 #[test]
@@ -124,16 +125,18 @@ fn in_an_ordinary_environment_no_connect_forks() {
         {
             let sockat::AnyConnection {
                 stream: mut c,
-                forked,
+                losses,
+                ..
             } = sockat::connect_any(&p).unwrap();
-            assert!(!forked, "{total}");
+            assert_eq!(losses, [], "{total}");
             ping(&listener, &mut c);
 
             let sockat::AnyConnection {
                 stream: mut c,
-                forked,
+                losses,
+                ..
             } = sockat::connect_any_nonblocking(&p).unwrap();
-            assert!(!forked, "{total}");
+            assert_eq!(losses, [], "{total}");
             let e = c.read(&mut buf).unwrap_err();
             assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{total}");
         }
@@ -177,12 +180,13 @@ fn a_long_file_name_is_connected_to_without_forking() {
     {
         let sockat::AnyConnection {
             stream: mut c,
-            forked,
+            losses,
+            ..
         } = sockat::connect_any(&p).unwrap();
-        assert!(!forked);
+        assert_eq!(losses, []);
         ping(&listener, &mut c);
         let any = sockat::connect_any_nonblocking(&p).unwrap();
-        assert!(!any.forked);
+        assert_eq!(any.losses, []);
     }
 }
 

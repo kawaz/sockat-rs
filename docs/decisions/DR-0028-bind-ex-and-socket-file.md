@@ -60,12 +60,12 @@ impl SocketFile {
 
 ## 未確定
 
-- `discard()` が listener を閉じるか (ハブ D12-Q4)。今は閉じない
-- 名前 (`bind_ex` / `SocketFile`) は仮
+- 名前 `bind_ex` / `SocketFile` は仮 (`discard` は確定)
 
 ## 判断の出所
 
 - `_ex` の振る舞い (realpath と `(st_dev, st_ino)` を覚え、同じ時だけ消す、bind の直後に覚え、覚えられなければエラー): ハブの SPEC (2026-11-19)
-- Rust の形 (`bind_ex(path) -> (UnixListener, SocketFile)`、`discard(self)`、Drop では消さない、derive Debug、listener を閉じるのは利用者): 統括の裁定 2026-11-19 (ハブ D12-Q4 で kawaz 確認中)
+- `discard()` は消すだけで listener を閉じない、名前 `discard`: kawaz 裁定 2026-11-19 (ハブ DR-0014、D12-Q4)
+- Rust の形 (`bind_ex(path) -> (UnixListener, SocketFile)`、`discard(self)`、Drop では消さない、derive Debug): 統括の裁定 2026-11-19 (ハブ DR-0014 の表と同じ)
 - 何も無い時・すり替えられていた時も `Ok(())`: 実装側の判断 2026-11-19 (ハブ SPEC で確定)
 - 確かめられない時はエラー: ハブ SPEC 8b001a76 (sockat-py の指摘)
