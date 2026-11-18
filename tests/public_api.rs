@@ -82,6 +82,10 @@ fn bind_and_connect_work_at_any_length() {
             assert!(is_socket(&p), "{total}: {p:?}");
             let mut client = sockat::connect(&p).unwrap();
             ping(&listener, &mut client);
+            // Closed before the unlink: on illumos an unlink followed by the
+            // close can make a concurrent bind fail with EADDRINUSE (a race in
+            // the kernel).
+            drop((client, listener));
             std::fs::remove_file(&p).unwrap();
             assert!(!is_socket(&p));
         }
@@ -194,6 +198,10 @@ fn a_short_path_behaves_exactly_like_std() {
                 .as_pathname()
                 .map(Path::to_path_buf),
         );
+        // Closed before the unlink: on illumos an unlink followed by the
+        // close can make a concurrent bind fail with EADDRINUSE (a race in
+        // the kernel).
+        drop((listener, client, accepted));
         std::fs::remove_file(&p).unwrap();
         addrs
     };
