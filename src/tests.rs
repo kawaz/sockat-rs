@@ -1457,6 +1457,67 @@ mod linux {
         std::fs::remove_dir(&made).unwrap();
     }
 
+    // What fails the checks of HeldDir::hold is someone else's, and so is
+    // everything in it: it is neither used nor emptied. In particular a
+    // replacement that already holds an `s` of its own must keep it (only an
+    // `s` that sockat's own symlinkat made is ever removed), and one holding
+    // other files keeps those. Each replacement is a directory put at the
+    // name between the mkdir and the open, given away by group / other
+    // permission (0755) or (as root only) by another owner.
+    #[test]
+    fn a_replaced_directory_is_left_with_its_contents() {
+        use crate::route::posix::HeldDir;
+        use std::os::unix::fs::PermissionsExt;
+        let places = tmp();
+        let bad = unsafe_place(places.path(), "bad");
+        let other = tmp();
+        let target = other.path().join("target.sock");
+        let theirs = other.path().join("theirs.sock");
+        let proc = Path::new(linux::PROC_SELF_FD);
+        let name = || Ok(String::from("sockat.BBBBBBBBBB"));
+        let replaced = |give_away: &dyn Fn(&Path)| {
+            let made = HeldDir::make_private_dir(&bad, name).unwrap();
+            give_away(&made);
+            std::os::unix::fs::symlink(&theirs, made.join("s")).unwrap();
+            std::fs::write(made.join("note"), b"theirs").unwrap();
+            let e = HeldDir::hold(made.clone(), &target, proc).err().unwrap();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+            assert_eq!(std::fs::read_link(made.join("s")).unwrap(), theirs);
+            assert_eq!(std::fs::read(made.join("note")).unwrap(), b"theirs");
+            std::fs::remove_file(made.join("s")).unwrap();
+            std::fs::remove_file(made.join("note")).unwrap();
+            std::fs::remove_dir(&made).unwrap();
+        };
+        replaced(&|d| std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap());
+        if sys::effective_uid() != 0 {
+            eprintln!("skipped the other user's directory: only root can chown");
+            return;
+        }
+        replaced(&|d| std::os::unix::fs::chown(d, Some(65534), None).unwrap());
+    }
+
+    // A place that is not a directory (here a file of ours with mode 0600,
+    // which the owner and mode test alone would call safe) is no place for
+    // either form of the symlink route: nothing is created and the next
+    // route is taken (with the thread-cwd route off, ENAMETOOLONG for a
+    // connect that may not fork), and the file is unchanged.
+    #[test]
+    fn a_place_that_is_not_a_directory_is_used_by_neither_form() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tmp();
+        let file = t.path().join("file");
+        std::fs::write(&file, b"keep").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!crate::route::posix::safe_base(&file));
+        let p = t.path().join("n".repeat(95));
+        let c = held_cfg(&[&file]);
+        let (_l, r) = route::run_long(BIND, &p, &c).unwrap();
+        assert!(matches!(r, Route::Fork { .. }), "{r:?}");
+        let e = route::run_long(CONNECT, &p, &c).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{e}");
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+    }
+
     // The held directory is reached through its fd, not its name. Another user
     // renaming it away and putting their own directory at its name changes
     // nothing for the connect: /proc/self/fd/<fd>/s still names the link in
@@ -2354,6 +2415,31 @@ mod posix {
             posix::only_we_can_replace(0o700, 0, 0),
             "root's own, for root"
         );
+    }
+
+    // A safe place must be a directory, judged through symlinks as the
+    // kernel would resolve a path through it. A file of ours with mode 0600
+    // or 0700 has the owner and mode a private TMPDIR has, yet nothing can be
+    // created in it, so it is not safe; a symlink to such a file neither. A
+    // symlink to a safe directory is (macOS's /tmp is one to /private/tmp).
+    #[test]
+    fn a_place_for_the_symlink_must_be_a_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tmp();
+        for mode in [0o600, 0o700] {
+            let file = t.path().join(format!("file{mode:o}"));
+            std::fs::write(&file, b"").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(!posix::safe_base(&file), "{mode:o}");
+            let link = t.path().join(format!("link{mode:o}"));
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            assert!(!posix::safe_base(&link), "{mode:o}");
+        }
+        let dir = place(t.path(), "dir", 0o700);
+        assert!(posix::safe_base(&dir));
+        let link = t.path().join("linkdir");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(posix::safe_base(&link));
     }
 
     /// A directory `name` under `parent` with exactly `mode` (set after

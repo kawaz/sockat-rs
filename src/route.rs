@@ -925,10 +925,13 @@ pub(crate) mod posix {
     /// `/private/tmp`), is a directory where no other user (root aside) can
     /// remove or rename an entry, so the symlink cannot be replaced between
     /// its creation and the bind / connect through it ([`only_we_can_replace`]
-    /// on its mode and owner). `false` when it cannot be looked up.
+    /// on its mode and owner). `false` when it cannot be looked up or is not a
+    /// directory (a file of ours with mode 0600 passes the mode and owner
+    /// test, yet is no place for anything).
     pub(crate) fn safe_base(base: &Path) -> bool {
-        std::fs::metadata(base)
-            .is_ok_and(|m| only_we_can_replace(m.mode(), m.uid(), sys::effective_uid()))
+        std::fs::metadata(base).is_ok_and(|m| {
+            m.is_dir() && only_we_can_replace(m.mode(), m.uid(), sys::effective_uid())
+        })
     }
 
     /// Whether, in a directory of `mode` owned by `owner`, only the user `us`
@@ -1043,10 +1046,14 @@ pub(crate) mod posix {
     /// fd keeps naming the directory sockat made. A replacement between
     /// `mkdir` and `open` is what the checks of [`HeldDir::hold`] are for.
     ///
-    /// On drop: `s` is removed through the fd, then the directory by its name,
-    /// but only while that name is still the held directory (same
-    /// `(st_dev, st_ino)` as the fd), so a directory put in its place is left
-    /// alone. Failures are ignored, as for [`TempLink`].
+    /// A value exists only once the directory passed the checks of
+    /// [`HeldDir::hold`] (what fails them is someone else's and is left alone,
+    /// its contents included), and `linked` is set only once this value's own
+    /// `symlinkat` made `s`. On drop: `s` is removed through the fd if this
+    /// value made it, then the directory by its name, but only while that
+    /// name is still the held directory (same `(st_dev, st_ino)` as the fd),
+    /// so a directory put in its place is left alone. Failures are ignored,
+    /// as for [`TempLink`].
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) struct HeldDir {
         pub(crate) path: PathBuf,
