@@ -142,6 +142,26 @@ fn config(bases: &[&Path]) -> Config {
     c
 }
 
+/// The symlink route a request takes: a bind goes through a link to the
+/// socket's directory, a connect through a link to the socket file (DR-0001
+/// decision 3 c).
+#[cfg(not(target_os = "freebsd"))]
+fn symlink(req: Request) -> Route {
+    match req {
+        Request::Bind => Route::SymlinkToDir,
+        Request::Connect(_) => Route::SymlinkToFile,
+    }
+}
+
+/// [`symlink`] in the widened sockaddr (Apple).
+#[cfg(target_vendor = "apple")]
+fn symlink_wide(req: Request) -> Route {
+    match req {
+        Request::Bind => Route::SymlinkToDirWide,
+        Request::Connect(_) => Route::SymlinkToFileWide,
+    }
+}
+
 fn errno(e: &io::Error) -> Option<i32> {
     e.raw_os_error()
 }
@@ -237,9 +257,10 @@ const FULL_BACKLOG: i32 = libc::ECONNREFUSED;
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 type Way = std::sync::Arc<dyn Fn(Request) -> io::Result<(OwnedFd, Route)> + Send + Sync>;
 
-/// Whether a route is the one a [`Way`] must take.
+/// Whether a route is the one a [`Way`] must take for a request (the
+/// symlink route differs between a bind and a connect).
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-type Want = fn(Route) -> bool;
+type Want = fn(Request, Route) -> bool;
 
 /// Run `f` on another thread and return its result, failing the test if it
 /// has not returned within 10 seconds.
@@ -299,11 +320,11 @@ fn peer_pid(server: &UnixStream) -> libc::pid_t {
 fn check_nonblocking_connect(way: &Way, want: Want, what: &str) {
     use std::os::fd::AsFd;
     let (l, r) = way(BIND).unwrap();
-    assert!(want(r), "{what}: bind {r:?}");
+    assert!(want(BIND, r), "{what}: bind {r:?}");
     let listener = UnixListener::from(l);
 
     let (c, r) = way(CONNECT_ANY).unwrap();
-    assert!(want(r), "{what}: blocking {r:?}");
+    assert!(want(CONNECT_ANY, r), "{what}: blocking {r:?}");
     assert!(
         !nonblocking(&c),
         "{what}: a blocking connect stays blocking"
@@ -312,7 +333,7 @@ fn check_nonblocking_connect(way: &Way, want: Want, what: &str) {
 
     let w = way.clone();
     let (c, r) = at_once(move || w(CONNECT_ANY_NB)).unwrap();
-    assert!(want(r), "{what}: nonblocking {r:?}");
+    assert!(want(CONNECT_ANY_NB, r), "{what}: nonblocking {r:?}");
     assert!(nonblocking(&c), "{what}: not O_NONBLOCK");
     let mut c = UnixStream::from(c);
     let (mut s, _) = listener.accept().unwrap();
@@ -335,7 +356,7 @@ fn check_nonblocking_connect(way: &Way, want: Want, what: &str) {
         let w = way.clone();
         match at_once(move || w(CONNECT_ANY_NB)) {
             Ok((c, r)) => {
-                assert!(want(r), "{what}: {r:?}");
+                assert!(want(CONNECT_ANY_NB, r), "{what}: {r:?}");
                 assert!(nonblocking(&c), "{what}: not O_NONBLOCK");
                 queued.push(c);
             }
@@ -385,7 +406,7 @@ fn check_fork_and_peer(way: &Way, want: Want, forks: bool, what: &str) {
             continue;
         }
         let (c, r) = way(req).unwrap();
-        assert!(want(r), "{what} {req:?}: {r:?}");
+        assert!(want(req, r), "{what} {req:?}: {r:?}");
         assert_eq!(nonblocking(&c), o.nonblocking, "{what} {req:?}");
         let (s, _) = listener.accept().unwrap();
         let seen = peer_pid(&s);
@@ -551,21 +572,43 @@ fn long_path_failures_are_the_kernels_errors() {
     }
 }
 
-// A file name that is too long for every route is ENAMETOOLONG. Every route
-// that does not hand the whole path to the kernel ends with the file name
-// alone in a sockaddr (Linux: behind "/proc/self/fd/N/"; macOS: in a widened
-// sockaddr of at most 253 bytes; the fork route: as is), so a name of 254 bytes
-// (NAME_MAX is 255) cannot be reached anywhere.
+// A file name of 254 bytes (NAME_MAX is 255) directly under a short directory.
+//
+// * bind: every route that does not hand the whole path to the kernel ends
+//   with the file name in a sockaddr (Linux: behind "/proc/self/fd/N/", the
+//   link to the directory and the fork route: as is, macOS: at most 253 bytes
+//   in the widened sockaddr; FreeBSD: bindat), so no bind route reaches it:
+//   ENAMETOOLONG, and nothing is created.
+// * connect: the link to the socket file is spelled without the file name, so
+//   the name's length does not matter (every target but FreeBSD, where
+//   connectat takes the name as bind does). A socket bound under a short name
+//   and renamed to the long one is reached and talks; with nothing there the
+//   error is the kernel's ENOENT, not ENAMETOOLONG. The route order here is the
+//   public one (TMPDIR, then /tmp), and the plain `connect` reaches it: no fork.
 #[test]
-fn a_file_name_too_long_for_any_route_is_enametoolong() {
+fn a_file_name_of_254_bytes_cannot_be_bound_but_can_be_connected_to() {
     let t = tmp();
     let name = "n".repeat(254);
     let p = t.path().join(&name);
-    for op in [BIND, CONNECT_ANY] {
-        let e = route::run(op, &p).unwrap_err();
-        assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{op:?}: {e}");
-    }
+    let e = route::run(BIND, &p).unwrap_err();
+    assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{e}");
     assert!(!is_socket(&p));
+
+    #[cfg(target_os = "freebsd")]
+    {
+        let e = route::run(CONNECT_ANY, &p).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{e}");
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        let e = route::run(CONNECT, &p).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::ENOENT), "{e}");
+        let (l, _) = route::run(BIND, &t.path().join("s.sock")).unwrap();
+        std::fs::rename(t.path().join("s.sock"), &p).unwrap();
+        let (c, r) = route::run(CONNECT, &p).unwrap();
+        assert!(!r.forked(), "{r:?}");
+        ping(l, c);
+    }
 }
 
 // A long path that does not end with a file name, or that contains a NUL, is
@@ -632,7 +675,7 @@ fn the_public_connects_return_the_stream_as_asked_and_report_no_fork_without_one
 }
 
 // The fork route (forced here; the last resort on every target but FreeBSD,
-// on Linux only without /proc) binds and connects relative to the directory
+// on Linux only when the /proc route cannot be used) binds and connects relative to the directory
 // fd from a forked child that fchdirs. The parent's socket is the one bound / connected
 // (fork shares the open file description), the socket file is in the
 // directory, and the parent's cwd is untouched.
@@ -813,18 +856,73 @@ mod linux {
     }
 
     // "/proc/self/fd/<n>/" takes about 17 bytes of the 107 that sun_path holds
-    // on Linux, so a file name of 95 bytes cannot be reached and must be
-    // ENAMETOOLONG (not std's own InvalidInput for a long path, which would
-    // differ from the other platforms). With /proc there, no other route is
-    // tried, so a place for the symlink changes nothing.
+    // on Linux, so a file name of 95 bytes does not fit behind it. That makes
+    // the /proc route unusable, as no /proc does (kawaz's ruling), and the
+    // POSIX order runs with the real /proc in place (the path is far from the
+    // cwd, so not relative):
+    //
+    // * bind: the link to the directory does not fit either (18 + 1 + 95 >
+    //   100 under /tmp), so the fork route binds it, up to the 107 bytes of
+    //   its sockaddr; a name of 108 is ENAMETOOLONG;
+    // * connect: the link to the socket file takes it without forking, for
+    //   all four connects; without a place for the link, connect_any forks
+    //   and connect is ENAMETOOLONG.
+    //
+    // A name of 80 bytes still fits behind /proc and takes that route.
     #[test]
-    fn a_file_name_that_does_not_fit_behind_proc_is_enametoolong() {
+    fn a_file_name_that_does_not_fit_behind_proc_takes_the_posix_order() {
         let t = tmp();
+        let tmp_base = config(&[Path::new("/tmp")]);
+        let no_base = config(&[]);
+
         let p = t.path().join("n".repeat(95));
-        for req in [BIND, CONNECT_ANY] {
-            let e = route::run_long(req, &p, &config(&[Path::new("/tmp")])).unwrap_err();
-            assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{e}");
+        let (l, r) = route::run_long(BIND, &p, &tmp_base).unwrap();
+        assert!(matches!(r, Route::Fork { .. }), "{r:?}");
+        assert!(is_socket(&p));
+        let listener = UnixListener::from(l);
+        for req in [CONNECT, CONNECT_NB, CONNECT_ANY, CONNECT_ANY_NB] {
+            let (c, r) = route::run_long(req, &p, &tmp_base).unwrap();
+            assert_eq!(r, Route::SymlinkToFile, "{req:?}");
+            ping(OwnedFd::from(listener.try_clone().unwrap()), c);
         }
+        let e = route::run_long(CONNECT, &p, &no_base).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{e}");
+        let (c, r) = route::run_long(CONNECT_ANY, &p, &no_base).unwrap();
+        assert!(matches!(r, Route::Fork { .. }), "{r:?}");
+        ping(OwnedFd::from(listener), c);
+
+        let longest = t.path().join("m".repeat(107));
+        let (_l, r) = route::run_long(BIND, &longest, &tmp_base).unwrap();
+        assert!(matches!(r, Route::Fork { .. }), "{r:?}");
+        assert!(is_socket(&longest));
+        let e = route::run_long(BIND, &t.path().join("o".repeat(108)), &tmp_base).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{e}");
+
+        let fits = t.path().join("f".repeat(80));
+        let (l, r) = route::run_long(BIND, &fits, &tmp_base).unwrap();
+        assert_eq!(r, Route::ProcFd);
+        let (c, r) = route::run_long(CONNECT, &fits, &tmp_base).unwrap();
+        assert_eq!(r, Route::ProcFd);
+        ping(l, c);
+    }
+
+    // Why a bind never goes through a link to the socket file: Linux does not
+    // follow a symlink in the last component of a bind, it finds the name
+    // taken (EADDRINUSE), even when the link dangles. A connect follows it.
+    // Pinned so the reason for the two shapes of the symlink route stays
+    // checkable.
+    #[test]
+    fn linux_binds_not_through_a_link_to_the_file_but_connects_through_it() {
+        let t = tmp();
+        let target = t.path().join("s.sock");
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let e = UnixListener::bind(&link).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::EADDRINUSE), "{e}");
+        assert!(!is_socket(&target));
+        let l = UnixListener::bind(&target).unwrap();
+        let c = UnixStream::connect(&link).unwrap();
+        ping(OwnedFd::from(l), OwnedFd::from(c));
     }
 
     /// A stand-in for `/proc/self/fd` on a system without /proc: a path under
@@ -898,13 +996,14 @@ mod linux {
         let far = nest(t.path(), 600, "sym.sock");
         let none = no_proc(t.path(), false);
         let c = with_proc(&none, &[base.path()]);
-        for (p, want) in [(&near, Route::Relative), (&far, Route::Symlink)] {
+        let relative: fn(Request) -> Route = |_| Route::Relative;
+        for (p, want) in [(&near, relative), (&far, symlink)] {
             let (l, r) = route::run_long(BIND, p, &c).unwrap();
-            assert_eq!(r, want);
+            assert_eq!(r, want(BIND));
             assert!(is_socket(p));
             let listener = UnixListener::from(l);
             let (cl, r) = route::run_long(CONNECT, p, &c).unwrap();
-            assert_eq!(r, want);
+            assert_eq!(r, want(CONNECT));
             // `ping` consumes a duplicate fd, so the listener stays open for
             // the connect through /proc below.
             ping(OwnedFd::from(listener.try_clone().unwrap()), cl);
@@ -977,8 +1076,8 @@ mod linux {
     // The side effect documented for the fork route: SO_PEERCRED is recorded
     // at connect time and keeps the pid of the child that connected, even
     // after the child has exited and the real client process has sent data.
-    // This is why Linux forks only without /proc, and why `sockat::connect`
-    // never forks; pinned here so the reason stays checkable.
+    // This is why Linux forks only when the /proc route cannot be used, and
+    // why `sockat::connect` never forks; pinned here so the reason stays checkable.
     #[test]
     fn so_peercred_keeps_the_pid_of_a_forked_connector() {
         let t = tmp();
@@ -1038,31 +1137,31 @@ mod linux {
                 "ProcFd",
                 nest(t, 300, "proc.sock"),
                 with_proc(proc, &[]),
-                |r| r == Route::ProcFd,
+                |_, r| r == Route::ProcFd,
             ),
             (
                 "Relative",
                 cwd.join(nest(rel_base, 99, "rel.sock")),
                 with_proc(&none, &[]),
-                |r| r == Route::Relative,
+                |_, r| r == Route::Relative,
             ),
             (
                 "Symlink",
                 nest(t, 600, "sym.sock"),
                 with_proc(&none, &[d.base.path()]),
-                |r| r == Route::Symlink,
+                |req, r| r == symlink(req),
             ),
             (
                 "Fork",
                 nest(t, 600, "fork.sock"),
                 with_proc(&none, &[]),
-                |r| matches!(r, Route::Fork { .. }),
+                |_, r| matches!(r, Route::Fork { .. }),
             ),
         ];
         let mut ways: Vec<(&'static str, Way, Want)> = vec![(
             "Direct",
             std::sync::Arc::new(move |req| route::run(req, &direct)),
-            |r| r == Route::Direct,
+            |_, r| r == Route::Direct,
         )];
         ways.extend(cases.into_iter().map(|(what, p, c, want)| {
             let way: Way = std::sync::Arc::new(move |req| route::run_long(req, &p, &c));
@@ -1102,7 +1201,8 @@ mod linux {
 }
 
 // ---------------------------------------------------------------------------
-// The POSIX route order: every target but FreeBSD (on Linux, without /proc)
+// The POSIX route order: every target but FreeBSD (on Linux, when the /proc
+// route cannot be used)
 // ---------------------------------------------------------------------------
 
 #[cfg(not(target_os = "freebsd"))]
@@ -1188,11 +1288,11 @@ mod posix {
     }
 
     // A path far from the cwd (600 bytes under /tmp, so no relative spelling
-    // fits) goes through a symlink `<base>/sockat.XXXXXXXXXX` to the socket's
-    // directory; with a short base the path through the link fits the plain
-    // sockaddr. The socket is created in the real directory (the link is to
-    // the directory, not to the socket), and the base is empty afterwards:
-    // the link is removed once the call returns.
+    // fits) goes through a symlink `<base>/sockat.XXXXXXXXXX`: a bind through
+    // one to the socket's directory, so the socket is created in the real
+    // directory; a connect through one to the socket file. With a short base
+    // both spellings fit the plain sockaddr. The base is empty afterwards: the
+    // link is removed once the call returns.
     #[test]
     fn a_path_far_from_the_cwd_goes_through_a_temporary_symlink() {
         let t = tmp();
@@ -1200,18 +1300,84 @@ mod posix {
         let base = tmp();
         let c = cfg(&[base.path()]);
         let (l, r) = route::run_long(BIND, &p, &c).unwrap();
-        assert_eq!(r, Route::Symlink);
+        assert_eq!(r, Route::SymlinkToDir);
         assert!(is_socket(&p));
         let (cl, r) = route::run_long(CONNECT, &p, &c).unwrap();
-        assert_eq!(r, Route::Symlink);
+        assert_eq!(r, Route::SymlinkToFile);
         ping(l, cl);
         assert_empty(base.path());
     }
 
+    // The link to the socket file is spelled `<base>/sockat.XXXXXXXXXX`
+    // whatever the file name, so a connect reaches a name too long for the
+    // link to the directory (`<base>/sockat.XXXXXXXXXX/<name>` over 100 bytes,
+    // on Apple also over 253 in the widened form), which a bind has to fork
+    // for. No connect forks there, the plain `connect` included, and nothing
+    // is left under the base.
+    #[test]
+    fn a_connect_reaches_a_file_name_too_long_for_the_link_to_the_directory() {
+        let t = tmp();
+        let base = tmp();
+        #[allow(unused_mut)]
+        let mut cases = vec![(plain(&[base.path()]), 90)];
+        #[cfg(target_vendor = "apple")]
+        cases.push((cfg(&[base.path()]), 240));
+        for (c, n) in cases {
+            let p = nest(t.path(), 600, &"n".repeat(n));
+            let (l, r) = route::run_long(BIND, &p, &c).unwrap();
+            assert!(matches!(r, Route::Fork { .. }), "{n}: {r:?}");
+            let listener = UnixListener::from(l);
+            for req in [CONNECT, CONNECT_ANY] {
+                let (cl, r) = route::run_long(req, &p, &c).unwrap();
+                assert_eq!(r, Route::SymlinkToFile, "{n} {req:?}");
+                ping(OwnedFd::from(listener.try_clone().unwrap()), cl);
+            }
+        }
+        assert_empty(base.path());
+    }
+
+    // Both links hold the path as the caller wrote it, so the kernel resolves
+    // them as it resolves the path: a `..` right after a symlink climbs out of
+    // the symlink's target, not out of the directory the symlink sits in.
+    // With `<t>/link -> <t>/real/sub`, `<t>/link/../x/...` names
+    // `<t>/real/x/...`; a socket at `<t>/x/...` (where a lexical `..` would
+    // lead) is a decoy that must not be reached. The bind goes through the
+    // link to the directory, the connect through the link to the file.
+    #[test]
+    fn the_links_resolve_the_path_as_the_kernel_does() {
+        let t = tmp();
+        let base = tmp();
+        let real = t.path().join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        std::os::unix::fs::symlink(real.join("sub"), t.path().join("link")).unwrap();
+        let at_real = nest_tail(&real.join("x"), 500, "s.sock");
+        let below = at_real.strip_prefix(&real).unwrap();
+        let spelled = t.path().join("link/..").join(below);
+        let decoy = t.path().join(below);
+        std::fs::create_dir_all(decoy.parent().unwrap()).unwrap();
+        let c = cfg(&[base.path()]);
+
+        let (l, r) = route::run_long(BIND, &spelled, &c).unwrap();
+        assert_eq!(r, Route::SymlinkToDir);
+        assert!(is_socket(&at_real));
+        assert!(!is_socket(&decoy));
+        let (decoy_l, _) = route::run(BIND, &decoy).unwrap();
+        let decoy_l = UnixListener::from(decoy_l);
+        decoy_l.set_nonblocking(true).unwrap();
+
+        let (cl, r) = route::run_long(CONNECT, &spelled, &c).unwrap();
+        assert_eq!(r, Route::SymlinkToFile);
+        ping(l, cl);
+        let e = decoy_l.accept().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+        assert_empty(base.path());
+    }
+
     // The symlink route checks the length through the link before creating
-    // anything: a base so long that no sockaddr carries
-    // `<base>/sockat.XXXXXXXXXX/<name>` (on Apple, not even the widened form)
-    // is skipped without touching the base, and the fork route takes over.
+    // anything: a base so long that no sockaddr carries even
+    // `<base>/sockat.XXXXXXXXXX` (the spelling of the link to the file; on
+    // Apple, not even the widened form) is skipped without touching the base,
+    // and the fork route takes over for bind and connect alike.
     #[test]
     fn a_base_too_long_for_the_symlink_route_falls_back_to_fork() {
         let t = tmp();
@@ -1251,21 +1417,21 @@ mod posix {
             (&[Path::new("/nonexistent")], true),
             (&[], true),
         ];
-        let way = |r: Route, forked: bool| {
+        let way = |req: Request, r: Route, forked: bool| {
             if forked {
                 matches!(r, Route::Fork { .. })
             } else {
-                r == Route::Symlink
+                r == symlink(req)
             }
         };
         for (i, (base, forked)) in cases.into_iter().enumerate() {
             let p = p.with_file_name(format!("{i}.sock"));
             let c = plain(base);
             let (l, r) = route::run_long(BIND, &p, &c).unwrap();
-            assert!(way(r, forked), "{base:?} {r:?}");
+            assert!(way(BIND, r, forked), "{base:?} {r:?}");
             assert!(is_socket(&p));
             let (cl, r) = route::run_long(CONNECT_ANY, &p, &c).unwrap();
-            assert!(way(r, forked), "{base:?} {r:?}");
+            assert!(way(CONNECT_ANY, r, forked), "{base:?} {r:?}");
             ping(l, cl);
         }
         assert_empty(short_base.path());
@@ -1273,9 +1439,12 @@ mod posix {
     }
 
     // A failure through the symlink is the kernel's error for the target
-    // (EADDRINUSE for an existing socket, ENOENT for a missing directory, since
-    // a link to a missing directory dangles), it is not retried on the fork
-    // route, and the link is removed in the failure case too.
+    // (bind through the link to the directory: EADDRINUSE for an existing
+    // socket, ENOENT for a missing directory, since a link to a missing
+    // directory dangles; connect through the link to the file: ENOENT for a
+    // missing socket, ECONNREFUSED for a socket nobody listens on), it is not
+    // retried on the fork route, and the link is removed in the failure case
+    // too.
     #[test]
     fn symlink_route_failures_are_reported_and_cleaned_up() {
         let t = tmp();
@@ -1290,6 +1459,12 @@ mod posix {
         assert_eq!(errno(&e), Some(libc::ENOENT), "{e}");
         let e = route::run_long(CONNECT_ANY, &p.with_file_name("x.sock"), &c).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ENOENT), "{e}");
+        let e = route::run_long(CONNECT_ANY, &missing, &c).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::ENOENT), "{e}");
+        let stale = p.with_file_name("stale.sock");
+        stale_socket(&stale);
+        let e = route::run_long(CONNECT_ANY, &stale, &c).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::ECONNREFUSED), "{e}");
         assert_empty(base.path());
     }
 
@@ -1371,6 +1546,7 @@ mod posix {
 
     // A base the link cannot be created in (missing, or a file) makes the
     // symlink route unusable rather than an error: the next route is tried.
+    // The same for the link to the directory (bind) and to the file (connect).
     #[test]
     fn an_unusable_base_skips_the_symlink_route() {
         let t = tmp();
@@ -1379,8 +1555,10 @@ mod posix {
         let file = t.path().join("file");
         std::fs::write(&file, b"").unwrap();
         for base in [Path::new("/nonexistent"), file.as_path()] {
-            let out = posix::symlink_route(BIND, base, dir, name, DIRECT_MAX);
-            assert!(matches!(out, SymlinkOutcome::Unusable), "{base:?}");
+            for req in [BIND, CONNECT] {
+                let out = posix::symlink_route(req, base, &p, dir, name, DIRECT_MAX);
+                assert!(matches!(out, SymlinkOutcome::Unusable), "{base:?} {req:?}");
+            }
         }
         assert!(!is_socket(&p));
     }
@@ -1413,11 +1591,12 @@ mod posix {
         );
     }
 
-    // The symlink goes under the first place where `<place>/sockat.XXXXXXXXXX/
-    // <name>` fits. A TMPDIR so long that even the widened form cannot carry
-    // the path through it (the situation of a deeply nested TMPDIR) is passed
-    // over without creating anything in it, and /tmp, the next place, is used:
-    // through a short place the path fits the plain sockaddr (Symlink). The
+    // The symlink goes under the first place where the spelling through it
+    // fits. A TMPDIR so long that even the widened form cannot carry it (the
+    // situation of a deeply nested TMPDIR) is passed over without creating
+    // anything in it, and /tmp, the next place, is used: through a short
+    // place the spelling fits the plain sockaddr (SymlinkToDir for the bind,
+    // SymlinkToFile for the connect). The
     // second case is the same with both places short: the first one is used
     // and the second is never touched.
     #[test]
@@ -1433,10 +1612,10 @@ mod posix {
         mark_untouched(&long_base);
         let c = cfg(&[&long_base, first.path()]);
         let (l, r) = route::run_long(BIND, &p, &c).unwrap();
-        assert_eq!(r, Route::Symlink);
+        assert_eq!(r, Route::SymlinkToDir);
         assert!(is_socket(&p));
         let (cl, r) = route::run_long(CONNECT_ANY, &p, &c).unwrap();
-        assert_eq!(r, Route::Symlink);
+        assert_eq!(r, Route::SymlinkToFile);
         ping(l, cl);
         assert_untouched(&long_base);
         assert_empty(first.path());
@@ -1445,7 +1624,7 @@ mod posix {
         let q = p.with_file_name("q.sock");
         let c = cfg(&[first.path(), second.path()]);
         let (l, r) = route::run_long(BIND, &q, &c).unwrap();
-        assert_eq!(r, Route::Symlink);
+        assert_eq!(r, Route::SymlinkToDir);
         let (cl, _) = route::run_long(CONNECT_ANY, &q, &c).unwrap();
         ping(l, cl);
         assert_untouched(second.path());
@@ -1525,10 +1704,10 @@ mod posix {
             let q = p.with_file_name(format!("{mode:o}.sock"));
             let c = cfg(&[&bad, good.path()]);
             let (l, r) = route::run_long(BIND, &q, &c).unwrap();
-            assert_eq!(r, Route::Symlink, "{mode:o}");
+            assert_eq!(r, Route::SymlinkToDir, "{mode:o}");
             assert!(is_socket(&q));
             let (cl, r) = route::run_long(CONNECT, &q, &c).unwrap();
-            assert_eq!(r, Route::Symlink, "{mode:o}");
+            assert_eq!(r, Route::SymlinkToFile, "{mode:o}");
             ping(l, cl);
             assert_untouched(&bad);
             assert_empty(good.path());
@@ -1538,9 +1717,9 @@ mod posix {
             let q = p.with_file_name(format!("ok{mode:o}.sock"));
             let c = cfg(&[&ok]);
             let (l, r) = route::run_long(BIND, &q, &c).unwrap();
-            assert_eq!(r, Route::Symlink, "{mode:o}");
+            assert_eq!(r, Route::SymlinkToDir, "{mode:o}");
             let (cl, r) = route::run_long(CONNECT, &q, &c).unwrap();
-            assert_eq!(r, Route::Symlink, "{mode:o}");
+            assert_eq!(r, Route::SymlinkToFile, "{mode:o}");
             ping(l, cl);
             assert_empty(&ok);
         }
@@ -1573,7 +1752,7 @@ mod posix {
             let q = p.with_file_name(format!("theirs{mode:o}.sock"));
             let c = cfg(&[&theirs, good.path()]);
             let (_l, r) = route::run_long(BIND, &q, &c).unwrap();
-            assert_eq!(r, Route::Symlink, "{mode:o}");
+            assert_eq!(r, Route::SymlinkToDir, "{mode:o}");
             assert_untouched(&theirs);
         }
     }
@@ -1594,10 +1773,10 @@ mod posix {
             let p = p.with_file_name(format!("{i}.sock"));
             let c = cfg(&[bad, good.path()]);
             let (l, r) = route::run_long(BIND, &p, &c).unwrap();
-            assert_eq!(r, Route::Symlink, "{bad:?}");
+            assert_eq!(r, Route::SymlinkToDir, "{bad:?}");
             assert!(is_socket(&p));
             let (cl, r) = route::run_long(CONNECT_ANY, &p, &c).unwrap();
-            assert_eq!(r, Route::Symlink);
+            assert_eq!(r, Route::SymlinkToFile);
             ping(l, cl);
         }
         assert_empty(good.path());
@@ -1624,7 +1803,7 @@ mod posix {
         let second = tmp();
         let c = cfg(&[first.path(), second.path()]);
         let (_l, r) = route::run_long(BIND, &p, &c).unwrap();
-        assert_eq!(r, Route::Symlink);
+        assert_eq!(r, Route::SymlinkToDir);
         mark_untouched(second.path());
 
         let e = route::run_long(BIND, &p, &c).unwrap_err();
@@ -1661,7 +1840,7 @@ mod posix {
                 ("SOCKAT_CHILD_PATH", p.as_os_str()),
             ],
         );
-        assert!(out.contains("sockat-child: Symlink"), "{out}");
+        assert!(out.contains("sockat-child: SymlinkToDir"), "{out}");
         assert!(is_socket(&p));
         assert_untouched(&long_tmpdir);
     }
@@ -1728,7 +1907,7 @@ mod posix {
             assert_eq!(errno(&e), Some(libc::ENOENT), "{nonblocking}: {e}");
 
             let (_c, r) = route::run_long(req, &p, &cfg(&[short_base.path()])).unwrap();
-            assert_eq!(r, Route::Symlink);
+            assert_eq!(r, Route::SymlinkToFile);
             drop(listener.accept().unwrap());
         }
         assert_untouched(&long_base);
@@ -2115,9 +2294,10 @@ mod apple {
         ping(l, cl);
     }
 
-    // With a base too long for the plain sockaddr (150 bytes), the path
-    // through the symlink goes in the widened one (SymlinkWide), still with
-    // the socket in the real directory and nothing left under the base.
+    // With a base too long for the plain sockaddr (150 bytes), the spelling
+    // through the symlink goes in the widened one (SymlinkToDirWide for the
+    // bind, SymlinkToFileWide for the connect), still with the socket in the
+    // real directory and nothing left under the base.
     #[test]
     fn a_path_through_a_long_base_goes_in_the_widened_sockaddr() {
         let t = tmp();
@@ -2127,10 +2307,10 @@ mod apple {
         std::fs::create_dir(&long_base).unwrap();
         let c = cfg(&[&long_base], true);
         let (l, r) = route::run_long(BIND, &p, &c).unwrap();
-        assert_eq!(r, Route::SymlinkWide);
+        assert_eq!(r, Route::SymlinkToDirWide);
         assert!(is_socket(&p));
         let (cl, r) = route::run_long(CONNECT, &p, &c).unwrap();
-        assert_eq!(r, Route::SymlinkWide);
+        assert_eq!(r, Route::SymlinkToFileWide);
         ping(l, cl);
         assert_empty(&long_base);
     }
@@ -2304,37 +2484,40 @@ mod apple {
                 "Relative",
                 cwd.join(nest(rel_base, 99, "rel.sock")),
                 cfg(&[none], true),
-                |r| r == Route::Relative,
+                |_, r| r == Route::Relative,
             ),
-            ("Wide", nest(t, 200, "wide.sock"), cfg(&[none], true), |r| {
-                r == Route::Wide
-            }),
+            (
+                "Wide",
+                nest(t, 200, "wide.sock"),
+                cfg(&[none], true),
+                |_, r| r == Route::Wide,
+            ),
             (
                 "WideRelative",
                 cwd.join(nest(rel_base, 240, "wrel.sock")),
                 cfg(&[none], true),
-                |r| r == Route::WideRelative,
+                |_, r| r == Route::WideRelative,
             ),
             (
                 "Symlink",
                 nest(t, 600, "sym.sock"),
                 cfg(&[d.short_base.path()], true),
-                |r| r == Route::Symlink,
+                |req, r| r == symlink(req),
             ),
             (
                 "SymlinkWide",
                 nest(t, 600, "symw.sock"),
                 cfg(&[&long_base], true),
-                |r| r == Route::SymlinkWide,
+                |req, r| r == symlink_wide(req),
             ),
-            ("Fork", nest(t, 600, "fork.sock"), cfg(&[], true), |r| {
+            ("Fork", nest(t, 600, "fork.sock"), cfg(&[], true), |_, r| {
                 matches!(r, Route::Fork { .. })
             }),
         ];
         let mut ways: Vec<(&'static str, Way, Want)> = vec![(
             "Direct",
             std::sync::Arc::new(move |req| route::run(req, &direct)),
-            |r| r == Route::Direct,
+            |_, r| r == Route::Direct,
         )];
         ways.extend(cases.into_iter().map(|(what, p, c, want)| {
             let way: Way = std::sync::Arc::new(move |req| route::run_long(req, &p, &c));

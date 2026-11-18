@@ -12,7 +12,7 @@
 //!   (optionally `O_NONBLOCK`, which std cannot connect with).
 //! * [`op_in_dir_forked`] — bind / connect relative to a directory fd in a forked
 //!   child that `fchdir`s (the last resort on every target but FreeBSD, and on
-//!   Linux only without /proc); returns the child's pid.
+//!   Linux only when the /proc route cannot be used); returns the child's pid.
 //! * `op_at` — `bindat(2)` / `connectat(2)` (FreeBSD).
 //! * `random_bytes` — the random part of the temporary symlink's name.
 //! * `effective_uid` — the owner a safe place for the temporary symlink may have.

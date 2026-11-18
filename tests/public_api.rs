@@ -112,22 +112,20 @@ fn in_an_ordinary_environment_no_connect_forks() {
     }
 }
 
-// A path that only the fork route reaches (every target but Linux, where /proc
-// reaches it, and FreeBSD, where connectat does): the file name is too long to
-// fit any sockaddr behind /tmp/sockat.XXXXXXXXXX/ (over 77 bytes for the plain
-// sockaddr; on macOS over 230 for the widened one) but fits the fork route's,
-// and the path is far from the cwd. `bind` forks to create it. `connect` and
-// `connect_nonblocking` do not fork, so for them the path is too long, as for
-// std: ENAMETOOLONG. `connect_any` and `connect_any_nonblocking` fork and
-// report that they did. (What the server sees as the peer after a fork is
-// checked in the crate's unit tests, which can query it.)
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+// A long file name far from the cwd, too long to fit behind
+// /tmp/sockat.XXXXXXXXXX/ (over 77 bytes for the plain sockaddr; on macOS over
+// 230 for the widened one) and, on Linux, behind /proc/self/fd/<n>/ (over
+// about 90), but within the fork route's sockaddr. `bind` reaches it (forking
+// on every target but FreeBSD, where bindat does). The connects reach it
+// through a symlink to the socket file, whose spelling does not contain the
+// file name, so in an ordinary environment (a writable /tmp) none of them
+// forks, and the plain `connect` and `connect_nonblocking` work too.
 #[test]
-fn a_path_only_the_fork_route_reaches_needs_connect_any() {
+fn a_long_file_name_is_connected_to_without_forking() {
     #[cfg(target_vendor = "apple")]
     const NAME_LEN: usize = 240;
     #[cfg(not(target_vendor = "apple"))]
-    const NAME_LEN: usize = 90;
+    const NAME_LEN: usize = 100;
     let t = tempfile::Builder::new()
         .prefix("sockat-")
         .tempdir_in("/tmp")
@@ -135,20 +133,18 @@ fn a_path_only_the_fork_route_reaches_needs_connect_any() {
     let p = nest(t.path(), 600, &"n".repeat(NAME_LEN));
     let listener = sockat::bind(&p).unwrap();
     assert!(is_socket(&p));
-    for e in [
-        sockat::connect(&p).unwrap_err(),
-        sockat::connect_nonblocking(&p).unwrap_err(),
-    ] {
-        assert_eq!(e.raw_os_error(), Some(libc::ENAMETOOLONG), "{e}");
-    }
-    let (mut c, forked) = sockat::connect_any(&p).unwrap();
-    assert!(forked);
+    let mut c = sockat::connect(&p).unwrap();
     ping(&listener, &mut c);
-    let (mut c, forked) = sockat::connect_any_nonblocking(&p).unwrap();
-    assert!(forked);
+    let mut c = sockat::connect_nonblocking(&p).unwrap();
     let mut buf = [0u8; 1];
     let e = c.read(&mut buf).unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+    drop(listener.accept().unwrap());
+    let (mut c, forked) = sockat::connect_any(&p).unwrap();
+    assert!(!forked);
+    ping(&listener, &mut c);
+    let (_c, forked) = sockat::connect_any_nonblocking(&p).unwrap();
+    assert!(!forked);
 }
 
 // Short paths are std's business: sockat hands them over unchanged, so the
@@ -297,8 +293,8 @@ fn concurrent_calls_leave_the_cwd_alone() {
 
 // The documented errors for a long path, through the public API: ENOENT for a
 // missing directory, EADDRINUSE for an existing file, ENAMETOOLONG when the
-// file name alone cannot be reached, InvalidInput for a path without a file
-// name.
+// file name alone is too long for every bind route, InvalidInput for a path
+// without a file name.
 #[test]
 fn long_path_errors_through_the_public_api() {
     let t = tempfile::Builder::new()

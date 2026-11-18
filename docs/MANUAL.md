@@ -42,7 +42,7 @@ server.read_exact(&mut buf)?;
 - **`connect`** replaces std's `UnixStream::connect`. It blocks
 - **`connect_nonblocking`** is for async runtimes. The socket is made nonblocking before the connect and returned that way, ready for tokio's `UnixStream::from_std`. When the listener's backlog is full it fails at once (`EAGAIN` on Linux, `ECONNREFUSED` on macOS). A Unix-domain connect completes or fails within the call, so there is nothing to wait for afterwards (checked on Linux and macOS)
 
-Both try every route but the fork route ([How a long path is reached](#how-a-long-path-is-reached)). Where only the fork route would reach the path, they return `ENAMETOOLONG`, as a plain connect to a path too long for `sun_path` does. In an ordinary environment (a writable `/tmp`) they reach a path at any directory depth, unless the file name itself is extremely long ([Where a path stops being reached](#where-a-path-stops-being-reached)).
+Both try every route but the fork route ([How a long path is reached](#how-a-long-path-is-reached)). Where only the fork route would reach the path, they return `ENAMETOOLONG`, as a plain connect to a path too long for `sun_path` does. In an ordinary environment (a writable `/tmp`) they reach a path whatever the directory depth and the file name length ([Where a path stops being reached](#where-a-path-stops-being-reached)).
 
 ## How a long path is reached
 
@@ -52,8 +52,8 @@ A path of at most 100 bytes is handed to std unchanged on every OS. A longer pat
 
 | OS | Order tried |
 |---|---|
-| Linux / Android (with `/proc`) | [/proc](#proc) |
-| Linux / Android (without `/proc`) | [relative path](#relative-path) → [symlink](#symlink) → [fork](#fork) |
+| Linux / Android (`/proc` usable) | [/proc](#proc) |
+| Linux / Android (`/proc` not usable) | [relative path](#relative-path) → [symlink](#symlink) → [fork](#fork) |
 | FreeBSD | [bindat](#bindat) |
 | macOS | [relative path](#relative-path) → [widened sockaddr](#widened-sockaddr) → [symlink](#symlink) → [fork](#fork) |
 | NetBSD / OpenBSD / illumos / other Unix | [relative path](#relative-path) → [symlink](#symlink) → [fork](#fork) |
@@ -67,9 +67,11 @@ Only `bind` and the `connect_any` variants try the fork route. `connect` / `conn
 
 Linux / Android. The directory is opened `O_PATH` and `/proc/self/fd/<fd>/<file name>` is passed to std. The kernel resolves that to the opened directory, so the socket is created there.
 
-- The directory part has no length limit. The whole `/proc/self/fd/<fd>/<file name>` must be at most 107 bytes, so the file name can be about 90 bytes (depending on the number of digits of the fd). Longer is `ENAMETOOLONG`
+- The directory part has no length limit. The whole `/proc/self/fd/<fd>/<file name>` must be at most 107 bytes, so the file name can be about 90 bytes (depending on the number of digits of the fd)
 - The directory is opened `O_PATH`, so no read permission on it is needed
-- When `/proc/self/fd/<fd>` cannot be looked up (a chroot or a minimal container with nothing mounted on `/proc`), there is taken to be no `/proc`, and the other routes are tried in order. With `/proc` there, this is the only route used
+- When it cannot be used, the other routes are tried in order. When it can, it is the only route used. It cannot be used when:
+  - `/proc/self/fd/<fd>` cannot be looked up (a chroot or a minimal container with nothing mounted on `/proc`)
+  - the file name does not fit the length above
 
 #### bindat
 
@@ -91,10 +93,15 @@ macOS. XNU takes an address whose `sun_path` runs past 104 bytes, as long as the
 
 #### symlink
 
-A symlink `sockat.XXXXXXXXXX` (10 random characters) pointing to the socket's directory is created in a temporary directory, the bind / connect goes through `<place>/sockat.XXXXXXXXXX/<file name>`, and the symlink is removed right away.
+A symlink `sockat.XXXXXXXXXX` (10 random characters) is created in a temporary directory, the bind / connect goes through it, and the symlink is removed right away.
 
-- The places tried are `TMPDIR` (when it is a non-empty absolute path), then `/tmp`. The first one where `<place>/sockat.XXXXXXXXXX/<file name>` fits in 100 bytes (on macOS, 253 in the widened sockaddr), that is safe, and where the symlink can be created is used. When `TMPDIR` is too deep for the path to fit, `/tmp` is used
-- Through `/tmp`, `/tmp/sockat.XXXXXXXXXX/` is 23 bytes, so a file name of at most 77 bytes (230 on macOS) is reached at any directory depth
+| | the symlink points to | spelling passed | reached through `/tmp` |
+|---|---|---|---|
+| bind | the socket's directory | `<place>/sockat.XXXXXXXXXX/<file name>` | a file name of up to 77 bytes (230 on macOS) |
+| connect | the socket file | `<place>/sockat.XXXXXXXXXX` | whatever the directory depth and the file name length |
+
+- The symlink points to the path as given, so it resolves to the same place as the path
+- The places tried are `TMPDIR` (when it is a non-empty absolute path), then `/tmp`. The first one where the spelling passed fits in 100 bytes (on macOS, 253 in the widened sockaddr), that is safe, and where the symlink can be created is used. When `TMPDIR` is too deep for it to fit, `/tmp` is used
 - **A safe place** is a directory where no other user can replace the symlink in it, one of the following. Nothing is created in a place that is not safe; the next one is tried
   - sticky and owned by root or by the calling user (as `/tmp` is)
   - owned by the calling user with no write permission for group and others (as macOS's `$TMPDIR` is)
@@ -113,22 +120,22 @@ A child is forked that `fchdir`s into the opened directory, binds / connects by 
 
 ### How a failing route is treated
 
-When a route actually binds / connects and fails (`ENOENT`, `EADDRINUSE`, `ECONNREFUSED`, ...), that error is returned and the next route is not tried. The next route is tried only when a route cannot be used at all (too long, no `/proc`, the kernel refusing the widened sockaddr, the place not being safe, the symlink not being creatable). The same goes for the places for the symlink: a bind / connect through one place that fails is not tried again through the next.
+When a route actually binds / connects and fails (`ENOENT`, `EADDRINUSE`, `ECONNREFUSED`, ...), that error is returned and the next route is not tried. The next route is tried only when a route cannot be used at all (too long, `/proc` not usable, the kernel refusing the widened sockaddr, the place not being safe, the symlink not being creatable). The same goes for the places for the symlink: a bind / connect through one place that fails is not tried again through the next.
 
 ### Where a path stops being reached
 
-When a path longer than 100 bytes is `ENAMETOOLONG`. `connect` / `connect_nonblocking` stop before the fork route, so they stop reaching a path earlier than `bind` and the `connect_any` variants.
+When a path longer than 100 bytes is `ENAMETOOLONG`.
 
-| OS | Only `connect` / `connect_nonblocking` are `ENAMETOOLONG` (`bind` and `connect_any` reach it by forking) when | Every function is `ENAMETOOLONG` when |
-|---|---|---|
-| Linux / Android (with `/proc`) | never (no fork is used) | the file name is over about 90 bytes |
-| Linux / Android (without `/proc`) | the relative path is over 100 bytes and the symlink route cannot be used | the file name is over 107 bytes |
-| FreeBSD | never (no fork is used) | the file name is over 103 bytes |
-| macOS | both the path and the relative path are over 253 bytes and the symlink route cannot be used | the file name is over 253 bytes |
-| NetBSD / OpenBSD / other BSDs | the relative path is over 100 bytes and the symlink route cannot be used | the file name is over 103 bytes |
-| illumos | the relative path is over 100 bytes and the symlink route cannot be used | the file name is over 107 bytes |
+| OS | `bind` | `connect` / `connect_nonblocking` | the `connect_any` variants |
+|---|---|---|---|
+| Linux / Android (with `/proc`) | the file name is over 107 bytes | the file name does not fit the `/proc` spelling, the relative path is over 100 bytes, and the symlink route cannot be used | the file name is over 107 bytes and the symlink route cannot be used |
+| Linux / Android (without `/proc`) | the file name is over 107 bytes | the relative path is over 100 bytes and the symlink route cannot be used | the file name is over 107 bytes and the symlink route cannot be used |
+| FreeBSD | the file name is over 103 bytes | the file name is over 103 bytes | the file name is over 103 bytes |
+| macOS | the file name is over 253 bytes | the path and the relative path are both over 253 bytes and the symlink route cannot be used | the file name is over 253 bytes and the symlink route cannot be used |
+| NetBSD / OpenBSD / other BSDs | the file name is over 103 bytes | the relative path is over 100 bytes and the symlink route cannot be used | the file name is over 103 bytes and the symlink route cannot be used |
+| illumos | the file name is over 107 bytes | the relative path is over 100 bytes and the symlink route cannot be used | the file name is over 107 bytes and the symlink route cannot be used |
 
-The symlink route cannot be used when the path does not fit through any place (through `/tmp`, a file name over 77 bytes, 230 on macOS), or when there is no safe place where the symlink can be created (a sandbox where neither `TMPDIR` nor `/tmp` can be used, and the like).
+- For a connect, the symlink route cannot be used only when there is no safe place where the symlink can be created (a sandbox where neither `TMPDIR` nor `/tmp` can be used, and the like). Through `/tmp` the length always fits
 
 ## The exception: connect_any
 
@@ -139,7 +146,7 @@ The symlink route cannot be used when the path does not fit through any place (t
 | `sockat::connect_any(path)` | `io::Result<(UnixStream, bool)>` (blocking) |
 | `sockat::connect_any_nonblocking(path)` | `io::Result<(UnixStream, bool)>` (nonblocking) |
 
-The order tried is that of `connect`; when no other route can be used, the connect is finally made on the [fork](#fork) route. The `bool` is `true` when the fork route was taken, and `false` otherwise. When it is `true` the side effects below apply, so it can be used, for example, to log or warn about it. Linux with `/proc` and FreeBSD never fork, so there it is always `false`.
+The order tried is that of `connect`; when no other route can be used, the connect is finally made on the [fork](#fork) route. The `bool` is `true` when the fork route was taken, and `false` otherwise. When it is `true` the side effects below apply, so it can be used, for example, to log or warn about it. FreeBSD never forks, so there it is always `false`.
 
 `connect_any_nonblocking` makes the socket nonblocking before the fork, so the child's connect does not wait either.
 
@@ -190,7 +197,7 @@ sockat itself never changes the cwd. When the relative spelling is made it is ch
 
 ### A symlink can be left behind
 
-If the process dies between creating and removing the symlink, `sockat.XXXXXXXXXX` (pointing to the socket's directory) is left under `TMPDIR` or `/tmp`. The `sockat.` prefix tells it apart as sockat's.
+If the process dies between creating and removing the symlink, `sockat.XXXXXXXXXX` (pointing to the socket's directory or file) is left under `TMPDIR` or `/tmp`. The `sockat.` prefix tells it apart as sockat's.
 
 ## Errors
 
@@ -201,8 +208,7 @@ If the process dies between creating and removing the symlink, `sockat.XXXXXXXXX
 | a file already exists at the bind path | `EADDRINUSE` |
 | a socket file nobody listens on | `ECONNREFUSED` |
 | the backlog is full | on Linux `EAGAIN` for a nonblocking connect (a blocking one waits for room), on macOS `ECONNREFUSED` |
-| `connect` / `connect_nonblocking` to a path only the fork route reaches | `ENAMETOOLONG` |
-| the file name alone fits no route ([Where a path stops being reached](#where-a-path-stops-being-reached)) | `ENAMETOOLONG` |
+| no route reaches the path ([Where a path stops being reached](#where-a-path-stops-being-reached)); for `connect` / `connect_nonblocking`, also when only the fork route would | `ENAMETOOLONG` |
 | a path longer than 100 bytes that does not end with a name (`dir/`, `dir/.`, `..`, ...) | `InvalidInput` |
 | a path containing NUL | `InvalidInput` |
 | the cwd changed during the relative route | `Other` |

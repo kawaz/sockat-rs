@@ -28,23 +28,23 @@ A path of at most 100 bytes is handed to std unchanged on every OS. A longer pat
 
 | OS | Order tried |
 |---|---|
-| Linux / Android (with `/proc`) | /proc |
-| Linux / Android (without `/proc`) | relative path → symlink → fork |
+| Linux / Android (`/proc` usable) | /proc |
+| Linux / Android (`/proc` not usable) | relative path → symlink → fork |
 | FreeBSD | bindat |
 | macOS | relative path → widened sockaddr → symlink → fork |
 | NetBSD / OpenBSD / illumos / other Unix | relative path → symlink → fork |
 | Windows | not supported (compile error) |
 
-- **/proc**: open the directory and pass `/proc/self/fd/<fd>/<file name>`
+- **/proc**: open the directory and pass `/proc/self/fd/<fd>/<file name>`. Not usable without `/proc`, or when the file name does not fit in it (over about 90 bytes)
 - **bindat**: `bindat(2)` / `connectat(2)`, by the file name relative to the directory fd
 - **relative path**: when the path relative to the cwd is at most 100 bytes, pass that. Only the path string is rewritten; the cwd is never changed
 - **widened sockaddr**: pass a sockaddr carrying up to 253 bytes, which the macOS kernel accepts
-- **symlink**: create a short symlink to the socket's directory under `TMPDIR` or `/tmp` and go through it. It is created only in a place where no other user can replace it, and removed at once
+- **symlink**: create a short symlink under `TMPDIR` or `/tmp` and go through it. For a bind it points to the socket's directory, for a connect to the socket file. It is created only in a place where no other user can replace it, and removed at once
 - **fork**: fork a child that `fchdir`s into the directory and binds / connects by the file name alone. **Only `bind` and the `connect_any` variants try it**
 
 None of the routes changes the calling process's cwd, so they can be used from multi-threaded programs.
 
-`connect` / `connect_nonblocking` never fork. Where only the fork route would reach the path, they return `ENAMETOOLONG`, as a plain connect to a path too long for `sun_path` does. That happens only on an OS with neither `/proc` nor `bindat`, when the path does not fit as a relative path (nor, on macOS, in the widened sockaddr) and the symlink route cannot be used either (the file name is too long, or there is no safe place to create the symlink). Even there, with a usable `/tmp` and a file name of at most 77 bytes (230 on macOS), the symlink route reaches the path at any directory depth. The length limits of each route, and where `connect` stops reaching a path, are in [docs/MANUAL.md](./docs/MANUAL.md#how-a-long-path-is-reached).
+`connect` / `connect_nonblocking` never fork. Where only the fork route would reach the path, they return `ENAMETOOLONG`, as a plain connect to a path too long for `sun_path` does. That happens only when the path fits neither the `/proc` spelling nor a relative path (nor, on macOS, the widened sockaddr) and there is no safe place to create the symlink. With a usable `/tmp`, `connect` reaches the path through the symlink whatever the directory depth and the file name length. The length limits of each route, and where `connect` stops reaching a path, are in [docs/MANUAL.md](./docs/MANUAL.md#how-a-long-path-is-reached).
 
 ## The exception: `connect_any`
 

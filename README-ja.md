@@ -28,23 +28,23 @@ std の `bind` / `connect` は `sun_path` に収まらないパスを断る。�
 
 | OS | 試す順番 |
 |---|---|
-| Linux / Android (`/proc` あり) | /proc |
-| Linux / Android (`/proc` 無し) | 相対パス → symlink → fork |
+| Linux / Android (`/proc` を使える) | /proc |
+| Linux / Android (`/proc` を使えない) | 相対パス → symlink → fork |
 | FreeBSD | bindat |
 | macOS | 相対パス → 広げた sockaddr → symlink → fork |
 | NetBSD / OpenBSD / illumos / その他の Unix | 相対パス → symlink → fork |
 | Windows | 対象外 (compile エラー) |
 
-- **/proc**: ディレクトリを開き、`/proc/self/fd/<fd>/<ファイル名>` で渡す
+- **/proc**: ディレクトリを開き、`/proc/self/fd/<fd>/<ファイル名>` で渡す。`/proc` が無い時と、ファイル名がこれに収まらない時 (およそ 90 バイト超) は使えない
 - **bindat**: `bindat(2)` / `connectat(2)` で、ディレクトリの fd を基準にファイル名で渡す
 - **相対パス**: cwd からの相対パスが 100 バイト以内なら、それで渡す。パスを文字列で書き直すだけで、cwd は変えない
 - **広げた sockaddr**: macOS のカーネルが受け付ける、253 バイトまで入る sockaddr で渡す
-- **symlink**: `TMPDIR` か `/tmp` に、ソケットのディレクトリを指す短い symlink を作り、それを通して渡す。他人が差し替えられない置き場にだけ作り、すぐ消す
+- **symlink**: `TMPDIR` か `/tmp` に短い symlink を作り、それを通して渡す。bind はソケットのディレクトリを、connect はソケットのファイルを指す。他人が差し替えられない置き場にだけ作り、すぐ消す
 - **fork**: ディレクトリに `fchdir` した子を fork し、子がファイル名だけで bind / connect する。**`bind` と `connect_any` 系だけが試す**
 
 どの経路も呼び出し元のプロセスの cwd を変えないので、マルチスレッドのプログラムから使える。
 
-`connect` / `connect_nonblocking` は fork しない。fork でしか届かない時は、パスが `sun_path` に入らない普通の connect と同じく `ENAMETOOLONG` を返す。そうなるのは、`/proc` も `bindat` も無い OS で、相対パス (macOS では広げた sockaddr も) に収まらず、かつ symlink の経路も使えない時 (ファイル名が長すぎる、安全に symlink を作れる置き場が無い) だけである。そうした OS でも、`/tmp` が使えてファイル名が 77 バイト (macOS は 230 バイト) 以内なら、ディレクトリの深さによらず symlink の経路で届く。各経路の長さの上限と、どこから `connect` では届かなくなるかは [docs/MANUAL-ja.md](./docs/MANUAL-ja.md#長いパスへの届き方) にある。
+`connect` / `connect_nonblocking` は fork しない。fork でしか届かない時は、パスが `sun_path` に入らない普通の connect と同じく `ENAMETOOLONG` を返す。そうなるのは、`/proc` の綴りにも相対パス (macOS では広げた sockaddr も) にも収まらず、安全に symlink を作れる置き場も無い時だけである。`/tmp` が使えれば、`connect` はディレクトリの深さにもファイル名の長さにもよらず symlink の経路で届く。各経路の長さの上限と、どこから `connect` では届かなくなるかは [docs/MANUAL-ja.md](./docs/MANUAL-ja.md#長いパスへの届き方) にある。
 
 ## 例外: `connect_any`
 

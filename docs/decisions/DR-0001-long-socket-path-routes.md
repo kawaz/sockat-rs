@@ -1,6 +1,6 @@
 # DR-0001: sun_path を超える socket のパスに届く経路と、試す順番
 
-- Status: Accepted (経路と試す順番、相対パスの作り方、Windows を対象外にすることは kawaz 指示 2026-11-18。/proc が無い時に他の Unix と同じ順に倒すこと、symlink の置き場に /tmp を足すことは kawaz 裁定 2026-11-18。公開する connect を「fork するか」「ブロックするか」の 4 つの関数にし、fork するのは `connect_any` 系だけにすること、`connect_any` 系は pid でなく fork の経路を通ったかを返すことは kawaz 裁定 2026-11-18。相対パスと symlink の経路を macOS 以外 (dirfd 基準の primitive の無い Unix、/proc の無い Linux) にも使うことは kawaz 裁定 2026-11-18。symlink の置き場を使う前に安全か確かめることは kawaz 裁定 2026-11-18。symlink の名前、fork の経路の権限、FreeBSD の扱いは統括の裁定 2026-11-18。tokio・観測の仕組みは実装側の判断で、残りは「未確定」)、0.2.1 で実装済み
+- Status: Accepted (経路と試す順番、相対パスの作り方、Windows を対象外にすることは kawaz 指示 2026-11-18。/proc が無い時に他の Unix と同じ順に倒すこと、symlink の置き場に /tmp を足すことは kawaz 裁定 2026-11-18。公開する connect を「fork するか」「ブロックするか」の 4 つの関数にし、fork するのは `connect_any` 系だけにすること、`connect_any` 系は pid でなく fork の経路を通ったかを返すことは kawaz 裁定 2026-11-18。相対パスと symlink の経路を macOS 以外 (dirfd 基準の primitive の無い Unix、/proc の無い Linux) にも使うことは kawaz 裁定 2026-11-18。symlink の置き場を使う前に安全か確かめることは kawaz 裁定 2026-11-18。connect の symlink をソケットのファイルを指す形にすること、/proc の綴りに収まらないファイル名を決定 3 の順に回すことは kawaz 承認 2026-11-18。symlink の名前、fork の経路の権限、FreeBSD の扱いは統括の裁定 2026-11-18。tokio・観測の仕組みは実装側の判断で、残りは「未確定」)、0.2.1 で実装済み
 - Date: 2026-11-18
 
 ## Context
@@ -28,18 +28,18 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 
 理由: 短いパスでは std と同じに振る舞うことが一番の約束で、そのためには短いパスに何も足さないのが確実である。
 
-### 2. Linux は `/proc/self/fd/<dirfd>/<name>`、/proc が無い時だけ決定 3 の順
+### 2. Linux は `/proc/self/fd/<dirfd>/<name>`、それが使えない時だけ決定 3 の順
 
 - ソケットを置くディレクトリを `O_PATH | O_DIRECTORY` で開き、`/proc/self/fd/<その fd>/<ファイル名>` を std に渡す。カーネルは `/proc/self/fd/<n>` をその fd が指すディレクトリとして解決するので、ソケットはそのディレクトリにできる (connect ならそこから引く)
-- /proc がある時は、これ以外を試さない。ディレクトリ部分の長さに上限が無く、一時ファイルも fork も要らず、cwd も変えない
-- `/proc/self/fd/<n>/<ファイル名>` が `sun_path` (107 バイト + NUL) に収まらない時 (ファイル名がおよそ 90 バイトを超える時) は `ENAMETOOLONG` にする。std に渡すと std 独自の `InvalidInput` になり、他の OS と食い違う
+- この綴りが使える時は、これ以外を試さない。ディレクトリ部分の長さに上限が無く、一時ファイルも fork も要らず、cwd も変えない
+- `/proc/self/fd/<n>/<ファイル名>` が `sun_path` (107 バイト + NUL) に収まらない時 (ファイル名がおよそ 90 バイトを超える時) は、/proc の経路は使えないとみなし、/proc が無い時と同じく決定 3 の順に進む (kawaz 承認)。bind と `connect_any` 系は fork で 107 バイトのファイル名まで、connect はファイルを指す symlink (3 c) で届く
 - **/proc が無い時は、決定 3 の順 (相対パス → symlink → fork) に進む** (kawaz 裁定)。ディレクトリを開いた後に `/proc/self/fd/<n>` を stat し、引けなければ /proc の経路は使えないとみなす (/proc を mount していない chroot や最小のコンテナ)。決定 3 の「経路自体が使えない時だけ次へ」の扱いで、/proc の経路で実際に bind / connect した結果のエラーはそのまま返し、他の経路でやり直さない。/proc を確かめずに bind / connect すると、/proc が無いだけなのに「ディレクトリが無い」と読める `ENOENT` になる
   - fork の経路では、子は /proc の経路のために開いた `O_PATH` の fd にそのまま `fchdir` する (Linux 3.5 以降、`O_PATH` のディレクトリの fd に `fchdir` できる)。なので /proc の経路と同じく、ディレクトリの検索権限で足りる (/proc の無い chroot で、uid 1000 が読み取り権限の無い mode 0300 のディレクトリに bind / connect できることを docker で確認した。`O_RDONLY` では `EACCES` で開けない。試験は docker の root で走り権限を確かめられないので、常設の試験は無い)
   - fork の経路では、ファイル名の長さの上限は fork の経路のもの (標準の `sun_path` に入ること) になる。/proc の綴りの上限 (およそ 90 バイト) は、その綴りを使わないので当てない
-  - fork の副作用 (3 d) は、/proc の無い環境で長いパスを bind する時と、`connect_any` 系で connect して fork の経路まで進んだ時だけ乗る。特に connect では、**サーバに見える peer の pid (`SO_PEERCRED`) は、もう終了した子の pid になり、呼び出し元が send しても変わらない** (ソケット自体は呼び出し元が持っていて普通に使える) (試験 `without_proc_the_server_sees_the_forked_child_as_the_peer`)
+  - fork の副作用 (3 d) は、/proc の経路が使えない時に長いパスを bind する時と、`connect_any` 系で connect して fork の経路まで進んだ時だけ乗る。特に connect では、**サーバに見える peer の pid (`SO_PEERCRED`) は、もう終了した子の pid になり、呼び出し元が send しても変わらない** (ソケット自体は呼び出し元が持っていて普通に使える) (試験 `without_proc_the_server_sees_the_forked_child_as_the_peer`)
 - Android も同じ扱いにする (未検証)
 
-理由: /proc がある時は fork を使わない。Linux の `SO_PEERCRED` は connect した時点の pid を記録し、子が終了した後もその pid のままになる (試験 `so_peercred_keeps_the_pid_of_a_forked_connector` で実機確認)。サーバが peer の pid を見る用途を壊す。/proc が無い時は他の Unix と同じ順に倒し、副作用の無い経路で届くならそれを使う (kawaz 裁定)。
+理由: /proc の綴りが使える時は fork を使わない。Linux の `SO_PEERCRED` は connect した時点の pid を記録し、子が終了した後もその pid のままになる (試験 `so_peercred_keeps_the_pid_of_a_forked_connector` で実機確認)。サーバが peer の pid を見る用途を壊す。/proc が無い時は他の Unix と同じ順に倒し、副作用の無い経路で届くならそれを使う (kawaz 裁定)。
 
 ### 3. dirfd 基準の primitive の無い Unix は、安い経路から順に試し、最後に fork
 
@@ -49,7 +49,7 @@ macOS、NetBSD、OpenBSD、illumos とその他の Unix、/proc の無い Linux 
 |---|---|---|---|
 | a | cwd からの相対パスを std に渡す | 全部 | 相対パスが 100 バイト以内 |
 | b | 広げた sockaddr (後述) で元のパス、無理なら相対パス | macOS だけ | どちらかが 253 バイト以内 |
-| c | `<置き場>/sockat.XXXXXXXXXX` → ソケットのディレクトリ、の symlink を経由する。置き場は `TMPDIR`、`/tmp` の順の候補 | 全部 | symlink を通したパスが 100 (b が使えるなら 253) 以内で、安全で symlink を作れる候補がある |
+| c | `<置き場>/sockat.XXXXXXXXXX` の symlink を経由する。bind はソケットのディレクトリを、connect はソケットのファイルを指す。置き場は `TMPDIR`、`/tmp` の順の候補 | 全部 | symlink を通した綴りが 100 (b が使えるなら 253) 以内で、安全で symlink を作れる候補がある |
 | d | ディレクトリの fd に `fchdir` した子を fork する | 全部 | 上が全部使えない時。`bind` と `connect_any` 系だけが試す (決定 6) |
 
 a と c は POSIX の範囲の手 (`getcwd`、`realpath`、`stat`、`symlink`) なので、どの Unix でも使える。b は XNU のカーネルの受け付け方に頼る手なので macOS だけで使う (決定 4 の FreeBSD の項も参照)。
@@ -58,7 +58,14 @@ a と c は POSIX の範囲の手 (`getcwd`、`realpath`、`stat`、`symlink`) �
 
 **fork を試さない connect** (`connect` / `connect_nonblocking`、決定 6) は、d に来た所で `ENAMETOOLONG` を返す。パスが `sun_path` に入らない時の普通の connect と同じエラーで、fork を使わないなら普通の connect と同じ立場なので、専用のエラーや文言は作らない (kawaz 裁定)。ディレクトリを開いてから判定するので、ディレクトリが無い時は `ENOENT` のままになる。ソケットは作らず、何も connect しない。
 
-ふつうの環境 (`/tmp` が書ける) では c で届く。`/tmp/sockat.XXXXXXXXXX/` が 23 バイトなので、ファイル名が 77 バイト (macOS は広げた sockaddr で 230 バイト) 以内なら、ディレクトリの深さによらない。d が要るのは、ファイル名がそれより長い時と、安全で symlink を作れる置き場が無い時 (サンドボックス等) である。
+ふつうの環境 (`/tmp` が書ける) では c で届く。
+
+| | c の綴り | 届く範囲 |
+|---|---|---|
+| connect | `/tmp/sockat.XXXXXXXXXX` (22 バイト) | ディレクトリの深さにもファイル名の長さにもよらない |
+| bind | `/tmp/sockat.XXXXXXXXXX/<ファイル名>` | ファイル名が 77 バイト (macOS は広げた sockaddr で 230 バイト) 以内 |
+
+d が要るのは、bind でファイル名がそれより長い時と、安全で symlink を作れる置き場が無い時 (サンドボックス等) である。
 
 #### a. cwd からの相対パス
 
@@ -85,14 +92,24 @@ a と c は POSIX の範囲の手 (`getcwd`、`realpath`、`stat`、`symlink`) �
 #### c. 短い symlink を経由する
 
 - 置き場の候補は `TMPDIR`、`/tmp` の順 (kawaz 裁定)。`TMPDIR` は空でなく絶対パスの時だけ候補に入れる (相対パスは cwd に依存するので外す。外すのは `TMPDIR` だけで、`/tmp` は試す)。`TMPDIR` が `/tmp` そのもの (`/tmp/` も含め、綴りが同じ) なら 1 回だけ試す。`/private/tmp` のように綴りの違う同じディレクトリは別の候補として扱う (綴りが短くなりうるので)
-- 候補を順に見て、最初に使えたもので bind / connect する。各候補では、何かを作る前に `<置き場>/sockat.XXXXXXXXXX/<ファイル名>` の長さを確かめる。100 以内なら std に、b が使えるなら 253 以内で広げた sockaddr に渡す。長さが足りない候補には何も作らず次の候補へ進む (`TMPDIR` が深すぎる時に `/tmp` で短くする。この作業をしたセッションのように `TMPDIR` が 100 バイトを超える環境で効く)
+- 候補を順に見て、最初に使えたもので bind / connect する。各候補では、何かを作る前に symlink を通した綴り (下の表) の長さを確かめる。100 以内なら std に、b が使えるなら 253 以内で広げた sockaddr に渡す。長さが足りない候補には何も作らず次の候補へ進む (`TMPDIR` が深すぎる時に `/tmp` で短くする。この作業をしたセッションのように `TMPDIR` が 100 バイトを超える環境で効く)
 - **置き場は、他人が symlink を差し替えられない所だけを使う** (kawaz 裁定)。置き場を stat し (symlink は辿る。macOS の `/tmp` は `/private/tmp` への symlink)、次のどちらかを満たす時だけ使う。満たさない候補には何も作らず次の候補へ進む
   - sticky bit が立っていて、持ち主が root か自分の実効 uid (`/tmp` がこれ)。sticky なディレクトリの中の名前を消したり rename したりできるのは、その名前の持ち主、ディレクトリの持ち主、root だけである。持ち主も見るのは、他人の sticky なディレクトリでは、その持ち主が中の symlink を差し替えられるから
   - 持ち主が自分の実効 uid で、group と other に書き込み権限が無い (`mode & 0o022 == 0`。macOS の `$TMPDIR` がこれ)。他人は中に何も作れず、消せない
   - これで、symlink を作ってから bind / connect するまでに他人が symlink を差し替えられないことが、仮定でなく確かめた事実になる。残るのは同じ uid か root による差し替えだけで、守る範囲の外。確かめるのは置き場そのもので、置き場を含む上位のディレクトリまでは見ない (他人が書ける非 sticky のディレクトリの下に `TMPDIR` を置くと、置き場ごと差し替えられうる。これも守る範囲の外)
   - symlink の inode を bind / connect の後に比べる確認は入れない。rename で退かして戻す形を見抜けない
 - 候補で symlink を作れない時 (置き場が無い、書けない、サンドボックス、名前を使い切った、乱数が取れない) も次の候補へ進む。広げた sockaddr をカーネルが受け付けなかった時も、以降の候補は 100 以内かで見て続ける。候補が尽きたら d に進む。symlink を作った後の bind / connect の失敗は、その結果を返し、次の候補で試し直さない (試験は後の候補のディレクトリの mtime が変わらないことで、そこに何も作られていないことを確かめる)
-- symlink はソケットのディレクトリへのリンクにする。カーネルはリンクを辿ってディレクトリ側にソケットを作るので、socket の実体は元のディレクトリにでき、置き場には何も残らない (試験で実機確認)
+- symlink の先と、カーネルに渡す綴り:
+
+  | 要求 | symlink の先 | 渡す綴り |
+  |---|---|---|
+  | bind | ソケットのディレクトリ | `<置き場>/sockat.XXXXXXXXXX/<ファイル名>` |
+  | connect | ソケットのファイル (元のパス) | `<置き場>/sockat.XXXXXXXXXX` |
+
+  - connect は最後の要素の symlink を辿る (macOS・Linux で確認)。綴りがファイル名の長さによらない
+  - bind はソケットのファイルを指す形を使わない。Linux は最後の要素の symlink を辿らず `EADDRINUSE` で断る (試験 `linux_binds_not_through_a_link_to_the_file_but_connects_through_it`)
+  - symlink の先は利用者のパスの綴りそのもの (相対パスは cwd を前に付ける) なので、カーネルは元のパスと同じに解決する。socket の実体は元の場所にでき、置き場には何も残らない (試験で実機確認)
+  - connect では、ディレクトリを指す形は使わない。ファイルを指す綴りの方が `/<ファイル名>` の分だけ常に短い。ディレクトリを指す形でだけ届くのは、パス全体が symlink の先の上限 (Linux 4096 バイト) を超える時だけで、そのパスは他のシステムコールでも開けない (macOS は 1024 バイトを超えるとどちらの形も `ENAMETOOLONG`。両方を実機で確認)
 - 名前は `sockat.` に乱数 10 文字 (英数 62 種)。乱数は OS の安全な乱数から取る: macOS・NetBSD・OpenBSD・DragonFly・illumos は `arc4random_buf(3)`、Linux・Android は `getrandom(2)` (C ライブラリの `getrandom` は glibc 2.25・bionic API 28 からなので、`syscall(2)` で呼ぶ。Linux 3.17 より古いカーネルでは `ENOSYS` で、symlink の経路は使えないとみなす)、その他の Unix は `/dev/urandom`。`symlink(2)` は既存の名前を置き換えずに `EEXIST` で失敗するので、これが symlink の `O_EXCL` になる。`EEXIST` なら名前を引き直す (16 回まで。使い切ったらその候補は使えないとみなし、次の候補に進む)。名前の生成を差し替えて、衝突した名前を飛ばすこと、既存のものに触らないこと、回数で打ち切ることを試験した
 - bind / connect が成功しても失敗しても、戻る時に symlink を消す (panic でも消す)。消すのに失敗しても無視する (ソケットは既にできていて、失敗させても symlink は戻らない)
 - プロセスが途中で死ぬと symlink が残る。名前が `sockat.` で始まるので、sockat の残骸と分かる (統括の裁定。一時ファイルの掃除に拾わせるための `tmp.` より、持ち主が分かることを取った)
@@ -147,7 +164,7 @@ a と c は POSIX の範囲の手 (`getcwd`、`realpath`、`stat`、`symlink`) �
 
 - `bind` と `connect` は std の `bind` / `connect` と同じ形で、置き換えるだけで使える
 - **`connect` は fork の経路を試さない** (kawaz 裁定)。fork は connect に普通求められる動きではない例外で、サーバに見える peer の pid が、もう終了したプロセス (fork した子) の pid になる (決定 3 d)。普通の環境では c (symlink) までで届く。fork が要る場面では、パスが `sun_path` に入らない時の普通の connect と同じく `ENAMETOOLONG` を返す
-- `connect_any` 系は、`connect` でも届かないよほど珍しい環境 (/proc も安全な一時ディレクトリも無い Linux、dirfd の手も一時ディレクトリも使えない Unix、ファイル名が symlink の経路にも収まらない時) で、fork の副作用を受け入れてでもつなぎたい時だけのもの。最後は fork してでもやり切る。fork の経路を通ったかを `bool` で返す (通った時に `true`)。fork の副作用が乗ったことを利用者が知り、ログに残す・警告するなどに使えるようにするため (kawaz 裁定)
+- `connect_any` 系は、`connect` でも届かないよほど珍しい環境 (安全で symlink を作れる一時ディレクトリが無く、/proc の綴りにも相対パスにも (macOS は広げた sockaddr にも) 収まらない時) で、fork の副作用を受け入れてでもつなぎたい時だけのもの。最後は fork してでもやり切る。fork の経路を通ったかを `bool` で返す (通った時に `true`)。fork の副作用が乗ったことを利用者が知り、ログに残す・警告するなどに使えるようにするため (kawaz 裁定)
 - pid の数値は返さない (kawaz 裁定)。fork の経路で connect した時にサーバに見える peer の pid は、もう終了したプロセスの pid で、呼び出し元にもサーバにも使い道が無い (サーバはその pid から呼び出し元のプロセスを辿れない)。fork が起き得るかは、fork しない `connect` と fork を受け入れる `connect_any` のどちらを呼ぶかで利用者が選んでいる
 - ブロックしない 2 つは、ソケットを connect の前に `O_NONBLOCK` にし、返す stream も非ブロッキングのまま (tokio の `from_std` にそのまま渡せる)。相手の backlog が満杯なら Linux は待たず `EAGAIN` を返す (tokio の connect と同じ)。Unix domain の connect は呼び出しの中で終わるか失敗し、Linux も XNU も `EINPROGRESS` を返さない (確かめた範囲は `route::ConnectOptions` の doc)
 - `bind` は最後は fork でやり切る。子は bind するだけで、listen は親がするので、listener に fork の副作用は残らない
@@ -183,9 +200,11 @@ a と c は POSIX の範囲の手 (`getcwd`、`realpath`、`stat`、`symlink`) �
 | 常に fork する (hyoui の方式をそのまま) | fork の副作用 (peer の pid、fd の複製) を、避けられる経路があるのに全員に負わせる |
 | `connect` も最後は fork する | fork は connect に普通求められる動きではなく、サーバに見える peer の pid がもう終了したプロセスの pid になる。普通の環境では symlink までで届くので、fork が要る場面は `connect_any` 系を選んだ利用者だけにする |
 | `connect_any` 系が fork した子の pid を返す | その pid はもう終了したプロセスのもので、呼び出し元にもサーバにも使い道が無い。利用者に要るのは fork の副作用が乗ったかどうかだけで、それは `bool` で足りる |
+| backlog を指定できる bind | 長いパスでも std と同じに使えることが責務で、std の bind にも backlog の指定は無い。要る人は listen し直せばよい (Linux / macOS で効く) |
 | 設定の型 (ブロックするか、fork するか) を持つ connect を 1 つ公開する | 軸は 2 つで閉じていて、関数 4 つで足りる。名前で振る舞いが読める |
 | 親のプロセスで `chdir` する | cwd は全スレッドで共有され、他のスレッドの相対パスの解決を巻き込む |
-| /proc がある Linux でも相対パス・symlink・fork を試す | /proc の経路が長さの制約無しで通るので要らない。fork は `SO_PEERCRED` の pid を壊す |
+| /proc の綴りが使える Linux でも相対パス・symlink・fork を試す | /proc の経路が長さの制約無しで通るので要らない。fork は `SO_PEERCRED` の pid を壊す |
+| connect でも、ソケットのファイルを指す symlink が使えない時にディレクトリを指す symlink を試す | ファイルを指す綴りの方が常に短い。ディレクトリを指す形でだけ届くのは、他のシステムコールでも開けない PATH_MAX 超えのパスだけ |
 | 子プロセスに bind させて fd を `SCM_RIGHTS` で受け取る | fork と同じ副作用に加え、受け渡しの手順が増える。fork 後の fd 共有で足りる |
 | 相対パスを書かれたままのパスの比較だけで作る | `/var` と `/private/var` のような違いで短くならない。cwd の接頭辞を削る手 (区切り単位、`$PWD` は stat で照合) と、実パスに揃える手の 2 段にした |
 | symlink の置き場の安全を、bind / connect の後に symlink の inode を比べて確かめる | rename で退かして戻す形を見抜けない。置き場の mode と持ち主を先に確かめる |

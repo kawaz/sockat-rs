@@ -36,15 +36,16 @@
 //!
 //! | Platform | Order tried |
 //! |---|---|
-//! | Linux, Android (with `/proc`) | /proc |
-//! | Linux, Android (without `/proc`) | relative path, symlink, fork |
+//! | Linux, Android (`/proc` usable) | /proc |
+//! | Linux, Android (`/proc` not usable) | relative path, symlink, fork |
 //! | FreeBSD | bindat |
 //! | macOS (Apple) | relative path, widened sockaddr, symlink, fork |
 //! | NetBSD, OpenBSD, illumos, other Unix | relative path, symlink, fork |
 //!
 //! * **/proc**: `/proc/self/fd/<dirfd>/<name>`, with the directory opened
 //!   `O_PATH`. The directory may be of any length; the whole spelling must fit
-//!   `sun_path` (a file name of about 90 bytes)
+//!   `sun_path` (a file name of about 90 bytes). Not usable without `/proc` or
+//!   for a longer file name
 //! * **bindat**: `bindat(2)` / `connectat(2)` with the directory fd and the file
 //!   name (up to 103 bytes)
 //! * **relative path**: the path spelled relative to the working directory,
@@ -52,13 +53,15 @@
 //!   cwd is never changed
 //! * **widened sockaddr**: a `sockaddr_un` carrying up to 253 bytes of path,
 //!   which XNU accepts: the path itself, or failing that the relative spelling
-//! * **symlink**: a short symlink to the socket's directory, under `TMPDIR` or
-//!   failing that `/tmp`, removed right after the call. It is created only in a
-//!   place where no other user can replace it before the bind / connect through
-//!   it: a sticky directory owned by root or the calling user (as `/tmp` is), or
-//!   a directory of the calling user's that group and others cannot write to.
-//!   Through `/tmp`, a file name of up to 77 bytes (230 on macOS) is reached
-//!   at any directory depth
+//! * **symlink**: a short symlink under `TMPDIR` or failing that `/tmp`,
+//!   removed right after the call: for a bind, to the socket's directory
+//!   (`<link>/<name>` is passed), for a connect, to the socket file (`<link>`
+//!   is passed). It is created only in a place where no other user can replace
+//!   it before the bind / connect through it: a sticky directory owned by root
+//!   or the calling user (as `/tmp` is), or a directory of the calling user's
+//!   that group and others cannot write to. Through `/tmp`, a connect is
+//!   reached whatever the directory depth and the file name length, a bind for
+//!   a file name of up to 77 bytes (230 on macOS)
 //! * **fork**: a forked child that `fchdir`s into the socket's directory makes
 //!   the call by the file name alone and exits. Only [`bind`],
 //!   [`connect_any`] and [`connect_any_nonblocking`] take it
@@ -78,10 +81,9 @@
 //! expected to, and after a connect through the fork route the peer pid the
 //! server sees is that of a process that has already exited. Where only the
 //! fork route would reach the path, they fail with `ENAMETOOLONG`, as any
-//! connect to a path too long for `sun_path` does. That happens only on a
-//! platform without `/proc` or `bindat`, when the path fits neither as a
-//! relative path (nor, on macOS, in the widened sockaddr) nor through the
-//! symlink (the file name is too long for it, or there is no safe place for it).
+//! connect to a path too long for `sun_path` does. That happens only when the
+//! path fits neither the `/proc` spelling nor a relative path (nor, on macOS,
+//! the widened sockaddr) and there is no safe place for the symlink.
 //!
 //! [`connect_any`] and [`connect_any_nonblocking`] are for that rare
 //! environment, when the connection is wanted at the cost of the fork's side
@@ -139,7 +141,7 @@
 //!   make that safe, it only detects the visible case.
 //! * **A temporary symlink can be left behind** if the process dies between
 //!   creating and removing it. It is named `sockat.XXXXXXXXXX` under `TMPDIR`
-//!   or `/tmp` and points to the socket's directory.
+//!   or `/tmp` and points to the socket's directory or file.
 //!
 //! # Errors
 //!
@@ -149,10 +151,9 @@
 //! `ECONNREFUSED` for a socket nobody listens on, `EAGAIN` for a full backlog
 //! on a nonblocking connect (Linux; macOS answers `ECONNREFUSED` to any
 //! connect on a full backlog, so there `ECONNREFUSED` alone does not mean
-//! nobody listens). When no route can reach the path, which happens when the
-//! file name alone is too long (or, for [`connect`] and
-//! [`connect_nonblocking`], when only the fork route would), the error is
-//! `ENAMETOOLONG`. A path longer than 100 bytes that does not end with a file
+//! nobody listens). When no route can reach the path (for [`bind`], a file
+//! name too long for every route; for [`connect`] and [`connect_nonblocking`],
+//! also when only the fork route would), the error is `ENAMETOOLONG`. A path longer than 100 bytes that does not end with a file
 //! name, or any path that contains a NUL byte, is an `InvalidInput` error.
 //!
 //! # Async runtimes
@@ -223,7 +224,7 @@ pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
 /// A path of at most 100 bytes goes to [`UnixStream::connect`] unchanged. A
 /// longer path is reached by every route the platform has but the fork route
 /// (see the [crate documentation](crate)), so in an ordinary environment it is
-/// reached at any directory depth, and the connection is always made by this
+/// reached whatever the directory depth and the file name length, and the connection is always made by this
 /// process. Only in a rare environment where nothing but the fork route would
 /// reach the path is the error `ENAMETOOLONG`, as for any connect to a path
 /// too long for `sun_path` ([`connect_any`] is for that case).
@@ -277,12 +278,11 @@ pub fn connect_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
 /// Use [`connect`] (or [`connect_nonblocking`]) unless it fails with
 /// `ENAMETOOLONG` in an environment you have to support: it reaches a long
 /// path in any ordinary environment. This is for the rare one where only the
-/// fork route does (on a platform without `/proc` or `bindat`, a path that fits
-/// neither as a relative path, nor on macOS in the widened sockaddr, nor
-/// through the symlink, because the file name is too long for it or there is no
-/// safe place for it), when the connection is wanted at the cost of the fork's
-/// side effects. The order tried is that of [`connect`], with the fork route
-/// last. Linux with `/proc` and FreeBSD never fork.
+/// fork route does (a path that fits neither the `/proc` spelling nor a
+/// relative path, nor on macOS the widened sockaddr, where there is no safe
+/// place for the symlink), when the connection is wanted at the cost of the
+/// fork's side effects. The order tried is that of [`connect`], with the fork
+/// route last. FreeBSD never forks.
 ///
 /// The fork route connects from a forked child that `fchdir`s into the
 /// socket's directory and exits at once. The second value is `true` when the

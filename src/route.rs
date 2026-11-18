@@ -113,13 +113,20 @@ pub(crate) enum Route {
     /// The relative spelling in a widened `sockaddr_un` (Apple).
     #[cfg(target_vendor = "apple")]
     WideRelative,
-    /// Through a short temporary symlink to the directory, in the plain
-    /// sockaddr.
+    /// Through a short temporary symlink to the socket's directory, in the
+    /// plain sockaddr (bind).
     #[cfg(not(target_os = "freebsd"))]
-    Symlink,
-    /// Through a temporary symlink, in a widened `sockaddr_un` (Apple).
+    SymlinkToDir,
+    /// [`Route::SymlinkToDir`] in a widened `sockaddr_un` (Apple).
     #[cfg(target_vendor = "apple")]
-    SymlinkWide,
+    SymlinkToDirWide,
+    /// Through a short temporary symlink to the socket file itself, in the
+    /// plain sockaddr (connect).
+    #[cfg(not(target_os = "freebsd"))]
+    SymlinkToFile,
+    /// [`Route::SymlinkToFile`] in a widened `sockaddr_un` (Apple).
+    #[cfg(target_vendor = "apple")]
+    SymlinkToFileWide,
     /// `bindat(2)` / `connectat(2)` on the directory fd (FreeBSD).
     #[cfg(target_os = "freebsd")]
     At,
@@ -167,7 +174,7 @@ pub(crate) fn run(req: Request, path: &Path) -> io::Result<(OwnedFd, Route)> {
 /// the environment given as `cfg` (the tests pass their own).
 ///
 /// Linux: `/proc/self/fd/<dirfd>/<name>` with the directory opened `O_PATH`;
-/// when there is no /proc, the POSIX order ([`posix::run`]) with that
+/// when that cannot be used, the POSIX order ([`posix::run`]) with that
 /// directory fd for the fork route. Every other target but FreeBSD: the POSIX
 /// order.
 ///
@@ -175,11 +182,11 @@ pub(crate) fn run(req: Request, path: &Path) -> io::Result<(OwnedFd, Route)> {
 /// fd refers to, so the socket is created in (or looked up in) that directory
 /// without ever changing the cwd. That route has no length limit on the
 /// directory, needs no temporary file and no fork, and works in multi-threaded
-/// processes, so with /proc nothing else is tried. The POSIX order is taken
-/// only when `<proc_self_fd>/<dirfd>` is not there (no /proc mounted, as in
-/// some chroots and minimal containers): the route itself cannot be used
-/// then. What a bind / connect through /proc returns is the result, never
-/// retried on another route.
+/// processes, so whenever it can be used nothing else is tried. It cannot be
+/// used when `<proc_self_fd>/<dirfd>` is not there (no /proc mounted, as in
+/// some chroots and minimal containers) or when the spelling does not fit
+/// `sun_path` (a file name of about 90 bytes or more). What a bind / connect
+/// through /proc returns is the result, never retried on another route.
 #[cfg(not(target_os = "freebsd"))]
 pub(crate) fn run_long(
     req: Request,
@@ -193,7 +200,7 @@ pub(crate) fn run_long(
         let opened = open_dir(dir)?;
         // `opened` stays open until this returns (dropped at the end of
         // scope), so the /proc spelling keeps naming it.
-        match linux::proc_spelling(opened.as_fd(), name, &cfg.proc_self_fd)? {
+        match linux::proc_spelling(opened.as_fd(), name, &cfg.proc_self_fd) {
             Some(via) => plain_op(req, &via).map(|fd| (fd, Route::ProcFd)),
             None => posix::run(req, path, dir, name, Some(opened.as_fd()), cfg),
         }
@@ -355,30 +362,24 @@ pub(crate) mod linux {
     /// Where the kernel lists the fds of the calling process.
     pub(crate) const PROC_SELF_FD: &str = "/proc/self/fd";
 
-    /// `<proc_self_fd>/<dir>/<name>`, or `None` when `<proc_self_fd>/<dir>`
-    /// cannot be looked up (no /proc). Without that check a bind / connect
-    /// through the spelling would fail with `ENOENT`, which reads as "the
-    /// directory does not exist" although it does.
+    /// `<proc_self_fd>/<dir>/<name>`, or `None` when the /proc route cannot
+    /// be used:
     ///
-    /// # Errors
-    ///
-    /// `ENAMETOOLONG` when the spelling does not fit `sun_path`: the file name
-    /// alone is too long to fit even behind the shortest directory spelling
-    /// there is.
+    /// * `<proc_self_fd>/<dir>` cannot be looked up (no /proc). Without this
+    ///   check a bind / connect through the spelling would fail with
+    ///   `ENOENT`, which reads as "the directory does not exist" although it
+    ///   does;
+    /// * the spelling does not fit `sun_path` (a file name of about 90 bytes
+    ///   or more). std would refuse it with its own `InvalidInput`.
     pub(crate) fn proc_spelling(
         dir: BorrowedFd<'_>,
         name: &OsStr,
         proc_self_fd: &Path,
-    ) -> io::Result<Option<PathBuf>> {
+    ) -> Option<PathBuf> {
         let fd_dir = proc_self_fd.join(dir.as_raw_fd().to_string());
-        if std::fs::metadata(&fd_dir).is_err() {
-            return Ok(None);
-        }
+        std::fs::metadata(&fd_dir).ok()?;
         let via = fd_dir.join(name);
-        if path::len(&via) >= sys::SUN_PATH_CAP {
-            return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
-        }
-        Ok(Some(via))
+        (path::len(&via) < sys::SUN_PATH_CAP).then_some(via)
     }
 }
 
@@ -425,7 +426,7 @@ pub(crate) mod apple {
 /// The routes that need nothing but POSIX (plus, on Apple, the widened
 /// `sockaddr_un`), tried in order on every target without a dirfd-relative
 /// primitive: Apple, NetBSD, OpenBSD, illumos and the other Unix targets, and
-/// Linux without /proc (DR-0001 decision 3).
+/// Linux when the /proc route cannot be used (DR-0001 decision 3).
 #[cfg(not(target_os = "freebsd"))]
 pub(crate) mod posix {
     use super::*;
@@ -498,10 +499,11 @@ pub(crate) mod posix {
     /// 2. (Apple) a widened `sockaddr_un` with the path itself, or failing
     ///    that with the relative spelling, when one of them is at most 253
     ///    bytes;
-    /// 3. a short symlink to the socket's directory under the first of
-    ///    `TMPDIR` and `/tmp` ([`Config::tmp_bases`]) where the path through
-    ///    it fits (in the plain sockaddr, or on Apple the widened one) and the
-    ///    symlink can be created;
+    /// 3. a short symlink ([`symlink_route`]: to the socket's directory for a
+    ///    bind, to the socket file for a connect) under the first of `TMPDIR`
+    ///    and `/tmp` ([`Config::tmp_bases`]) where the path through it fits
+    ///    (in the plain sockaddr, or on Apple the widened one) and the symlink
+    ///    can be created;
     /// 4. a forked child that `fchdir`s into the directory (`opened` when the
     ///    caller has it open already, as Linux does), unless the request rules
     ///    it out (then `ENAMETOOLONG`).
@@ -553,7 +555,7 @@ pub(crate) mod posix {
             let limit = if wide { WIDE_PATH_MAX } else { DIRECT_MAX };
             #[cfg(not(target_vendor = "apple"))]
             let limit = DIRECT_MAX;
-            match symlink_route(req, base, dir, name, limit) {
+            match symlink_route(req, base, path, dir, name, limit) {
                 SymlinkOutcome::Done(done) => return done,
                 #[cfg(target_vendor = "apple")]
                 SymlinkOutcome::WideRefused => wide = false,
@@ -721,49 +723,76 @@ pub(crate) mod posix {
     /// Length of the random part of the symlink name (`sockat.XXXXXXXXXX`).
     pub(crate) const LINK_RANDOM_LEN: usize = 10;
 
-    /// Bind / connect through `<base>/sockat.XXXXXXXXXX/<name>`, where the
-    /// symlink `sockat.XXXXXXXXXX` points to the socket's directory, when that
-    /// path is at most `limit` bytes: [`DIRECT_MAX`] for the plain sockaddr,
-    /// or on Apple the widened form's 253 (a path over [`DIRECT_MAX`] then
-    /// goes in the widened form), and `base` is a place where nobody else can
-    /// replace the symlink ([`safe_base`]).
+    /// Bind / connect `path` (directory part `dir`, file name `name`) through
+    /// a symlink `<base>/sockat.XXXXXXXXXX`:
     ///
-    /// The length of the path through the symlink and the safety of `base` are
-    /// checked before anything is created. The symlink is a link to the directory, so the kernel
-    /// creates (or looks up) the socket inside the real directory; nothing is
-    /// left under `base` once the symlink is removed, which happens when this
-    /// returns (including on panic) whatever the outcome.
+    /// | request | the link points to | spelling handed to the kernel | route |
+    /// |---|---|---|---|
+    /// | bind | `dir` | `<link>/<name>` | [`Route::SymlinkToDir`] |
+    /// | connect | `path` | `<link>` | [`Route::SymlinkToFile`] |
+    ///
+    /// A connect follows a symlink in the last component, so the link to the
+    /// file reaches the socket by a spelling whose length depends on neither
+    /// the directory nor the file name. A bind does not: Linux refuses it with
+    /// `EADDRINUSE`, the link being there already. Both links hold the
+    /// caller's own spelling (made absolute against the cwd), so the kernel
+    /// resolves them as it resolves `path`.
+    ///
+    /// Used when the spelling is at most `limit` bytes ([`DIRECT_MAX`] for the
+    /// plain sockaddr, or on Apple the widened form's 253: a spelling over
+    /// [`DIRECT_MAX`] then goes in the widened form) and `base` is a place
+    /// where nobody else can replace the symlink ([`safe_base`]). Both are
+    /// checked before anything is created. Nothing is left under `base`: the
+    /// symlink is removed when this returns (including on panic) whatever the
+    /// outcome.
     pub(crate) fn symlink_route(
         req: Request,
         base: &Path,
+        path: &Path,
         dir: &Path,
         name: &OsStr,
         limit: usize,
     ) -> SymlinkOutcome {
-        let placeholder = format!("{LINK_PREFIX}{}", "X".repeat(LINK_RANDOM_LEN));
-        if path::len(&base.join(placeholder).join(name)) > limit || !safe_base(base) {
+        let to_file = matches!(req, Request::Connect(_));
+        let placeholder = base.join(format!("{LINK_PREFIX}{}", "X".repeat(LINK_RANDOM_LEN)));
+        let spelling_len = if to_file {
+            path::len(&placeholder)
+        } else {
+            path::len(&placeholder.join(name))
+        };
+        if spelling_len > limit || !safe_base(base) {
             return SymlinkOutcome::Unusable;
         }
-        let target = if dir.is_absolute() {
-            dir.to_path_buf()
+        let target = if to_file { path } else { dir };
+        let target = if target.is_absolute() {
+            target.to_path_buf()
         } else {
             match std::env::current_dir() {
-                Ok(cwd) => cwd.join(dir),
+                Ok(cwd) => cwd.join(target),
                 Err(_) => return SymlinkOutcome::Unusable,
             }
         };
         let Ok(link) = TempLink::create(base, &target) else {
             return SymlinkOutcome::Unusable;
         };
-        let via = link.path.join(name);
+        let (via, plain_route) = if to_file {
+            (link.path.clone(), Route::SymlinkToFile)
+        } else {
+            (link.path.join(name), Route::SymlinkToDir)
+        };
         #[cfg(target_vendor = "apple")]
         if path::len(&via) > DIRECT_MAX {
+            let wide_route = if to_file {
+                Route::SymlinkToFileWide
+            } else {
+                Route::SymlinkToDirWide
+            };
             return match apple::wide_op(req, &via) {
                 Err(e) if apple::refuses_wide(&e) => SymlinkOutcome::WideRefused,
-                done => SymlinkOutcome::Done(done.map(|fd| (fd, Route::SymlinkWide))),
+                done => SymlinkOutcome::Done(done.map(|fd| (fd, wide_route))),
             };
         }
-        SymlinkOutcome::Done(plain_op(req, &via).map(|fd| (fd, Route::Symlink)))
+        SymlinkOutcome::Done(plain_op(req, &via).map(|fd| (fd, plain_route)))
     }
 
     /// Whether `base`, followed through symlinks (macOS's `/tmp` is one to
