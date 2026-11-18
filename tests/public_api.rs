@@ -543,6 +543,50 @@ fn bind_ex_leaves_a_replaced_socket_file_alone() {
     file.discard().unwrap();
 }
 
+// discard() reports Ok(()) only when it knows the bind's file is gone: a
+// directory along the path removed (ENOENT) or replaced by a plain file
+// (ENOTDIR) means the file is not there. When the path cannot be looked up
+// for another reason (no search permission on the directory, EACCES) whether
+// the file is still there is unknown, so that is an error, not Ok(()) (hub
+// SPEC 8b001a76), and the file is left there. The EACCES half needs a
+// non-root user (root ignores the permission bits).
+#[test]
+fn bind_ex_discard_errs_only_when_it_cannot_tell() {
+    let t = tempfile::Builder::new()
+        .prefix("sockat-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let p = nest(t.path(), 400, "s.sock");
+    let dir = p.parent().unwrap().to_path_buf();
+
+    let (listener, file) = sockat::bind_ex(&p).unwrap();
+    drop(listener);
+    std::fs::remove_file(&p).unwrap();
+    std::fs::remove_dir(&dir).unwrap();
+    std::fs::write(&dir, b"not a directory").unwrap();
+    file.discard().unwrap();
+    std::fs::remove_file(&dir).unwrap();
+    std::fs::create_dir(&dir).unwrap();
+
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |m: u32| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap();
+    let (listener, file) = sockat::bind_ex(&p).unwrap();
+    drop(listener);
+    mode(0o600);
+    // Root ignores the permission bits: then the path can still be looked up
+    // and there is no EACCES to see.
+    if std::fs::symlink_metadata(&p).is_ok() {
+        mode(0o700);
+        file.discard().unwrap();
+        return;
+    }
+    let r = file.discard();
+    mode(0o700);
+    let e = r.unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(libc::EACCES), "{e}");
+    assert!(is_socket(&p), "the file must still be there");
+}
+
 // The path is remembered as its real path at the time of the bind, so a
 // symlink along the given path repointed afterwards does not send discard()
 // elsewhere: with `<t>/link -> <t>/one`, a socket bound at

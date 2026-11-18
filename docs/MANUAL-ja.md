@@ -200,7 +200,7 @@ file.discard()?;
 ```
 
 - `bind_ex` は bind が通った直後、経路の中で listener を返す前に、ソケットのファイルの realpath と `(st_dev, st_ino)` を覚える (中心の経路では D と R が残っている間に、bind と同じ綴りで引く)。覚えられなければ listener を閉じ、ファイルは消さずにエラーを返す
-- `SocketFile::discard()` は、その realpath にある物の `(st_dev, st_ino)` が同じ時だけ消す。別の物 (後から同じパスに bind された別のソケット、ファイル、symlink) は消さず、何も無ければ何もしない。どちらも `Ok(())`
+- `SocketFile::discard()` は、その realpath にある物の `(st_dev, st_ino)` が同じ時だけ消す。別の物 (後から同じパスに bind された別のソケット、ファイル、symlink) は消さず、何も無ければ (途中のディレクトリが消された・ディレクトリでない物に置き換わった時も) 何もしない。どちらも `Ok(())`。それ以外の理由で確かめられない時 (`EACCES` 等) と消そうとして失敗した時はエラー (消せたか分からないのを `Ok(())` にしない)
 - `discard()` は listener を閉じない。listener は std の `UnixListener` で、tokio 等へ渡せる。閉じるのは listener を持っている側で、閉じてから `discard()` する
 - `SocketFile` を drop しても何もしない
 - 短いパス (std にそのまま渡す) でも同じ

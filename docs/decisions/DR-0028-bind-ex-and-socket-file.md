@@ -28,7 +28,7 @@ impl SocketFile {
   - std に渡す長さのパス: std の bind が返った直後に `realpath(3)` と `lstat(2)`
   - 中心の経路: D と R が残っている間に、bind と同じ綴り `R/<ファイル名>` で D の fd から `fstatat(AT_SYMLINK_NOFOLLOW)` (R は辿り、ソケットのファイル自体は辿らない)。パスは R の先 (ソケットのディレクトリの realpath) とファイル名。スレッド cwd はスレッドが終わった直後、fork は子の終了を受けた後
 - 覚えられなければ listener を閉じ、ファイルは消さずにエラーを返す
-- `discard()` は realpath を `lstat` し、`(st_dev, st_ino)` が同じ時だけ `unlink` する。違う物 (別のソケット、ファイル、symlink) があれば触らず、何も無ければ何もしない。どちらも `Ok(())`
+- `discard()` は realpath を `lstat` し、`(st_dev, st_ino)` が同じ時だけ `unlink` する。違う物 (別のソケット、ファイル、symlink) があれば触らず、何も無ければ (`lstat` が `ENOENT` / `ENOTDIR`) 何もしない。どちらも `Ok(())`。確かめられない時 (`lstat` がそれ以外で失敗、`EACCES` 等) と `unlink` の失敗はエラー (試験 `bind_ex_discard_errs_only_when_it_cannot_tell`)
 - `discard()` は listener を閉じない。閉じるのは listener を持っている利用者 (tokio、サーバのフレームワーク等)
 - `SocketFile` を drop しても何もしない
 - 短いパス (std にそのまま渡す) でも同じく覚えて消せる
@@ -67,4 +67,5 @@ impl SocketFile {
 
 - `_ex` の振る舞い (realpath と `(st_dev, st_ino)` を覚え、同じ時だけ消す、bind の直後に覚え、覚えられなければエラー): ハブの SPEC (2026-11-19)
 - Rust の形 (`bind_ex(path) -> (UnixListener, SocketFile)`、`discard(self)`、Drop では消さない、derive Debug、listener を閉じるのは利用者): 統括の裁定 2026-11-19 (ハブ D12-Q4 で kawaz 確認中)
-- 何も無い時・すり替えられていた時も `Ok(())`: 実装側の判断 2026-11-19
+- 何も無い時・すり替えられていた時も `Ok(())`: 実装側の判断 2026-11-19 (ハブ SPEC で確定)
+- 確かめられない時はエラー: ハブ SPEC 8b001a76 (sockat-py の指摘)

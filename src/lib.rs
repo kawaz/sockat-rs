@@ -375,8 +375,12 @@ impl SocketFile {
     /// following a symlink).
     ///
     /// Anything else there (another socket bound at the path since, a file
-    /// or a symlink put in its place) is left alone, and so is nothing at all:
-    /// both are `Ok(())`, the file of the bind being gone either way. The
+    /// or a symlink put in its place) is left alone, and so is nothing at all
+    /// (the path or a directory along it gone, or a directory along it
+    /// replaced by something that is not one): all are `Ok(())`, the file of
+    /// the bind being gone either way. When what is at the path cannot be
+    /// looked up for another reason (`EACCES`, say), whether the file is
+    /// still there is unknown, and that is an error rather than `Ok(())`. The
     /// listener is not touched; close it first, as a socket file removed under
     /// a listener that is still open leaves that listener unreachable by path.
     ///
@@ -389,15 +393,17 @@ impl SocketFile {
     ///
     /// # Errors
     ///
-    /// Those of `lstat(2)` (other than `ENOENT`) and `unlink(2)` on the path.
+    /// Those of `lstat(2)` (other than `ENOENT` and `ENOTDIR`, which mean
+    /// the file is not there) and `unlink(2)` on the path.
     pub fn discard(self) -> io::Result<()> {
+        let gone = |e: &io::Error| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR));
         match file_id(&self.path) {
             Ok(id) if id == self.id => match std::fs::remove_file(&self.path) {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) if gone(&e) => Ok(()),
                 removed => removed,
             },
             Ok(_) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) if gone(&e) => Ok(()),
             Err(e) => Err(e),
         }
     }
