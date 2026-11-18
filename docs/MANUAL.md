@@ -282,6 +282,8 @@ On the fork route (`bind` and the `connect_any` ones), the nature of fork brings
 
 R points to the real path of the socket's directory as it was when R was made. The /proc, relative and connectat fallback routes and the fork of the `connect_any` ones look the directory up first (open it, or resolve it to a real path) and then connect by the file name. If a directory along the path is renamed or a symlink along it repointed in between, the socket is created in (or looked up in) the directory as it was looked up. The widened sockaddr and the symlink route let the kernel resolve the original path, and behave as std does in this respect.
 
+When D can be made nowhere and a bind goes through R (`.sockat.XXXXXXXXXX`) made in the socket's directory itself, and that directory is not sticky and others can write to it, someone else can replace R between its creation and the bind, and the socket can then be bound in another directory (a name already there is `EADDRINUSE`; nothing is overwritten).
+
 ### The relative route is exposed to another thread's chdir
 
 sockat itself never changes the cwd. The relative spelling is checked to name the same directory when it is made, and the cwd is checked again after the connect. If another thread changed the cwd in between, the result is discarded (the connected socket closed) and an error (`Other`) returned. A change undone in between is not seen. A program that changes the cwd while connecting races every relative path in the process anyway; sockat does not make that safe, it only detects the visible case.
