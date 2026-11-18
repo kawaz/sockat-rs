@@ -156,11 +156,11 @@ push: ci check-on-default-branch ensure-clean check-outdated-translations check-
     bump-semver vcs push --branch main --jj-bookmark-auto-advance
     ccmsg notify --self --text "Monitor で 'just watch' を起動して" 2>/dev/null || true
 
-# push した commit の CI (ci.yml) を SHA-pinned で watch する
+# push した commit の workflow (CI と Release) を SHA-pinned で watch する
 #
 # watch-workflow.sh は gh-monitor plugin の中にあり PATH に乗らないので、
 # cache から最新版を探して使う。
-[doc("ci.yml の完了を SHA-pinned watch する")]
+[doc("push した commit の workflow (CI と Release) の完了を SHA-pinned watch する")]
 [script]
 watch:
     ws=$(ls "$HOME"/.claude-personal/plugins/cache/gh-monitor/gh-monitor/*/scripts/watch-workflow.sh 2>/dev/null | sort -V | tail -1)
