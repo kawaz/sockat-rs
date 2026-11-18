@@ -168,4 +168,4 @@ watch:
         echo "watch-workflow.sh が見つかりません (gh-monitor plugin が未インストール?)" >&2
         exit 1
     fi
-    "$ws" --sha "$(bump-semver vcs get commit-id --rev "$(bump-semver vcs get default-branch)")" kawaz/sockat
+    "$ws" --sha "$(bump-semver vcs get commit-id --rev "$(bump-semver vcs get default-branch)")" kawaz/sockat-rs

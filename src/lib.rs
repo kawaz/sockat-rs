@@ -77,9 +77,9 @@
 //! of them can be used from multi-threaded programs. Windows is not supported
 //! (the crate is Unix-only). The details, and where each function stops
 //! reaching a path, are in the
-//! [manual](https://github.com/kawaz/sockat/blob/main/docs/MANUAL.md); the
+//! [manual](https://github.com/kawaz/sockat-rs/blob/main/docs/MANUAL.md); the
 //! design and the reasons for the order in
-//! [DR-0001](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0001-long-socket-path-routes.md)
+//! [DR-0001](https://github.com/kawaz/sockat-rs/blob/main/docs/decisions/DR-0001-long-socket-path-routes.md)
 //! (in Japanese).
 //!
 //! # The exception: `connect_any`
