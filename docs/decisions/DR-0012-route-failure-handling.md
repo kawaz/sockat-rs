@@ -14,11 +14,13 @@
   - /proc を使えない ([DR-0003](DR-0003-linux-proc-self-fd.md))
   - 広げた sockaddr をカーネルが受け付けない ([DR-0005](DR-0005-widened-sockaddr-on-macos.md))
   - symlink の置き場が安全でない・作れない ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md))
+  - 相対パスの経路で、作った綴りのディレクトリが元と `(st_dev, st_ino)` で一致しない、または cwd が既に変わっている ([DR-0004](DR-0004-relative-path-from-cwd.md))
+  - スレッド cwd の経路で、スレッドを作れない、`unshare` が断られた、`pthread_fchdir_np` が無い・失敗した ([DR-0020](DR-0020-thread-cwd-route.md))
   - 長さが足りない
-- **fork を試さない connect** (`connect` / `connect_nonblocking`) は、fork の経路の手前で `ENAMETOOLONG` を返す。ソケットは作らず、何も connect しない。専用のエラーや文言は作らない
-- ディレクトリが無い時は、どの OS でも、ファイル名の長さによらず `ENOENT` を返す。ディレクトリを先に開いてから、ファイル名が収まるかを判定する
+- **fork を試さない connect** (`connect` / `connect_nonblocking`) は、スレッド cwd の経路の後、fork の経路の手前で `ENAMETOOLONG` を返す。ファイルシステムに何も作らず、何も connect しない。専用のエラーや文言は作らない。スレッド cwd の経路で実際に connect した失敗 (`ENOENT`、`ECONNREFUSED` 等) は、`ENAMETOOLONG` に変えずにそのまま返す
+- ディレクトリが無い時は、どの OS でも、ファイル名の長さによらず `ENOENT` を返す。ディレクトリを先に開いてから、ファイル名が収まるかを判定する (スレッド cwd と fork の経路の手前)
 
-試験: `a_missing_directory_is_enoent_even_when_the_name_fits_no_sockaddr` (254 バイトのファイル名、bind と各 connect、symlink の置き場なしで fork の経路の手前まで進める場合も)。
+試験: `a_missing_directory_is_enoent_even_when_the_name_fits_no_sockaddr` (254 バイトのファイル名、bind と各 connect、symlink の置き場なしでスレッド cwd と fork の経路の手前まで進める場合も)、`the_thread_cwd_route_reports_the_kernels_errors` (スレッド cwd の経路の失敗をそのまま返す)。
 
 ## 理由
 
@@ -37,4 +39,5 @@
 
 - fork を試さない connect は `ENAMETOOLONG`、専用のエラーは作らない: kawaz 裁定 2026-11-18
 - ディレクトリが無い時はどの OS でも `ENOENT` にそろえる: 統括の裁定 2026-11-18
+- スレッド cwd の経路が使えない時に次へ進む: kawaz 裁定 (ハブ DR-0005、2026-11-18)
 - 本当の失敗を次の経路でやり直さない: 出所の記録なし

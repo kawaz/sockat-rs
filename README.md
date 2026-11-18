@@ -18,7 +18,7 @@ Use `sockat::bind` / `sockat::connect` where you would use std's `UnixListener::
 - The results are std's own `UnixListener` / `UnixStream`
 - A path that std accepts is handed to std unchanged, so it behaves exactly as with std
 - Even for a long path, the socket file is created at the path given
-- `connect` too tries every route up to a short symlink under a temporary directory, so in an ordinary environment it reaches long paths as well
+- `connect` too tries every route before the fork route (a short symlink under a temporary directory, and on Linux and the Apple OSes a route that moves the cwd of one thread only), so in an ordinary environment it reaches long paths as well
 
 ## Why
 
@@ -38,9 +38,9 @@ A longer path is tried on the routes below, in this order per OS, and bound / co
 | OS | Order tried |
 |---|---|
 | Linux / Android (`/proc` usable) | /proc |
-| Linux / Android (`/proc` not usable) | relative path → symlink → fork |
+| Linux / Android (`/proc` not usable) | relative path → symlink → thread cwd → fork |
 | FreeBSD | bindat |
-| macOS | relative path → widened sockaddr → symlink → fork |
+| macOS / iOS and the other Apple OSes | relative path → widened sockaddr → symlink → thread cwd → fork |
 | NetBSD / OpenBSD / illumos / other Unix | relative path → symlink → fork |
 | Windows | not supported (compile error) |
 
@@ -49,11 +49,12 @@ A longer path is tried on the routes below, in this order per OS, and bound / co
 - **relative path**: when std accepts the path relative to the cwd, pass that. Only the path string is rewritten; the cwd is never changed
 - **widened sockaddr**: pass a sockaddr carrying up to 253 bytes, which the macOS kernel accepts
 - **symlink**: create a short symlink under `TMPDIR` or `/tmp` and go through it. For a bind it points to the socket's directory, for a connect to the socket file. It is created only in a place where no other user can replace it, and removed at once
+- **thread cwd**: move the cwd of a throwaway thread, and of it alone, into the directory (Linux: `unshare(CLONE_FS)` and `fchdir`; Apple OSes: `pthread_fchdir_np`) and bind / connect by the file name alone. It has no side effects, so every function tries it
 - **fork**: fork a child that `fchdir`s into the directory and binds / connects by the file name alone. **Only `bind` and the `connect_any` variants try it**
 
 None of the routes changes the calling process's cwd, so they can be used from multi-threaded programs.
 
-`connect` / `connect_nonblocking` never fork. Where only the fork route would reach the path, they return `ENAMETOOLONG`, as a plain connect to a path too long for `sun_path` does. That happens only when the path fits neither the `/proc` spelling nor a relative path (nor, on macOS, the widened sockaddr) and there is no safe place to create the symlink. With a usable `/tmp`, `connect` reaches the path through the symlink whatever the directory depth and the file name length. The length limits of each route, and where `connect` stops reaching a path, are in [docs/MANUAL.md](./docs/MANUAL.md#how-a-long-path-is-reached).
+`connect` / `connect_nonblocking` never fork. Where only the fork route would reach the path, they return `ENAMETOOLONG`, as a plain connect to a path too long for `sun_path` does. That happens only when the path fits neither the `/proc` spelling nor a relative path (nor, on the Apple OSes, the widened sockaddr), there is no safe place to create the symlink, and the thread cwd route cannot be used either (NetBSD / OpenBSD / illumos, Linux where `unshare` is refused, an Apple OS without `pthread_fchdir_np`). With a usable `/tmp`, `connect` reaches the path through the symlink whatever the directory depth and the file name length. The length limits of each route, and where `connect` stops reaching a path, are in [docs/MANUAL.md](./docs/MANUAL.md#how-a-long-path-is-reached).
 
 ## The exception: `connect_any`
 

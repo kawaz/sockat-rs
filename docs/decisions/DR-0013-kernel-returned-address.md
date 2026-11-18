@@ -17,7 +17,7 @@
   | 相対パス | 相対パス |
   | 広げた sockaddr | std のバッファ (106 バイト) で切れたパス (試験で確認、panic はしない) |
   | symlink | もう無い symlink を通したパス |
-  | fork、bindat | ファイル名だけ |
+  | スレッド cwd、fork、bindat | ファイル名だけ |
 
 - 利用者には元のパスを持ってもらう。doc にそう書く
 - OpenBSD では、103 バイト以内の短いパス ([DR-0002](DR-0002-std-handles-paths-it-accepts.md) で std にそのまま渡す) でも、std の `local_addr()` がパスの末尾 1 バイトを欠いて返す (CI の VM で観測、std の `UnixListener::bind` を直接使った場合)。sockat は手を入れない。std がパスそのものを返す前提を見る試験は、OpenBSD では外す

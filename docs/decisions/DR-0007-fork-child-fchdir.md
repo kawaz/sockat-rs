@@ -5,11 +5,11 @@
 
 ## Context
 
-相対パス・広げた sockaddr・symlink のどれでも届かない環境 (安全で symlink を作れる置き場が無いサンドボックス等、bind でファイル名が symlink の綴りに収まらない時) が残る。cwd はプロセスの全スレッドで共有されるので、呼び出し元のプロセスで `chdir` はできない。hyoui (DR-0041 決定 5) は、ディレクトリの fd に `fchdir` した子を fork してファイル名だけで bind / connect する。
+相対パス・広げた sockaddr・symlink のどれでも届かない環境 (安全で symlink を作れる置き場が無いサンドボックス等、bind でファイル名が symlink の綴りに収まらない時) が残る。Linux と Apple の OS ではそこにスレッド cwd の経路 ([DR-0020](DR-0020-thread-cwd-route.md)) があるが、それも使えない環境 (`unshare` を断る seccomp、`pthread_fchdir_np` の無い libSystem) と、それの無い Unix (NetBSD・OpenBSD・illumos 等) が残る。cwd はプロセスの全スレッドで共有されるので、呼び出し元のプロセスで `chdir` はできない。hyoui (DR-0041 決定 5) は、ディレクトリの fd に `fchdir` した子を fork してファイル名だけで bind / connect する。
 
 ## Decision
 
-dirfd 基準の primitive の無い Unix と /proc の無い Linux で、他の経路が全部使えない時の最後の経路にする ([DR-0001](DR-0001-long-socket-path-routes.md))。試すのは `bind` と `connect_any` 系だけ ([DR-0010](DR-0010-public-api.md))。
+dirfd 基準の primitive の無い Unix と /proc の無い Linux で、他の経路 (Linux と Apple の OS ではスレッド cwd の経路も) が全部使えない時の最後の経路にする ([DR-0001](DR-0001-long-socket-path-routes.md))。試すのは `bind` と `connect_any` 系だけ ([DR-0010](DR-0010-public-api.md))。
 
 1. 親がソケットを作り、ディレクトリを開いた fd を持ち、sockaddr を組み立ててから fork する (ブロックしない connect では、ソケットを fork の前に `O_NONBLOCK` にする)
 2. 子は `fchdir(dirfd)` → ファイル名で `bind` / `connect` → `_exit(結果)`

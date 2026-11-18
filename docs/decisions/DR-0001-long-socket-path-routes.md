@@ -22,12 +22,13 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
   | OS | 試す順番 |
   |---|---|
   | Linux / Android (/proc を使える) | /proc |
-  | Linux / Android (/proc を使えない) | 相対パス → symlink → fork |
+  | Linux / Android (/proc を使えない) | 相対パス → symlink → スレッド cwd → fork |
   | FreeBSD | bindat |
-  | macOS | 相対パス → 広げた sockaddr → symlink → fork |
+  | macOS / iOS 等 Apple の OS | 相対パス → 広げた sockaddr → symlink → スレッド cwd → fork |
   | NetBSD / OpenBSD / illumos / その他の Unix | 相対パス → symlink → fork |
   | Windows | 対象外 ([DR-0009](DR-0009-windows-out-of-scope.md)) |
 
+- NUL を含むパスは、長さを見る前に `InvalidInput` にする。Linux / Android の先頭の NUL (abstract namespace) は対象外で std にそのまま渡す ([DR-0021](DR-0021-nul-is-invalid-at-any-length.md))
 - **順番の方針: 副作用の無い安い経路から試し、fork は最後に回す。** ディレクトリの fd を基準にできる primitive (Linux の /proc、FreeBSD の `bindat`) が使える時は、それだけを使う
 - どの経路も呼び出し元のプロセスの cwd を変えない
 - fork の経路を試すのは `bind` と `connect_any` 系だけ ([DR-0010](DR-0010-public-api.md))
@@ -37,14 +38,15 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 |---|---|---|
 | /proc (`/proc/self/fd/<fd>/<ファイル名>`) | Linux / Android | [DR-0003](DR-0003-linux-proc-self-fd.md) |
 | 相対パス (cwd から) | FreeBSD 以外 | [DR-0004](DR-0004-relative-path-from-cwd.md) |
-| 広げた sockaddr (253 バイト) | macOS | [DR-0005](DR-0005-widened-sockaddr-on-macos.md) |
+| 広げた sockaddr (253 バイト) | Apple の OS | [DR-0005](DR-0005-widened-sockaddr-on-macos.md) |
 | symlink (安全な置き場の短い symlink を経由) | FreeBSD 以外 | [DR-0006](DR-0006-symlink-in-safe-temp-dir.md) |
+| スレッド cwd (使い捨てのスレッドだけ cwd を移す) | Linux / Android、Apple の OS | [DR-0020](DR-0020-thread-cwd-route.md) |
 | fork (`fchdir` した子が bind / connect) | FreeBSD 以外 | [DR-0007](DR-0007-fork-child-fchdir.md) |
 | bindat (`bindat(2)` / `connectat(2)`) | FreeBSD | [DR-0008](DR-0008-freebsd-bindat-and-other-unix.md) |
 
 ### 全経路に共通の限界: ディレクトリを先に引く
 
-- /proc・相対パス・bindat・fork の経路は、先にディレクトリを引いて (開く、または実パスにする) から、ファイル名で bind / connect する
+- /proc・相対パス・bindat・スレッド cwd・fork の経路は、先にディレクトリを引いて (開く、または実パスにする) から、ファイル名で bind / connect する
 - その間に途中のディレクトリが rename されたり symlink が張り替えられたりすると、引いた時点のディレクトリにソケットができる (connect ならそこを見る)。呼んだ瞬間のパスの意味とずれうる
 - 広げた sockaddr と symlink の経路は元のパスをそのままカーネルに解決させるので、この点は元のパスと同じに振る舞う
 
@@ -53,7 +55,7 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 ## 理由
 
 - fork は副作用がある (サーバに見える peer の pid が終了した子の pid になる、子が一瞬全 fd の複製を持つ。[DR-0007](DR-0007-fork-child-fchdir.md))。避けられる経路があるなら、そちらで届かせる
-- ふつうの環境 (`/tmp` が書ける) では symlink の経路までで届く ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md))。fork が要るのは、それも使えない時だけになる
+- ふつうの環境 (`/tmp` が書ける) では symlink の経路までで届く ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md))。Linux と Apple の OS では、それも使えない時にスレッド cwd の経路が副作用無しで届く ([DR-0020](DR-0020-thread-cwd-route.md))。fork が要るのは、それらも使えない時だけになる
 
 ## 却下した案
 
@@ -69,5 +71,6 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 ## 判断の出所
 
 - 経路と試す順番: kawaz 指示 2026-11-18
+- スレッド cwd の経路を symlink の後、fork の前に足す: kawaz 裁定 (ハブ DR-0005、2026-11-18)
 - 副作用の無い安い経路から試し、fork は最後: kawaz 裁定 2026-11-18
 - 上に無い細部: 出所の記録なし

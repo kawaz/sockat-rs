@@ -14,7 +14,7 @@ FreeBSD 10 以降には、ディレクトリの fd を基準にする `bindat(2)
   - ディレクトリを `O_RDONLY` で開くので、ディレクトリの読み取り権限も要る
   - ファイル名は 103 バイトまで。超えると `ENAMETOOLONG`
   - 初回の CI で落ちたら、fork に倒さずに原因を直す
-- NetBSD / OpenBSD / illumos など、ディレクトリの fd を基準にする primitive が無い Unix は、相対パス → symlink → fork の順で試す ([DR-0001](DR-0001-long-socket-path-routes.md))。/proc の無い Linux も同じ順 ([DR-0003](DR-0003-linux-proc-self-fd.md))
+- NetBSD / OpenBSD / illumos など、ディレクトリの fd を基準にする primitive が無い Unix は、相対パス → symlink → fork の順で試す ([DR-0001](DR-0001-long-socket-path-routes.md))。/proc の無い Linux と Apple の OS は、この順の fork の前にスレッド cwd の経路が入る ([DR-0003](DR-0003-linux-proc-self-fd.md)、[DR-0020](DR-0020-thread-cwd-route.md))
 - NetBSD・OpenBSD・illumos は CI の VM で全部の試験を回す ([DR-0019](DR-0019-ci-targets.md))
 
 ## 理由
