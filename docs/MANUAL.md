@@ -249,7 +249,7 @@ The order tried is that of `connect`; when no other route (the [thread cwd](#thr
 | symlink | a path through a symlink that no longer exists |
 | thread cwd, fork, bindat | the file name alone |
 
-Keep the original path yourself and use that.
+Keep the original path yourself and use that. Removing, `stat`ing or `chmod`ing by the reported spelling can do more than miss: it can hit another file (the fd in `/proc/self/fd/<n>` is already closed and another directory may take the same number later; a relative spelling or a bare file name resolves against the cwd of the moment). The same spelling shows in `Debug` output and in what frameworks log or report as the peer, so do not trust those either.
 
 On OpenBSD, std's `local_addr()` drops the last byte of the path even for a short path of at most 103 bytes (which sockat hands to std unchanged; seen in CI). This is std's / the OS's behaviour, not sockat's: std's `UnixListener::bind` used directly gives the same.
 

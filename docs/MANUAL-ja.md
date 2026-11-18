@@ -249,7 +249,7 @@ let sockat::AnyConnection { stream, forked } = sockat::connect_any(path)?;
 | symlink | もう無い symlink を通したパス |
 | スレッド cwd、fork、bindat | ファイル名だけ |
 
-元のパスは自分で持っておき、それを使う。
+元のパスは自分で持っておき、それを使う。返ってきた綴りでファイルを消す・`stat` する・`chmod` すると、消し損ねるだけでなく別のファイルに当たることがある (`/proc/self/fd/<n>` の fd は既に閉じていて、後で別のディレクトリが同じ番号を取りうる。相対パスとファイル名だけの綴りはその時の cwd から解決される)。同じ綴りは `Debug` の表示や、フレームワークのログ・接続元の情報にも出るので、それも信じない。
 
 OpenBSD では、103 バイト以内の短いパス (sockat は std にそのまま渡す) でも、std の `local_addr()` がパスの末尾 1 バイトを欠いて返す (CI で観測)。sockat ではなく std / OS の振る舞いで、std の `UnixListener::bind` を直接使っても同じになる。
 

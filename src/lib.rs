@@ -136,7 +136,12 @@
 //!   `/proc/self/fd/...` path, a path through a temporary symlink that no
 //!   longer exists, or a bare file name. Keep the path you passed and use
 //!   that (for example to remove the socket file with
-//!   [`std::fs::remove_file`], which has no length limit).
+//!   [`std::fs::remove_file`], which has no length limit). Never remove,
+//!   `stat` or `chmod` by the reported address: it can name another file
+//!   (the fd number in a `/proc/self/fd/...` spelling is closed and may be
+//!   reused by another directory; a relative path or a bare file name
+//!   resolves against the current cwd). The same address shows in `Debug`
+//!   output and in what frameworks log or hand out as the peer address.
 //! * **A path that does not end with a file name is `InvalidInput`.** A path
 //!   longer than std accepts ending in `/`, `/.` or `/..` (or being `..`)
 //!   cannot be split into a directory and a file name and is refused before
