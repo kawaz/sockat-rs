@@ -748,6 +748,18 @@ pub(crate) fn local_peer_pid(sock: BorrowedFd<'_>) -> io::Result<libc::pid_t> {
     Ok(pid)
 }
 
+/// The length `getsockname(2)` reports for `sock`'s address, asked with room
+/// for the widest address any target here builds ([`ADDR_STORAGE`] bytes).
+/// Test-only: checks whether a bound address fits a `sockaddr_un` (Apple).
+#[cfg(all(test, target_vendor = "apple"))]
+pub(crate) fn local_address_len(sock: BorrowedFd<'_>) -> io::Result<usize> {
+    let mut storage = [0u8; ADDR_STORAGE];
+    let mut len = ADDR_STORAGE as libc::socklen_t;
+    // SAFETY: the kernel writes at most `len` bytes into `storage`.
+    cvt(unsafe { libc::getsockname(sock.as_raw_fd(), storage.as_mut_ptr().cast(), &mut len) })?;
+    Ok(len as usize)
+}
+
 /// `SO_PEERCRED` pid of a connected socket (Linux). Test-only.
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 pub(crate) fn peer_cred_pid(sock: BorrowedFd<'_>) -> io::Result<libc::pid_t> {

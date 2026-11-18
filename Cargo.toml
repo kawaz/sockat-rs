@@ -16,10 +16,10 @@ readme = "README.md"
 include = ["src/**", "README.md", "LICENSE", "Cargo.toml"]
 
 [features]
-# connect_any / connect_any_nonblocking: connects that fork as the last resort
-# (DR-0022). Off by default; enabling it is the choice to accept the fork's
-# side effects.
-connect-any = []
+# connect_any / connect_any_nonblocking (and AnyConnection, what they return):
+# connects that fork as the last resort (DR-0022, DR-0026). Off by default;
+# enabling it is the choice to accept the fork's side effects.
+any = []
 
 [package.metadata.docs.rs]
 all-features = true

@@ -46,7 +46,8 @@
 //! | Linux, Android (`/proc` usable) | /proc, relative path, symlink, thread cwd, fork (only /proc when its spelling fits) |
 //! | Linux, Android (`/proc` not usable) | relative path, symlink, thread cwd, fork |
 //! | FreeBSD | bindat |
-//! | macOS, iOS (Apple) | relative path, widened sockaddr, symlink, thread cwd, fork |
+//! | macOS, iOS (Apple), bind | relative path, symlink, thread cwd, fork |
+//! | macOS, iOS (Apple), connects | relative path, widened sockaddr, symlink, thread cwd, fork |
 //! | NetBSD, OpenBSD, illumos, other Unix | relative path, symlink, fork |
 //!
 //! * **/proc**: `/proc/self/fd/<dirfd>/<name>`, with the directory opened
@@ -58,8 +59,12 @@
 //! * **relative path**: the path spelled relative to the working directory,
 //!   when std accepts that. Only the path string is rewritten; the
 //!   cwd is never changed
-//! * **widened sockaddr**: a `sockaddr_un` carrying up to 253 bytes of path,
-//!   which XNU accepts: the path itself, or failing that the relative spelling
+//! * **widened sockaddr** (connects only): a `sockaddr_un` carrying up to 253
+//!   bytes of path, which XNU accepts: the path itself, or failing that the
+//!   relative spelling. A bind never uses it: the address of a socket bound so
+//!   does not fit `sun_path`, `getsockname(2)` reports it cut short, and
+//!   readers of it break (CPython, Go's `net.FileConn`). So on Apple every
+//!   spelling of a bind, the file name included, fits the plain `sun_path`
 //! * **symlink**: a short symlink under `TMPDIR` or failing that `/tmp`,
 //!   removed right after the call: for a bind, to the socket's directory
 //!   (`<link>/<name>` is passed), for a connect, to the socket file (`<link>`
@@ -68,7 +73,7 @@
 //!   or the calling user (as `/tmp` is), or a directory of the calling user's
 //!   that group and others cannot write to. Through `/tmp`, a connect is
 //!   reached whatever the directory depth and the file name length, a bind for
-//!   a file name of up to 84 bytes (80 where `sun_path` is 104, 230 on macOS).
+//!   a file name of up to 84 bytes (80 where `sun_path` is 104).
 //!   On Linux and Android with `/proc`, a connect also uses a place that is
 //!   not safe: a private directory (mode 0700) is created there, held by an
 //!   fd and checked to be the one created (owned by the calling user, no
@@ -85,7 +90,9 @@
 //!   `pthread_fchdir_np` is missing; then the next route is tried
 //! * **fork**: a forked child that `fchdir`s into the socket's directory makes
 //!   the call by the file name alone and exits. Only [`bind`],
-//!   `connect_any` and `connect_any_nonblocking` take it
+//!   `connect_any` and `connect_any_nonblocking` take it. For a bind the child
+//!   only binds; the listen is made by the calling process, so a client sees
+//!   the calling process as the server, as with any other route
 //!
 //! None of these changes the working directory of the calling process, and all
 //! of them can be used from multi-threaded programs. Windows is not supported
@@ -112,12 +119,13 @@
 //!
 //! `connect_any` and `connect_any_nonblocking` are for that rare environment,
 //! when the connection is wanted at the cost of the fork's side effects. They
-//! take the fork route as the last resort and also return whether they did, so
-//! that the caller can, for example, log or warn about it. They are behind the
-//! crate feature `connect-any` (see [Features](#features)). [`bind`] takes
-//! the fork route as a last resort too; the child only binds and the listen is
-//! done by the calling process, so the listener is this process's like any
-//! other.
+//! take the fork route as the last resort and return the stream with whether
+//! they took it (`AnyConnection`), so that the caller can, for example, log or
+//! warn about it. They are behind the crate feature `any` (see
+//! [Features](#features)). [`bind`] takes the fork route as a last resort too;
+//! the child only binds and the listen is done by the calling process, so the
+//! listener is this process's like any other, and nothing a client can see
+//! differs.
 //!
 //! # What differs from std for a long path
 //!
@@ -126,9 +134,9 @@
 //!   report the spelling handed to the kernel when the listener was bound
 //!   (whichever route the client took): a relative path, a
 //!   `/proc/self/fd/...` path, a path through a temporary symlink that no
-//!   longer exists, or a bare file name, and on macOS possibly truncated. Keep
-//!   the path you passed and use that (for example to remove the socket file
-//!   with [`std::fs::remove_file`], which has no length limit).
+//!   longer exists, or a bare file name. Keep the path you passed and use
+//!   that (for example to remove the socket file with
+//!   [`std::fs::remove_file`], which has no length limit).
 //! * **A path that does not end with a file name is `InvalidInput`.** A path
 //!   longer than std accepts ending in `/`, `/.` or `/..` (or being `..`)
 //!   cannot be split into a directory and a file name and is refused before
@@ -142,11 +150,15 @@
 //!   (`SO_PEERCRED`) it stays the exited child's. The number of an exited pid
 //!   may be reused by another process later. Nothing can be looked up from
 //!   that pid (the process, its parent): the process is gone.
-//! * **The forked child briefly holds every fd of the process** (fork route).
-//!   As with any `fork(2)`, the child has copies of all file descriptors until
-//!   it exits a moment later, so a socket or pipe another thread closes during
-//!   that moment stays open until then (a peer sees the EOF slightly later; a
-//!   listener closed meanwhile can still accept a connection into its backlog).
+//! * **The fork route has side effects no peer sees** ([`bind`] and the
+//!   `connect_any` ones). As with any `fork(2)`, the child has copies of all
+//!   file descriptors until it exits a moment later, so a socket or pipe
+//!   another thread closes during that moment stays open until then (a peer
+//!   sees the EOF slightly later; a listener closed meanwhile can still accept
+//!   a connection into its backlog). The calling process also gets a
+//!   `SIGCHLD`, the `pthread_atfork` handlers run, monitoring tools see a
+//!   short-lived child, and a `waitpid(-1)` on another thread may reap the
+//!   child (sockat then reads the outcome off the socket).
 //!   On macOS the fork route opens the socket's directory `O_SEARCH` and on
 //!   Linux `O_PATH`, so it needs no more permission than a plain bind /
 //!   connect; on other Unix targets it (and FreeBSD's `bindat`) opens it
@@ -191,16 +203,20 @@
 //! `SocketAddr::from_abstract_name` and `UnixListener::bind_addr` /
 //! `UnixStream::connect_addr`).
 //!
+//! A path longer than `PATH_MAX` (1024 on macOS, 4096 on Linux) is
+//! `ENAMETOOLONG`: the directory is opened by the full path, and that limit is
+//! outside what sockat is for.
+//!
 //! # Features
 //!
-//! * `connect-any` (off by default): `connect_any` and
-//!   `connect_any_nonblocking`, the connects that fork as the last resort.
-//!   Enabling it is the choice to accept the fork's side effects; the other
-//!   functions do not need it.
+//! * `any` (off by default): `connect_any` and `connect_any_nonblocking`, the
+//!   connects that fork as the last resort, and `AnyConnection`, what they
+//!   return. Enabling it is the choice to accept the fork's side effects; the
+//!   other functions do not need it.
 //!
 //! ```toml
 //! [dependencies]
-//! sockat = { version = "0.3", features = ["connect-any"] }
+//! sockat = { version = "0.4", features = ["any"] }
 //! ```
 //!
 //! # Async runtimes
@@ -275,7 +291,7 @@ pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
 /// process. Only in a rare environment where nothing but the fork route would
 /// reach the path is the error `ENAMETOOLONG`, as for any connect to a path
 /// too long for `sun_path` (`connect_any`, behind the crate feature
-/// `connect-any`, is for that case).
+/// `any`, is for that case).
 ///
 /// The stream blocks, like std's. In async code use [`connect_nonblocking`].
 ///
@@ -320,7 +336,38 @@ pub fn connect_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
     .map(|(stream, _)| stream)
 }
 
-/// Available on crate feature `connect-any` only.
+/// Available on crate feature `any` only.
+///
+/// What [`connect_any`] and [`connect_any_nonblocking`] return: the stream,
+/// and whether the fork route was taken to connect it.
+///
+/// The fields are public so the value can be taken apart as it comes:
+///
+/// ```no_run
+/// let path = "/a/very/long/directory/.../server.sock";
+/// let sockat::AnyConnection { stream, forked } = sockat::connect_any(path)?;
+/// if forked {
+///     eprintln!("connected to {path} through a forked child");
+/// }
+/// # drop(stream);
+/// # Ok::<(), std::io::Error>(())
+/// ```
+#[cfg(feature = "any")]
+#[derive(Debug)]
+pub struct AnyConnection {
+    /// The connected stream, std's own type. It belongs to this process and
+    /// works as usual whichever route made the connection.
+    pub stream: UnixStream,
+    /// `true` when the connection was made through the fork route, by a
+    /// forked child that has exited since; `false` on every other route (the
+    /// connection was made by this process). After the fork route, the peer
+    /// pid the server sees is that of the exited child (see
+    /// [`connect_any`]); use this to note it, for example by logging or
+    /// warning about it.
+    pub forked: bool,
+}
+
+/// Available on crate feature `any` only.
 ///
 /// [`connect`], forking when nothing else reaches the path, and whether it
 /// did.
@@ -336,10 +383,9 @@ pub fn connect_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
 /// forks.
 ///
 /// The fork route connects from a forked child that `fchdir`s into the
-/// socket's directory and exits at once. The second value is `true` when the
-/// fork route was taken, and `false` on every other route (the connection was
-/// made by this process). Use it to note the fork's side effects, for example
-/// by logging or warning about it.
+/// socket's directory and exits at once. [`AnyConnection::forked`] is `true`
+/// when the fork route was taken, and `false` on every other route (the
+/// connection was made by this process).
 ///
 /// After the fork route, the peer pid the server sees is that of the child, a
 /// process that has already exited. The stream itself belongs to this process
@@ -354,8 +400,8 @@ pub fn connect_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
 ///
 /// Those of [`connect`], except that a path only the fork route reaches is
 /// connected rather than `ENAMETOOLONG`.
-#[cfg(feature = "connect-any")]
-pub fn connect_any<P: AsRef<Path>>(path: P) -> io::Result<(UnixStream, bool)> {
+#[cfg(feature = "any")]
+pub fn connect_any<P: AsRef<Path>>(path: P) -> io::Result<AnyConnection> {
     connect_with(
         path.as_ref(),
         ConnectOptions {
@@ -363,9 +409,10 @@ pub fn connect_any<P: AsRef<Path>>(path: P) -> io::Result<(UnixStream, bool)> {
             fork: true,
         },
     )
+    .map(|(stream, forked)| AnyConnection { stream, forked })
 }
 
-/// Available on crate feature `connect-any` only.
+/// Available on crate feature `any` only.
 ///
 /// [`connect_any`] on a nonblocking socket, as [`connect_nonblocking`] is to
 /// [`connect`]. Like [`connect_any`], only for the rare environment where
@@ -376,8 +423,8 @@ pub fn connect_any<P: AsRef<Path>>(path: P) -> io::Result<(UnixStream, bool)> {
 /// # Errors
 ///
 /// Those of [`connect_any`], and `EAGAIN` for a full backlog on Linux.
-#[cfg(feature = "connect-any")]
-pub fn connect_any_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<(UnixStream, bool)> {
+#[cfg(feature = "any")]
+pub fn connect_any_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<AnyConnection> {
     connect_with(
         path.as_ref(),
         ConnectOptions {
@@ -385,6 +432,7 @@ pub fn connect_any_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<(UnixStrea
             fork: true,
         },
     )
+    .map(|(stream, forked)| AnyConnection { stream, forked })
 }
 
 /// The four connects: block or not, fork or not ([`ConnectOptions`]). Returns

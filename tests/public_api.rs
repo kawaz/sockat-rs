@@ -93,7 +93,7 @@ fn bind_and_connect_work_at_any_length() {
 }
 
 // The four connects (the two that may fork with the crate feature
-// `connect-any`) in an ordinary environment (a writable /tmp, the socket
+// `any`) in an ordinary environment (a writable /tmp, the socket
 // under a temporary directory with a short file name): every length is
 // reached without forking on every platform (DR-0006: the symlink route under
 // /tmp takes any directory depth), so the two connects that may fork report
@@ -119,13 +119,19 @@ fn in_an_ordinary_environment_no_connect_forks() {
         assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{total}");
         drop(listener.accept().unwrap());
 
-        #[cfg(feature = "connect-any")]
+        #[cfg(feature = "any")]
         {
-            let (mut c, forked) = sockat::connect_any(&p).unwrap();
+            let sockat::AnyConnection {
+                stream: mut c,
+                forked,
+            } = sockat::connect_any(&p).unwrap();
             assert!(!forked, "{total}");
             ping(&listener, &mut c);
 
-            let (mut c, forked) = sockat::connect_any_nonblocking(&p).unwrap();
+            let sockat::AnyConnection {
+                stream: mut c,
+                forked,
+            } = sockat::connect_any_nonblocking(&p).unwrap();
             assert!(!forked, "{total}");
             let e = c.read(&mut buf).unwrap_err();
             assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{total}");
@@ -135,20 +141,18 @@ fn in_an_ordinary_environment_no_connect_forks() {
 
 // A long file name far from the cwd, too long to fit behind
 // /tmp/sockat.XXXXXXXXXX/ (over 84 bytes for the plain sockaddr on Linux, 80
-// on the BSDs; on macOS over 230 for the widened one) and, on Linux, behind
-// /proc/self/fd/<n>/ (over about 90), but within the sockaddr of the thread
-// cwd and fork routes. `bind` reaches it (through the thread cwd route on Linux
-// and Apple where it can be used, otherwise forking; FreeBSD through bindat).
+// on Apple and the BSDs, where a bind never widens the sockaddr) and, on
+// Linux, behind /proc/self/fd/<n>/ (over about 90), but within the plain
+// sockaddr of the thread cwd and fork routes (100 bytes). `bind` reaches it
+// (through the thread cwd route on Linux and Apple where it can be used,
+// otherwise forking; FreeBSD through bindat).
 // The connects reach it through a symlink to the socket file, whose spelling
 // does not contain the file name, so in an ordinary environment (a writable
 // /tmp) none of them forks, and the plain `connect` and `connect_nonblocking`
 // work too (the two that may fork are checked with the crate feature
-// `connect-any`).
+// `any`).
 #[test]
 fn a_long_file_name_is_connected_to_without_forking() {
-    #[cfg(target_vendor = "apple")]
-    const NAME_LEN: usize = 240;
-    #[cfg(not(target_vendor = "apple"))]
     const NAME_LEN: usize = 100;
     let t = tempfile::Builder::new()
         .prefix("sockat-")
@@ -164,13 +168,16 @@ fn a_long_file_name_is_connected_to_without_forking() {
     let e = c.read(&mut buf).unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
     drop(listener.accept().unwrap());
-    #[cfg(feature = "connect-any")]
+    #[cfg(feature = "any")]
     {
-        let (mut c, forked) = sockat::connect_any(&p).unwrap();
+        let sockat::AnyConnection {
+            stream: mut c,
+            forked,
+        } = sockat::connect_any(&p).unwrap();
         assert!(!forked);
         ping(&listener, &mut c);
-        let (_c, forked) = sockat::connect_any_nonblocking(&p).unwrap();
-        assert!(!forked);
+        let any = sockat::connect_any_nonblocking(&p).unwrap();
+        assert!(!any.forked);
     }
 }
 
@@ -358,6 +365,64 @@ fn long_path_errors_through_the_public_api() {
         sockat::bind(&dir_slash).unwrap_err().kind(),
         std::io::ErrorKind::InvalidInput
     );
+}
+
+// The address a long-path bind leaves on the socket fits sun_path on every
+// platform, so whoever reads it (std's local_addr, CPython's getsockname, Go's
+// net.FileConn) gets it whole: std shows at most std_max bytes. On Apple that
+// is because a bind never takes the widened sockaddr (DR-0024): a socket bound
+// through it has an address of up to 255 bytes, which std shows cut short at
+// sun_path's 104 bytes with no NUL. Checked on the listener, on the stream it
+// accepts and as the client's peer address, for lengths up to 253 bytes (all
+// within the widened form) and past it.
+#[test]
+fn the_address_of_a_long_path_bind_fits_sun_path() {
+    let t = tempfile::Builder::new()
+        .prefix("sockat-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    for total in [std_max() + 1, 200, 253, 400] {
+        let p = nest(t.path(), total, &format!("{total}.sock"));
+        let listener = sockat::bind(&p).unwrap();
+        let client = sockat::connect(&p).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        for (what, addr) in [
+            ("listener", listener.local_addr().unwrap()),
+            ("accepted", accepted.local_addr().unwrap()),
+            ("client's peer", client.peer_addr().unwrap()),
+        ] {
+            let shown = addr.as_pathname().unwrap();
+            assert!(
+                shown.as_os_str().len() <= std_max(),
+                "{total} {what}: {shown:?}"
+            );
+        }
+    }
+}
+
+// The longest file name a bind reaches is sun_path less the NUL (std_max: 107
+// on Linux, 103 on Apple and the BSDs), on every platform: every bind route
+// that does not hand the kernel the whole path ends with the file name in the
+// plain sockaddr (on Apple too, a bind never widening it, DR-0024). A name of
+// std_max bytes directly under a short directory binds and is reached; one
+// byte more is ENAMETOOLONG, and nothing is created.
+#[test]
+fn a_bind_reaches_a_file_name_up_to_sun_path_less_the_nul() {
+    let t = tempfile::Builder::new()
+        .prefix("sockat-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let at = t.path().join("a".repeat(std_max()));
+    let listener = sockat::bind(&at).unwrap();
+    assert!(is_socket(&at));
+    let mut client = sockat::connect(&at).unwrap();
+    ping(&listener, &mut client);
+    let over = t.path().join("o".repeat(std_max() + 1));
+    assert_eq!(
+        sockat::bind(&over).unwrap_err().raw_os_error(),
+        Some(libc::ENAMETOOLONG)
+    );
+    assert!(!over.exists());
 }
 
 // A long path needs no more permission on the socket's directory than std's

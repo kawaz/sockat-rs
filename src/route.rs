@@ -64,6 +64,18 @@ impl Request {
         matches!(self, Request::Connect(o) if o.nonblocking)
     }
 
+    /// Whether the widened `sockaddr_un` may carry this request's spelling
+    /// (Apple): a connect only. A socket bound through the widened form has
+    /// an address that does not fit `sun_path`, which `getsockname(2)` then
+    /// reports cut short, and readers of it break (CPython appends unrelated
+    /// bytes to it, Go's `net.FileConn` loses the peer's `RemoteAddr`). A
+    /// connect binds nothing of its own, so its own address is not affected
+    /// (DR-0024).
+    #[cfg(target_vendor = "apple")]
+    fn may_widen(self) -> bool {
+        matches!(self, Request::Connect(_))
+    }
+
     /// Whether the fork route may be taken.
     #[cfg(any(test, not(target_os = "freebsd")))]
     fn may_fork(self) -> bool {
@@ -107,19 +119,16 @@ pub(crate) enum Route {
     /// The path spelled relative to the cwd, in the plain sockaddr.
     #[cfg(not(target_os = "freebsd"))]
     Relative,
-    /// The path itself in a widened `sockaddr_un` (Apple).
+    /// The path itself in a widened `sockaddr_un` (Apple, a connect).
     #[cfg(target_vendor = "apple")]
     Wide,
-    /// The relative spelling in a widened `sockaddr_un` (Apple).
+    /// The relative spelling in a widened `sockaddr_un` (Apple, a connect).
     #[cfg(target_vendor = "apple")]
     WideRelative,
     /// Through a short temporary symlink to the socket's directory, in the
     /// plain sockaddr (bind).
     #[cfg(not(target_os = "freebsd"))]
     SymlinkToDir,
-    /// [`Route::SymlinkToDir`] in a widened `sockaddr_un` (Apple).
-    #[cfg(target_vendor = "apple")]
-    SymlinkToDirWide,
     /// Through a short temporary symlink to the socket file itself, in the
     /// plain sockaddr (connect).
     #[cfg(not(target_os = "freebsd"))]
@@ -366,6 +375,11 @@ pub(crate) fn fork_op(
 /// The socket is made `O_NONBLOCK` here, before the fork, so the child's
 /// connect runs on a nonblocking socket: the flag belongs to the open file
 /// description that parent and child share.
+///
+/// After a bind, the listen is made here, by this process, never by the
+/// child: the process that listens is the one a client's peer-credential
+/// query (`LOCAL_PEERPID`, `SO_PEERCRED`) names as the server, so a child
+/// that listened would leave clients seeing an exited process (DR-0025).
 #[cfg(any(test, not(target_os = "freebsd")))]
 fn fork_in(
     req: Request,
@@ -475,15 +489,20 @@ pub(crate) mod freebsd {
     }
 }
 
-/// The widened `sockaddr_un` that XNU takes (Apple).
+/// The widened `sockaddr_un` that XNU takes (Apple), for a connect only
+/// ([`Request::may_widen`]).
 #[cfg(target_vendor = "apple")]
 pub(crate) mod apple {
     use super::*;
 
-    /// Bind (and listen) or connect a fresh socket to `path` in a widened
-    /// `sockaddr_un`.
-    pub(crate) fn wide_op(req: Request, path: &Path) -> io::Result<OwnedFd> {
-        raw_op(req, &SockAddr::wide(path.as_os_str())?)
+    /// Connect a fresh socket (`O_NONBLOCK` for a nonblocking connect) to
+    /// `path` in a widened `sockaddr_un`. There is no bind counterpart: a
+    /// socket bound so has an address that does not fit `sun_path` (DR-0024).
+    pub(crate) fn wide_connect(options: ConnectOptions, path: &Path) -> io::Result<OwnedFd> {
+        raw_op(
+            Request::Connect(options),
+            &SockAddr::wide(path.as_os_str())?,
+        )
     }
 
     /// Whether an error from a widened-address call means the kernel does not
@@ -525,9 +544,9 @@ pub(crate) mod posix {
         /// Where the temporary symlink may go, in the order tried: `TMPDIR`
         /// when it is set to an absolute path, then `/tmp`.
         pub(crate) tmp_bases: Vec<PathBuf>,
-        /// Whether to try the widened `sockaddr_un` at all (Apple). Always
-        /// `true` outside the tests, which turn it off to stand in for a
-        /// kernel that refuses the widened form.
+        /// Whether to try the widened `sockaddr_un` at all for a connect
+        /// (Apple; a bind never does). Always `true` outside the tests, which
+        /// turn it off to stand in for a kernel that refuses the widened form.
         #[cfg(target_vendor = "apple")]
         pub(crate) wide: bool,
         /// Where the kernel lists the fds of the process (Linux):
@@ -578,17 +597,17 @@ pub(crate) mod posix {
     ///
     /// 1. the path spelled relative to the cwd, when that is at most
     ///    [`DIRECT_MAX`] bytes;
-    /// 2. (Apple) a widened `sockaddr_un` with the path itself, or failing
-    ///    that with the relative spelling, when one of them is at most 253
-    ///    bytes;
+    /// 2. (Apple, a connect) a widened `sockaddr_un` with the path itself,
+    ///    or failing that with the relative spelling, when one of them is at
+    ///    most 253 bytes;
     /// 3. a short symlink ([`symlink_route`]: to the socket's directory for a
     ///    bind, to the socket file for a connect) under the first of `TMPDIR`
     ///    and `/tmp` ([`Config::tmp_bases`]) where the path through it fits
-    ///    (in the plain sockaddr, or on Apple the widened one) and the symlink
-    ///    can be created. A place that is not safe is passed over, except, for
-    ///    a connect when /proc can be used (`proc`: where `/proc/self/fd` is,
-    ///    Linux), that it is used through a private directory held by an fd
-    ///    ([`HeldDir`]);
+    ///    (in the plain sockaddr, or on Apple for a connect the widened one)
+    ///    and the symlink can be created. A place that is not safe is passed
+    ///    over, except, for a connect when /proc can be used (`proc`: where
+    ///    `/proc/self/fd` is, Linux), that it is used through a private
+    ///    directory held by an fd ([`HeldDir`]);
     /// 4. (Linux, Apple) the file name on a thread whose own working directory
     ///    is moved into the directory ([`thread_cwd_in`]), for every request;
     /// 5. a forked child that `fchdir`s into the directory, unless the request
@@ -596,8 +615,12 @@ pub(crate) mod posix {
     ///
     /// The last two use the directory opened (`opened` when the caller has it
     /// open already, as Linux does) and the file name in a sockaddr: the plain
-    /// one, or on Apple the widened one for a name too long for it while the
-    /// kernel takes that form.
+    /// one, or on Apple for a connect the widened one for a name too long for
+    /// it while the kernel takes that form.
+    ///
+    /// A bind on Apple never uses the widened form (DR-0024): every one of its
+    /// spellings is judged against [`DIRECT_MAX`], so a file name over 103
+    /// bytes is `ENAMETOOLONG` there.
     ///
     /// A failure of a route ends the search with that error, except where it
     /// shows that the route itself cannot be used (the kernel refusing the
@@ -621,17 +644,20 @@ pub(crate) mod posix {
                 .map(|fd| (fd, Route::Relative));
         }
 
+        // Whether the widened form may still carry a spelling: for a connect
+        // only (a bind never widens, [`Request::may_widen`]), and until the
+        // kernel refuses it.
         #[cfg(target_vendor = "apple")]
-        let mut wide = cfg.wide;
+        let mut wide = cfg.wide && req.may_widen();
         #[cfg(target_vendor = "apple")]
-        if wide {
+        if let (true, Request::Connect(o)) = (wide, req) {
             let attempt = if path::len(path) <= WIDE_PATH_MAX {
-                Some(apple::wide_op(req, path).map(|fd| (fd, Route::Wide)))
+                Some(apple::wide_connect(o, path).map(|fd| (fd, Route::Wide)))
             } else {
                 rel.as_ref()
                     .filter(|r| path::len(&r.path) <= WIDE_PATH_MAX)
                     .map(|rel| {
-                        rel.run(|p| apple::wide_op(req, p))
+                        rel.run(|p| apple::wide_connect(o, p))
                             .map(|fd| (fd, Route::WideRelative))
                     })
             };
@@ -669,7 +695,7 @@ pub(crate) mod posix {
         };
 
         // The plain sockaddr for the file name, or on Apple the widened one
-        // for a name too long for it when the kernel takes that.
+        // for a connect's name too long for it when the kernel takes that.
         #[cfg(target_vendor = "apple")]
         let addr = match SockAddr::standard(name) {
             Err(e) if wide && e.raw_os_error() == Some(libc::ENAMETOOLONG) => SockAddr::wide(name)?,
@@ -818,8 +844,8 @@ pub(crate) mod posix {
     pub(crate) enum SymlinkOutcome {
         /// The route ran; this is its result.
         Done(io::Result<(OwnedFd, Route)>),
-        /// The path through the symlink needed the widened form and the kernel
-        /// refused it (Apple).
+        /// The connect's path through the symlink needed the widened form and
+        /// the kernel refused it (Apple).
         #[cfg(target_vendor = "apple")]
         WideRefused,
         /// The route could not be used (too long, no usable base, symlink not
@@ -850,12 +876,12 @@ pub(crate) mod posix {
     /// resolves them as it resolves `path`.
     ///
     /// Used when the spelling is at most `limit` bytes ([`DIRECT_MAX`] for the
-    /// plain sockaddr, or on Apple the widened form's 253: a spelling over
-    /// [`DIRECT_MAX`] then goes in the widened form) and `base` is a place
-    /// where nobody else can replace the symlink ([`safe_base`]). Both are
-    /// checked before anything is created. Nothing is left under `base`: the
-    /// symlink is removed when this returns (including on panic) whatever the
-    /// outcome.
+    /// plain sockaddr, or on Apple for a connect the widened form's 253: a
+    /// spelling over [`DIRECT_MAX`] then goes in the widened form) and `base`
+    /// is a place where nobody else can replace the symlink ([`safe_base`]).
+    /// Both are checked before anything is created. Nothing is left under
+    /// `base`: the symlink is removed when this returns (including on panic)
+    /// whatever the outcome.
     ///
     /// A `base` that is not safe is used for a connect only, and only when
     /// `proc` says where `/proc/self/fd` is (Linux with /proc): through a
@@ -906,16 +932,13 @@ pub(crate) mod posix {
         } else {
             (link.path.join(name), Route::SymlinkToDir)
         };
+        // Only a connect's spelling can be over DIRECT_MAX here: a bind's
+        // `limit` is DIRECT_MAX, since a bind never widens.
         #[cfg(target_vendor = "apple")]
-        if path::len(&via) > DIRECT_MAX {
-            let wide_route = if to_file {
-                Route::SymlinkToFileWide
-            } else {
-                Route::SymlinkToDirWide
-            };
-            return match apple::wide_op(req, &via) {
+        if let (true, Request::Connect(o)) = (path::len(&via) > DIRECT_MAX, req) {
+            return match apple::wide_connect(o, &via) {
                 Err(e) if apple::refuses_wide(&e) => SymlinkOutcome::WideRefused,
-                done => SymlinkOutcome::Done(done.map(|fd| (fd, wide_route))),
+                done => SymlinkOutcome::Done(done.map(|fd| (fd, Route::SymlinkToFileWide))),
             };
         }
         SymlinkOutcome::Done(plain_op(req, &via).map(|fd| (fd, plain_route)))

@@ -230,15 +230,6 @@ fn symlink(req: Request) -> Route {
     }
 }
 
-/// [`symlink`] in the widened sockaddr (Apple).
-#[cfg(target_vendor = "apple")]
-fn symlink_wide(req: Request) -> Route {
-    match req {
-        Request::Bind => Route::SymlinkToDirWide,
-        Request::Connect(_) => Route::SymlinkToFileWide,
-    }
-}
-
 fn errno(e: &io::Error) -> Option<i32> {
     e.raw_os_error()
 }
@@ -701,11 +692,10 @@ fn a_missing_directory_is_enoent_even_when_the_name_fits_no_sockaddr() {
 // A file name of 254 bytes (NAME_MAX is 255) directly under a short directory.
 //
 // * bind: every route that does not hand the whole path to the kernel ends
-//   with the file name in a sockaddr (Linux: behind "/proc/self/fd/N/", the
-//   link to the directory, the thread-cwd and the fork route: as is, macOS: at
-//   most 253 bytes
-//   in the widened sockaddr; FreeBSD: bindat), so no bind route reaches it:
-//   ENAMETOOLONG, and nothing is created.
+//   with the file name in a sockaddr (Linux: behind "/proc/self/fd/N/"; the
+//   link to the directory; the thread-cwd and the fork route: as is, in the
+//   plain sockaddr, a bind never widening it on Apple; FreeBSD: bindat), so
+//   no bind route reaches it: ENAMETOOLONG, and nothing is created.
 // * connect: the link to the socket file is spelled without the file name, so
 //   the name's length does not matter (every target but FreeBSD, where
 //   connectat takes the name as bind does). A socket bound under a short name
@@ -875,8 +865,8 @@ fn the_public_connects_return_the_stream_as_asked_and_report_no_fork_without_one
     let p = nest(t.path(), 200, "s.sock");
     let listener = crate::bind(&p).unwrap();
     type Connect = fn(&Path) -> io::Result<(UnixStream, bool)>;
-    // The two that may fork exist only with the crate feature `connect-any`;
-    // without it the other two are checked alone.
+    // The two that may fork exist only with the crate feature `any`; without
+    // it the other two are checked alone.
     #[allow(unused_mut)]
     let mut connects: Vec<(&str, Connect, bool)> = vec![
         ("connect", |p| crate::connect(p).map(|c| (c, false)), false),
@@ -886,12 +876,16 @@ fn the_public_connects_return_the_stream_as_asked_and_report_no_fork_without_one
             true,
         ),
     ];
-    #[cfg(feature = "connect-any")]
+    #[cfg(feature = "any")]
     connects.extend([
-        ("connect_any", (|p| crate::connect_any(p)) as Connect, false),
+        (
+            "connect_any",
+            (|p| crate::connect_any(p).map(|a| (a.stream, a.forked))) as Connect,
+            false,
+        ),
         (
             "connect_any_nonblocking",
-            |p| crate::connect_any_nonblocking(p),
+            |p| crate::connect_any_nonblocking(p).map(|a| (a.stream, a.forked)),
             true,
         ),
     ]);
@@ -921,6 +915,54 @@ fn the_fork_route_binds_and_connects_through_the_shared_socket() {
     let c = route::fork_op(CONNECT_ANY, dir, &addr).unwrap().0;
     assert_eq!(std::env::current_dir().unwrap(), cwd);
     ping(l, c);
+}
+
+// The fork route's bind leaves the listen to this process (DR-0025): the child
+// only binds and exits, and this process listens. The process that listens is
+// the one a client's peer-credential query names as the server
+// (LOCAL_PEERPID on macOS, SO_PEERCRED on Linux, asked on the client's own
+// socket), so a client must see this process there, not the exited child. A
+// child that listened would show itself there: on Linux for good, on macOS
+// until something is sent. So it is checked right after the connect (before
+// the server accepts and before anything is sent), after the accept, and after
+// data went both ways. The client is an ordinary connect of this process (it
+// does not fork), so the pid it sees is the server's alone. Two binds: the
+// route forced (fork_op), and the route order with every earlier route
+// unusable (no place for a symlink, the thread-cwd route off, and a file name
+// of 95 bytes, too long behind /proc/self/fd/<n>/ on Linux).
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[test]
+fn a_client_sees_this_process_as_the_server_of_a_fork_route_bind() {
+    let me = std::process::id() as libc::pid_t;
+    let t = tmp();
+    let forced = nest(t.path(), 400, "forced.sock");
+    let (dir, name) = path::split(&forced).unwrap();
+    let addr = SockAddr::standard(name).unwrap();
+    let (forced_l, child) = route::fork_op(BIND, dir, &addr).unwrap();
+    assert_ne!(child, me);
+    let ordered = nest(t.path(), 400, &"n".repeat(95));
+    let (ordered_l, r) = route::run_long(BIND, &ordered, &no_thread_cwd(config(&[]))).unwrap();
+    assert!(matches!(r, Route::Fork { .. }), "{r:?}");
+
+    for (what, l, p) in [
+        ("forced", forced_l, &forced),
+        ("ordered", ordered_l, &ordered),
+    ] {
+        let listener = UnixListener::from(l);
+        let (c, r) = route::run(CONNECT, p).unwrap();
+        assert!(!r.forked(), "{what}: {r:?}");
+        let mut c = UnixStream::from(c);
+        assert_eq!(peer_pid(&c), me, "{what}: before the accept");
+        let (mut s, _) = listener.accept().unwrap();
+        assert_eq!(peer_pid(&c), me, "{what}: before anything is sent");
+        c.write_all(b"ping").unwrap();
+        let mut buf = [0u8; 4];
+        s.read_exact(&mut buf).unwrap();
+        s.write_all(b"pong").unwrap();
+        c.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"pong");
+        assert_eq!(peer_pid(&c), me, "{what}: after both sent");
+    }
 }
 
 // The child of the fork route reports errno through its exit status, and the
@@ -2051,11 +2093,12 @@ mod posix {
     // The link to the socket file is spelled `<base>/sockat.XXXXXXXXXX`
     // whatever the file name, so a connect reaches a name too long for the
     // link to the directory (`<base>/sockat.XXXXXXXXXX/<name>` over
-    // DIRECT_MAX bytes, on Apple also over 253 in the widened form), which a
-    // bind has to go past the symlink route for (here to the fork route, the
-    // thread-cwd route being made unusable as on the targets without it). No
-    // connect forks there, the plain `connect` included, and nothing is left
-    // under the base.
+    // DIRECT_MAX bytes), which a bind has to go past the symlink route for
+    // (here to the fork route, the thread-cwd route being made unusable as on
+    // the targets without it). On Apple also with the widened form on: a
+    // bind never widens (DR-0024), so its link to the directory is judged
+    // against DIRECT_MAX all the same. No connect forks there, the plain
+    // `connect` included, and nothing is left under the base.
     #[test]
     fn a_connect_reaches_a_file_name_too_long_for_the_link_to_the_directory() {
         let t = tmp();
@@ -2063,7 +2106,7 @@ mod posix {
         #[allow(unused_mut)]
         let mut cases = vec![(no_thread_cwd(plain(&[base.path()])), 90)];
         #[cfg(target_vendor = "apple")]
-        cases.push((no_thread_cwd(cfg(&[base.path()])), 240));
+        cases.push((no_thread_cwd(cfg(&[base.path()])), 100));
         for (c, n) in cases {
             let p = nest(t.path(), 600, &"n".repeat(n));
             let (l, r) = route::run_long(BIND, &p, &c).unwrap();
@@ -3247,38 +3290,77 @@ mod apple {
 
     // XNU takes a socket address of up to SOCK_MAXADDRLEN (255) bytes, so the
     // widened form carries 255 - 2 = 253 bytes of path. Pinned against the
-    // running kernel: 253 bytes binds and connects with the socket at the path;
+    // running kernel for a connect, the only call that widens: a socket bound
+    // at a 253-byte path (through the route order, which does not widen a
+    // bind) is reached by a connect in the widened form with that path, and
     // SockAddr::wide refuses 254 before the kernel is asked.
     #[test]
     fn the_widened_sockaddr_carries_253_bytes() {
         assert_eq!(WIDE_PATH_MAX, 253);
         let t = tmp();
         let p = nest(t.path(), 253, "s.sock");
-        let l = apple::wide_op(BIND, &p).unwrap();
+        let (l, r) = route::run(BIND, &p).unwrap();
+        assert!(!wide_route(r), "{r:?}");
         assert!(is_socket(&p));
-        let c = apple::wide_op(CONNECT_ANY, &p).unwrap();
+        let c = apple::wide_connect(CONNECT_OPTIONS, &p).unwrap();
         ping(l, c);
 
         let t = tmp();
         let p = nest(t.path(), 254, "s.sock");
-        let e = apple::wide_op(BIND, &p).unwrap_err();
+        let e = apple::wide_connect(CONNECT_OPTIONS, &p).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ENAMETOOLONG));
     }
 
-    // What std reports for a socket bound through the widened form: XNU's
-    // getsockname copies at most the caller's buffer (std passes a plain
-    // sockaddr_un) and reports that length, so std shows a truncated path.
-    // It must not panic, and it is not the path: users keep their own.
+    /// The options of a blocking connect that may fork, for
+    /// [`apple::wide_connect`].
+    const CONNECT_OPTIONS: ConnectOptions = ConnectOptions {
+        nonblocking: false,
+        fork: true,
+    };
+
+    /// Whether `r` hands the kernel a widened `sockaddr_un`.
+    fn wide_route(r: Route) -> bool {
+        matches!(
+            r,
+            Route::Wide | Route::WideRelative | Route::SymlinkToFileWide
+        )
+    }
+
+    /// The length of the address `getsockname(2)` reports for `sock`, asked
+    /// with room for the widest address there is.
+    fn reported_len(sock: &impl std::os::fd::AsFd) -> usize {
+        sys::local_address_len(sock.as_fd()).unwrap()
+    }
+
+    /// The length of a `struct sockaddr_un`: what readers of a socket's
+    /// address (std, CPython, Go) make room for.
+    const SOCKADDR_UN_LEN: usize = std::mem::size_of::<libc::sockaddr_un>();
+
+    // Why a bind never takes the widened form (DR-0024), pinned against the
+    // running kernel: the address of a socket bound so does not fit a
+    // sockaddr_un. getsockname reports the full widened length when the
+    // buffer has room, and XNU fills a plain sockaddr_un (as std passes) to
+    // the brim with no NUL, so std shows a path cut short. A reader that
+    // takes the reported length at its word reads past a sockaddr_un (CPython
+    // then appends unrelated bytes). Should a future XNU stop doing this, the
+    // decision can be looked at again. Made with the system calls directly:
+    // sockat itself has no way to bind so.
     #[test]
-    fn local_addr_of_a_widened_bind_is_truncated() {
+    fn the_address_of_a_widened_bind_does_not_fit_a_sockaddr_un() {
         let t = tmp();
         let p = nest(t.path(), 200, "s.sock");
-        let l = UnixListener::from(apple::wide_op(BIND, &p).unwrap());
+        let sock = sys::socket(false).unwrap();
+        sys::bind(sock.as_fd(), &SockAddr::wide(p.as_os_str()).unwrap()).unwrap();
+        sys::listen(sock.as_fd()).unwrap();
+        assert!(is_socket(&p));
+        let reported = reported_len(&sock);
+        assert!(reported > SOCKADDR_UN_LEN, "{reported}");
+        let l = UnixListener::from(sock);
         let addr = l.local_addr().unwrap();
         let shown = addr.as_pathname().unwrap();
         assert_ne!(shown, p.as_path());
         eprintln!(
-            "local_addr of a widened bind: {} bytes {shown:?}",
+            "a widened bind: getsockname reports {reported} bytes, std shows {} bytes {shown:?}",
             path::len(shown)
         );
         assert!(
@@ -3288,10 +3370,93 @@ mod apple {
         );
     }
 
+    // A bind never takes the widened form (DR-0024), even with the kernel
+    // taking it (`wide: true`), for each of the spellings a connect widens:
+    // the path itself (200 bytes under /tmp), the relative spelling (240
+    // bytes below the cwd), the link to the directory under a 150-byte place,
+    // and the file name for the thread-cwd and fork routes (a name of 100
+    // bytes fits the plain sockaddr). Each bind takes a route in the plain
+    // sockaddr, and the address the socket ends up with fits a sockaddr_un
+    // (getsockname reports at most its length, and std shows the whole
+    // spelling); a connect to the same path still widens where it can. A file
+    // name over 103 bytes fits no plain sockaddr, so its bind is ENAMETOOLONG
+    // on every route, with nothing created, while it was reachable widened.
+    #[test]
+    fn a_bind_never_widens_so_its_address_fits_a_sockaddr_un() {
+        let t = tmp();
+        let below = tmp_below_cwd();
+        let cwd = std::env::current_dir().unwrap();
+        let rel_base = below.path().strip_prefix(&cwd).unwrap();
+        let lb = tmp();
+        let long_base = nest(lb.path(), 150, "base");
+        std::fs::create_dir(&long_base).unwrap();
+        let none = Path::new("/nonexistent");
+        let cases: Vec<(&str, PathBuf, Config, Route)> = vec![
+            (
+                "the path",
+                nest(t.path(), 200, "wide.sock"),
+                cfg(&[none], true),
+                Route::Wide,
+            ),
+            (
+                "the relative spelling",
+                cwd.join(nest(rel_base, 240, "wrel.sock")),
+                cfg(&[none], true),
+                Route::WideRelative,
+            ),
+            (
+                "the link to the directory",
+                nest(t.path(), 600, "link.sock"),
+                cfg(&[&long_base], true),
+                Route::SymlinkToFileWide,
+            ),
+            (
+                "the file name, thread cwd",
+                nest(t.path(), 600, &"t".repeat(100)),
+                cfg(&[], true),
+                Route::ThreadCwd,
+            ),
+            (
+                "the file name, fork",
+                nest(t.path(), 600, &"f".repeat(100)),
+                no_thread_cwd(cfg(&[], true)),
+                Route::Fork { child: 0 },
+            ),
+        ];
+        for (what, p, c, connect_route) in cases {
+            let (l, r) = route::run_long(BIND, &p, &c).unwrap();
+            assert!(!wide_route(r), "{what}: {r:?}");
+            assert!(is_socket(&p), "{what}");
+            let reported = reported_len(&l);
+            assert!(reported <= SOCKADDR_UN_LEN, "{what}: {reported}");
+            let listener = UnixListener::from(l);
+            let shown = listener.local_addr().unwrap();
+            let shown = shown.as_pathname().unwrap();
+            assert!(path::len(shown) <= DIRECT_MAX, "{what}: {shown:?}");
+            let (cl, r) = route::run_long(CONNECT_ANY, &p, &c).unwrap();
+            assert_eq!(
+                std::mem::discriminant(&r),
+                std::mem::discriminant(&connect_route),
+                "{what}: connect {r:?}"
+            );
+            ping(OwnedFd::from(listener), cl);
+            assert_empty(&long_base);
+        }
+
+        let p = t.path().join("n".repeat(DIRECT_MAX + 1));
+        for c in [cfg(&[], true), no_thread_cwd(cfg(&[], true))] {
+            let e = route::run_long(BIND, &p, &c).unwrap_err();
+            assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{e}");
+            assert!(!is_socket(&p));
+        }
+    }
+
     // Route order b with the path itself: over DIRECT_MAX bytes, no relative
-    // spelling of at most DIRECT_MAX, and at most 253 bytes: the widened form
-    // with the path. Under /tmp the relative spelling from the package root
-    // climbs all the way up, so it is long.
+    // spelling of at most DIRECT_MAX, and at most 253 bytes: a connect takes
+    // the widened form with the path. A bind never does (DR-0024): with no
+    // place for a symlink it takes the thread-cwd route. Under /tmp the
+    // relative spelling from the package root climbs all the way up, so it is
+    // long.
     #[test]
     fn a_path_up_to_253_bytes_takes_the_widened_route() {
         for total in [DIRECT_MAX + 1, 200, 253] {
@@ -3299,16 +3464,17 @@ mod apple {
             let p = nest(t.path(), total, "s.sock");
             let c = cfg(&[Path::new("/nonexistent")], true);
             let (l, r) = route::run_long(BIND, &p, &c).unwrap();
-            assert_eq!(r, Route::Wide, "{total}");
+            assert_eq!(r, Route::ThreadCwd, "{total}");
             assert!(is_socket(&p));
             let (cl, r) = route::run_long(CONNECT_ANY, &p, &c).unwrap();
-            assert_eq!(r, Route::Wide);
+            assert_eq!(r, Route::Wide, "{total}");
             ping(l, cl);
         }
     }
 
     // Route order b with the relative spelling: the path is over 253 bytes but
-    // its spelling relative to the cwd is at most 253.
+    // its spelling relative to the cwd is at most 253, so a connect widens
+    // that. A bind takes the thread-cwd route instead, as above.
     #[test]
     fn a_path_over_253_bytes_short_relative_to_the_cwd_takes_the_widened_relative_route() {
         let t = tmp_below_cwd();
@@ -3318,41 +3484,47 @@ mod apple {
         assert!(path::len(&p) > WIDE_PATH_MAX);
         let c = cfg(&[Path::new("/nonexistent")], true);
         let (l, r) = route::run_long(BIND, &p, &c).unwrap();
-        assert_eq!(r, Route::WideRelative);
+        assert_eq!(r, Route::ThreadCwd);
         assert!(is_socket(&p));
         let (cl, r) = route::run_long(CONNECT_ANY, &p, &c).unwrap();
         assert_eq!(r, Route::WideRelative);
         ping(l, cl);
     }
 
-    // With a base too long for the plain sockaddr (150 bytes), the spelling
-    // through the symlink goes in the widened one (SymlinkToDirWide for the
-    // bind, SymlinkToFileWide for the connect), still with the socket in the
-    // real directory and nothing left under the base.
+    // With a place too long for the plain sockaddr (150 bytes), a connect's
+    // spelling through the symlink to the file goes in the widened one
+    // (SymlinkToFileWide), with nothing left under the place. A bind's link
+    // to the directory does not fit the plain sockaddr there, and a bind
+    // never widens, so the bind passes the place by (untouched) and takes
+    // the thread-cwd route; the socket is in the real directory either way.
     #[test]
-    fn a_path_through_a_long_base_goes_in_the_widened_sockaddr() {
+    fn a_connect_through_a_long_place_goes_in_the_widened_sockaddr() {
         let t = tmp();
         let p = nest(t.path(), 600, "s.sock");
         let lb = tmp();
         let long_base = nest(lb.path(), 150, "base");
         std::fs::create_dir(&long_base).unwrap();
+        mark_untouched(&long_base);
         let c = cfg(&[&long_base], true);
         let (l, r) = route::run_long(BIND, &p, &c).unwrap();
-        assert_eq!(r, Route::SymlinkToDirWide);
+        assert_eq!(r, Route::ThreadCwd);
         assert!(is_socket(&p));
+        assert_untouched(&long_base);
         let (cl, r) = route::run_long(CONNECT, &p, &c).unwrap();
         assert_eq!(r, Route::SymlinkToFileWide);
         ping(l, cl);
         assert_empty(&long_base);
     }
 
-    // The thread-cwd and fork routes put the file name in the plain sockaddr,
-    // and only a name too long for that (over 103 bytes) in the widened one,
-    // when the kernel takes it. Without the widened form such a name is
-    // ENAMETOOLONG on both. The thread-cwd route is checked as the order takes
-    // it, the fork route with the thread-cwd route made unusable.
+    // The thread-cwd and fork routes put a connect's file name in the plain
+    // sockaddr, and only a name too long for that (over 103 bytes) in the
+    // widened one, when the kernel takes it. Without the widened form such a
+    // name is ENAMETOOLONG on both, and so it is for a bind with or without
+    // it (a bind never widens), so the socket is bound under a short name and
+    // renamed to the long one. The thread-cwd route is checked as the order
+    // takes it, the fork route with the thread-cwd route made unusable.
     #[test]
-    fn the_thread_cwd_and_fork_routes_widen_only_a_name_too_long_for_the_plain_sockaddr() {
+    fn the_thread_cwd_and_fork_routes_widen_only_a_connects_name_too_long_for_the_plain_sockaddr() {
         let thread: fn(Route) -> bool = |r| r == Route::ThreadCwd;
         let fork: fn(Route) -> bool = |r| matches!(r, Route::Fork { .. });
         for (i, (c, narrow, want)) in [
@@ -3367,17 +3539,20 @@ mod apple {
         .enumerate()
         {
             let t = tmp();
-            let name = format!("{i}").repeat(150);
-            let p = nest(t.path(), 600, &name);
-            let (l, r) = route::run_long(BIND, &p, &c).unwrap();
+            let short = nest(t.path(), 600, "s.sock");
+            let p = short.with_file_name(format!("{i}").repeat(150));
+            for c in [&c, &narrow] {
+                let e = route::run_long(BIND, &p, c).unwrap_err();
+                assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{e}");
+            }
+            let (l, r) = route::run_long(BIND, &short, &c).unwrap();
             assert!(want(r), "{r:?}");
-            assert!(is_socket(&p));
+            std::fs::rename(&short, &p).unwrap();
             let (cl, r) = route::run_long(CONNECT_ANY, &p, &c).unwrap();
             assert!(want(r), "{r:?}");
             ping(l, cl);
 
-            let q = p.with_file_name("m".repeat(150));
-            let e = route::run_long(BIND, &q, &narrow).unwrap_err();
+            let e = route::run_long(CONNECT_ANY, &p, &narrow).unwrap_err();
             assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{e}");
         }
     }
@@ -3469,7 +3644,8 @@ mod apple {
     // LOCAL_PEERPID names the child at first. XNU updates it when the real
     // client sends, after which it names the client process. Documented in
     // the crate docs; pinned so a change in XNU's behaviour is noticed. The
-    // relative / widened routes connect from this process directly.
+    // widened route connects from this process directly (to a listener bound
+    // through the route order, which does not widen a bind).
     #[test]
     fn local_peerpid_of_a_forked_connect_names_the_child_until_the_client_sends() {
         let me = std::process::id() as libc::pid_t;
@@ -3489,13 +3665,24 @@ mod apple {
 
         // The widened route connects from this process itself.
         let wp = nest(t.path(), 200, "w.sock");
-        let wl = UnixListener::from(apple::wide_op(BIND, &wp).unwrap());
-        let _wc = apple::wide_op(CONNECT_ANY, &wp).unwrap();
+        let wl = UnixListener::from(route::run(BIND, &wp).unwrap().0);
+        let _wc = apple::wide_connect(CONNECT_OPTIONS, &wp).unwrap();
         let (ws, _) = wl.accept().unwrap();
         assert_eq!(sys::local_peer_pid(ws.as_fd()).unwrap(), me);
     }
 
     // ----- connect options (nonblocking, the child's pid, no fork) -----
+
+    /// The route a request takes on a way whose connects take the widened
+    /// route `connected`: a bind never widens (DR-0024), and on these ways
+    /// (no place for a link to the directory in the plain sockaddr) it takes
+    /// the thread-cwd route.
+    fn widened_but_bound(req: Request, connected: Route) -> Route {
+        match req {
+            Request::Bind => Route::ThreadCwd,
+            Request::Connect(_) => connected,
+        }
+    }
 
     /// Places and directories one [`ways`] call works in, removed at the end of
     /// the test.
@@ -3520,12 +3707,14 @@ mod apple {
     /// The eight Apple routes, each a [`Way`] to its own socket path, with the
     /// route each must take: the path itself (DIRECT_MAX bytes); the relative
     /// spelling of a path below the cwd (DIRECT_MAX bytes relative); the
-    /// widened sockaddr (200 bytes under /tmp); the widened sockaddr with the relative
-    /// spelling (240 bytes relative, over 253 absolute); the symlink under a
-    /// short place (plain sockaddr) and under a 150-byte place (widened); the
-    /// thread-cwd route (600 bytes, no place for a symlink); and the fork route
-    /// (the same with the thread-cwd route made unusable). Same inputs as the
-    /// route-order tests above use to force each route.
+    /// widened sockaddr (200 bytes under /tmp); the widened sockaddr with the
+    /// relative spelling (240 bytes relative, over 253 absolute); the symlink
+    /// under a short place (plain sockaddr) and under a 150-byte place
+    /// (widened); the thread-cwd route (600 bytes, no place for a symlink);
+    /// and the fork route (the same with the thread-cwd route made unusable).
+    /// Same inputs as the route-order tests above use to force each route. A
+    /// bind never widens (DR-0024), so on the three widened ways the bind
+    /// takes the thread-cwd route and the connects the widened one.
     fn ways(d: &Dirs) -> Vec<(&'static str, Way, Want)> {
         let t = d.t.path();
         let cwd = std::env::current_dir().unwrap();
@@ -3545,13 +3734,13 @@ mod apple {
                 "Wide",
                 nest(t, 200, "wide.sock"),
                 cfg(&[none], true),
-                |_, r| r == Route::Wide,
+                |req, r| r == widened_but_bound(req, Route::Wide),
             ),
             (
                 "WideRelative",
                 cwd.join(nest(rel_base, 240, "wrel.sock")),
                 cfg(&[none], true),
-                |_, r| r == Route::WideRelative,
+                |req, r| r == widened_but_bound(req, Route::WideRelative),
             ),
             (
                 "Symlink",
@@ -3563,7 +3752,7 @@ mod apple {
                 "SymlinkWide",
                 nest(t, 600, "symw.sock"),
                 cfg(&[&long_base], true),
-                |req, r| r == symlink_wide(req),
+                |req, r| r == widened_but_bound(req, Route::SymlinkToFileWide),
             ),
             (
                 "ThreadCwd",
