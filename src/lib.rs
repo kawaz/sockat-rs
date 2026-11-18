@@ -43,7 +43,7 @@
 //!
 //! | Platform | Order tried |
 //! |---|---|
-//! | Linux, Android (`/proc` usable) | /proc |
+//! | Linux, Android (`/proc` usable) | /proc, relative path, symlink, thread cwd, fork (only /proc when its spelling fits) |
 //! | Linux, Android (`/proc` not usable) | relative path, symlink, thread cwd, fork |
 //! | FreeBSD | bindat |
 //! | macOS, iOS (Apple) | relative path, widened sockaddr, symlink, thread cwd, fork |
@@ -68,7 +68,12 @@
 //!   or the calling user (as `/tmp` is), or a directory of the calling user's
 //!   that group and others cannot write to. Through `/tmp`, a connect is
 //!   reached whatever the directory depth and the file name length, a bind for
-//!   a file name of up to 84 bytes (80 where `sun_path` is 104, 230 on macOS)
+//!   a file name of up to 84 bytes (80 where `sun_path` is 104, 230 on macOS).
+//!   On Linux and Android with `/proc`, a connect also uses a place that is
+//!   not safe: a private directory (mode 0700) is created there, held by an
+//!   fd and checked to be the one created, and the connect goes through a
+//!   symlink inside it as `/proc/self/fd/<fd>/s`, so another user renaming
+//!   the directory changes nothing
 //! * **thread cwd** (Linux, Apple): a thread started for the call alone moves
 //!   its own working directory, and no other thread's, into the socket's
 //!   directory (`unshare(CLONE_FS)` then `fchdir` on Linux,
@@ -98,7 +103,8 @@
 //! fork route would reach the path, they fail with `ENAMETOOLONG`, as any
 //! connect to a path too long for `sun_path` does. That happens only when the
 //! path fits neither the `/proc` spelling nor a relative path (nor, on Apple,
-//! the widened sockaddr), there is no safe place for the symlink, and the
+//! the widened sockaddr), there is no place for the symlink (a safe one, but
+//! on Linux with `/proc` any place where a directory can be created), and the
 //! thread cwd route cannot be used either: on NetBSD, OpenBSD and illumos,
 //! which do not have it, on Linux under a seccomp filter, and on an Apple
 //! OS without `pthread_fchdir_np`.
@@ -161,7 +167,8 @@
 //!   make that safe, it only detects the visible case.
 //! * **A temporary symlink can be left behind** if the process dies between
 //!   creating and removing it. It is named `sockat.XXXXXXXXXX` under `TMPDIR`
-//!   or `/tmp` and points to the socket's directory or file.
+//!   or `/tmp` and points to the socket's directory or file (or, held by an
+//!   fd on Linux, is a directory holding such a symlink).
 //!
 //! # Errors
 //!

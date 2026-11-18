@@ -18,6 +18,8 @@
 //!   Linux only when the /proc route cannot be used); returns the child's pid.
 //! * `op_at` — `bindat(2)` / `connectat(2)` (FreeBSD).
 //! * `random_bytes` — the random part of the temporary symlink's name.
+//! * `symlink_at` / `unlink_at` — the symlink inside the held directory of the
+//!   symlink route (Linux).
 //! * `effective_uid` — the owner a safe place for the temporary symlink may have.
 
 // FreeBSD reaches long paths through bindat / connectat, so the fork route is
@@ -627,6 +629,31 @@ pub(crate) fn op_at(
         }
     };
     cvt(rc).map(drop)
+}
+
+/// `symlinkat(2)`: create the symlink `name` inside the directory `dir`,
+/// pointing to `target` (Linux, Android; the held-directory form of the
+/// symlink route).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn symlink_at(
+    target: &std::path::Path,
+    dir: BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+) -> io::Result<()> {
+    let target = std::ffi::CString::new(target.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    // SAFETY: both strings are NUL-terminated and live for the call; `dir` is
+    // a borrowed, live fd.
+    cvt(unsafe { libc::symlinkat(target.as_ptr(), dir.as_raw_fd(), name.as_ptr()) }).map(drop)
+}
+
+/// `unlinkat(2)` without flags: remove the non-directory `name` inside the
+/// directory `dir` (Linux, Android).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn unlink_at(dir: BorrowedFd<'_>, name: &std::ffi::CStr) -> io::Result<()> {
+    // SAFETY: `name` is NUL-terminated and lives for the call; `dir` is a
+    // borrowed, live fd.
+    cvt(unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) }).map(drop)
 }
 
 /// The effective uid of this process (`geteuid(2)`, which cannot fail).

@@ -1220,6 +1220,275 @@ mod linux {
         ping(l, cl);
     }
 
+    // ----- the held-directory form of the symlink route -----
+    //
+    // A place for the symlink that is not safe (other users can rename or
+    // remove its entries) is used by a connect when /proc is there, through a
+    // private directory made in it and held by an fd. The tests use a real
+    // /proc, a file name of 95 bytes (too long for /proc/self/fd/<n>/<name>,
+    // so the /proc route itself cannot be used) and the thread-cwd route
+    // turned off (as under a seccomp filter): the situation where a connect
+    // would otherwise be ENAMETOOLONG while the bind forks.
+
+    /// A directory `name` under `parent` that anyone may write to and that is
+    /// not sticky (mode 0777): not a safe place for the symlink.
+    fn unsafe_place(parent: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let d = parent.join(name);
+        std::fs::create_dir(&d).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            !crate::route::posix::safe_base(&d),
+            "the premise: {d:?} is not safe"
+        );
+        d
+    }
+
+    /// The route order's inputs with the real /proc, `bases` as the places
+    /// for the symlink and the thread-cwd route off.
+    fn held_cfg(bases: &[&Path]) -> Config {
+        no_thread_cwd(with_proc(Path::new(linux::PROC_SELF_FD), bases))
+    }
+
+    // Through a place that is not safe, every connect reaches the socket at
+    // the path given, through the held directory, from this process (no
+    // fork; the server sees this process's pid), and the place is empty again
+    // afterwards, after a failing connect too: a missing socket is the
+    // kernel's ENOENT and a socket nobody listens on ECONNREFUSED (the
+    // connect through the held directory is the result, not ENAMETOOLONG).
+    // The bind does not use the form (its spelling would be longer than the
+    // /proc route's, which already did not fit), so it forks and creates
+    // nothing in the place. Without the form the connects that may not fork
+    // would be ENAMETOOLONG here.
+    #[test]
+    fn a_connect_goes_through_a_held_directory_in_a_place_that_is_not_safe() {
+        let me = std::process::id() as libc::pid_t;
+        let t = tmp();
+        let places = tmp();
+        let bad = unsafe_place(places.path(), "bad");
+        let c = held_cfg(&[&bad]);
+        let p = t.path().join("n".repeat(95));
+
+        mark_untouched(&bad);
+        let (l, r) = route::run_long(BIND, &p, &c).unwrap();
+        assert!(matches!(r, Route::Fork { .. }), "{r:?}");
+        assert!(is_socket(&p));
+        assert_untouched(&bad);
+        let listener = UnixListener::from(l);
+        for req in [CONNECT, CONNECT_NB, CONNECT_ANY, CONNECT_ANY_NB] {
+            let (cl, r) = route::run_long(req, &p, &c).unwrap();
+            assert_eq!(r, Route::SymlinkInHeldDir, "{req:?}");
+            assert!(!r.forked());
+            let mut cl = UnixStream::from(cl);
+            let (mut s, _) = listener.accept().unwrap();
+            assert_eq!(peer_pid(&s), me, "{req:?}");
+            cl.write_all(b"ping").unwrap();
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"ping");
+            assert_empty(&bad);
+        }
+
+        let missing = p.with_file_name("m".repeat(95));
+        let e = route::run_long(CONNECT, &missing, &c).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::ENOENT), "{e}");
+        assert_empty(&bad);
+        let stale = p.with_file_name("s".repeat(95));
+        stale_socket(&stale);
+        let e = route::run_long(CONNECT, &stale, &c).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::ECONNREFUSED), "{e}");
+        assert_empty(&bad);
+    }
+
+    // The places are tried in their order (TMPDIR, then /tmp) and each is used
+    // the way it allows: a safe place directly, one that is not safe through a
+    // held directory. So a TMPDIR that is not safe is used up before /tmp:
+    //
+    // * not safe, then not safe: the first is used, the second untouched;
+    // * not safe, then safe: the first is still used (through the held
+    //   directory), the safe one untouched;
+    // * safe, then not safe: the plain symlink in the first, the other
+    //   untouched.
+    //
+    // A connect that fails through the first place is not tried again
+    // through the next.
+    #[test]
+    fn the_places_are_used_in_order_each_as_it_allows() {
+        let t = tmp();
+        let places = tmp();
+        let bad1 = unsafe_place(places.path(), "bad1");
+        let bad2 = unsafe_place(places.path(), "bad2");
+        let good = tmp();
+        let p = t.path().join("n".repeat(95));
+        let (l, _) = route::run_long(BIND, &p, &held_cfg(&[])).unwrap();
+        let listener = UnixListener::from(l);
+        let cases: [(&[&Path], Route, &Path, &Path); 3] = [
+            (&[&bad1, &bad2], Route::SymlinkInHeldDir, &bad1, &bad2),
+            (
+                &[&bad1, good.path()],
+                Route::SymlinkInHeldDir,
+                &bad1,
+                good.path(),
+            ),
+            (
+                &[good.path(), &bad1],
+                Route::SymlinkToFile,
+                good.path(),
+                &bad1,
+            ),
+        ];
+        for (bases, want, used, other) in cases {
+            let c = held_cfg(bases);
+            mark_untouched(other);
+            let (cl, r) = route::run_long(CONNECT, &p, &c).unwrap();
+            assert_eq!(r, want, "{bases:?}");
+            ping(OwnedFd::from(listener.try_clone().unwrap()), cl);
+            let e = route::run_long(CONNECT, &p.with_file_name("x.sock"), &c).unwrap_err();
+            assert_eq!(errno(&e), Some(libc::ENOENT), "{e}");
+            assert_untouched(other);
+            assert_empty(used);
+        }
+    }
+
+    // The held-directory form needs /proc (the spelling goes through
+    // /proc/self/fd). Without it a place that is not safe is passed over with
+    // nothing created in it, as on the other targets: with the thread-cwd
+    // route off, the connect that may not fork is ENAMETOOLONG and
+    // connect_any forks.
+    #[test]
+    fn without_proc_a_place_that_is_not_safe_is_passed_over() {
+        let t = tmp();
+        let places = tmp();
+        let bad = unsafe_place(places.path(), "bad");
+        let c = no_thread_cwd(with_proc(&no_proc(t.path(), false), &[&bad]));
+        let p = nest(t.path(), 300, "s.sock");
+        mark_untouched(&bad);
+        let (l, r) = route::run_long(BIND, &p, &c).unwrap();
+        assert!(matches!(r, Route::Fork { .. }), "{r:?}");
+        let e = route::run_long(CONNECT, &p, &c).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{e}");
+        let (cl, r) = route::run_long(CONNECT_ANY, &p, &c).unwrap();
+        assert!(matches!(r, Route::Fork { .. }), "{r:?}");
+        ping(l, cl);
+        assert_untouched(&bad);
+    }
+
+    // Between the mkdir of the private directory and its open, another user
+    // of the place can put something else at its name. What is opened must be
+    // a directory owned by the effective uid with permission bits 0700, opened
+    // without following a symlink; anything else is refused before anything
+    // is created in it, and is left where it is (it is not sockat's to
+    // remove). Each replacement is made by hand between the two steps:
+    //
+    // * the directory with another mode (0755);
+    // * a symlink to another directory (O_NOFOLLOW refuses it, and nothing
+    //   appears in that directory);
+    // * a plain file;
+    // * (as root only) a directory owned by another user.
+    //
+    // Unreplaced, the same steps hold the directory with `s` in it pointing
+    // to the target, and dropping it removes both.
+    #[test]
+    fn a_directory_replaced_before_it_is_held_is_not_used() {
+        use crate::route::posix::HeldDir;
+        use std::os::unix::fs::PermissionsExt;
+        let places = tmp();
+        let bad = unsafe_place(places.path(), "bad");
+        let other = tmp();
+        let target = other.path().join("target.sock");
+        let name = || Ok(String::from("sockat.AAAAAAAAAA"));
+        let fresh = || HeldDir::make_private_dir(&bad, name).unwrap();
+
+        let made = fresh();
+        let mode_of = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_of(&made), 0o700);
+        let held = HeldDir::hold(made.clone(), &target).unwrap();
+        let link = made.join("s");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        drop(held);
+        assert!(!made.exists() && std::fs::symlink_metadata(&made).is_err());
+
+        let made = fresh();
+        std::fs::set_permissions(&made, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = HeldDir::hold(made.clone(), &target).err().unwrap();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+        assert_empty(&made);
+        std::fs::remove_dir(&made).unwrap();
+
+        let made = fresh();
+        std::fs::remove_dir(&made).unwrap();
+        std::os::unix::fs::symlink(other.path(), &made).unwrap();
+        let e = HeldDir::hold(made.clone(), &target).err().unwrap();
+        // With O_DIRECTORY as well, Linux answers ENOTDIR for the symlink
+        // (observed in docker, Linux 7.2) where O_NOFOLLOW alone would be
+        // ELOOP; either is the refusal that matters here.
+        assert!(
+            matches!(errno(&e), Some(libc::ENOTDIR | libc::ELOOP)),
+            "{e}"
+        );
+        assert_empty(other.path());
+        assert!(
+            std::fs::symlink_metadata(&made)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_file(&made).unwrap();
+
+        let made = fresh();
+        std::fs::remove_dir(&made).unwrap();
+        std::fs::write(&made, b"").unwrap();
+        let e = HeldDir::hold(made.clone(), &target).err().unwrap();
+        assert_eq!(errno(&e), Some(libc::ENOTDIR), "{e}");
+        assert!(made.is_file());
+        std::fs::remove_file(&made).unwrap();
+
+        if sys::effective_uid() != 0 {
+            eprintln!("skipped the other user's directory: only root can chown");
+            return;
+        }
+        let made = fresh();
+        std::os::unix::fs::chown(&made, Some(65534), None).unwrap();
+        let e = HeldDir::hold(made.clone(), &target).err().unwrap();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+        assert_empty(&made);
+        std::fs::remove_dir(&made).unwrap();
+    }
+
+    // The held directory is reached through its fd, not its name. Another user
+    // renaming it away and putting their own directory at its name changes
+    // nothing for the connect: /proc/self/fd/<fd>/s still names the link in
+    // the directory sockat made. And the clean-up removes `s` through the fd,
+    // but removes a directory by the name only while the name is still the
+    // held directory (same st_dev / st_ino as the fd): the directory put in
+    // its place is left alone, and the renamed one, now empty, stays where it
+    // was moved to.
+    #[test]
+    fn a_held_directory_renamed_away_is_still_used_and_its_replacement_is_not_removed() {
+        use crate::route::posix::HeldDir;
+        let t = tmp();
+        let places = tmp();
+        let bad = unsafe_place(places.path(), "bad");
+        let p = t.path().join("s.sock");
+        let listener = UnixListener::bind(&p).unwrap();
+
+        let held = HeldDir::create(&bad, &p).unwrap();
+        let moved = bad.join("moved");
+        std::fs::rename(&held.path, &moved).unwrap();
+        std::fs::create_dir(&held.path).unwrap();
+        let via = held.spelling(Path::new(linux::PROC_SELF_FD));
+        let c = UnixStream::connect(&via).unwrap();
+        ping(
+            OwnedFd::from(listener.try_clone().unwrap()),
+            OwnedFd::from(c),
+        );
+        let decoy = held.path.clone();
+        drop(held);
+        assert!(decoy.is_dir(), "the directory put in its place was removed");
+        assert_empty(&decoy);
+        assert_empty(&moved);
+    }
+
     // Why a bind never goes through a link to the socket file: Linux does not
     // follow a symlink in the last component of a bind, it finds the name
     // taken (EADDRINUSE), even when the link dangles. A connect follows it.
@@ -1904,7 +2173,7 @@ mod posix {
         std::fs::write(&file, b"").unwrap();
         for base in [Path::new("/nonexistent"), file.as_path()] {
             for req in [BIND, CONNECT] {
-                let out = posix::symlink_route(req, base, &p, dir, name, DIRECT_MAX);
+                let out = posix::symlink_route(req, base, &p, dir, name, DIRECT_MAX, None);
                 assert!(matches!(out, SymlinkOutcome::Unusable), "{base:?} {req:?}");
             }
         }
