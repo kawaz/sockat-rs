@@ -59,7 +59,15 @@ jobs:
       - uses: vmactions/netbsd-vm@v1
         with:
           usesh: true
-          prepare: /usr/sbin/pkg_add rust
+          # The default mirror (cdn.netbsd.org) is tried first; when it does
+          # not answer, the package comes from ftp.netbsd.org, which redirects
+          # <arch>/<release> to the current pkgsrc branch.
+          prepare: |
+            /usr/sbin/pkg_add rust || {
+              PKG_PATH="https://ftp.netbsd.org/pub/pkgsrc/packages/NetBSD/$(uname -p)/$(uname -r)/All"
+              export PKG_PATH
+              /usr/sbin/pkg_add rust
+            }
           run: cargo test --all-features
 
   openbsd:
