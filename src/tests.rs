@@ -185,6 +185,20 @@ fn no_thread_cwd(c: Config) -> Config {
     return c;
 }
 
+/// `c` with every means of the central route that comes before the fork
+/// turned off: the thread-cwd means ([`no_thread_cwd`]) and, on Linux, /proc
+/// (looked for where nothing is), so that a bind, with D or without it, goes
+/// on to the fork route. FreeBSD's bindat cannot turn out unusable and stays.
+fn fork_means_only(c: Config) -> Config {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    return Config {
+        proc_self_fd: PathBuf::from("/nonexistent/proc/self/fd"),
+        ..no_thread_cwd(c)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    return no_thread_cwd(c);
+}
+
 /// Why the thread-cwd means cannot be used in this environment, or `None`
 /// when it can: one bind through it, in a directory of its own.
 ///
@@ -883,9 +897,10 @@ fn the_fork_route_binds_and_connects_through_the_shared_socket() {
 // does not fork), so the pid it sees is the server's alone. Three binds: the
 // route forced (fork_op); the central route with its other means unusable
 // (the thread-cwd means off, and a file name of 85 bytes, too long behind
-// /proc/self/fd/<n>/R/ on Linux), forking in D; and with D made nowhere,
-// forking with R beside the socket (a name of 80 bytes, within the 19 bytes
-// `.sockat.XXXXXXXXXX/` leaves on Apple).
+// /proc/self/fd/<n>/R/ on Linux), forking in D; and with D made nowhere and
+// the means before the fork off (thread cwd, /proc), forking with R beside the
+// socket (a name of 80 bytes, within the 19 bytes `.sockat.XXXXXXXXXX/` leaves
+// on Apple).
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 #[test]
 fn a_client_sees_this_process_as_the_server_of_a_fork_route_bind() {
@@ -902,7 +917,7 @@ fn a_client_sees_this_process_as_the_server_of_a_fork_route_bind() {
     let (in_d_l, r) = route::run_long(BIND, &in_d, &c).unwrap();
     assert!(r.forked(), "{r:?}");
     let beside = nest(t.path(), 400, &"b".repeat(80));
-    let (beside_l, r) = route::run_long(BIND, &beside, &config(&[], &[])).unwrap();
+    let (beside_l, r) = route::run_long(BIND, &beside, &fork_means_only(config(&[], &[]))).unwrap();
     assert!(r.forked(), "{r:?}");
 
     for (what, l, p) in [
@@ -1179,7 +1194,9 @@ fn the_callers_own_thread_cwd_is_left_as_it_is() {
 //   number n is reused by another directory that holds `<name>`: ENOENT again,
 //   and that file stays. The premise is checked too: the same spelling without
 //   R (what a bind straight through /proc would leave) does reach the file;
-// * `.sockat.XXXXXXXXXX/<name>` (D made nowhere) the same as `R/<name>`.
+// * `.sockat.XXXXXXXXXX/<name>` and `/proc/self/fd/<n>/.sockat.XXXXXXXXXX/<name>`
+//   (D made nowhere, by the platform's first means and by the fork) the same
+//   as `R/<name>` and its /proc version.
 //
 // Runs in a child process: its cwd is a directory of decoys, and reusing an fd
 // number by opening directories until it comes up needs a process where no
@@ -1227,35 +1244,37 @@ fn child_spelling_names_nothing() {
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     configs.push(("thread cwd", config(&[at(&place)], &[])));
     configs.push(("beside", config(&[], &[])));
+    configs.push(("beside, fork", fork_means_only(config(&[], &[]))));
     for (i, (what, c)) in configs.into_iter().enumerate() {
         let p = nest(&t.join(i.to_string()), 600, "s.sock");
         let (l, _) = route::run_long(BIND, &p, &c).unwrap();
         let l = UnixListener::from(l);
         let shown = reported(&l);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        if let Ok(rest) = shown.strip_prefix(route::linux::PROC_SELF_FD) {
-            child_proc_spelling_names_nothing(rest);
-            continue;
-        }
-        let prefix = if what == "beside" {
+        let prefix = if what.starts_with("beside") {
             own::HIDDEN_PREFIX
         } else {
             ""
         };
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Ok(rest) = shown.strip_prefix(route::linux::PROC_SELF_FD) {
+            child_proc_spelling_names_nothing(rest, prefix);
+            continue;
+        }
         assert!(through_link(&shown, prefix, "s.sock"), "{what}: {shown:?}");
         gone(&shown, what);
     }
 }
 
-/// `rest` is `<n>/R/s.sock` of a `/proc/self/fd/...` spelling: reuse the fd
-/// number n for a directory holding `s.sock`, then check that the spelling
-/// does not reach it while the same spelling without R does.
+/// `rest` is `<n>/R/s.sock` of a `/proc/self/fd/...` spelling, R drawn with
+/// `prefix` (none in D, `.sockat.` beside the socket): reuse the fd number n
+/// for a directory holding `s.sock`, then check that the spelling does not
+/// reach it while the same spelling without R does.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn child_proc_spelling_names_nothing(rest: &Path) {
+fn child_proc_spelling_names_nothing(rest: &Path, prefix: &str) {
     use std::os::fd::AsRawFd;
     let parts: Vec<_> = rest.iter().collect();
     assert_eq!(parts.len(), 3, "{rest:?}");
-    assert!(is_drawn(parts[1], ""), "{rest:?}");
+    assert!(is_drawn(parts[1], prefix), "{rest:?}");
     let n: i32 = parts[0].to_str().unwrap().parse().unwrap();
     let other = tmp();
     std::fs::write(other.path().join("s.sock"), b"theirs").unwrap();
@@ -1630,8 +1649,18 @@ fn d_in_the_socket_directory_is_hidden_and_removed() {
     }
 }
 
+/// Whether `r` is the fork route a bind takes with [`fork_means_only`]: on
+/// FreeBSD bindat, which cannot be turned off and comes first.
+fn bind_forks_beside(r: Route) -> bool {
+    #[cfg(target_os = "freebsd")]
+    return r == Route::At;
+    #[cfg(not(target_os = "freebsd"))]
+    return r.forked();
+}
+
 // With D made nowhere (no place given, standing in for every place failing:
-// TMPDIR, /tmp and the socket's directory), a bind forks with R made in the
+// TMPDIR, /tmp and the socket's directory) and the means before the fork off
+// (thread cwd, /proc: [`fork_means_only`]), a bind forks with R made in the
 // socket's directory, `.sockat.XXXXXXXXXX` to the directory itself, so the
 // spelling the kernel keeps is `.sockat.XXXXXXXXXX/<name>`, and R is removed
 // afterwards. The socket is at the path given and reached; the client sees
@@ -1639,15 +1668,16 @@ fn d_in_the_socket_directory_is_hidden_and_removed() {
 // to the fallback routes (here a symlink under a place for it), not forking.
 // The spelling costs 19 bytes: a file name of DIRECT_MAX - 19 binds, one byte
 // more is ENAMETOOLONG with nothing made (even where R/<name> would fit in D).
+// (FreeBSD binds by bindat instead, with the same spelling.)
 #[test]
 fn with_d_made_nowhere_a_bind_forks_with_r_beside_the_socket() {
     let t = tmp();
     let links = tmp();
-    let c = config(&[], &[links.path()]);
+    let c = fork_means_only(config(&[], &[links.path()]));
     let p = nest(t.path(), 600, "s.sock");
     let dir = p.parent().unwrap();
     let (l, r) = route::run_long(BIND, &p, &c).unwrap();
-    assert!(r.forked(), "{r:?}");
+    assert!(bind_forks_beside(r), "{r:?}");
     assert!(is_socket(&p));
     assert_none_named(dir, own::HIDDEN_PREFIX);
     let listener = UnixListener::from(l);
@@ -1667,12 +1697,78 @@ fn with_d_made_nowhere_a_bind_forks_with_r_beside_the_socket() {
     let longest = DIRECT_MAX - 19;
     let fits = t.path().join("f".repeat(longest));
     let (_l, r) = route::run_long(BIND, &fits, &c).unwrap();
-    assert!(r.forked(), "{r:?}");
+    assert!(bind_forks_beside(r), "{r:?}");
     let over = t.path().join("o".repeat(longest + 1));
     mark_untouched(t.path());
     let e = route::run_long(BIND, &over, &c).unwrap_err();
     assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{e}");
     assert_untouched(t.path());
+}
+
+// With D made nowhere, a bind tries the means of the central route in the same
+// order as with D, beside the socket: R (`.sockat.XXXXXXXXXX`, to the socket's
+// directory) made in the socket's directory and the call made with
+// `.sockat.XXXXXXXXXX/<name>` relative to its fd (kawaz 2026-11-19, D12-Q1).
+// By default that is the platform's first means (the thread-cwd means where it
+// is usable, else /proc on Linux, bindat on FreeBSD, the fork elsewhere); with
+// the thread-cwd means off, Linux takes the /proc version
+// `/proc/self/fd/<n>/.sockat.XXXXXXXXXX/<name>` while the name fits it (about
+// 72 bytes), and a name of 80 bytes, which does not, goes on to the fork. The
+// spelling the kernel keeps holds R with `.sockat.`, the socket is reached,
+// and no R is left in the socket's directory. When the socket's directory
+// cannot be opened (its open refused, standing in for a directory without
+// read permission where it is opened O_RDONLY), R cannot be made beside it:
+// the bind is ENAMETOOLONG and nothing is made there. (The connects reach the
+// socket by the fallback routes, here a symlink under a place for it.)
+#[test]
+fn with_d_made_nowhere_a_bind_tries_the_central_means_beside_the_socket() {
+    let t = tmp();
+    let links = tmp();
+    let nowhere = config(&[], &[links.path()]);
+    let default: fn(Route) -> bool = |r| central_route(BIND, thread_here(), r);
+    #[allow(unused_mut)]
+    let mut cases = vec![("default", nowhere.clone(), "s.sock".to_string(), default)];
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let proc: fn(Route) -> bool = |r| r == Route::ProcThroughLink;
+        let fork: fn(Route) -> bool = |r| r.forked();
+        let off = no_thread_cwd(nowhere.clone());
+        cases.push(("thread cwd off", off.clone(), "p.sock".to_string(), proc));
+        cases.push(("thread cwd off, 80", off, "f".repeat(80), fork));
+    }
+    for (i, (what, c, name, want)) in cases.into_iter().enumerate() {
+        let p = nest(&t.path().join(i.to_string()), 400, &name);
+        let dir = p.parent().unwrap();
+        let (l, r) = route::run_long(BIND, &p, &c).unwrap();
+        assert!(want(r), "{what}: {r:?}");
+        assert!(is_socket(&p), "{what}");
+        assert_none_named(dir, own::HIDDEN_PREFIX);
+        let listener = UnixListener::from(l);
+        #[cfg(not(target_os = "openbsd"))]
+        {
+            let shown = reported(&listener);
+            assert!(
+                holds_r(&shown, own::HIDDEN_PREFIX, &name),
+                "{what}: {shown:?}"
+            );
+        }
+        let (cl, _) = route::run_long(CONNECT, &p, &c).unwrap();
+        ping_kept(&listener, cl);
+    }
+
+    let p = nest(&t.path().join("refused"), 400, "s.sock");
+    let dir = p.parent().unwrap();
+    let c = Config {
+        open_socket_dir: refuse_socket_dir,
+        ..nowhere
+    };
+    mark_untouched(dir);
+    socket_dir_opens();
+    let e = route::run_long(BIND, &p, &c).unwrap_err();
+    assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{e}");
+    assert_untouched(dir);
+    assert_eq!(socket_dir_opens(), 1, "the try beside the socket asks once");
+    assert_empty(links.path());
 }
 
 // The central route's spelling is `R/<name>`, 11 bytes more than the file
@@ -3811,14 +3907,15 @@ mod apple {
     use std::os::fd::AsFd;
     use std::os::unix::ffi::OsStrExt;
 
-    /// The route order's inputs with no place for D (a connect goes straight
-    /// to the fallback routes; a bind forks beside the socket), `links` as
-    /// the places for the symlink and the widened sockaddr on or off
-    /// (`wide: false` stands in for a kernel that refuses it).
+    /// The route order's inputs with no place for D and the thread-cwd means
+    /// off (a connect goes straight to the fallback routes; a bind forks
+    /// beside the socket), `links` as the places for the symlink and the
+    /// widened sockaddr on or off (`wide: false` stands in for a kernel that
+    /// refuses it).
     fn cfg(links: &[&Path], wide: bool) -> Config {
         Config {
             wide,
-            ..config(&[], links)
+            ..no_thread_cwd(config(&[], links))
         }
     }
 

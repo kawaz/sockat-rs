@@ -48,7 +48,7 @@ A longer path is reached first by **the central route**. sockat makes a director
 - **/proc version**: pass `/proc/self/fd/<D's fd>/R/<file name>`
 - **bindat / connectat**: pass D's fd
 - **fork**: fork a child that `fchdir`s into D and binds. The caller listens afterwards, so it has no side effect visible to peers
-- D goes in `TMPDIR`, `/tmp` or the socket's directory (`.sockat.XXXXXXXXXX`), the first where it can be made. A place needs to be neither safe nor short (D is held by its fd). Where D can be made nowhere, a bind makes R in the socket's directory and forks
+- D goes in `TMPDIR`, `/tmp` or the socket's directory (`.sockat.XXXXXXXXXX`), the first where it can be made. A place needs to be neither safe nor short (D is held by its fd). Where D can be made nowhere, a bind makes R in the socket's directory and tries the same means in the same order (thread cwd, /proc version, fork)
 
 When the central route cannot be used, the connects alone try **the fallback routes**. The kernel keeps no spelling of a connect, so these carry no random part.
 

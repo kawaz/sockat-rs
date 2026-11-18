@@ -63,8 +63,8 @@
 - /proc 版の綴りは D の fd の桁で変わる。D を作る前は、`/proc` を確かめた時に `/` の fd が取った番号 + 1 (置き場を先に開く) を D の fd とみなして見積もり、D を開いた後に D の fd で引き直して長さを測り直す。収まらなければ D と R を片付けて次の手段へ
 - D の置き場は `${TMPDIR:-/tmp}` (相対パスも可)、`/tmp` (同じ綴りなら飛ばす)、ソケットのディレクトリの順。安全も長さも問わない (D は fd で掴み、綴りに出ない)
 - 置き場で「作れない」のは、開けない、D を作れない、名前を使い切った、乱数が取れない、確認が通らない、0700 にそろえられない、R を作れない時。次の置き場へ進む
-- どこにも D を作れない時、bind はソケットのディレクトリに R (`.sockat.XXXXXXXXXX`) を作り、fork の子がソケットのディレクトリの fd に `fchdir` して `.sockat.XXXXXXXXXX/<ファイル名>` で bind する。綴りが収まらないか R も作れなければ `ENAMETOOLONG`。connect 系は予備の経路へ
-- D 無しで試す手段は `route::MEANS_WITHOUT_OWN_DIR` の 1 か所で決める (今は fork だけ)
+- どこにも D を作れない時、bind は D 無しの形に進む。ソケットのディレクトリに R (`.sockat.XXXXXXXXXX`、ソケットのディレクトリの realpath を指す) を作り、D の fd の代わりにソケットのディレクトリの fd を基準に `.sockat.XXXXXXXXXX/<ファイル名>` で bind する。手段は D の時と同じ並び (スレッド cwd (FreeBSD は bindat) → /proc 版 `/proc/self/fd/<fd>/.sockat.XXXXXXXXXX/<ファイル名>` → fork)。ソケットのディレクトリを開けない、綴りが収まらない、R も作れなければ `ENAMETOOLONG` (試験 `with_d_made_nowhere_a_bind_tries_the_central_means_beside_the_socket`)。connect 系は予備の経路へ
+- D 無しの形は中心の経路と同じ手段の並び (`route::central_means` の結果) をそのまま使う (`route::without_own_dir`)。/proc 版は D の綴りで見積もった後、`.sockat.XXXXXXXXXX/<ファイル名>` とソケットのディレクトリの fd で測り直す (D 無しの綴りは 8 バイト長いので、D の見積もりで外れた /proc 版が D 無しで収まることは無い)
 
 ### 予備の経路 (connect 系)
 
@@ -98,6 +98,7 @@
 |---|---|---|
 | bind のファイル名 (`R/` の 11 バイト) | 96 | 92 |
 | D 無しの bind のファイル名 (`.sockat.XXXXXXXXXX/` の 19 バイト) | 88 | 84 |
+| D 無しの /proc 版のファイル名 | およそ 72 (fd の桁で変わる) | |
 | /proc 版のファイル名 | およそ 79 (fd の桁で変わる) | |
 
 ## 理由
@@ -133,8 +134,6 @@
 
 ## 未確定
 
-- D をどこにも作れない時の bind で、fork の前にスレッド cwd と /proc 版を D 無しで試すか (ハブ QUESTIONS.md D12-Q1)。今は fork だけ
-- `connect_any` 系の fork と FreeBSD の connect の予備は D を通さない (ハブ D12-Q2)。今は通さない
 - 作った直後の D を開けない時 (umask が持ち主の検索・読み取りを削った)、名前で確かめて空なら消すか (ハブ D12-Q5)。今は残す
 - Android は compile もしていない。macOS 以外の Apple の OS に `pthread_fchdir_np` があるか、iOS で動くかは確かめていない
 - FreeBSD の bindat / connectat に D の fd を渡す形、NetBSD・OpenBSD・illumos の振る舞いは CI の VM で確かめる。手元では compile (clippy) まで
@@ -144,4 +143,5 @@
 
 - 中心の経路、D の置き場、試す順番、予備の経路: kawaz 裁定 (ハブ DR-0012、2026-11-19)
 - D の開き方 (Linux は `/proc` の有無によらず `O_PATH`、Apple の OS は `O_SEARCH`)、ソケットのディレクトリを `stat` で引き fd が要る経路だけが開く: ハブの SPEC (2026-11-19)
-- `ENOTDIR`、D 無しで試す手段を 1 か所で決める形、`Config` の項目: 実装側の判断 2026-11-19
+- D をどこにも作れない時の bind も D 無しの形でスレッド cwd → /proc 版 → fork の順に試す (D12-Q1)、`connect_any` 系の fork と FreeBSD の connect の予備は D を通さない (D12-Q2): kawaz 裁定 2026-11-19 (ハブ DR-0012・SPEC 0412b609)
+- `ENOTDIR`、`Config` の項目: 実装側の判断 2026-11-19

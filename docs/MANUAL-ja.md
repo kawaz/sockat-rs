@@ -93,8 +93,8 @@ std が受け付ける長さ (標準に渡す長さ) までのパスは std に�
 
 - **D の置き場**は `TMPDIR` (未設定なら `/tmp`。相対パスでもよい)、`/tmp`、ソケットのディレクトリ (名前は `.sockat.XXXXXXXXXX`) の順。最初に D を作れた所を使う。置き場は安全 (sticky 等) でなくても深くてもよい (D は fd で掴み、綴りに置き場が出ない)
 - 置き場を開けない、D を作れない、確かめた結果が違う、0700 にそろえられない、R を作れない時は、次の置き場に進む
-- **どこにも D を作れない時**、bind はソケットのディレクトリに R (`.sockat.XXXXXXXXXX`) を作り、[fork](#fork) の子がソケットのディレクトリに `fchdir` して `.sockat.XXXXXXXXXX/<ファイル名>` で bind する。connect 系は予備の経路に進む
-- 綴りは `R/<ファイル名>` で、R の 11 バイトの分、ファイル名は sockaddr に入る長さより短くなる (Linux / illumos 96 バイト、Apple の OS / BSD 92 バイトまで。/proc 版はおよそ 79 バイトまで、D 無しの fork は 88 / 84 バイトまで)
+- **どこにも D を作れない時**、bind はソケットのディレクトリに R (`.sockat.XXXXXXXXXX`) を作り、D の代わりにソケットのディレクトリを基準に `.sockat.XXXXXXXXXX/<ファイル名>` で bind する。手段は D の時と同じ順 (スレッド cwd (FreeBSD は bindat) → /proc 版 `/proc/self/fd/<fd>/.sockat.XXXXXXXXXX/<ファイル名>` → [fork](#fork))。ソケットのディレクトリを開けない、R も作れない時は `ENAMETOOLONG`。connect 系は予備の経路に進む
+- 綴りは `R/<ファイル名>` で、R の 11 バイトの分、ファイル名は sockaddr に入る長さより短くなる (Linux / illumos 96 バイト、Apple の OS / BSD 92 バイトまで。/proc 版はおよそ 79 バイトまで。D 無しは 88 / 84 バイトまで、その /proc 版はおよそ 72 バイトまで)
 - スレッド cwd は**どの関数も試す**。呼び出し元のプロセスが bind / connect するので、サーバに見える peer の pid は呼び出し元のもの。fd の複製も無い。`connect_any` 系はこの経路では `forked` が `false`
 - スレッド cwd を使えないのは次の時で、次の手段に進む:
   - Linux で seccomp の filter が掛かっている (docker の既定も掛かっている)。filter には `unshare` をエラーでなくプロセスの kill (SIGSYS) で断るもの (systemd の `SystemCallFilter=` の既定の動作等) があるので、filter が掛かっていれば `unshare` を呼ばない
@@ -102,7 +102,7 @@ std が受け付ける長さ (標準に渡す長さ) までのパスは std に�
   - Apple の OS で `pthread_fchdir_np` が無い・失敗した (公開ヘッダに無い関数なので、実行時に探す)
   - スレッドを作れない
 - D は Linux では `O_PATH`、Apple の OS では `O_SEARCH`、他の OS では `O_RDONLY` で開く。0700 にそろえるのは、`/proc` を使える Linux は `/proc/self/fd/<fd>` の `chmod`、`/proc` の無い Linux は名前で `O_RDONLY` で開き直して同じ物か照合してから `fchmod`、他は `fchmod`
-- 中心の経路 (/proc 版を含む) はソケットのディレクトリを開かず (開くのは D をソケットのディレクトリに作る時と D 無しの fork だけ)、R を通して検索権限だけで届く。読み取り権限の無いディレクトリでも、通常の bind / connect と同じ権限で届く
+- 中心の経路 (/proc 版を含む) はソケットのディレクトリを開かず (開くのは D をソケットのディレクトリに作る時と D 無しの形だけ)、R を通して検索権限だけで届く。読み取り権限の無いディレクトリでも、通常の bind / connect と同じ権限で届く
 
 ### 予備の経路 (connect 系)
 
@@ -158,7 +158,7 @@ FreeBSD。ソケットのディレクトリを開き、`connectat(2)` でファ�
 
 - **`bind` と `connect_any` 系だけが試す。** `connect` / `connect_nonblocking` は試さずに `ENAMETOOLONG` を返す
 - `connect_any` 系のファイル名は sockaddr に入る長さまで (Apple の OS では、カーネルが広げた sockaddr を受け付ける時 253 バイト)
-- ソケットのディレクトリを開くのは `connect_any` 系と D 無しの fork だけ。macOS は `O_SEARCH`、Linux は `O_PATH` で開くので通常の bind / connect と同じ権限で足り、他の Unix は `O_RDONLY` で開くので読み取り権限も要る (開けなければこの経路は使えない)
+- fork の経路でソケットのディレクトリを開くのは `connect_any` 系と D 無しの fork。macOS は `O_SEARCH`、Linux は `O_PATH` で開くので通常の bind / connect と同じ権限で足り、他の Unix は `O_RDONLY` で開くので読み取り権限も要る (開けなければこの経路は使えない)
 - bind は子が bind するだけで listen は呼び出し元なので、fork の経路でも相手から見える副作用が無い。クライアントに見えるサーバの peer (macOS の `LOCAL_PEERPID`、Linux の `SO_PEERCRED`) は、send の前から呼び出し元 ([DR-0025](./decisions/DR-0025-fork-bind-listen-by-parent.md))。fork しない版の bind は無い
 - 子の区間は async-signal-safe な呼び出し (`fchdir`、`bind` / `connect`、`_exit`) だけなので、マルチスレッドのプロセスから呼べる
 - 副作用がある: [connect した時の peer の pid](#fork-の経路で-connect-した時の副作用) (相手から見える。connect だけ)、[相手から見えない副作用](#fork-の経路の相手から見えない副作用) (bind でも connect でも)
@@ -177,7 +177,7 @@ std にそのまま渡せない長さのパスが `ENAMETOOLONG` になる時 (�
 | illumos | ファイル名が 96 バイトを超える | 相対パスが 107 バイトを超え、symlink の経路も使えない | ファイル名が 107 バイトを超え、symlink の経路も使えない |
 
 - Linux でスレッド cwd が使えない時 (seccomp の filter 等)、bind はファイル名およそ 79 バイトまで /proc 版、その先 96 バイトまでは fork
-- D をどこにも作れない時、bind は D 無しの fork でファイル名 88 バイト (Apple の OS / BSD は 84) まで届く (ソケットのディレクトリに R を作れる時)。connect 系は予備の経路の分だけ届く (D の中のファイルへの symlink は使えない)
+- D をどこにも作れない時、bind は D 無しの形でファイル名 88 バイト (Apple の OS / BSD は 84) まで届く (ソケットのディレクトリを開けて R を作れる時)。connect 系は予備の経路の分だけ届く (D の中のファイルへの symlink は使えない)
 - Apple の OS の connect 系の 253 バイトは、カーネルが広げた sockaddr を受け付ける時。断った時は 103 バイト
 - connect で symlink の経路が使えないのは、安全で symlink を作れる置き場が無い時 (`TMPDIR` も `/tmp` も使えないサンドボックス等)。`/tmp` が使えれば長さは足りる
 - PATH_MAX (macOS 1024、Linux 4096) を超えるパスは `ENAMETOOLONG`。ディレクトリを引く等でフルパスを渡すからで、sockat の責務外
@@ -253,7 +253,8 @@ let sockat::AnyConnection { stream, forked } = sockat::connect_any(path)?;
 |---|---|
 | スレッド cwd、fork、bindat (D の中) | `R/<ファイル名>` |
 | /proc 版 | `/proc/self/fd/<fd>/R/<ファイル名>` |
-| D 無しの fork | `.sockat.XXXXXXXXXX/<ファイル名>` |
+| D 無しのスレッド cwd、fork、bindat | `.sockat.XXXXXXXXXX/<ファイル名>` |
+| D 無しの /proc 版 | `/proc/self/fd/<fd>/.sockat.XXXXXXXXXX/<ファイル名>` |
 
 R (と `.sockat.XXXXXXXXXX`) は bind の後に消えているので、返ってきた綴りでファイルを消す・`stat` する・`chmod` しても、何にも当たらない (fd の番号が使い回されても、どの cwd から解決しても)。ソケット自体にも当たらないので、元のパスは自分で持っておき、それを使う (消すなら `bind_ex` も使える)。同じ綴りは `Debug` の表示や、フレームワークのログ・接続元の情報にも出る。
 

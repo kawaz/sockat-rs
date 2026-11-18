@@ -81,11 +81,14 @@
 //! in `TMPDIR` (or `/tmp` when it is unset), then `/tmp`, then the socket's
 //! directory (named `.sockat.XXXXXXXXXX` there). None of them needs to be
 //! safe or short: D is held by its fd. When D can be made in none of them, a
-//! bind forks with R (`.sockat.XXXXXXXXXX`) made beside the socket, and a
-//! connect goes on to the fallback routes.
+//! bind makes R (`.sockat.XXXXXXXXXX`) beside the socket instead and tries
+//! the same means (thread cwd or bindat, /proc, fork) with
+//! `.sockat.XXXXXXXXXX/<file name>` relative to the socket's directory, and
+//! a connect goes on to the fallback routes.
 //!
 //! `R/<file name>` takes 11 bytes, so a bind reaches a file name of up to 96
-//! bytes (Linux, illumos) or 92 (Apple, the BSDs); 88 / 84 without D.
+//! bytes (Linux, illumos) or 92 (Apple, the BSDs); 88 / 84 without D (about
+//! 72 by the /proc version).
 //!
 //! **The fallback routes** (connects only). A connected socket is not bound,
 //! so its spelling is kept nowhere and needs no random part:

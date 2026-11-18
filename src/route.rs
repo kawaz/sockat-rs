@@ -13,7 +13,9 @@
 //!    (Linux), `bindat` / `connectat` (FreeBSD), and for a bind a forked
 //!    child in D. D and R are removed when the call returns, so the spelling
 //!    the kernel keeps for a bound socket names nothing afterwards. A bind
-//!    for which D can be made nowhere forks with R made beside the socket.
+//!    for which D can be made nowhere makes R beside the socket instead and
+//!    tries the same means with `.sockat.XXXXXXXXXX/<file name>` relative to
+//!    the socket's directory's fd.
 //! 2. **The fallback routes** for a connect ([`fallback`]), which leave no
 //!    spelling behind (a connected socket is not bound): per target, the ones
 //!    of the table in [`fallback`].
@@ -138,8 +140,8 @@ pub(crate) enum Route {
     At,
     /// A forked child that `fchdir`s into a directory and makes the call
     /// there: D with `R/<name>` (bind), the socket's directory with
-    /// `.sockat.XXXXXXXXXX/<name>` (bind, D made nowhere) or with the file
-    /// name (the connects that may fork).
+    /// `.sockat.XXXXXXXXXX/<name>` (bind, D made nowhere, the means before
+    /// the fork unusable) or with the file name (the connects that may fork).
     Fork {
         /// The pid of the child that made the call ([`sys::op_in_dir_forked`]).
         /// The public API does not return it, only [`Route::forked`]: it is
@@ -517,13 +519,11 @@ pub(crate) enum Means {
     #[cfg(target_os = "freebsd")]
     At,
     /// A forked child that `fchdir`s into the directory (a bind only here).
+    /// FreeBSD has none: bindat cannot turn out unusable, so nothing comes
+    /// after it.
+    #[cfg(not(target_os = "freebsd"))]
     Fork,
 }
-
-/// The means a request takes without D, in order: the fork route, for a
-/// bind only (SPEC). Adding the thread-cwd or /proc means here is all it
-/// takes to try them without D as well.
-const MEANS_WITHOUT_OWN_DIR: &[Means] = &[Means::Fork];
 
 /// The central route: D, R, and the means in order (module doc).
 ///
@@ -535,8 +535,8 @@ const MEANS_WITHOUT_OWN_DIR: &[Means] = &[Means::Fork];
 /// readers (DR-0027).
 ///
 /// D is tried in [`Config::own_dir_places`] in order. Made in none of them, a
-/// bind forks with R made beside the socket ([`without_own_dir`]) and a
-/// connect goes on to the fallback routes.
+/// bind tries the same means with R made beside the socket
+/// ([`without_own_dir`]) and a connect goes on to the fallback routes.
 fn central(t: &Target<'_>) -> Step {
     let means = central_means(t);
     if means.is_empty() {
@@ -550,7 +550,7 @@ fn central(t: &Target<'_>) -> Step {
             step
         }
         None => match t.req {
-            Request::Bind => without_own_dir(t, real_dir),
+            Request::Bind => without_own_dir(t, real_dir, &means),
             Request::Connect(_) => Step::Next,
         },
     }
@@ -655,6 +655,7 @@ fn by_means(
             .map(|via| plain_op(t.req, &via).map(|fd| (fd, Route::ProcThroughLink))),
         #[cfg(target_os = "freebsd")]
         Means::At => Some(freebsd::at(t.req, anchor.fd, addr).map(|fd| (fd, Route::At))),
+        #[cfg(not(target_os = "freebsd"))]
         Means::Fork => {
             Some(fork_in(t.req, anchor.fd, addr).map(|(fd, child)| (fd, Route::Fork { child })))
         }
@@ -692,10 +693,12 @@ fn make_own_dir(t: &Target<'_>, target: &Path, link: own::LinkName) -> Option<ow
 /// A bind for which D could be made in none of the places: R
 /// (`.sockat.XXXXXXXXXX`, to the socket's directory) is made in the socket's
 /// directory itself, and the call is made with `<R>/<name>` relative to the
-/// socket's directory fd by [`MEANS_WITHOUT_OWN_DIR`]. R is removed when this
-/// returns. [`Step::Next`] (and so `ENAMETOOLONG`) when that spelling does
-/// not fit or R cannot be made either.
-fn without_own_dir(t: &Target<'_>, real_dir: &Path) -> Step {
+/// socket's directory fd by the same `means` as with D (thread cwd, /proc,
+/// fork; bindat on FreeBSD), each measured again against this spelling
+/// (hub DR-0012, D12-Q1). R is removed when this returns. [`Step::Next`]
+/// (and so `ENAMETOOLONG`) when the socket's directory cannot be opened, the
+/// spelling does not fit or R cannot be made.
+fn without_own_dir(t: &Target<'_>, real_dir: &Path, means: &[Means]) -> Step {
     let placeholder = own::spelling_placeholder(OsStr::new(own::HIDDEN_PREFIX), t.name);
     if path::len(&placeholder) > DIRECT_MAX {
         return Step::Next;
@@ -706,7 +709,7 @@ fn without_own_dir(t: &Target<'_>, real_dir: &Path) -> Step {
     let Ok(link) = own::LinkBeside::create(dir_fd, real_dir) else {
         return Step::Next;
     };
-    let step = through(t, link.anchor(), MEANS_WITHOUT_OWN_DIR);
+    let step = through(t, link.anchor(), means);
     drop(link);
     step
 }

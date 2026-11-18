@@ -93,8 +93,8 @@ sockat makes a directory D of its own, holds it by an fd, makes in it a symlink 
 
 - **The places for D** are `TMPDIR` (`/tmp` when it is unset; a relative one is fine), `/tmp`, then the socket's directory (named `.sockat.XXXXXXXXXX` there), in that order. The first where D can be made is used. A place needs to be neither safe (sticky etc.) nor short: D is held by its fd and the place never appears in a spelling
 - When a place cannot be opened, D cannot be created, the check fails, D cannot be set to 0700 or R cannot be created, the next place is tried
-- **When D can be made nowhere**, a bind creates R (`.sockat.XXXXXXXXXX`) in the socket's directory and a [forked](#fork) child that `fchdir`s into the socket's directory binds `.sockat.XXXXXXXXXX/<file name>`. A connect goes on to the fallback routes
-- The spelling is `R/<file name>`, so the file name has R's 11 bytes less than the sockaddr length (up to 96 bytes on Linux / illumos, 92 on Apple OSes / the BSDs; about 79 for the /proc version; 88 / 84 for the fork without D)
+- **When D can be made nowhere**, a bind creates R (`.sockat.XXXXXXXXXX`) in the socket's directory and binds `.sockat.XXXXXXXXXX/<file name>` relative to the socket's directory instead of D, by the same means in the same order (thread cwd (bindat on FreeBSD), the /proc version `/proc/self/fd/<fd>/.sockat.XXXXXXXXXX/<file name>`, [fork](#fork)). When the socket's directory cannot be opened or R cannot be made, it is `ENAMETOOLONG`. A connect goes on to the fallback routes
+- The spelling is `R/<file name>`, so the file name has R's 11 bytes less than the sockaddr length (up to 96 bytes on Linux / illumos, 92 on Apple OSes / the BSDs; about 79 for the /proc version. Without D 88 / 84, about 72 for its /proc version)
 - **Every function takes the thread-cwd means.** The calling process makes the call, so the peer pid the server sees is the caller's, and no fd is copied. `connect_any` reports `forked` as `false` on it
 - The thread-cwd means cannot be used, and the next means is tried, when:
   - on Linux a seccomp filter is in effect (docker's default installs one). A filter may refuse `unshare` by killing the process (SIGSYS) rather than with an error (systemd's `SystemCallFilter=` does by default), so `unshare` is not called at all then
@@ -102,7 +102,7 @@ sockat makes a directory D of its own, holds it by an fd, makes in it a symlink 
   - on Apple `pthread_fchdir_np` is missing or fails (it is not in a public header, so it is looked up at run time)
   - no thread can be started
 - D is opened `O_PATH` on Linux, `O_SEARCH` on Apple OSes, `O_RDONLY` elsewhere. It is set to 0700 by `chmod` of `/proc/self/fd/<fd>` on Linux with `/proc`, by `fchmod` of D opened again by name `O_RDONLY` and checked to be the same directory on Linux without `/proc`, by `fchmod` elsewhere
-- The central route (the /proc version included) does not open the socket's directory (only D made in it and the fork without D do); R reaches it with search permission alone. A directory without read permission is reached with the same permission as a plain bind / connect
+- The central route (the /proc version included) does not open the socket's directory (only D made in it and the form without D do); R reaches it with search permission alone. A directory without read permission is reached with the same permission as a plain bind / connect
 
 ### The fallback routes (connects)
 
@@ -158,7 +158,7 @@ A child forked after an `fchdir` to a directory fd binds / connects by a spellin
 
 - **Only `bind` and the `connect_any` ones take it.** `connect` / `connect_nonblocking` return `ENAMETOOLONG` instead
 - The file name of the `connect_any` ones fits the sockaddr length (on Apple, 253 bytes while the kernel takes the widened sockaddr)
-- Only the `connect_any` ones and the fork without D open the socket's directory. macOS opens it `O_SEARCH` and Linux `O_PATH`, which need no more permission than a plain bind / connect; other Unix targets open it `O_RDONLY`, which needs read permission as well (when it cannot be opened, the route cannot be used)
+- On the fork route, the `connect_any` ones and the fork without D open the socket's directory. macOS opens it `O_SEARCH` and Linux `O_PATH`, which need no more permission than a plain bind / connect; other Unix targets open it `O_RDONLY`, which needs read permission as well (when it cannot be opened, the route cannot be used)
 - For a bind the child only binds and the caller listens, so the fork route has no side effect a peer sees. The server's peer a client sees (macOS's `LOCAL_PEERPID`, Linux's `SO_PEERCRED`) is the caller from before anything is sent ([DR-0025](./decisions/DR-0025-fork-bind-listen-by-parent.md)). There is no bind that never forks
 - The child makes only async-signal-safe calls (`fchdir`, `bind` / `connect`, `_exit`), so it can be used from multi-threaded processes
 - Side effects: [the peer pid of a connect](#side-effects-of-a-connect-through-the-fork-route) (seen by the peer, connects only), [side effects no peer sees](#side-effects-of-the-fork-route-that-no-peer-sees) (binds and connects)
@@ -177,7 +177,7 @@ When a path too long for std is `ENAMETOOLONG` (assuming the directory exists an
 | illumos | file name over 96 bytes | the relative path over 107 bytes, and no symlink | file name over 107 bytes, and no symlink |
 
 - On Linux without the thread-cwd means (a seccomp filter, ...), a bind takes the /proc version for a file name of up to about 79 bytes and the fork route up to 96
-- When D can be made nowhere, a bind reaches a file name of up to 88 bytes (84 on Apple OSes / the BSDs) by the fork without D (when R can be made in the socket's directory). The connects reach what the fallback routes reach (without the symlink to the file in D)
+- When D can be made nowhere, a bind reaches a file name of up to 88 bytes (84 on Apple OSes / the BSDs) by the form without D (when the socket's directory can be opened and R made in it). The connects reach what the fallback routes reach (without the symlink to the file in D)
 - The 253 bytes of the connects on Apple OSes hold while the kernel takes the widened sockaddr; after it refuses, 103
 - A connect has no symlink route only when there is no safe place where the symlink can be made (a sandbox that allows neither `TMPDIR` nor `/tmp`, ...). With `/tmp` usable, the length is never the limit
 - A path longer than PATH_MAX (1024 on macOS, 4096 on Linux) is `ENAMETOOLONG`: the directory is looked up by the full path. That limit is outside what sockat is for
@@ -253,7 +253,8 @@ The order tried is that of `connect`; when every other route is unusable, the co
 |---|---|
 | thread cwd, fork, bindat (in D) | `R/<file name>` |
 | /proc version | `/proc/self/fd/<fd>/R/<file name>` |
-| fork without D | `.sockat.XXXXXXXXXX/<file name>` |
+| thread cwd, fork, bindat without D | `.sockat.XXXXXXXXXX/<file name>` |
+| the /proc version without D | `/proc/self/fd/<fd>/.sockat.XXXXXXXXXX/<file name>` |
 
 R (and `.sockat.XXXXXXXXXX`) is gone once the bind has returned, so removing, `stat`ing or `chmod`ing by the reported address hits nothing (however the fd number is reused, from whatever cwd it is resolved). It does not reach the socket either: keep the path you passed and use that (or `bind_ex` to remove the file). The same spelling shows in `Debug` output and in what frameworks log or hand out as the peer address.
 

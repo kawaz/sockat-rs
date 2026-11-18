@@ -48,7 +48,7 @@ std が受け付ける長さ (`sun_path` − 1) のパスは std にそのまま
 - **/proc 版**: `/proc/self/fd/<D の fd>/R/<ファイル名>` で渡す
 - **bindat / connectat**: D の fd を渡す
 - **fork**: D に `fchdir` した子を fork し、子が bind する。bind の後の listen は呼び出し元がするので、相手から見える副作用が無い
-- D は `TMPDIR`、`/tmp`、ソケットのディレクトリ (`.sockat.XXXXXXXXXX`) の順に、作れた所に作る。置き場は安全でなくても深くてもよい (fd で掴む)。どこにも作れなければ、bind はソケットのディレクトリに R を作って fork する
+- D は `TMPDIR`、`/tmp`、ソケットのディレクトリ (`.sockat.XXXXXXXXXX`) の順に、作れた所に作る。置き場は安全でなくても深くてもよい (fd で掴む)。どこにも作れなければ、bind はソケットのディレクトリに R を作り、同じ順 (スレッド cwd → /proc 版 → fork) で試す
 
 中心の経路が使えない時、connect 系だけが**予備の経路**を試す。connect の綴りはカーネルに残らないので、綴りにランダムな部品を挟まない。
 
