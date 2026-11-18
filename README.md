@@ -4,6 +4,8 @@
 
 A Rust library that binds and connects Unix domain sockets even when the path is longer than `sun_path` allows (104 bytes on macOS and the BSDs, 108 on Linux, NUL included).
 
+The language-independent behaviour is defined by the [sockat specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md); sockat-rs is its Rust implementation.
+
 ```rust
 let listener = sockat::bind("/a/very/deep/directory/.../server.sock")?;
 let stream = sockat::connect("/a/very/deep/directory/.../server.sock")?;

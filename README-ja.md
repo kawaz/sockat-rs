@@ -4,6 +4,8 @@
 
 `sun_path` の上限 (NUL 込みで macOS と BSD は 104 バイト、Linux は 108 バイト) を超えるパスでも、Unix domain socket を bind / connect できる Rust のライブラリ。
 
+言語によらない振る舞いの正本は [sockat の仕様](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md) で、sockat-rs はその Rust 実装。
+
 ```rust
 let listener = sockat::bind("/とても/深い/ディレクトリ/.../server.sock")?;
 let stream = sockat::connect("/とても/深い/ディレクトリ/.../server.sock")?;

@@ -2,6 +2,8 @@
 
 sockat は、`sun_path` の上限を超えるパスでも Unix domain socket を bind / connect できる Rust のライブラリ (公開 crate)。短いパスは std にそのまま渡し、長いパスだけを OS ごとの経路で短い綴りにして渡す。
 
+言語によらない振る舞いの正本はハブの [sockat の仕様](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md) (kawaz/sockat) で、sockat-rs はその Rust 実装。
+
 ## 必読
 
 - [docs/decisions/DR-0001](docs/decisions/DR-0001-long-socket-path-routes.md) — 経路と試す順番、各経路の安全性の考え方、却下した案、未確定の点。経路に手を入れる前に読む
@@ -20,6 +22,7 @@ sockat は、`sun_path` の上限を超えるパスでも Unix domain socket を
 
 ## 守ること
 
+- **振る舞いを変える時は、先にハブの SPEC を直す。** sockat-rs の docs と実装はその後に追従させる
 - **`unsafe` は `src/sys.rs` にだけ書く。** `just lint-unsafe` が他のファイルの `unsafe` を落とす。`sys.rs` の関数は安全に呼べる形で公開し、各 `unsafe` に `SAFETY:` を添える
 - **std が受け付けるパス (OS ごとの `sun_path` − 1 バイト以内) には何も足さない。** std の関数をそのまま呼ぶ (DR-0001 決定 1)
 - **経路の本当の失敗は次の経路でやり直さない。** 次へ進むのは経路自体が使えない時だけ (DR-0001 決定 3)

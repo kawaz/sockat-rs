@@ -4,6 +4,8 @@
 
 sockat の使い方と、長いパスにどう届くか、長いパスで std と違う点のリファレンス。設計の判断と理由は [DR-0001](./decisions/DR-0001-long-socket-path-routes.md) にある。
 
+言語によらない振る舞いの正本は [sockat の仕様](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md) で、sockat-rs はその Rust 実装。
+
 ## 使い方
 
 ```toml
