@@ -15,7 +15,7 @@
   - `TMPDIR` は空でなく絶対パスの時だけ候補に入れる (外すのは `TMPDIR` だけで、`/tmp` は試す)
   - `TMPDIR` が `/tmp` そのもの (`/tmp/` も含め、綴りが同じ) なら 1 回だけ試す。`/private/tmp` のように綴りの違う同じディレクトリは別の候補として扱う
 - 候補を順に見て、最初に使えたもので bind / connect する。何かを作る前に symlink を通した綴りの長さを確かめ、std にそのまま渡せる長さ ([DR-0002](DR-0002-std-handles-paths-it-accepts.md)) 以内なら std に、macOS で広げた sockaddr ([DR-0005](DR-0005-widened-sockaddr-on-macos.md)) が使えるなら 253 以内でそれに渡す。長さが足りない候補には何も作らず次へ進む
-- **他人が symlink を差し替えられない置き場だけを使う。** 置き場を stat し (symlink は辿る。macOS の `/tmp` は `/private/tmp` への symlink)、次のどちらかを満たす時だけ使う。満たさない候補には何も作らず次へ進む。例外は /proc を使える Linux / Android の connect 系で、安全でない候補を自分専用のディレクトリを fd で掴む形で使う ([DR-0023](DR-0023-unsafe-base-held-by-fd.md))
+- **他人が symlink を差し替えられない置き場だけを使う。** 置き場を stat し (symlink は辿る。macOS の `/tmp` は `/private/tmp` への symlink)、ディレクトリで、次のどちらかを満たす時だけ使う。満たさない候補には何も作らず次へ進む。例外は /proc を使える Linux / Android の connect 系で、安全でない候補を自分専用のディレクトリを fd で掴む形で使う ([DR-0023](DR-0023-unsafe-base-held-by-fd.md))
   - sticky bit が立っていて、持ち主が root か自分の実効 uid (`/tmp` がこれ)
   - 持ち主が自分の実効 uid で、group と other に書き込み権限が無い (`mode & 0o022 == 0`。macOS の `$TMPDIR` がこれ)
 - 確かめるのは置き場そのもので、置き場を含む上位のディレクトリまでは見ない
@@ -43,6 +43,7 @@
 ## 理由
 
 - 置き場の条件で、symlink を作ってから bind / connect するまでに他人が symlink を差し替えられないことが、仮定でなく確かめた事実になる。sticky なディレクトリの中の名前を消したり rename したりできるのは、その名前の持ち主、ディレクトリの持ち主、root だけで、他人の sticky なディレクトリではその持ち主が差し替えられるので持ち主も見る。残るのは同じ uid か root による差し替えと、他人が書ける上位ディレクトリの下に置き場がある場合で、守る範囲の外
+- ディレクトリであることも見るのは、自分の mode 0600 のファイルが持ち主と mode の条件だけなら通ってしまうから。中に何も作れないので置き場ではない (試験 `a_place_for_the_symlink_must_be_a_directory`)
 - `TMPDIR` が深すぎる時に `/tmp` で短くできる (`TMPDIR` が std にそのまま渡せる長さを超える環境で効く)。相対パスの `TMPDIR` は cwd に依存するので外す。綴りの違う同じディレクトリを別に扱うのは、綴りが短くなりうるから
 - symlink の先が利用者のパスそのものなので、カーネルは元のパスと同じに解決する。socket の実体は元の場所にでき、置き場には何も残らない (試験で実機確認)。ディレクトリを先に引く限界 ([DR-0001](DR-0001-long-socket-path-routes.md)) も無い
 - connect は最後の要素の symlink を辿る (macOS・Linux で確認) ので、ファイルを指す綴りがファイル名の長さによらず最短になる
@@ -63,6 +64,7 @@
 
 - 置き場を `TMPDIR`、`/tmp` の順にする: kawaz 裁定 2026-11-18
 - 置き場を使う前に安全か確かめる: kawaz 裁定 2026-11-18
+- 置き場がディレクトリであることも確かめる: ハブの SPEC (sockat-py の指摘、2026-11-18)
 - bind はディレクトリを、connect はファイルを指す: kawaz 承認 2026-11-18
 - 名前 (`sockat.` の接頭辞): 統括の裁定 2026-11-18。kawaz は接頭辞を支持
 - symlink の経路を macOS 以外にも使う: [DR-0008](DR-0008-freebsd-bindat-and-other-unix.md)

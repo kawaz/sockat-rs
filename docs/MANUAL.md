@@ -115,7 +115,7 @@ A symlink `sockat.XXXXXXXXXX` (10 random characters) is created in a temporary d
 
 - The symlink points to the path as given, so it resolves to the same place as the path
 - The places tried are `TMPDIR` (when it is a non-empty absolute path), then `/tmp`. The first one where the spelling passed is within the sockaddr length (253 bytes on an Apple OS whose kernel takes the widened sockaddr), that is safe, and where the symlink can be created is used. When `TMPDIR` is too deep for it to fit, `/tmp` is used
-- **A safe place** is a directory where no other user can replace the symlink in it, one of the following. Nothing is created in a place that is not safe; the next one is tried (the connects on Linux / Android with `/proc` use it in the held form below)
+- **A safe place** is a directory where no other user can replace the symlink in it (what is not a directory is not safe), one of the following. Nothing is created in a place that is not safe; the next one is tried (the connects on Linux / Android with `/proc` use it in the held form below)
   - sticky and owned by root or by the calling user (as `/tmp` is)
   - owned by the calling user with no write permission for group and others (as macOS's `$TMPDIR` is)
 - Symlinks are followed to judge a place (macOS's `/tmp` is a symlink to `/private/tmp`)
@@ -129,7 +129,7 @@ Only the connects (`connect`, `connect_nonblocking`, the `connect_any` variants)
 2. A directory `sockat.XXXXXXXXXX` of mode 0700 is created in the place (named as the symlinks are)
 3. It is opened `O_PATH | O_DIRECTORY | O_NOFOLLOW` (which needs no permission on the directory) and checked to be a directory owned by the calling user with no permission for group and others. Anything else (someone replaced it between the creation and the open) is neither used nor removed. Once checked, it is set to 0700 through `/proc/self/fd/<fd>` (so that a umask that takes some of the owner's bits does not stop it; that spelling reaches what the fd holds, so nothing can be swapped in)
 4. A symlink `s` to the socket file is created inside through the fd, and the connect goes to `/proc/self/fd/<fd>/s`
-5. Whether the connect succeeds or fails, `s` is removed, and the directory is removed only while its name still names the opened one
+5. Whether the connect succeeds or fails, the `s` it created is removed, and the directory is removed only while its name still names the opened one. A directory that failed the check is left alone, its contents included
 
 - Another user renaming the directory away and putting something else in its place does not affect the connect, which goes through the fd, and what was put there is not removed
 - The spelling is about 20 bytes, whatever the file name length and the depth of the place
