@@ -21,7 +21,7 @@ sockat は、`sun_path` の上限を超えるパスでも Unix domain socket を
 ## 守ること
 
 - **`unsafe` は `src/sys.rs` にだけ書く。** `just lint-unsafe` が他のファイルの `unsafe` を落とす。`sys.rs` の関数は安全に呼べる形で公開し、各 `unsafe` に `SAFETY:` を添える
-- **100 バイト以内のパスには何も足さない。** std の関数をそのまま呼ぶ (DR-0001 決定 1)
+- **std が受け付けるパス (OS ごとの `sun_path` − 1 バイト以内) には何も足さない。** std の関数をそのまま呼ぶ (DR-0001 決定 1)
 - **経路の本当の失敗は次の経路でやり直さない。** 次へ進むのは経路自体が使えない時だけ (DR-0001 決定 3)
 - **fork した子の区間は async-signal-safe な呼び出しだけ。** allocation・lock・Rust の destructor を通さない。sockaddr は fork の前に親が組み立てる
 - **経路は公開 API に出さない。** 試験は crate 内で各経路の関数を呼ぶ (DR-0001 決定 8)
