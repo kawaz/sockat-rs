@@ -33,7 +33,7 @@ let mut buf = [0; 4];
 server.read_exact(&mut buf)?;
 ```
 
-- A path of at most 100 bytes goes to the std function unchanged (std has no nonblocking connect, so `connect_nonblocking` connects a socket of its own with the address std would build)
+- A path that std accepts ([the length per OS](#how-a-long-path-is-reached)) goes to the std function unchanged (std has no nonblocking connect, so `connect_nonblocking` connects a socket of its own with the address std would build)
 - The socket file is created at the path given. It is not removed when the listener is closed (as with std). To remove it, call `std::fs::remove_file(path)` with the original path (unlink has no `sun_path` limit)
 - Sockets sockat creates itself are set up like std's (close-on-exec, `SO_NOSIGPIPE` where std sets it (macOS / iOS, FreeBSD, NetBSD, DragonFly), the same listen backlog as std)
 
@@ -46,7 +46,14 @@ Both try every route but the fork route ([How a long path is reached](#how-a-lon
 
 ## How a long path is reached
 
-A path of at most 100 bytes is handed to std unchanged on every OS. A longer path is tried on the routes below, in this order per OS, and bound / connected on the first route that can be used. None of the routes changes the calling process's cwd, so they can be used from multi-threaded programs.
+A path that std accepts (up to `sun_path` − 1 bytes) is handed to std unchanged.
+
+| OS | Handed to std |
+|---|---|
+| Linux / Android / illumos | up to 107 bytes |
+| macOS / iOS / FreeBSD / NetBSD / OpenBSD | up to 103 bytes |
+
+A longer path is tried on the routes below, in this order per OS, and bound / connected on the first route that can be used. None of the routes changes the calling process's cwd, so they can be used from multi-threaded programs.
 
 ### Order per OS
 
@@ -82,7 +89,7 @@ FreeBSD. `bindat(2)` / `connectat(2)` bind / connect by the file name relative t
 
 #### relative path
 
-When the path spelled relative to the cwd is at most 100 bytes, that is passed to std. Used only when the path given is absolute. Only the path string is rewritten; the cwd is never changed (no `chdir`).
+When std accepts the path spelled relative to the cwd, that is passed to std. Used only when the path given is absolute. Only the path string is rewritten; the cwd is never changed (no `chdir`).
 
 - If the path is below the cwd (`getcwd`, or a `$PWD` that names the same directory as the cwd), the prefix is cut off. Otherwise both sides are resolved to real paths and the spelling climbs with `..`. The shorter one is used
 - The relative spelling is checked to name the same directory as the path before it is used, and the cwd is checked to be unchanged after the bind / connect ([below](#the-relative-route-is-exposed-to-another-threads-chdir))
@@ -97,11 +104,11 @@ A symlink `sockat.XXXXXXXXXX` (10 random characters) is created in a temporary d
 
 | | the symlink points to | spelling passed | reached through `/tmp` |
 |---|---|---|---|
-| bind | the socket's directory | `<place>/sockat.XXXXXXXXXX/<file name>` | a file name of up to 77 bytes (230 on macOS) |
+| bind | the socket's directory | `<place>/sockat.XXXXXXXXXX/<file name>` | a file name of up to 84 bytes (80 where `sun_path` is 104, 230 on macOS) |
 | connect | the socket file | `<place>/sockat.XXXXXXXXXX` | whatever the directory depth and the file name length |
 
 - The symlink points to the path as given, so it resolves to the same place as the path
-- The places tried are `TMPDIR` (when it is a non-empty absolute path), then `/tmp`. The first one where the spelling passed fits in 100 bytes (on macOS, 253 in the widened sockaddr), that is safe, and where the symlink can be created is used. When `TMPDIR` is too deep for it to fit, `/tmp` is used
+- The places tried are `TMPDIR` (when it is a non-empty absolute path), then `/tmp`. The first one where std accepts the spelling passed (on macOS, where it fits 253 bytes in the widened sockaddr), that is safe, and where the symlink can be created is used. When `TMPDIR` is too deep for it to fit, `/tmp` is used
 - **A safe place** is a directory where no other user can replace the symlink in it, one of the following. Nothing is created in a place that is not safe; the next one is tried
   - sticky and owned by root or by the calling user (as `/tmp` is)
   - owned by the calling user with no write permission for group and others (as macOS's `$TMPDIR` is)
@@ -125,16 +132,16 @@ When a route actually binds / connects and fails (`ENOENT`, `EADDRINUSE`, `ECONN
 
 ### Where a path stops being reached
 
-When a path longer than 100 bytes is `ENAMETOOLONG`.
+When a path longer than std accepts is `ENAMETOOLONG`.
 
 | OS | `bind` | `connect` / `connect_nonblocking` | the `connect_any` variants |
 |---|---|---|---|
-| Linux / Android (with `/proc`) | the file name is over 107 bytes | the file name does not fit the `/proc` spelling, the relative path is over 100 bytes, and the symlink route cannot be used | the file name is over 107 bytes and the symlink route cannot be used |
-| Linux / Android (without `/proc`) | the file name is over 107 bytes | the relative path is over 100 bytes and the symlink route cannot be used | the file name is over 107 bytes and the symlink route cannot be used |
+| Linux / Android (with `/proc`) | the file name is over 107 bytes | the file name does not fit the `/proc` spelling, the relative path is over 107 bytes, and the symlink route cannot be used | the file name is over 107 bytes and the symlink route cannot be used |
+| Linux / Android (without `/proc`) | the file name is over 107 bytes | the relative path is over 107 bytes and the symlink route cannot be used | the file name is over 107 bytes and the symlink route cannot be used |
 | FreeBSD | the file name is over 103 bytes | the file name is over 103 bytes | the file name is over 103 bytes |
 | macOS | the file name is over 253 bytes | the path and the relative path are both over 253 bytes and the symlink route cannot be used | the file name is over 253 bytes and the symlink route cannot be used |
-| NetBSD / OpenBSD / other BSDs | the file name is over 103 bytes | the relative path is over 100 bytes and the symlink route cannot be used | the file name is over 103 bytes and the symlink route cannot be used |
-| illumos | the file name is over 107 bytes | the relative path is over 100 bytes and the symlink route cannot be used | the file name is over 107 bytes and the symlink route cannot be used |
+| NetBSD / OpenBSD / other BSDs | the file name is over 103 bytes | the relative path is over 103 bytes and the symlink route cannot be used | the file name is over 103 bytes and the symlink route cannot be used |
+| illumos | the file name is over 107 bytes | the relative path is over 107 bytes and the symlink route cannot be used | the file name is over 107 bytes and the symlink route cannot be used |
 
 - For a connect, the symlink route cannot be used only when there is no safe place where the symlink can be created (a sandbox where neither `TMPDIR` nor `/tmp` can be used, and the like). Through `/tmp` the length always fits
 
@@ -178,11 +185,11 @@ The order tried is that of `connect`; when no other route can be used, the conne
 
 Keep the original path yourself and use that.
 
-On OpenBSD, std's `local_addr()` drops the last byte of the path even for a short path of at most 100 bytes (which sockat hands to std unchanged; seen in CI). This is std's / the OS's behaviour, not sockat's: std's `UnixListener::bind` used directly gives the same.
+On OpenBSD, std's `local_addr()` drops the last byte of the path even for a short path of at most 103 bytes (which sockat hands to std unchanged; seen in CI). This is std's / the OS's behaviour, not sockat's: std's `UnixListener::bind` used directly gives the same.
 
 ### A path that does not end with a name is InvalidInput
 
-A path longer than 100 bytes whose last part is not a file name (`dir/`, `dir/.`, `dir/..`, `..`) is refused with `InvalidInput` before anything is created: it cannot be split into a directory and a file name. A path of at most 100 bytes goes to std unchanged and gets the kernel's error (for example a bind of `dir/` is `EADDRINUSE` on both macOS and Linux).
+A path longer than std accepts whose last part is not a file name (`dir/`, `dir/.`, `dir/..`, `..`) is refused with `InvalidInput` before anything is created: it cannot be split into a directory and a file name. A shorter path goes to std unchanged and gets the kernel's error (for example a bind of `dir/` is `EADDRINUSE` on both macOS and Linux).
 
 ### The forked child briefly holds copies of every fd
 
@@ -210,7 +217,7 @@ If the process dies between creating and removing the symlink, `sockat.XXXXXXXXX
 | a socket file nobody listens on | `ECONNREFUSED` |
 | the backlog is full | on Linux `EAGAIN` for a nonblocking connect (a blocking one waits for room), on macOS `ECONNREFUSED` |
 | no route reaches the path ([Where a path stops being reached](#where-a-path-stops-being-reached)); for `connect` / `connect_nonblocking`, also when only the fork route would | `ENAMETOOLONG` |
-| a path longer than 100 bytes that does not end with a name (`dir/`, `dir/.`, `..`, ...) | `InvalidInput` |
+| a path longer than std accepts that does not end with a name (`dir/`, `dir/.`, `..`, ...) | `InvalidInput` |
 | a path containing NUL | `InvalidInput` |
 | the cwd changed during the relative route | `Other` |
 | the forked child did not exit normally; or its exit status was collected elsewhere (`SIGCHLD` set to `SIG_IGN`, a `waitpid(-1)` in another thread) and the socket is not bound / connected | `Other` |

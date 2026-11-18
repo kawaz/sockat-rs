@@ -33,7 +33,7 @@ let mut buf = [0; 4];
 server.read_exact(&mut buf)?;
 ```
 
-- パスが 100 バイト以内なら std の関数をそのまま呼ぶ (`connect_nonblocking` は std に無いので、std と同じアドレスで自前のソケットを connect する)
+- std が受け付ける長さ ([OS ごとの値](#長いパスへの届き方)) のパスは std の関数をそのまま呼ぶ (`connect_nonblocking` は std に無いので、std と同じアドレスで自前のソケットを connect する)
 - ソケットファイルは渡したパスにできる。listener を閉じても消えない (std と同じ)。消す時は元のパスで `std::fs::remove_file(path)` する (unlink には `sun_path` の上限が無い)
 - 自前で作るソケットは std と同じ設定 (close-on-exec、std が付ける OS (macOS / iOS、FreeBSD、NetBSD、DragonFly) では `SO_NOSIGPIPE`、std と同じ listen の backlog)
 
@@ -46,7 +46,14 @@ server.read_exact(&mut buf)?;
 
 ## 長いパスへの届き方
 
-100 バイト以内のパスは、どの OS でも std にそのまま渡す。それを超えるパスは、OS ごとに次の順に試し、最初に使えた経路で bind / connect する。どの経路も呼び出し元のプロセスの cwd を変えないので、マルチスレッドのプログラムから使える。
+std が受け付ける長さ (`sun_path` − 1) のパスは std にそのまま渡す。
+
+| OS | std にそのまま渡す長さ |
+|---|---|
+| Linux / Android / illumos | 107 バイトまで |
+| macOS / iOS / FreeBSD / NetBSD / OpenBSD | 103 バイトまで |
+
+それを超えるパスは、OS ごとに次の順に試し、最初に使えた経路で bind / connect する。どの経路も呼び出し元のプロセスの cwd を変えないので、マルチスレッドのプログラムから使える。
 
 ### OS ごとに試す順番
 
@@ -82,7 +89,7 @@ FreeBSD。`bindat(2)` / `connectat(2)` で、ディレクトリの fd を基準�
 
 #### 相対パス
 
-cwd からの相対パスが 100 バイト以内なら、それを std に渡す。元のパスが絶対パスの時だけ使う。パスを文字列で書き直すだけで、cwd は変えない (`chdir` しない)。
+cwd からの相対パスが std にそのまま渡せる長さなら、それを std に渡す。元のパスが絶対パスの時だけ使う。パスを文字列で書き直すだけで、cwd は変えない (`chdir` しない)。
 
 - パスが cwd (`getcwd`、または cwd と同じディレクトリを指す `$PWD`) の下にあれば、前を削る。そうでなければ、両方を実パスに揃えて `..` で上る綴りを作る。短い方を使う
 - 相対パスが元のパスと同じディレクトリを指すことを確かめてから使い、bind / connect の後に cwd が変わっていないことも確かめる ([後述](#相対パスの経路は他のスレッドの-chdir-に弱い))
@@ -97,11 +104,11 @@ macOS。XNU は `sun_path` が 104 バイトを超えるアドレスも、パス
 
 | | symlink の先 | 渡す綴り | `/tmp` で届く範囲 |
 |---|---|---|---|
-| bind | ソケットのディレクトリ | `<置き場>/sockat.XXXXXXXXXX/<ファイル名>` | ファイル名が 77 バイト (macOS は 230 バイト) 以内 |
+| bind | ソケットのディレクトリ | `<置き場>/sockat.XXXXXXXXXX/<ファイル名>` | ファイル名が 84 バイト (`sun_path` が 104 の OS は 80、macOS は 230) 以内 |
 | connect | ソケットのファイル | `<置き場>/sockat.XXXXXXXXXX` | ディレクトリの深さにもファイル名の長さにもよらない |
 
 - symlink の先は渡したパスそのものなので、元のパスと同じ場所に解決される
-- 置き場の候補は、`TMPDIR` (空でない絶対パスの時)、`/tmp` の順。渡す綴りが 100 バイト (macOS は広げた sockaddr で 253 バイト) に収まり、安全で、symlink を作れた最初の候補を使う。`TMPDIR` が深くて収まらない時は `/tmp` を使う
+- 置き場の候補は、`TMPDIR` (空でない絶対パスの時)、`/tmp` の順。渡す綴りが std にそのまま渡せる長さ (macOS は広げた sockaddr で 253 バイト) に収まり、安全で、symlink を作れた最初の候補を使う。`TMPDIR` が深くて収まらない時は `/tmp` を使う
 - **安全な置き場**は、他人が中の symlink を差し替えられないディレクトリで、次のどちらか。満たさない候補には何も作らず、次の候補に進む
   - sticky bit が立っていて、持ち主が root か自分 (`/tmp` がこれ)
   - 持ち主が自分で、group と other に書き込み権限が無い (macOS の `$TMPDIR` がこれ)
@@ -125,16 +132,16 @@ macOS。XNU は `sun_path` が 104 バイトを超えるアドレスも、パス
 
 ### どこから届かなくなるか
 
-100 バイトを超えるパスが `ENAMETOOLONG` になる時。
+std にそのまま渡せない長さのパスが `ENAMETOOLONG` になる時。
 
 | OS | `bind` | `connect` / `connect_nonblocking` | `connect_any` 系 |
 |---|---|---|---|
-| Linux / Android (`/proc` あり) | ファイル名が 107 バイトを超える | ファイル名が `/proc` の綴りに収まらず、相対パスが 100 バイトを超え、symlink の経路も使えない | ファイル名が 107 バイトを超え、symlink の経路も使えない |
-| Linux / Android (`/proc` 無し) | ファイル名が 107 バイトを超える | 相対パスが 100 バイトを超え、symlink の経路も使えない | ファイル名が 107 バイトを超え、symlink の経路も使えない |
+| Linux / Android (`/proc` あり) | ファイル名が 107 バイトを超える | ファイル名が `/proc` の綴りに収まらず、相対パスが 107 バイトを超え、symlink の経路も使えない | ファイル名が 107 バイトを超え、symlink の経路も使えない |
+| Linux / Android (`/proc` 無し) | ファイル名が 107 バイトを超える | 相対パスが 107 バイトを超え、symlink の経路も使えない | ファイル名が 107 バイトを超え、symlink の経路も使えない |
 | FreeBSD | ファイル名が 103 バイトを超える | ファイル名が 103 バイトを超える | ファイル名が 103 バイトを超える |
 | macOS | ファイル名が 253 バイトを超える | 元のパスも相対パスも 253 バイトを超え、symlink の経路も使えない | ファイル名が 253 バイトを超え、symlink の経路も使えない |
-| NetBSD / OpenBSD / その他の BSD | ファイル名が 103 バイトを超える | 相対パスが 100 バイトを超え、symlink の経路も使えない | ファイル名が 103 バイトを超え、symlink の経路も使えない |
-| illumos | ファイル名が 107 バイトを超える | 相対パスが 100 バイトを超え、symlink の経路も使えない | ファイル名が 107 バイトを超え、symlink の経路も使えない |
+| NetBSD / OpenBSD / その他の BSD | ファイル名が 103 バイトを超える | 相対パスが 103 バイトを超え、symlink の経路も使えない | ファイル名が 103 バイトを超え、symlink の経路も使えない |
+| illumos | ファイル名が 107 バイトを超える | 相対パスが 107 バイトを超え、symlink の経路も使えない | ファイル名が 107 バイトを超え、symlink の経路も使えない |
 
 - connect で symlink の経路が使えないのは、安全で symlink を作れる置き場が無い時 (`TMPDIR` も `/tmp` も使えないサンドボックス等)。`/tmp` が使えれば長さは足りる
 
@@ -178,11 +185,11 @@ macOS。XNU は `sun_path` が 104 バイトを超えるアドレスも、パス
 
 元のパスは自分で持っておき、それを使う。
 
-OpenBSD では、100 バイト以内の短いパス (sockat は std にそのまま渡す) でも、std の `local_addr()` がパスの末尾 1 バイトを欠いて返す (CI で観測)。sockat ではなく std / OS の振る舞いで、std の `UnixListener::bind` を直接使っても同じになる。
+OpenBSD では、103 バイト以内の短いパス (sockat は std にそのまま渡す) でも、std の `local_addr()` がパスの末尾 1 バイトを欠いて返す (CI で観測)。sockat ではなく std / OS の振る舞いで、std の `UnixListener::bind` を直接使っても同じになる。
 
 ### 名前で終わらないパスは InvalidInput
 
-100 バイトを超えるパスで、最後がファイル名でないもの (`dir/`、`dir/.`、`dir/..`、`..`) は、何も作らずに `InvalidInput` を返す。ディレクトリとファイル名に分けられないからである。100 バイト以内のパスは std にそのまま渡すので、カーネルのエラーになる (例えば `dir/` の bind は macOS でも Linux でも `EADDRINUSE`)。
+std にそのまま渡せない長さのパスで、最後がファイル名でないもの (`dir/`、`dir/.`、`dir/..`、`..`) は、何も作らずに `InvalidInput` を返す。ディレクトリとファイル名に分けられないからである。それより短いパスは std にそのまま渡すので、カーネルのエラーになる (例えば `dir/` の bind は macOS でも Linux でも `EADDRINUSE`)。
 
 ### fork した子は一瞬、全 fd の複製を持つ
 
@@ -210,7 +217,7 @@ symlink を作ってから消すまでの間にプロセスが死ぬと、`TMPDI
 | 誰も listen していないソケットファイル | `ECONNREFUSED` |
 | backlog が満杯 | Linux はブロックしない connect で `EAGAIN` (ブロックする connect は空くまで待つ)、macOS は `ECONNREFUSED` |
 | どの経路にも収まらない ([どこから届かなくなるか](#どこから届かなくなるか))。`connect` / `connect_nonblocking` では、fork の経路でしか届かない時も | `ENAMETOOLONG` |
-| 100 バイトを超えるパスで、名前で終わらない (`dir/`、`dir/.`、`..` 等) | `InvalidInput` |
+| std にそのまま渡せない長さのパスで、名前で終わらない (`dir/`、`dir/.`、`..` 等) | `InvalidInput` |
 | NUL を含むパス | `InvalidInput` |
 | 相対パスの経路の途中で cwd が変わった | `Other` |
 | fork した子が正常に終了しなかった。または子の終了状態を他で刈り取られ (`SIGCHLD` を `SIG_IGN` にしている、他のスレッドの `waitpid(-1)`)、ソケットが bind / connect されていなかった | `Other` |

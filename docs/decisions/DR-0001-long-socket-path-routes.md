@@ -1,6 +1,6 @@
 # DR-0001: sun_path を超える socket のパスに届く経路と、試す順番
 
-- Status: Accepted、実装済み (0.2.4)
+- Status: Accepted、実装済み (0.2.5)
 - Date: 2026-11-18
 
 ## Context
@@ -20,13 +20,20 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 
 ## Decision
 
-### 1. 100 バイト以内のパスは std にそのまま渡す
+### 1. std が受け付けるパス (`sun_path` − 1 バイト以内) は std にそのまま渡す
 
-- パスが 100 バイト以内なら `UnixListener::bind` / `UnixStream::connect` をそのまま呼ぶ。何も足さない (環境変数も読まない)
-- 100 は全プラットフォームで同じ値にする。両方の `sun_path` (104 / 108、NUL 込み) より小さいので、同じパスがどの OS でも同じ扱いになる
+- パスが `sun_path` − 1 バイト以内なら `UnixListener::bind` / `UnixStream::connect` をそのまま呼ぶ。何も足さない (環境変数も読まない)
+- 値は OS ごとに違う。libc の `sockaddr_un` の `sun_path` の配列の長さから求める (`sys::SUN_PATH_CAP`)
+
+  | OS | `sun_path` (NUL 込み) | std にそのまま渡す長さ |
+  |---|---|---|
+  | Linux / Android / illumos | 108 | 107 バイトまで |
+  | macOS / iOS / FreeBSD / NetBSD / OpenBSD | 104 | 103 バイトまで |
+
+- std の判定と同じ境界である。std (`library/std/src/os/unix/net/addr.rs` の `sockaddr_un`) は `bytes.len() >= addr.sun_path.len()` のパスを `InvalidInput` で断る (試験 `a_path_std_accepts_goes_to_std_unchanged_and_one_byte_more_does_not` が std 自身で確かめる)
 - ブロックしない connect (決定 6) は std では作れないので、自前のソケットに std と同じアドレスのバイト列を渡す
 
-理由: 短いパスでは std と同じに振る舞うことが一番の約束で、そのためには短いパスに何も足さないのが確実である。
+理由: std が受け付けるパスは std に完全に任せる。閾値を小さくすると std が受け付けるパスまで他の経路に回り、std より悪くなる (例: Linux の 101〜107 バイトのパスが /proc の経路に回り、`local_addr()` が `/proc/self/fd/N/name` になる)。どの OS でも同じパスが同じ扱いになることは利用者への約束ではない。
 
 ### 2. Linux は `/proc/self/fd/<dirfd>/<name>`、それが使えない時だけ決定 3 の順
 
@@ -43,13 +50,13 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 
 ### 3. dirfd 基準の primitive の無い Unix は、安い経路から順に試し、最後に fork
 
-macOS、NetBSD、OpenBSD、illumos とその他の Unix、/proc の無い Linux では、100 バイトを超えるパスを次の順に試す。影響の無い安い経路から試し、fork は最後に回す (kawaz 裁定)。
+macOS、NetBSD、OpenBSD、illumos とその他の Unix、/proc の無い Linux では、決定 1 の長さを超えるパスを次の順に試す。影響の無い安い経路から試し、fork は最後に回す (kawaz 裁定)。
 
 | 順 | 経路 | 使う OS | 使う条件 |
 |---|---|---|---|
-| a | cwd からの相対パスを std に渡す | 全部 | 相対パスが 100 バイト以内 |
+| a | cwd からの相対パスを std に渡す | 全部 | 相対パスが決定 1 の長さ以内 |
 | b | 広げた sockaddr (後述) で元のパス、無理なら相対パス | macOS だけ | どちらかが 253 バイト以内 |
-| c | `<置き場>/sockat.XXXXXXXXXX` の symlink を経由する。bind はソケットのディレクトリを、connect はソケットのファイルを指す。置き場は `TMPDIR`、`/tmp` の順の候補 | 全部 | symlink を通した綴りが 100 (b が使えるなら 253) 以内で、安全で symlink を作れる候補がある |
+| c | `<置き場>/sockat.XXXXXXXXXX` の symlink を経由する。bind はソケットのディレクトリを、connect はソケットのファイルを指す。置き場は `TMPDIR`、`/tmp` の順の候補 | 全部 | symlink を通した綴りが決定 1 の長さ (b が使えるなら 253) 以内で、安全で symlink を作れる候補がある |
 | d | ディレクトリの fd に `fchdir` した子を fork する | 全部 | 上が全部使えない時。`bind` と `connect_any` 系だけが試す (決定 6) |
 
 a と c は POSIX の範囲の手 (`getcwd`、`realpath`、`stat`、`symlink`) なので、どの Unix でも使える。b は XNU のカーネルの受け付け方に頼る手なので macOS だけで使う (決定 4 の FreeBSD の項も参照)。
@@ -63,7 +70,7 @@ a と c は POSIX の範囲の手 (`getcwd`、`realpath`、`stat`、`symlink`) �
 | | c の綴り | 届く範囲 |
 |---|---|---|
 | connect | `/tmp/sockat.XXXXXXXXXX` (22 バイト) | ディレクトリの深さにもファイル名の長さにもよらない |
-| bind | `/tmp/sockat.XXXXXXXXXX/<ファイル名>` | ファイル名が 77 バイト (macOS は広げた sockaddr で 230 バイト) 以内 |
+| bind | `/tmp/sockat.XXXXXXXXXX/<ファイル名>` | ファイル名が 84 バイト (`sun_path` が 104 の OS は 80、macOS は広げた sockaddr で 230) 以内 |
 
 d が要るのは、bind でファイル名がそれより長い時と、安全で symlink を作れる置き場が無い時 (サンドボックス等) である。
 
@@ -73,7 +80,7 @@ d が要るのは、bind でファイル名がそれより長い時と、安全�
 
 1. **cwd の下にあるなら、前を削る。** パスが cwd の綴りで始まっていれば (区切り単位で比べる。`/a/b` は `/a/bc` の接頭辞ではない)、それを削った残りを使う。cwd の綴りの候補は `getcwd(3)` の値と `$PWD` である。残りは cwd から下へ降りるだけで、元のパスと同じ symlink を同じ順に通るので、解決の結果が元のパスと一致する。realpath も要らない
    - `$PWD` は環境変数なので嘘をつきうる (`chdir` が更新しない、誰でも書ける)。`stat($PWD)` と `stat(".")` の `(st_dev, st_ino)` が一致した時だけ使う。`getcwd` の値はそのまま使う
-2. **1 で 100 バイト以内にならない時だけ、両方を実パスに揃えて `..` で上る。** ソケットのディレクトリを `realpath(3)` で実パスにし、`getcwd` の実パス (macOS で `cd /var` すると `/private/var` が返る) との差から、`..` で上ってから下る綴りを作る。両方が実パスなら、どの `..` も実ディレクトリから上るので、カーネルの解決と一致する
+2. **1 で決定 1 の長さ以内にならない時だけ、両方を実パスに揃えて `..` で上る。** ソケットのディレクトリを `realpath(3)` で実パスにし、`getcwd` の実パス (macOS で `cd /var` すると `/private/var` が返る) との差から、`..` で上ってから下る綴りを作る。両方が実パスなら、どの `..` も実ディレクトリから上るので、カーネルの解決と一致する
    - 書かれたままのパスで比べると、`/var` と `/private/var` のように片方が symlink 経由だと共通部分を見落とす。パスの途中の symlink の先で `..` を使うと、symlink の先の親に着いてしまう
 
 2 つのうち短い方を使う。使う前に、相対パスのディレクトリと元のディレクトリの `(st_dev, st_ino)` が同じことを確かめる (cwd が消されている、他のスレッドが変えた、を弾く)。bind / connect の後に cwd の `(st_dev, st_ino)` が変わっていないことも確かめ、変わっていたら結果を捨ててエラーにする (試験は bind / connect を行う関数の中で cwd を変えて、他のスレッドの代わりにする)。
@@ -92,13 +99,13 @@ d が要るのは、bind でファイル名がそれより長い時と、安全�
 #### c. 短い symlink を経由する
 
 - 置き場の候補は `TMPDIR`、`/tmp` の順 (kawaz 裁定)。`TMPDIR` は空でなく絶対パスの時だけ候補に入れる (相対パスは cwd に依存するので外す。外すのは `TMPDIR` だけで、`/tmp` は試す)。`TMPDIR` が `/tmp` そのもの (`/tmp/` も含め、綴りが同じ) なら 1 回だけ試す。`/private/tmp` のように綴りの違う同じディレクトリは別の候補として扱う (綴りが短くなりうるので)
-- 候補を順に見て、最初に使えたもので bind / connect する。各候補では、何かを作る前に symlink を通した綴り (下の表) の長さを確かめる。100 以内なら std に、b が使えるなら 253 以内で広げた sockaddr に渡す。長さが足りない候補には何も作らず次の候補へ進む (`TMPDIR` が深すぎる時に `/tmp` で短くする。この作業をしたセッションのように `TMPDIR` が 100 バイトを超える環境で効く)
+- 候補を順に見て、最初に使えたもので bind / connect する。各候補では、何かを作る前に symlink を通した綴り (下の表) の長さを確かめる。決定 1 の長さ以内なら std に、b が使えるなら 253 以内で広げた sockaddr に渡す。長さが足りない候補には何も作らず次の候補へ進む (`TMPDIR` が深すぎる時に `/tmp` で短くする。この作業をしたセッションのように `TMPDIR` が決定 1 の長さを超える環境で効く)
 - **置き場は、他人が symlink を差し替えられない所だけを使う** (kawaz 裁定)。置き場を stat し (symlink は辿る。macOS の `/tmp` は `/private/tmp` への symlink)、次のどちらかを満たす時だけ使う。満たさない候補には何も作らず次の候補へ進む
   - sticky bit が立っていて、持ち主が root か自分の実効 uid (`/tmp` がこれ)。sticky なディレクトリの中の名前を消したり rename したりできるのは、その名前の持ち主、ディレクトリの持ち主、root だけである。持ち主も見るのは、他人の sticky なディレクトリでは、その持ち主が中の symlink を差し替えられるから
   - 持ち主が自分の実効 uid で、group と other に書き込み権限が無い (`mode & 0o022 == 0`。macOS の `$TMPDIR` がこれ)。他人は中に何も作れず、消せない
   - これで、symlink を作ってから bind / connect するまでに他人が symlink を差し替えられないことが、仮定でなく確かめた事実になる。残るのは同じ uid か root による差し替えだけで、守る範囲の外。確かめるのは置き場そのもので、置き場を含む上位のディレクトリまでは見ない (他人が書ける非 sticky のディレクトリの下に `TMPDIR` を置くと、置き場ごと差し替えられうる。これも守る範囲の外)
   - symlink の inode を bind / connect の後に比べる確認は入れない。rename で退かして戻す形を見抜けない
-- 候補で symlink を作れない時 (置き場が無い、書けない、サンドボックス、名前を使い切った、乱数が取れない) も次の候補へ進む。広げた sockaddr をカーネルが受け付けなかった時も、以降の候補は 100 以内かで見て続ける。候補が尽きたら d に進む。symlink を作った後の bind / connect の失敗は、その結果を返し、次の候補で試し直さない (試験は後の候補のディレクトリの mtime が変わらないことで、そこに何も作られていないことを確かめる)
+- 候補で symlink を作れない時 (置き場が無い、書けない、サンドボックス、名前を使い切った、乱数が取れない) も次の候補へ進む。広げた sockaddr をカーネルが受け付けなかった時も、以降の候補は決定 1 の長さ以内かで見て続ける。候補が尽きたら d に進む。symlink を作った後の bind / connect の失敗は、その結果を返し、次の候補で試し直さない (試験は後の候補のディレクトリの mtime が変わらないことで、そこに何も作られていないことを確かめる)
 - symlink の先と、カーネルに渡す綴り:
 
   | 要求 | symlink の先 | 渡す綴り |
@@ -185,7 +192,7 @@ d が要るのは、bind でファイル名がそれより長い時と、安全�
 ### 9. カーネルが返すアドレスは元のパスではない
 
 - `local_addr()` / `peer_addr()` (`getsockname` / `getpeername`) は、実際に bind に使った綴りを返す: 相対パス、`/proc/self/fd/...`、もう無い symlink、ファイル名だけ。macOS の広げた sockaddr では std のバッファ (106 バイト) で切れたパスになる (試験で確認、panic はしない)
-- OpenBSD では、100 バイト以内の短いパス (決定 1 で std にそのまま渡す) でも、std の `local_addr()` がパスの末尾 1 バイトを欠いて返す (CI の VM で観測、std の `UnixListener::bind` を直接使った場合。原因が OpenBSD の `getsockname` の返す長さか std の解釈かは調べていない)。sockat ではなく std / OS の振る舞いなので、sockat は手を入れない。std がパスそのものを返す前提を見る試験は、OpenBSD では外す
+- OpenBSD では、103 バイト以内の短いパス (決定 1 で std にそのまま渡す) でも、std の `local_addr()` がパスの末尾 1 バイトを欠いて返す (CI の VM で観測、std の `UnixListener::bind` を直接使った場合。原因が OpenBSD の `getsockname` の返す長さか std の解釈かは調べていない)。sockat ではなく std / OS の振る舞いなので、sockat は手を入れない。std がパスそのものを返す前提を見る試験は、OpenBSD では外す
 - 利用者には元のパスを持ってもらう。doc にそう書く
 
 ### 10. 共通の限界: ディレクトリを先に引く
@@ -223,6 +230,7 @@ d が要るのは、bind でファイル名がそれより長い時と、安全�
 ## 裁定の記録
 
 - 経路と試す順番、相対パスの作り方、Windows を対象外にすること: kawaz 指示 2026-11-18
+- 直接渡す閾値を OS ごとの sun_path − 1 にする: kawaz 裁定 2026-11-18
 - /proc が無い時に他の Unix と同じ順に倒すこと: kawaz 裁定 2026-11-18
 - symlink の置き場に /tmp を足すこと: kawaz 裁定 2026-11-18
 - 公開する connect を「fork するか」「ブロックするか」の 4 つの関数にし、fork するのは `connect_any` 系だけにすること: kawaz 裁定 2026-11-18

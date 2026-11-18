@@ -12,9 +12,16 @@
 //!
 //! Use [`bind`] and [`connect`] where you would use std's, and
 //! [`connect_nonblocking`] in async code. They take a path of any length and
-//! return std's own types. A path of at most 100 bytes is handed to std
-//! unchanged, so short paths behave exactly as with std. For a longer path the
-//! socket file is still created at (or looked up at) the path given.
+//! return std's own types. A path that std accepts is handed to std
+//! unchanged, so it behaves exactly as with std:
+//!
+//! | Platform | `sun_path` (NUL included) | Handed to std |
+//! |---|---|---|
+//! | Linux, Android, illumos | 108 | up to 107 bytes |
+//! | macOS, iOS, FreeBSD, NetBSD, OpenBSD | 104 | up to 103 bytes |
+//!
+//! For a longer path the socket file is still created at (or looked up at) the
+//! path given.
 //!
 //! ```no_run
 //! use std::io::{Read, Write};
@@ -31,7 +38,7 @@
 //!
 //! # How a long path is reached
 //!
-//! A path longer than 100 bytes is tried on these routes, in this order per
+//! A path longer than std accepts is tried on these routes, in this order per
 //! platform, and bound / connected on the first route that can be used:
 //!
 //! | Platform | Order tried |
@@ -49,7 +56,7 @@
 //! * **bindat**: `bindat(2)` / `connectat(2)` with the directory fd and the file
 //!   name (up to 103 bytes)
 //! * **relative path**: the path spelled relative to the working directory,
-//!   when that is at most 100 bytes. Only the path string is rewritten; the
+//!   when std accepts that. Only the path string is rewritten; the
 //!   cwd is never changed
 //! * **widened sockaddr**: a `sockaddr_un` carrying up to 253 bytes of path,
 //!   which XNU accepts: the path itself, or failing that the relative spelling
@@ -61,7 +68,7 @@
 //!   or the calling user (as `/tmp` is), or a directory of the calling user's
 //!   that group and others cannot write to. Through `/tmp`, a connect is
 //!   reached whatever the directory depth and the file name length, a bind for
-//!   a file name of up to 77 bytes (230 on macOS)
+//!   a file name of up to 84 bytes (80 where `sun_path` is 104, 230 on macOS)
 //! * **fork**: a forked child that `fchdir`s into the socket's directory makes
 //!   the call by the file name alone and exits. Only [`bind`],
 //!   [`connect_any`] and [`connect_any_nonblocking`] take it
@@ -104,9 +111,9 @@
 //!   the path you passed and use that (for example to remove the socket file
 //!   with [`std::fs::remove_file`], which has no length limit).
 //! * **A path that does not end with a file name is `InvalidInput`.** A path
-//!   longer than 100 bytes ending in `/`, `/.` or `/..` (or being `..`) cannot
-//!   be split into a directory and a file name and is refused before anything
-//!   is created; a short one goes to std and gets the kernel's error.
+//!   longer than std accepts ending in `/`, `/.` or `/..` (or being `..`)
+//!   cannot be split into a directory and a file name and is refused before
+//!   anything is created; a shorter one goes to std and gets the kernel's error.
 //! * **The peer pid the server sees can be that of an exited process**
 //!   ([`connect_any`] and [`connect_any_nonblocking`], when they take the fork
 //!   route): the forked child that made the connect and exited. The socket
@@ -153,8 +160,9 @@
 //! connect on a full backlog, so there `ECONNREFUSED` alone does not mean
 //! nobody listens). When no route can reach the path (for [`bind`], a file
 //! name too long for every route; for [`connect`] and [`connect_nonblocking`],
-//! also when only the fork route would), the error is `ENAMETOOLONG`. A path longer than 100 bytes that does not end with a file
-//! name, or any path that contains a NUL byte, is an `InvalidInput` error.
+//! also when only the fork route would), the error is `ENAMETOOLONG`. A path
+//! longer than std accepts that does not end with a file name, or any path that
+//! contains a NUL byte, is an `InvalidInput` error.
 //!
 //! # Async runtimes
 //!
@@ -200,9 +208,9 @@ mod tests;
 /// Create a socket bound to `path` and listening on it, like
 /// [`UnixListener::bind`] but for a path of any length.
 ///
-/// A path of at most 100 bytes goes to [`UnixListener::bind`] unchanged. A
-/// longer path is reached by the routes the platform has, the fork route as
-/// the last resort (see the [crate documentation](crate)): the forked child
+/// A path that std accepts goes to [`UnixListener::bind`] unchanged. A longer
+/// path is reached by the routes the platform has, the fork route as the last
+/// resort (see the [crate documentation](crate) for both): the forked child
 /// only binds, and the listen is done by this process, so the listener is this
 /// process's like any other. The socket file is created at `path` either way,
 /// and is not removed when the listener is dropped (as with std).
@@ -212,8 +220,8 @@ mod tests;
 /// The errors of `bind(2)` / `listen(2)`, for example `EADDRINUSE` when `path`
 /// exists and `ENOENT` when its directory does not; `ENAMETOOLONG` when the file
 /// name alone is too long for any route; `InvalidInput` for a path longer than
-/// 100 bytes that does not end with a file name, or for a path that contains a
-/// NUL byte.
+/// std accepts that does not end with a file name, or for a path that contains
+/// a NUL byte.
 pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
     route::run(route::Request::Bind, path.as_ref()).map(|(fd, _)| UnixListener::from(fd))
 }
@@ -221,8 +229,8 @@ pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
 /// Connect to the socket at `path`, like [`UnixStream::connect`] but for a path
 /// of any length, without forking. Use it wherever std's would be used.
 ///
-/// A path of at most 100 bytes goes to [`UnixStream::connect`] unchanged. A
-/// longer path is reached by every route the platform has but the fork route
+/// A path that std accepts goes to [`UnixStream::connect`] unchanged. A longer
+/// path is reached by every route the platform has but the fork route
 /// (see the [crate documentation](crate)), so in an ordinary environment it is
 /// reached whatever the directory depth and the file name length, and the connection is always made by this
 /// process. Only in a rare environment where nothing but the fork route would
@@ -236,8 +244,8 @@ pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
 /// The errors of `connect(2)`, for example `ENOENT` when nothing is at `path`
 /// and `ECONNREFUSED` when nobody listens on it (on macOS also when its backlog
 /// is full); `ENAMETOOLONG` when no route but the fork route reaches the path
-/// (or none at all does); `InvalidInput` for a path longer than 100 bytes that
-/// does not end with a file name, or for a path that contains a NUL byte.
+/// (or none at all does); `InvalidInput` for a path longer than std accepts
+/// that does not end with a file name, or for a path that contains a NUL byte.
 pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
     connect_with(
         path.as_ref(),

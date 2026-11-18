@@ -14,7 +14,7 @@ let stream = sockat::connect("/とても/深い/ディレクトリ/.../server.so
 std の `UnixListener::bind` / `UnixStream::connect` の代わりに `sockat::bind` / `sockat::connect` を使う。非同期のコードでは、待たずに非ブロッキングの stream を返す `sockat::connect_nonblocking` を使う。
 
 - 戻り値は std の `UnixListener` / `UnixStream` そのもの
-- 100 バイト以内のパスは std にそのまま渡すので、短いパスでは std と同じに振る舞う
+- std が受け付ける長さのパスは std にそのまま渡すので、std と同じに振る舞う
 - 長いパスでも、ソケットファイルは渡したパスにできる
 - `connect` も一時ディレクトリの短い symlink を経由する経路までは試すので、普通の環境では長いパスでも届く
 
@@ -24,7 +24,14 @@ std の `bind` / `connect` は `sun_path` に収まらないパスを断る。�
 
 ## 長いパスへの届き方
 
-100 バイト以内のパスは、どの OS でも std にそのまま渡す。それを超えるパスは、OS ごとに次の順に試し、最初に使えた経路で bind / connect する。
+std が受け付ける長さ (`sun_path` − 1) のパスは std にそのまま渡す。
+
+| OS | std にそのまま渡す長さ |
+|---|---|
+| Linux / Android / illumos | 107 バイトまで |
+| macOS / iOS / FreeBSD / NetBSD / OpenBSD | 103 バイトまで |
+
+それを超えるパスは、OS ごとに次の順に試し、最初に使えた経路で bind / connect する。
 
 | OS | 試す順番 |
 |---|---|
@@ -37,7 +44,7 @@ std の `bind` / `connect` は `sun_path` に収まらないパスを断る。�
 
 - **/proc**: ディレクトリを開き、`/proc/self/fd/<fd>/<ファイル名>` で渡す。`/proc` が無い時と、ファイル名がこれに収まらない時 (およそ 90 バイト超) は使えない
 - **bindat**: `bindat(2)` / `connectat(2)` で、ディレクトリの fd を基準にファイル名で渡す
-- **相対パス**: cwd からの相対パスが 100 バイト以内なら、それで渡す。パスを文字列で書き直すだけで、cwd は変えない
+- **相対パス**: cwd からの相対パスが std にそのまま渡せる長さなら、それで渡す。パスを文字列で書き直すだけで、cwd は変えない
 - **広げた sockaddr**: macOS のカーネルが受け付ける、253 バイトまで入る sockaddr で渡す
 - **symlink**: `TMPDIR` か `/tmp` に短い symlink を作り、それを通して渡す。bind はソケットのディレクトリを、connect はソケットのファイルを指す。他人が差し替えられない置き場にだけ作り、すぐ消す
 - **fork**: ディレクトリに `fchdir` した子を fork し、子がファイル名だけで bind / connect する。**`bind` と `connect_any` 系だけが試す**
@@ -55,7 +62,7 @@ fork の経路で connect すると、サーバに見える peer の pid は、�
 ## 長いパスで std と違う点
 
 - `local_addr()` / `peer_addr()` は元のパスを返さず、bind の時にカーネルに渡した綴り (相対パス、`/proc/self/fd/...`、もう無い symlink を通したパス等) を返す。元のパスは自分で持っておく
-- 100 バイトを超えるパスで、名前で終わらないもの (`dir/`、`dir/.`、`..` で終わるもの) は `InvalidInput` になる
+- std にそのまま渡せない長さのパスで、名前で終わらないもの (`dir/`、`dir/.`、`..` で終わるもの) は `InvalidInput` になる
 - その他 (fork の副作用、ディレクトリを先に引くこと、symlink が残りうること) は [docs/MANUAL-ja.md](./docs/MANUAL-ja.md#長いパスで-std-と違う点)
 
 ## async ランタイム

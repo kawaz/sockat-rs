@@ -489,12 +489,36 @@ fn sockets_carry_so_nosigpipe_where_std_sets_it() {
     assert_eq!(sys::so_nosigpipe(client.as_fd()).unwrap(), std_says);
 }
 
-// The plain route is the contract that short paths behave exactly like std:
-// at most DIRECT_MAX (100) bytes goes to std unchanged, one byte more does not.
-// 100 is the same on every platform and below both sun_path sizes (104 / 108
-// with the NUL), so a path's route does not depend on where it runs.
+// The plain route is the contract that every path std accepts behaves exactly
+// like std: at most DIRECT_MAX bytes goes to std unchanged, one byte more does
+// not. DIRECT_MAX is sun_path less the NUL (107 on Linux, Android and illumos,
+// 103 on Apple and the BSDs), which is std's own limit: std binds and connects
+// a path of DIRECT_MAX bytes and refuses one byte more with InvalidInput
+// (checked here against std itself). So no path std can take is sent down
+// another route, and none that std refuses is handed to it.
 #[test]
-fn a_path_of_100_bytes_goes_to_std_unchanged_and_101_does_not() {
+fn a_path_std_accepts_goes_to_std_unchanged_and_one_byte_more_does_not() {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "illumos"))]
+    assert_eq!(DIRECT_MAX, 107);
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    assert_eq!(DIRECT_MAX, 103);
+
+    let t = tmp();
+    let std_at = nest(t.path(), DIRECT_MAX, "a.sock");
+    let l = UnixListener::bind(&std_at).unwrap();
+    let c = UnixStream::connect(&std_at).unwrap();
+    ping(OwnedFd::from(l), OwnedFd::from(c));
+    let std_over = nest(t.path(), DIRECT_MAX + 1, "o.sock");
+    let e = UnixListener::bind(&std_over).unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+    let e = UnixStream::connect(&std_over).unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+
     let t = tmp();
     let at_limit = nest(t.path(), DIRECT_MAX, "s.sock");
     let (l, r) = route::run(BIND, &at_limit).unwrap();
@@ -531,7 +555,7 @@ fn a_path_of_100_bytes_goes_to_std_unchanged_and_101_does_not() {
 // macOS it exercises the symlink or fork route.
 #[test]
 fn long_paths_bind_at_the_given_path_and_accept_connections() {
-    for total in [101, 150, 253, 254, 300, 600] {
+    for total in [DIRECT_MAX + 1, 150, 253, 254, 300, 600] {
         let t = tmp();
         let p = nest(t.path(), total, "s.sock");
         let (l, _) = route::run(BIND, &p).unwrap();
@@ -822,12 +846,12 @@ mod linux {
     use crate::route::linux;
     use std::os::fd::AsFd;
 
-    // Every path over 100 bytes takes /proc/self/fd/<dirfd>/<name> on Linux,
-    // however long the directory part is (the directory never goes into the
-    // sockaddr). With /proc there, nothing else is tried.
+    // Every path over DIRECT_MAX bytes takes /proc/self/fd/<dirfd>/<name> on
+    // Linux, however long the directory part is (the directory never goes into
+    // the sockaddr). With /proc there, nothing else is tried.
     #[test]
     fn long_paths_take_the_proc_fd_route() {
-        for total in [101, 300, 1000] {
+        for total in [DIRECT_MAX + 1, 300, 1000] {
             let t = tmp();
             let p = nest(t.path(), total, "s.sock");
             let (l, r) = route::run(BIND, &p).unwrap();
@@ -861,9 +885,9 @@ mod linux {
     // POSIX order runs with the real /proc in place (the path is far from the
     // cwd, so not relative):
     //
-    // * bind: the link to the directory does not fit either (18 + 1 + 95 >
-    //   100 under /tmp), so the fork route binds it, up to the 107 bytes of
-    //   its sockaddr; a name of 108 is ENAMETOOLONG;
+    // * bind: the link to the directory does not fit either (23 + 95 >
+    //   DIRECT_MAX under /tmp), so the fork route binds it, up to the 107
+    //   bytes of its sockaddr; a name of 108 is ENAMETOOLONG;
     // * connect: the link to the socket file takes it without forking, for
     //   all four connects; without a place for the link, connect_any forks
     //   and connect is ENAMETOOLONG.
@@ -962,7 +986,11 @@ mod linux {
         for empty in [false, true] {
             let t = tmp();
             let c = with_proc(&no_proc(t.path(), empty), &[]);
-            for (total, name) in [(101, "s.sock"), (300, "s.sock"), (1000, "s.sock")] {
+            for (total, name) in [
+                (DIRECT_MAX + 1, "s.sock"),
+                (300, "s.sock"),
+                (1000, "s.sock"),
+            ] {
                 let p = nest(t.path(), total, name);
                 let (l, r) = route::run_long(BIND, &p, &c).unwrap();
                 assert!(matches!(r, Route::Fork { .. }), "{r:?} {total} {empty}");
@@ -982,8 +1010,9 @@ mod linux {
 
     // Without /proc the cheaper POSIX routes come before the fork route, as
     // on the other Unix targets: a path whose spelling relative to the cwd is
-    // at most 100 bytes takes the relative route, and a path far from the cwd
-    // goes through a symlink under the first usable place. Neither forks.
+    // at most DIRECT_MAX bytes takes the relative route, and a path far from
+    // the cwd goes through a symlink under the first usable place. Neither
+    // forks.
     // With /proc, the same paths take the /proc route and nothing else.
     #[test]
     fn without_proc_the_relative_and_symlink_routes_come_before_fork() {
@@ -992,7 +1021,7 @@ mod linux {
         let base = tmp();
         let cwd = std::env::current_dir().unwrap();
         let rel_base = below.path().strip_prefix(&cwd).unwrap();
-        let near = cwd.join(nest(rel_base, 99, "rel.sock"));
+        let near = cwd.join(nest(rel_base, DIRECT_MAX, "rel.sock"));
         let far = nest(t.path(), 600, "sym.sock");
         let none = no_proc(t.path(), false);
         let c = with_proc(&none, &[base.path()]);
@@ -1121,17 +1150,18 @@ mod linux {
     }
 
     /// The five Linux routes, each a [`Way`] to its own socket path, with the
-    /// route each must take: the path itself (100 bytes), /proc (300 bytes),
-    /// and with /proc made to look absent, the relative spelling (99 bytes
-    /// relative, below the cwd), the symlink under a short place (600 bytes),
-    /// and the fork route (600 bytes, no place for a symlink).
+    /// route each must take: the path itself (DIRECT_MAX bytes), /proc (300
+    /// bytes), and with /proc made to look absent, the relative spelling
+    /// (DIRECT_MAX bytes relative, below the cwd), the symlink under a short
+    /// place (600 bytes), and the fork route (600 bytes, no place for a
+    /// symlink).
     fn ways(d: &Dirs) -> Vec<(&'static str, Way, Want)> {
         let t = d.t.path();
         let cwd = std::env::current_dir().unwrap();
         let rel_base = d.below_cwd.path().strip_prefix(&cwd).unwrap();
         let none = no_proc(t, false);
         let proc = Path::new(linux::PROC_SELF_FD);
-        let direct = nest(t, 100, "direct.sock");
+        let direct = nest(t, DIRECT_MAX, "direct.sock");
         let cases: Vec<(&'static str, PathBuf, Config, Want)> = vec![
             (
                 "ProcFd",
@@ -1141,7 +1171,7 @@ mod linux {
             ),
             (
                 "Relative",
-                cwd.join(nest(rel_base, 99, "rel.sock")),
+                cwd.join(nest(rel_base, DIRECT_MAX, "rel.sock")),
                 with_proc(&none, &[]),
                 |_, r| r == Route::Relative,
             ),
@@ -1265,16 +1295,17 @@ mod posix {
         assert_ne!(a, b);
     }
 
-    // Route order a: a path over 100 bytes whose spelling relative to the cwd
-    // is at most 100 bytes takes the relative route (through std, the plain
-    // sockaddr), before anything else is considered (on Apple, the widened
-    // form). The socket is at the given absolute path.
+    // Route order a: a path over DIRECT_MAX bytes whose spelling relative to
+    // the cwd is at most DIRECT_MAX bytes takes the relative route (through
+    // std, the plain sockaddr), before anything else is considered (on Apple,
+    // the widened form). The socket is at the given absolute path.
     #[test]
     fn a_path_short_relative_to_the_cwd_takes_the_relative_route() {
         let t = tmp_below_cwd();
         let cwd = std::env::current_dir().unwrap();
-        // Relative spelling of 99 bytes; the absolute path is cwd + "/" + 99.
-        let rel_len = 99;
+        // Relative spelling of DIRECT_MAX bytes, so the absolute path (cwd +
+        // "/" + that) is over DIRECT_MAX however short the cwd is.
+        let rel_len = DIRECT_MAX;
         let rel_base = t.path().strip_prefix(&cwd).unwrap();
         let p = cwd.join(nest(rel_base, rel_len, "s.sock"));
         assert!(path::len(&p) > DIRECT_MAX);
@@ -1310,10 +1341,10 @@ mod posix {
 
     // The link to the socket file is spelled `<base>/sockat.XXXXXXXXXX`
     // whatever the file name, so a connect reaches a name too long for the
-    // link to the directory (`<base>/sockat.XXXXXXXXXX/<name>` over 100 bytes,
-    // on Apple also over 253 in the widened form), which a bind has to fork
-    // for. No connect forks there, the plain `connect` included, and nothing
-    // is left under the base.
+    // link to the directory (`<base>/sockat.XXXXXXXXXX/<name>` over
+    // DIRECT_MAX bytes, on Apple also over 253 in the widened form), which a
+    // bind has to fork for. No connect forks there, the plain `connect`
+    // included, and nothing is left under the base.
     #[test]
     fn a_connect_reaches_a_file_name_too_long_for_the_link_to_the_directory() {
         let t = tmp();
@@ -2257,13 +2288,13 @@ mod apple {
         );
     }
 
-    // Route order b with the path itself: over 100 bytes, no relative spelling
-    // of at most 100, and at most 253 bytes: the widened form with the path.
-    // Under /tmp the relative spelling from the package root climbs all the way
-    // up, so it is long.
+    // Route order b with the path itself: over DIRECT_MAX bytes, no relative
+    // spelling of at most DIRECT_MAX, and at most 253 bytes: the widened form
+    // with the path. Under /tmp the relative spelling from the package root
+    // climbs all the way up, so it is long.
     #[test]
     fn a_path_up_to_253_bytes_takes_the_widened_route() {
-        for total in [101, 200, 253] {
+        for total in [DIRECT_MAX + 1, 200, 253] {
             let t = tmp();
             let p = nest(t.path(), total, "s.sock");
             let c = cfg(&[Path::new("/nonexistent")], true);
@@ -2464,9 +2495,9 @@ mod apple {
     }
 
     /// The seven Apple routes, each a [`Way`] to its own socket path, with the
-    /// route each must take: the path itself (100 bytes); the relative
-    /// spelling of a path below the cwd (99 bytes relative); the widened
-    /// sockaddr (200 bytes under /tmp); the widened sockaddr with the relative
+    /// route each must take: the path itself (DIRECT_MAX bytes); the relative
+    /// spelling of a path below the cwd (DIRECT_MAX bytes relative); the
+    /// widened sockaddr (200 bytes under /tmp); the widened sockaddr with the relative
     /// spelling (240 bytes relative, over 253 absolute); the symlink under a
     /// short place (plain sockaddr) and under a 150-byte place (widened); and
     /// the fork route (600 bytes, no place for a symlink). Same inputs as the
@@ -2478,11 +2509,11 @@ mod apple {
         let long_base = nest(d.long_base_dir.path(), 150, "base");
         std::fs::create_dir_all(&long_base).unwrap();
         let none = Path::new("/nonexistent");
-        let direct = nest(t, 100, "direct.sock");
+        let direct = nest(t, DIRECT_MAX, "direct.sock");
         let cases: Vec<(&'static str, PathBuf, Config, Want)> = vec![
             (
                 "Relative",
-                cwd.join(nest(rel_base, 99, "rel.sock")),
+                cwd.join(nest(rel_base, DIRECT_MAX, "rel.sock")),
                 cfg(&[none], true),
                 |_, r| r == Route::Relative,
             ),

@@ -14,7 +14,7 @@ let stream = sockat::connect("/a/very/deep/directory/.../server.sock")?;
 Use `sockat::bind` / `sockat::connect` where you would use std's `UnixListener::bind` / `UnixStream::connect`. In async code, use `sockat::connect_nonblocking`, which does not wait and returns a nonblocking stream.
 
 - The results are std's own `UnixListener` / `UnixStream`
-- A path of at most 100 bytes is handed to std unchanged, so short paths behave exactly as with std
+- A path that std accepts is handed to std unchanged, so it behaves exactly as with std
 - Even for a long path, the socket file is created at the path given
 - `connect` too tries every route up to a short symlink under a temporary directory, so in an ordinary environment it reaches long paths as well
 
@@ -24,7 +24,14 @@ std's `bind` / `connect` refuse a path that does not fit `sun_path`. The file sy
 
 ## How a long path is reached
 
-A path of at most 100 bytes is handed to std unchanged on every OS. A longer path is tried on the routes below, in this order per OS, and bound / connected on the first route that can be used.
+A path that std accepts (up to `sun_path` − 1 bytes) is handed to std unchanged.
+
+| OS | Handed to std |
+|---|---|
+| Linux / Android / illumos | up to 107 bytes |
+| macOS / iOS / FreeBSD / NetBSD / OpenBSD | up to 103 bytes |
+
+A longer path is tried on the routes below, in this order per OS, and bound / connected on the first route that can be used.
 
 | OS | Order tried |
 |---|---|
@@ -37,7 +44,7 @@ A path of at most 100 bytes is handed to std unchanged on every OS. A longer pat
 
 - **/proc**: open the directory and pass `/proc/self/fd/<fd>/<file name>`. Not usable without `/proc`, or when the file name does not fit in it (over about 90 bytes)
 - **bindat**: `bindat(2)` / `connectat(2)`, by the file name relative to the directory fd
-- **relative path**: when the path relative to the cwd is at most 100 bytes, pass that. Only the path string is rewritten; the cwd is never changed
+- **relative path**: when std accepts the path relative to the cwd, pass that. Only the path string is rewritten; the cwd is never changed
 - **widened sockaddr**: pass a sockaddr carrying up to 253 bytes, which the macOS kernel accepts
 - **symlink**: create a short symlink under `TMPDIR` or `/tmp` and go through it. For a bind it points to the socket's directory, for a connect to the socket file. It is created only in a place where no other user can replace it, and removed at once
 - **fork**: fork a child that `fchdir`s into the directory and binds / connects by the file name alone. **Only `bind` and the `connect_any` variants try it**
@@ -55,7 +62,7 @@ After a connect through the fork route, the peer pid the server sees is that of 
 ## What differs from std for a long path
 
 - `local_addr()` / `peer_addr()` do not return the path: they return the spelling handed to the kernel at bind time (a relative path, `/proc/self/fd/...`, a path through a symlink that no longer exists, ...). Keep the path yourself
-- A path longer than 100 bytes that does not end with a file name (ending in `dir/`, `dir/.`, `..`) is an `InvalidInput` error
+- A path longer than std accepts that does not end with a file name (ending in `dir/`, `dir/.`, `..`) is an `InvalidInput` error
 - The rest (the fork's side effects, the directory being looked up first, a symlink that may be left behind) is in [docs/MANUAL.md](./docs/MANUAL.md#what-differs-from-std-for-a-long-path)
 
 ## Async runtimes

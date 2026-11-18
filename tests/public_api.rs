@@ -30,6 +30,16 @@ fn nest(base: &Path, total: usize, name: &str) -> PathBuf {
     p
 }
 
+/// The longest path std accepts on this target, `sun_path` less the NUL (107
+/// on Linux, 103 on macOS): sockat hands a path up to this length to std and
+/// takes its own routes past it.
+fn std_max() -> usize {
+    fn sun_path_len<const N: usize>(_: fn(&libc::sockaddr_un) -> &[libc::c_char; N]) -> usize {
+        N
+    }
+    sun_path_len(|un| &un.sun_path) - 1
+}
+
 fn is_socket(p: &Path) -> bool {
     std::fs::symlink_metadata(p)
         .map(|m| m.file_type().is_socket())
@@ -49,9 +59,11 @@ fn ping(listener: &UnixListener, client: &mut UnixStream) {
 
 // The promise of the crate: a socket can be bound and reached at a path of any
 // length (well past sun_path's 104 / 108 bytes), the socket file is at that
-// path, and it can be removed by that path. Two bases: the default temporary
-// directory (on macOS $TMPDIR is already about 50 bytes, and longer under
-// sandboxes and test harnesses) and /tmp.
+// path, and it can be removed by that path. Both sides of the length std
+// accepts are included (the last length handed to std and the first one
+// past it). Two bases: the default temporary directory (on macOS $TMPDIR is
+// already about 50 bytes, and longer under sandboxes and test harnesses) and
+// /tmp.
 #[test]
 fn bind_and_connect_work_at_any_length() {
     let bases = [
@@ -61,8 +73,9 @@ fn bind_and_connect_work_at_any_length() {
             .tempdir_in("/tmp")
             .unwrap(),
     ];
+    let max = std_max();
     for base in &bases {
-        for total in [100, 101, 108, 200, 253, 254, 400, 1000] {
+        for total in [100, max, max + 1, 108, 200, 253, 254, 400, 1000] {
             let total = total.max(base.path().as_os_str().len() + 10);
             let p = nest(base.path(), total, "s.sock");
             let listener = sockat::bind(&p).unwrap();
@@ -88,7 +101,7 @@ fn in_an_ordinary_environment_no_connect_forks() {
         .prefix("sockat-")
         .tempdir_in("/tmp")
         .unwrap();
-    for total in [101, 253, 400, 1000] {
+    for total in [std_max() + 1, 253, 400, 1000] {
         let p = nest(t.path(), total, &format!("{total}.sock"));
         let listener = sockat::bind(&p).unwrap();
 
@@ -113,9 +126,9 @@ fn in_an_ordinary_environment_no_connect_forks() {
 }
 
 // A long file name far from the cwd, too long to fit behind
-// /tmp/sockat.XXXXXXXXXX/ (over 77 bytes for the plain sockaddr; on macOS over
-// 230 for the widened one) and, on Linux, behind /proc/self/fd/<n>/ (over
-// about 90), but within the fork route's sockaddr. `bind` reaches it (forking
+// /tmp/sockat.XXXXXXXXXX/ (over 84 bytes for the plain sockaddr on Linux, 80
+// on the BSDs; on macOS over 230 for the widened one) and, on Linux, behind
+// /proc/self/fd/<n>/ (over about 90), but within the fork route's sockaddr. `bind` reaches it (forking
 // on every target but FreeBSD, where bindat does). The connects reach it
 // through a symlink to the socket file, whose spelling does not contain the
 // file name, so in an ordinary environment (a writable /tmp) none of them

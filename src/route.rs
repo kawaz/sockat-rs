@@ -83,12 +83,12 @@ fn fork_ruled_out() -> io::Error {
     io::Error::from_raw_os_error(libc::ENAMETOOLONG)
 }
 
-/// A path of at most this many bytes is handed to std as is.
-///
-/// The limit is the same on every target and below both `sun_path` sizes
-/// (104 on BSDs / Apple and 108 on Linux, NUL included), so whether a path
-/// takes the plain route does not depend on the platform it runs on.
-pub(crate) const DIRECT_MAX: usize = 100;
+/// The longest path std accepts, `sun_path` less the NUL: 107 on Linux,
+/// Android and illumos, 103 on Apple and the BSDs. A path of at most this many
+/// bytes is handed to std as is, so std alone decides what happens to every
+/// path it can take (DR-0001 decision 1). It is also the limit of every other
+/// spelling that goes in the plain sockaddr.
+pub(crate) const DIRECT_MAX: usize = sys::SUN_PATH_CAP - 1;
 
 /// Which way a bind / connect went. The public API does not show it (users
 /// are not meant to care); what it may show is whether the connect took the
@@ -379,7 +379,7 @@ pub(crate) mod linux {
         let fd_dir = proc_self_fd.join(dir.as_raw_fd().to_string());
         std::fs::metadata(&fd_dir).ok()?;
         let via = fd_dir.join(name);
-        (path::len(&via) < sys::SUN_PATH_CAP).then_some(via)
+        (path::len(&via) <= DIRECT_MAX).then_some(via)
     }
 }
 

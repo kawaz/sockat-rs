@@ -38,10 +38,19 @@ pub(crate) enum Op {
 /// Offset of `sun_path` in `struct sockaddr_un` (2 on every supported target).
 const SUN_PATH_OFFSET: usize = std::mem::offset_of!(libc::sockaddr_un, sun_path);
 
-/// Size of the `sun_path` field of `struct sockaddr_un` (104 on BSDs and Apple,
-/// 108 on Linux). A path fits the standard form when it is shorter than this,
-/// leaving room for the terminating NUL as std does.
-pub(crate) const SUN_PATH_CAP: usize = std::mem::size_of::<libc::sockaddr_un>() - SUN_PATH_OFFSET;
+/// Length of the `sun_path` array of `struct sockaddr_un` (104 on BSDs and
+/// Apple, 108 on Linux and illumos). A path fits the standard form when it is
+/// shorter than this, leaving room for the terminating NUL: the same test std
+/// makes (`bytes.len() >= addr.sun_path.len()` is refused).
+pub(crate) const SUN_PATH_CAP: usize = sun_path_len(|un| &un.sun_path);
+
+/// The `N` of the array that `field` picks out of a `sockaddr_un`, read off its
+/// type at compile time.
+const fn sun_path_len<const N: usize>(
+    _field: fn(&libc::sockaddr_un) -> &[libc::c_char; N],
+) -> usize {
+    N
+}
 
 /// Longest path the widened `sockaddr_un` carries on Apple targets.
 ///
