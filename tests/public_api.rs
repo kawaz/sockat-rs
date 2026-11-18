@@ -79,7 +79,7 @@ fn bind_and_connect_work_at_any_length() {
 // under a temporary directory with a short file name): every length is
 // reached without forking on every platform (DR-0001: the symlink route under
 // /tmp takes any directory depth), so the two connects that may fork report
-// no child's pid, and the two that may not connect as well. The nonblocking
+// that they did not, and the two that may not connect as well. The nonblocking
 // ones hand back a stream that does not wait: a read with nothing to read is
 // WouldBlock.
 #[test]
@@ -101,12 +101,12 @@ fn in_an_ordinary_environment_no_connect_forks() {
         assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{total}");
         drop(listener.accept().unwrap());
 
-        let (mut c, child) = sockat::connect_any(&p).unwrap();
-        assert_eq!(child, None, "{total}");
+        let (mut c, forked) = sockat::connect_any(&p).unwrap();
+        assert!(!forked, "{total}");
         ping(&listener, &mut c);
 
-        let (mut c, child) = sockat::connect_any_nonblocking(&p).unwrap();
-        assert_eq!(child, None, "{total}");
+        let (mut c, forked) = sockat::connect_any_nonblocking(&p).unwrap();
+        assert!(!forked, "{total}");
         let e = c.read(&mut buf).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{total}");
     }
@@ -119,7 +119,8 @@ fn in_an_ordinary_environment_no_connect_forks() {
 // and the path is far from the cwd. `bind` forks to create it. `connect` and
 // `connect_nonblocking` do not fork, so for them the path is too long, as for
 // std: ENAMETOOLONG. `connect_any` and `connect_any_nonblocking` fork and
-// report the child's pid, which is not this process's.
+// report that they did. (What the server sees as the peer after a fork is
+// checked in the crate's unit tests, which can query it.)
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
 #[test]
 fn a_path_only_the_fork_route_reaches_needs_connect_any() {
@@ -140,12 +141,11 @@ fn a_path_only_the_fork_route_reaches_needs_connect_any() {
     ] {
         assert_eq!(e.raw_os_error(), Some(libc::ENAMETOOLONG), "{e}");
     }
-    let me = std::process::id();
-    let (mut c, child) = sockat::connect_any(&p).unwrap();
-    assert!(child.is_some_and(|pid| pid != me), "{child:?}");
+    let (mut c, forked) = sockat::connect_any(&p).unwrap();
+    assert!(forked);
     ping(&listener, &mut c);
-    let (mut c, child) = sockat::connect_any_nonblocking(&p).unwrap();
-    assert!(child.is_some_and(|pid| pid != me), "{child:?}");
+    let (mut c, forked) = sockat::connect_any_nonblocking(&p).unwrap();
+    assert!(forked);
     let mut buf = [0u8; 1];
     let e = c.read(&mut buf).unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);

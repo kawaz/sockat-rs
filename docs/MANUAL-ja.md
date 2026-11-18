@@ -52,10 +52,10 @@ server.read_exact(&mut buf)?;
 
 | 関数 | 戻り値 |
 |---|---|
-| `sockat::connect_any(path)` | `io::Result<(UnixStream, Option<u32>)>` (ブロックする) |
-| `sockat::connect_any_nonblocking(path)` | `io::Result<(UnixStream, Option<u32>)>` (非ブロッキング) |
+| `sockat::connect_any(path)` | `io::Result<(UnixStream, bool)>` (ブロックする) |
+| `sockat::connect_any_nonblocking(path)` | `io::Result<(UnixStream, bool)>` (非ブロッキング) |
 
-他の経路が全部使えない時、ディレクトリに `fchdir` した子を fork して、子に connect させる。`Option<u32>` は、fork の経路を通った時にサーバから peer に見える子の pid (`Some`)、通らなかった時は `None`。
+他の経路が全部使えない時、ディレクトリに `fchdir` した子を fork して、子に connect させる。`bool` は、fork の経路を通った時に `true`、通らなかった時は `false`。`true` の時は下の副作用が乗っているので、ログに残す・警告するなどに使える。
 
 ### fork の経路で connect した時の副作用
 
@@ -64,7 +64,8 @@ server.read_exact(&mut buf)?;
 - サーバに見える uid / gid は呼び出し元と同じ
 - macOS (`LOCAL_PEERPID`) は、呼び出し元が send すると呼び出し元の pid に変わる。Linux (`SO_PEERCRED`) は終了した子の pid のまま変わらない
 - サーバがその pid からプロセスの情報 (実行ファイル、ppid を辿って親を見る等) を引こうとしても、プロセスはもう無いので引けない。番号が再利用されていれば、無関係なプロセスの情報を掴む
-- 終了した pid の番号は、後で別のプロセスに再利用されうる。`connect_any` が返す pid は「誰が connect したか」の記録で、signal を送る相手ではない。サーバ側のログと突き合わせる時も、時刻と合わせて読む
+- 終了した pid の番号は、後で別のプロセスに再利用されうる
+- なので、この pid は呼び出し元にもサーバにも使い道が無い。`connect_any` は pid の数値は返さず、fork の経路を通ったかだけを返す
 - NetBSD・OpenBSD・illumos では確かめていない
 
 ## OS ごとの届き方
@@ -124,6 +125,8 @@ symlink の経路は `/tmp/sockat.XXXXXXXXXX/<ファイル名>` (ファイル名
 | 広げた sockaddr | 途中で切れたパス |
 | symlink | もう無い symlink を通したパス |
 | fork / bindat | ファイル名だけ |
+
+OpenBSD では、100 バイト以内の短いパス (sockat は std にそのまま渡す) でも、std の `local_addr()` がパスの末尾 1 バイトを欠いて返す (CI で観測)。sockat ではなく std / OS の振る舞いで、std の `UnixListener::bind` を直接使っても同じになる。
 
 元のパスは自分で持っておき、それを使う。
 

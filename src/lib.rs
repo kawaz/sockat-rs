@@ -47,9 +47,10 @@
 //! safe temporary directory, a Unix with neither a dirfd-relative connect nor
 //! a usable temporary directory, a file name too long for the symlink) and
 //! the connection is wanted at the cost of the fork's side effects. They fork
-//! as the last resort and then also return the forked child's pid, the peer
-//! pid the server sees. [`bind`] forks as a last resort too; the child only binds and the
-//! listen is done by the calling process, so the listener is unaffected.
+//! as the last resort and also return whether they did, so that the caller
+//! can, for example, log or warn about it. [`bind`] forks as a last resort
+//! too; the child only binds and the listen is done by the calling process, so
+//! the listener is unaffected.
 //!
 //! # How a long path is reached
 //!
@@ -86,8 +87,8 @@
 //!   server sees are the caller's. On macOS (`LOCAL_PEERPID`) the server sees
 //!   the caller's pid once the caller sends on the socket; on Linux
 //!   (`SO_PEERCRED`) it stays the exited child's. The number of an exited pid
-//!   may be reused by another process later. The child's pid is returned so it
-//!   can be told apart.
+//!   may be reused by another process later. Nothing can be looked up from
+//!   that pid (the process, its parent): the process is gone.
 //! * **The directory is resolved slightly earlier than the call.** The /proc,
 //!   relative, `bindat` and fork routes look the directory up first (open it, or
 //!   resolve it to a real path) and then bind / connect by the file name. If a
@@ -241,8 +242,8 @@ pub fn connect_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
     .map(|(stream, _)| stream)
 }
 
-/// [`connect`], forking when nothing else reaches the path, and the pid the
-/// server sees as the peer when it is not this process.
+/// [`connect`], forking when nothing else reaches the path, and whether it
+/// did.
 ///
 /// Use [`connect`] (or [`connect_nonblocking`]) unless it fails with
 /// `ENAMETOOLONG` in an environment you have to support: it reaches a long
@@ -253,23 +254,25 @@ pub fn connect_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
 /// connection is wanted at the cost of the fork's side effects.
 ///
 /// The fork route connects from a forked child that `fchdir`s into the
-/// socket's directory and exits at once. The second value is `Some(pid)` of
-/// that child when the fork route was taken, and `None` on every other route
-/// (the connection was made by this process).
+/// socket's directory and exits at once. The second value is `true` when the
+/// fork route was taken, and `false` on every other route (the connection was
+/// made by this process). Use it to note the fork's side effects, for example
+/// by logging or warning about it.
 ///
 /// After the fork route, the peer pid the server sees is that of the child, a
 /// process that has already exited. The stream itself belongs to this process
 /// and works as usual. The uid and gid the server sees are this process's. On
 /// macOS (`LOCAL_PEERPID`) the server sees this process's pid once it sends on
-/// the stream; on Linux (`SO_PEERCRED`) it stays the exited child's. The
-/// number of an exited pid may be reused by another process later: the pid
-/// returned is a record of who connected, not a process to signal.
+/// the stream; on Linux (`SO_PEERCRED`) it stays the exited child's. Nothing
+/// can be looked up from that pid (the process, its parent): the process is
+/// gone, and the number may be reused by another process later. So the pid
+/// itself is of no use to this process or to the server, and is not returned.
 ///
 /// # Errors
 ///
 /// Those of [`connect`], except that a path only the fork route reaches is
 /// connected rather than `ENAMETOOLONG`.
-pub fn connect_any<P: AsRef<Path>>(path: P) -> io::Result<(UnixStream, Option<u32>)> {
+pub fn connect_any<P: AsRef<Path>>(path: P) -> io::Result<(UnixStream, bool)> {
     connect_with(
         path.as_ref(),
         ConnectOptions {
@@ -287,7 +290,7 @@ pub fn connect_any<P: AsRef<Path>>(path: P) -> io::Result<(UnixStream, Option<u3
 /// # Errors
 ///
 /// Those of [`connect_any`], and `EAGAIN` for a full backlog on Linux.
-pub fn connect_any_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<(UnixStream, Option<u32>)> {
+pub fn connect_any_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<(UnixStream, bool)> {
     connect_with(
         path.as_ref(),
         ConnectOptions {
@@ -297,13 +300,10 @@ pub fn connect_any_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<(UnixStrea
     )
 }
 
-/// The four connects: block or not, fork or not ([`ConnectOptions`]). Returns the stream and the
-/// pid of the forked child that made the connect when the fork route was
-/// taken (`None` on every other route; always `None` without `fork`).
-pub(crate) fn connect_with(
-    path: &Path,
-    options: ConnectOptions,
-) -> io::Result<(UnixStream, Option<u32>)> {
+/// The four connects: block or not, fork or not ([`ConnectOptions`]). Returns
+/// the stream and whether the fork route was taken (always `false` without
+/// `fork`).
+pub(crate) fn connect_with(path: &Path, options: ConnectOptions) -> io::Result<(UnixStream, bool)> {
     route::run(route::Request::Connect(options), path)
-        .map(|(fd, route)| (UnixStream::from(fd), route.child()))
+        .map(|(fd, route)| (UnixStream::from(fd), route.forked()))
 }

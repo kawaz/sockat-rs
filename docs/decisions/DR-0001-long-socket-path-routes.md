@@ -1,6 +1,6 @@
 # DR-0001: sun_path を超える socket のパスに届く経路と、試す順番
 
-- Status: Accepted (経路と試す順番、相対パスの作り方、Windows を対象外にすることは kawaz 指示 2026-11-18。/proc が無い時に他の Unix と同じ順に倒すこと、symlink の置き場に /tmp を足すことは kawaz 裁定 2026-11-18。公開する connect を「fork するか」「ブロックするか」の 4 つの関数にし、fork するのは `connect_any` 系だけにすることは kawaz 裁定 2026-11-18。相対パスと symlink の経路を macOS 以外 (dirfd 基準の primitive の無い Unix、/proc の無い Linux) にも使うことは kawaz 裁定 2026-11-18。symlink の置き場を使う前に安全か確かめることは kawaz 裁定 2026-11-18。symlink の名前、fork の経路の権限、FreeBSD の扱いは統括の裁定 2026-11-18。tokio・観測の仕組みは実装側の判断で、残りは「未確定」)、0.2.0 で実装済み
+- Status: Accepted (経路と試す順番、相対パスの作り方、Windows を対象外にすることは kawaz 指示 2026-11-18。/proc が無い時に他の Unix と同じ順に倒すこと、symlink の置き場に /tmp を足すことは kawaz 裁定 2026-11-18。公開する connect を「fork するか」「ブロックするか」の 4 つの関数にし、fork するのは `connect_any` 系だけにすること、`connect_any` 系は pid でなく fork の経路を通ったかを返すことは kawaz 裁定 2026-11-18。相対パスと symlink の経路を macOS 以外 (dirfd 基準の primitive の無い Unix、/proc の無い Linux) にも使うことは kawaz 裁定 2026-11-18。symlink の置き場を使う前に安全か確かめることは kawaz 裁定 2026-11-18。symlink の名前、fork の経路の権限、FreeBSD の扱いは統括の裁定 2026-11-18。tokio・観測の仕組みは実装側の判断で、残りは「未確定」)、0.2.0 で実装済み
 - Date: 2026-11-18
 
 ## Context
@@ -114,6 +114,7 @@ a と c は POSIX の範囲の手 (`getcwd`、`realpath`、`stat`、`symlink`) �
   - uid / gid は呼び出し元と同じ
   - macOS の `LOCAL_PEERPID` は、呼び出し元が send すると呼び出し元の pid に変わる (試験 `local_peerpid_of_a_forked_connect_names_the_child_until_the_client_sends` で実機確認)。Linux の `SO_PEERCRED` は終了した子の pid のままで、send しても変わらない (決定 2)
   - 終了した pid の番号は、後で別のプロセスに再利用されうる
+  - その pid からは、プロセスの情報も ppid も引けない (プロセスはもう無い)
   - NetBSD・OpenBSD・illumos の peer の資格情報の振る舞いは確かめていない
 - **子は一瞬、プロセスの全 fd の複製を持つ** (fork の性質)。その間に他のスレッドが閉じたソケットやパイプは、子が終わるまで開いたままになる。閉じた listener の backlog にさらに接続が入りうる。試験でこれを踏んだ (並行する試験の fork が、別の試験の閉じたはずの listener を生かしていた)
 - macOS ではディレクトリを `O_SEARCH` で開く。検索権限だけで開け、その fd に `fchdir` できる (macOS 26.5.2 で確認: 読み取り権限の無い mode 0300 のディレクトリは `O_RDONLY` では `EACCES` で開けないが、`O_SEARCH` なら開けて bind できる。mode 0100 では通常の bind と同じく bind が `EACCES`。`O_EXEC` 単独ではディレクトリに `EISDIR`)。なので通常の bind / connect と同じ権限で足りる。`O_SEARCH` をディレクトリに受け付けない古いカーネルは `EISDIR` / `EINVAL` を返すとみなし、その時は `O_RDONLY` で開き直す (この分岐は手元のカーネルでは通らないので、試験では `O_SEARCH` で開いた結果を値として差し替えて通す)
@@ -141,12 +142,13 @@ a と c は POSIX の範囲の手 (`getcwd`、`realpath`、`stat`、`symlink`) �
 | `sockat::bind(path)` | `io::Result<UnixListener>` | 最後に試す | (待たない) |
 | `sockat::connect(path)` | `io::Result<UnixStream>` | 試さない (要る時は `ENAMETOOLONG`) | する |
 | `sockat::connect_nonblocking(path)` | `io::Result<UnixStream>` | 試さない | しない |
-| `sockat::connect_any(path)` | `io::Result<(UnixStream, Option<u32>)>` | 最後に試す | する |
-| `sockat::connect_any_nonblocking(path)` | `io::Result<(UnixStream, Option<u32>)>` | 最後に試す | しない |
+| `sockat::connect_any(path)` | `io::Result<(UnixStream, bool)>` | 最後に試す | する |
+| `sockat::connect_any_nonblocking(path)` | `io::Result<(UnixStream, bool)>` | 最後に試す | しない |
 
 - `bind` と `connect` は std の `bind` / `connect` と同じ形で、置き換えるだけで使える
 - **`connect` は fork の経路を試さない** (kawaz 裁定)。fork は connect に普通求められる動きではない例外で、サーバに見える peer の pid が、もう終了したプロセス (fork した子) の pid になる (決定 3 d)。普通の環境では c (symlink) までで届く。fork が要る場面では、パスが `sun_path` に入らない時の普通の connect と同じく `ENAMETOOLONG` を返す
-- `connect_any` 系は、`connect` でも届かないよほど珍しい環境 (/proc も安全な一時ディレクトリも無い Linux、dirfd の手も一時ディレクトリも使えない Unix、ファイル名が symlink の経路にも収まらない時) で、fork の副作用を受け入れてでもつなぎたい時だけのもの。最後は fork してでもやり切る。fork の経路を通った時は、サーバに見える子の pid を `Some` で返す (型は `std::process::id()` に合わせて `u32`)。通らなかった時は `None`
+- `connect_any` 系は、`connect` でも届かないよほど珍しい環境 (/proc も安全な一時ディレクトリも無い Linux、dirfd の手も一時ディレクトリも使えない Unix、ファイル名が symlink の経路にも収まらない時) で、fork の副作用を受け入れてでもつなぎたい時だけのもの。最後は fork してでもやり切る。fork の経路を通ったかを `bool` で返す (通った時に `true`)。fork の副作用が乗ったことを利用者が知り、ログに残す・警告するなどに使えるようにするため (kawaz 裁定)
+- pid の数値は返さない (kawaz 裁定)。fork の経路で connect した時にサーバに見える peer の pid は、もう終了したプロセスの pid で、呼び出し元にもサーバにも使い道が無い (サーバはその pid から呼び出し元のプロセスを辿れない)。fork が起き得るかは、fork しない `connect` と fork を受け入れる `connect_any` のどちらを呼ぶかで利用者が選んでいる
 - ブロックしない 2 つは、ソケットを connect の前に `O_NONBLOCK` にし、返す stream も非ブロッキングのまま (tokio の `from_std` にそのまま渡せる)。相手の backlog が満杯なら Linux は待たず `EAGAIN` を返す (tokio の connect と同じ)。Unix domain の connect は呼び出しの中で終わるか失敗し、Linux も XNU も `EINPROGRESS` を返さない (確かめた範囲は `route::ConnectOptions` の doc)
 - `bind` は最後は fork でやり切る。子は bind するだけで、listen は親がするので、listener に fork の副作用は残らない
 - 軸は「fork するか」と「ブロックするか」の 2 つで閉じている (タイムアウトはブロックしない connect で足り、bind は待たない) ので、設定の型でなく関数 4 つにした
@@ -160,12 +162,13 @@ a と c は POSIX の範囲の手 (`getcwd`、`realpath`、`stat`、`symlink`) �
 
 ### 8. どの経路を通ったかは利用者に見せない
 
-- 経路 (`Route`) は crate 内の値で、公開 API は捨てる。`connect_any` 系が返すのは経路の名前でなく、結果としてサーバに見えるもの (fork した子の pid) である。peer の pid を監査と突き合わせる用途のため
+- 経路 (`Route`) は crate 内の値で、公開 API は捨てる。`connect_any` 系が返すのは経路の名前でなく、fork の経路を通ったか (= サーバに見える peer の pid が終了したプロセスのものになったか) だけである (決定 6)
 - 試験は crate 内の単体試験 (`src/tests.rs`) に置き、各経路の関数を直接呼んで強制する。経路の順番の分岐は、環境を読む部分を値 (`route::posix::Config`) にして試験から差し替える: symlink の置き場の候補、macOS で広げた sockaddr を受け付けないカーネル、Linux の /proc の場所 (`/proc/self/fd`。試験は何も無い場所や空のディレクトリを渡して /proc の無い環境の代わりにし、本物の /proc には触らない)。feature も cfg(test) 専用の公開口も要らない
 
 ### 9. カーネルが返すアドレスは元のパスではない
 
 - `local_addr()` / `peer_addr()` (`getsockname` / `getpeername`) は、実際に bind に使った綴りを返す: 相対パス、`/proc/self/fd/...`、もう無い symlink、ファイル名だけ。macOS の広げた sockaddr では std のバッファ (106 バイト) で切れたパスになる (試験で確認、panic はしない)
+- OpenBSD では、100 バイト以内の短いパス (決定 1 で std にそのまま渡す) でも、std の `local_addr()` がパスの末尾 1 バイトを欠いて返す (CI の VM で観測、std の `UnixListener::bind` を直接使った場合。原因が OpenBSD の `getsockname` の返す長さか std の解釈かは調べていない)。sockat ではなく std / OS の振る舞いなので、sockat は手を入れない。std がパスそのものを返す前提を見る試験は、OpenBSD では外す
 - 利用者には元のパスを持ってもらう。doc にそう書く
 
 ### 10. 共通の限界: ディレクトリを先に引く
@@ -179,6 +182,7 @@ a と c は POSIX の範囲の手 (`getcwd`、`realpath`、`stat`、`symlink`) �
 |---|---|
 | 常に fork する (hyoui の方式をそのまま) | fork の副作用 (peer の pid、fd の複製) を、避けられる経路があるのに全員に負わせる |
 | `connect` も最後は fork する | fork は connect に普通求められる動きではなく、サーバに見える peer の pid がもう終了したプロセスの pid になる。普通の環境では symlink までで届くので、fork が要る場面は `connect_any` 系を選んだ利用者だけにする |
+| `connect_any` 系が fork した子の pid を返す | その pid はもう終了したプロセスのもので、呼び出し元にもサーバにも使い道が無い。利用者に要るのは fork の副作用が乗ったかどうかだけで、それは `bool` で足りる |
 | 設定の型 (ブロックするか、fork するか) を持つ connect を 1 つ公開する | 軸は 2 つで閉じていて、関数 4 つで足りる。名前で振る舞いが読める |
 | 親のプロセスで `chdir` する | cwd は全スレッドで共有され、他のスレッドの相対パスの解決を巻き込む |
 | /proc がある Linux でも相対パス・symlink・fork を試す | /proc の経路が長さの制約無しで通るので要らない。fork は `SO_PEERCRED` の pid を壊す |

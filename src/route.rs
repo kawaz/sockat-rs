@@ -91,8 +91,8 @@ fn fork_ruled_out() -> io::Error {
 pub(crate) const DIRECT_MAX: usize = 100;
 
 /// Which way a bind / connect went. The public API does not show it (users
-/// are not meant to care); what it may show is its consequence for the peer,
-/// [`Route::child`].
+/// are not meant to care); what it may show is whether the connect took the
+/// fork route, [`Route::forked`], whose consequence the server sees.
 ///
 /// "In the plain sockaddr" means through std, except for a nonblocking
 /// connect, which std cannot make: that one is sockat's own socket, set up as
@@ -127,24 +127,24 @@ pub(crate) enum Route {
     #[cfg(not(target_os = "freebsd"))]
     Fork {
         /// The pid of the child that made the call ([`sys::op_in_dir_forked`]).
+        /// The public API does not return it, only [`Route::forked`]: it is
+        /// the pid of an exited process, of no use to the caller or the
+        /// server (DR-0001 decision 6). The tests read it to check that the
+        /// peer the server sees is this child.
         child: libc::pid_t,
     },
 }
 
 impl Route {
-    /// The pid of the forked child that made the call, when the route forked
-    /// (`None` otherwise), as the `u32` that `std::process::id` uses.
+    /// Whether the route forked: the call was made by a forked child.
     ///
-    /// For a connect, this is the pid a server's peer-credential query names
-    /// instead of the calling process: Linux's `SO_PEERCRED` for the life of
-    /// the connection, macOS's `LOCAL_PEERPID` until the caller sends
-    /// (DR-0001 decision 8).
-    pub(crate) fn child(self) -> Option<u32> {
+    /// For a connect, the peer pid the server sees is then that of the child,
+    /// a process that has already exited (DR-0001 decision 3 d).
+    pub(crate) fn forked(self) -> bool {
         match self {
-            // `fork(2)` hands the parent the child's pid, which is positive.
             #[cfg(not(target_os = "freebsd"))]
-            Route::Fork { child } => u32::try_from(child).ok(),
-            _ => None,
+            Route::Fork { .. } => true,
+            _ => false,
         }
     }
 }

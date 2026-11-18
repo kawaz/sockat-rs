@@ -35,12 +35,12 @@ fork は `bind` と、次の節の `connect_any` 系だけが使う。`bind` の
 
 `connect` / `connect_nonblocking` は fork しない。fork でしか届かない時は、パスが `sun_path` に入らない普通の connect と同じく `ENAMETOOLONG` を返す。
 
-`connect_any` / `connect_any_nonblocking` は、それでも届かないよほど珍しい環境 (`/proc` も安全な一時ディレクトリも無い Linux、dirfd 基準の connect も使える一時ディレクトリも無い Unix 等、またはファイル名が symlink の経路にも収まらないほど長い時) で、fork の副作用を受け入れてでもつなぎたい時だけのもの。最後は fork した子に connect させて (子はすぐ終了する)、その時はサーバに見える peer の pid、つまりその子の pid も返す (`(UnixStream, Option<u32>)`)。
+`connect_any` / `connect_any_nonblocking` は、それでも届かないよほど珍しい環境 (`/proc` も安全な一時ディレクトリも無い Linux、dirfd 基準の connect も使える一時ディレクトリも無い Unix 等、またはファイル名が symlink の経路にも収まらないほど長い時) で、fork の副作用を受け入れてでもつなぎたい時だけのもの。最後は fork した子に connect させて (子はすぐ終了する)、fork の経路を通ったかも返す (`(UnixStream, bool)`、通った時に `true`)。ログに残す・警告するなどに使える。
 
 ## 長いパスで std と違う点
 
 - `local_addr()` / `peer_addr()` は元のパスを返さない (実際にカーネルに渡した綴りを返す)。元のパスは自分で持っておく
-- `connect_any` 系が fork の経路を通った時は、サーバに見える peer の pid が、もう終了したプロセス (fork した子) の pid になる。ソケット自体は呼び出し元が持っていて普通に使える。uid / gid は呼び出し元と同じ。macOS は呼び出し元が send すると呼び出し元の pid に変わる。終了した pid の番号は別のプロセスに再利用されうる
+- `connect_any` 系が fork の経路を通った時は、サーバに見える peer の pid が、もう終了したプロセス (fork した子) の pid になる。ソケット自体は呼び出し元が持っていて普通に使える。uid / gid は呼び出し元と同じ。macOS は呼び出し元が send すると呼び出し元の pid に変わる。その pid からはプロセスの情報も ppid も引けず、番号は別のプロセスに再利用されうる
 - 詳しくは [docs/MANUAL-ja.md](./docs/MANUAL-ja.md)
 
 ## async ランタイム

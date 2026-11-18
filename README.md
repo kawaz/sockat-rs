@@ -35,12 +35,12 @@ Only `bind` and the `connect_any` variants of the next section fork. `bind`'s ch
 
 `connect` / `connect_nonblocking` never fork. Where only a fork would reach the path, they return `ENAMETOOLONG`, as a plain connect to a path too long for `sun_path` does.
 
-`connect_any` / `connect_any_nonblocking` are only for the rare environment where even they cannot reach the path (Linux with neither `/proc` nor a safe temporary directory, a Unix with neither a dirfd-relative connect nor a usable temporary directory, or a file name too long even for the symlink route), when you want the connection at the cost of the fork's side effects. As the last resort they have a forked child make the connect and exit, and then also return that child's pid, the peer pid the server sees (`(UnixStream, Option<u32>)`).
+`connect_any` / `connect_any_nonblocking` are only for the rare environment where even they cannot reach the path (Linux with neither `/proc` nor a safe temporary directory, a Unix with neither a dirfd-relative connect nor a usable temporary directory, or a file name too long even for the symlink route), when you want the connection at the cost of the fork's side effects. As the last resort they have a forked child make the connect and exit, and they also return whether they took the fork route (`(UnixStream, bool)`, `true` when they did), for example to log or warn about it.
 
 ## What differs from std for a long path
 
 - `local_addr()` / `peer_addr()` do not return the path (they return the spelling actually handed to the kernel). Keep the path yourself
-- When the `connect_any` variants do take the fork route, the peer pid the server sees is the pid of a process that has already exited (the forked child). The socket itself belongs to the caller and works as usual. The uid / gid are the caller's. On macOS the server sees the caller's pid once the caller sends. The number of an exited pid may be reused by another process
+- When the `connect_any` variants do take the fork route, the peer pid the server sees is the pid of a process that has already exited (the forked child). The socket itself belongs to the caller and works as usual. The uid / gid are the caller's. On macOS the server sees the caller's pid once the caller sends. Nothing (the process, its ppid) can be looked up from that pid, and its number may be reused by another process
 - Details in [docs/MANUAL.md](./docs/MANUAL.md)
 
 ## Async runtimes

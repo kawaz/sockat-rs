@@ -356,16 +356,16 @@ fn check_nonblocking_connect(way: &Way, want: Want, what: &str) {
 /// for all four), with `forks` telling whether that way is the fork route:
 ///
 /// * The fork route: the connects that may fork (`connect_any`,
-///   `connect_any_nonblocking`) connect and report the child's pid, which is
-///   what the server's peer-credential query names right after the connect
-///   (not this process). The ones that may not (`connect`,
-///   `connect_nonblocking`) fail with `ENAMETOOLONG` and no connection
-///   reaches the listener.
-/// * Any other route: all four connect on it, report no pid, and the server
-///   names this process. The nonblocking ones return an `O_NONBLOCK` socket,
-///   the others not.
+///   `connect_any_nonblocking`) connect and report that they forked
+///   ([`Route::forked`]), and the server's peer-credential query right after
+///   the connect names the forked child, not this process. The ones that may
+///   not (`connect`, `connect_nonblocking`) fail with `ENAMETOOLONG` and no
+///   connection reaches the listener.
+/// * Any other route: all four connect on it, report that they did not fork,
+///   and the server names this process. The nonblocking ones return an
+///   `O_NONBLOCK` socket, the others not.
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-fn check_fork_and_pid(way: &Way, want: Want, forks: bool, what: &str) {
+fn check_fork_and_peer(way: &Way, want: Want, forks: bool, what: &str) {
     let me = std::process::id() as libc::pid_t;
     let (l, _) = way(BIND).unwrap();
     let listener = UnixListener::from(l);
@@ -389,11 +389,14 @@ fn check_fork_and_pid(way: &Way, want: Want, forks: bool, what: &str) {
         assert_eq!(nonblocking(&c), o.nonblocking, "{what} {req:?}");
         let (s, _) = listener.accept().unwrap();
         let seen = peer_pid(&s);
+        assert_eq!(r.forked(), forks, "{what} {req:?}: {r:?}");
         if forks {
-            assert_eq!(r.child(), u32::try_from(seen).ok(), "{what} {req:?}: {r:?}");
+            assert!(
+                matches!(r, Route::Fork { child } if child == seen),
+                "{what} {req:?}: {r:?}, server sees {seen}"
+            );
             assert_ne!(seen, me, "{what} {req:?}");
         } else {
-            assert_eq!(r.child(), None, "{what} {req:?}: {r:?}");
             assert_eq!(seen, me, "{what} {req:?}");
         }
     }
@@ -448,11 +451,18 @@ fn a_path_of_100_bytes_goes_to_std_unchanged_and_101_does_not() {
     assert_eq!(r, Route::Direct);
     ping(l, c);
     // std's own view of the bound address is the path itself on this route.
-    let l = UnixListener::bind(t.path().join("x.sock")).unwrap();
-    assert_eq!(
-        l.local_addr().unwrap().as_pathname(),
-        Some(t.path().join("x.sock").as_path())
-    );
+    // Not on OpenBSD: there std's own local_addr drops the last byte of the
+    // path (seen in CI: "/tmp/sockat-XXXXXX/x.soc" for ".../x.sock"), with
+    // std's UnixListener::bind and no sockat involved. This only checks a
+    // premise about std, not something sockat promises (DR-0001 decision 9).
+    #[cfg(not(target_os = "openbsd"))]
+    {
+        let l = UnixListener::bind(t.path().join("x.sock")).unwrap();
+        assert_eq!(
+            l.local_addr().unwrap().as_pathname(),
+            Some(t.path().join("x.sock").as_path())
+        );
+    }
 
     let t = tmp();
     let over = nest(t.path(), DIRECT_MAX + 1, "s.sock");
@@ -553,23 +563,25 @@ fn long_paths_without_a_file_name_or_with_nul_are_invalid_input() {
 
 // The four public connects, as they map onto the connect options: on a long
 // path that no route forks for (200 bytes: the /proc route on Linux, the
-// widened sockaddr on macOS), each connects, reports no child's pid, and
+// widened sockaddr on macOS), each connects from this process (the server
+// sees its pid), the two that may fork report that they did not, and each
 // returns a stream that is O_NONBLOCK exactly for the two nonblocking ones.
-// Which of them may fork is checked route by route (check_fork_and_pid) and
+// Which of them may fork is checked route by route (check_fork_and_peer) and
 // through the public API in tests/public_api.rs.
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 #[test]
-fn the_public_connects_return_the_stream_as_asked_and_no_pid_without_a_fork() {
+fn the_public_connects_return_the_stream_as_asked_and_report_no_fork_without_one() {
     use std::os::fd::AsFd;
+    let me = std::process::id() as libc::pid_t;
     let t = tmp();
     let p = nest(t.path(), 200, "s.sock");
     let listener = crate::bind(&p).unwrap();
-    type Connect = fn(&Path) -> io::Result<(UnixStream, Option<u32>)>;
+    type Connect = fn(&Path) -> io::Result<(UnixStream, bool)>;
     let connects: [(&str, Connect, bool); 4] = [
-        ("connect", |p| crate::connect(p).map(|c| (c, None)), false),
+        ("connect", |p| crate::connect(p).map(|c| (c, false)), false),
         (
             "connect_nonblocking",
-            |p| crate::connect_nonblocking(p).map(|c| (c, None)),
+            |p| crate::connect_nonblocking(p).map(|c| (c, false)),
             true,
         ),
         ("connect_any", |p| crate::connect_any(p), false),
@@ -580,10 +592,11 @@ fn the_public_connects_return_the_stream_as_asked_and_no_pid_without_a_fork() {
         ),
     ];
     for (what, connect, nb) in connects {
-        let (c, child) = connect(&p).unwrap();
-        assert_eq!(child, None, "{what}");
+        let (c, forked) = connect(&p).unwrap();
+        assert!(!forked, "{what}");
         assert_eq!(sys::is_nonblocking(c.as_fd()).unwrap(), nb, "{what}");
-        drop(listener.accept().unwrap());
+        let (s, _) = listener.accept().unwrap();
+        assert_eq!(peer_pid(&s), me, "{what}");
     }
 }
 
@@ -1045,14 +1058,14 @@ mod linux {
 
     // DR-0001 decisions 6 and 8, route by route: only the fork route
     // connects from another process (the child, whose pid SO_PEERCRED
-    // keeps), so only there do the connects that may fork report a pid and
+    // keeps), so only there do the connects that may fork report a fork and
     // the ones that may not fail with ENAMETOOLONG. Every other route
-    // connects from this process for all four. See check_fork_and_pid.
+    // connects from this process for all four. See check_fork_and_peer.
     #[test]
-    fn only_the_fork_route_reports_the_childs_pid_or_needs_connect_any() {
+    fn only_the_fork_route_reports_a_fork_or_needs_connect_any() {
         let d = Dirs::new();
         for (what, way, want) in ways(&d) {
-            check_fork_and_pid(&way, want, what == "Fork", what);
+            check_fork_and_peer(&way, want, what == "Fork", what);
         }
     }
 }
@@ -2319,13 +2332,13 @@ mod apple {
     // DR-0001 decisions 6 and 8, route by route: only the fork route
     // connects from another process (the child; LOCAL_PEERPID names it until
     // this process sends), so only there do the connects that may fork report
-    // a pid and the ones that may not fail with ENAMETOOLONG. Every other
-    // route connects from this process for all four. See check_fork_and_pid.
+    // a fork and the ones that may not fail with ENAMETOOLONG. Every other
+    // route connects from this process for all four. See check_fork_and_peer.
     #[test]
-    fn only_the_fork_route_reports_the_childs_pid_or_needs_connect_any() {
+    fn only_the_fork_route_reports_a_fork_or_needs_connect_any() {
         let d = Dirs::new();
         for (what, way, want) in ways(&d) {
-            check_fork_and_pid(&way, want, what == "Fork", what);
+            check_fork_and_peer(&way, want, what == "Fork", what);
         }
         assert_empty(d.short_base.path());
     }

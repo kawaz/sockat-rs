@@ -52,10 +52,10 @@ Both try every way up to the short symlink under a temporary directory (`TMPDIR`
 
 | Function | Returns |
 |---|---|
-| `sockat::connect_any(path)` | `io::Result<(UnixStream, Option<u32>)>` (blocking) |
-| `sockat::connect_any_nonblocking(path)` | `io::Result<(UnixStream, Option<u32>)>` (nonblocking) |
+| `sockat::connect_any(path)` | `io::Result<(UnixStream, bool)>` (blocking) |
+| `sockat::connect_any_nonblocking(path)` | `io::Result<(UnixStream, bool)>` (nonblocking) |
 
-When every other route is unusable, a child that `fchdir`s into the directory is forked and makes the connect. The `Option<u32>` is that child's pid when the fork route was taken (`Some`), and `None` otherwise.
+When every other route is unusable, a child that `fchdir`s into the directory is forked and makes the connect. The `bool` is `true` when the fork route was taken, and `false` otherwise. When it is `true` the side effects below apply, so it can be used, for example, to log or warn about it.
 
 ### Side effects of connecting through the fork route
 
@@ -64,7 +64,8 @@ When every other route is unusable, a child that `fchdir`s into the directory is
 - The uid / gid the server sees are the caller's
 - On macOS (`LOCAL_PEERPID`), once the caller sends on the socket, the server sees the caller's pid instead. On Linux (`SO_PEERCRED`) it stays the exited child's pid
 - If the server looks the pid up for information about the process (its executable, its parent by following the ppid, ...), there is nothing to find: the process is gone. If the number has been reused, the server gets the information of an unrelated process
-- The number of an exited pid may be reused by another process later. The pid `connect_any` returns is a record of who connected, not a process to signal; when matching it against the server's logs, read it together with the time
+- The number of an exited pid may be reused by another process later
+- So the pid is of no use to the caller or to the server. `connect_any` does not return its number, only whether the fork route was taken
 - NetBSD, OpenBSD and illumos were not checked
 
 ## Per OS
@@ -124,6 +125,8 @@ Not supported. The crate does not compile on non-Unix targets.
 | widened sockaddr | a truncated path |
 | symlink | a path through a symlink that no longer exists |
 | fork / bindat | the file name alone |
+
+On OpenBSD, std's `local_addr()` drops the last byte of the path even for a short path of at most 100 bytes (which sockat hands to std unchanged; seen in CI). This is std's / the OS's behaviour, not sockat's: std's `UnixListener::bind` used directly gives the same.
 
 Keep the original path yourself and use that.
 
