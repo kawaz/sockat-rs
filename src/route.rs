@@ -1,13 +1,33 @@
 //! The order in which the ways of reaching a long socket path are tried
-//! (DR-0001). [`run`] is the only entry point used by the public API; the
-//! per-route functions are `pub(crate)` so the tests can force each route.
+//! (DR-0027). [`run`] is the only entry point used by the public API; the
+//! pieces are `pub(crate)` so the tests can force each one.
+//!
+//! A path longer than [`DIRECT_MAX`] goes, in this order:
+//!
+//! 1. **The central route** ([`central`]): a directory of sockat's own, D, is
+//!    made in a place ([`Config::own_dir_places`]) and held by an fd, a
+//!    symlink R with a random name to the socket's directory is made in it,
+//!    and the call is made with `R/<file name>` relative to D's fd, by the
+//!    first means that can be used ([`Means`]): a thread whose own working
+//!    directory is D (Linux, Apple), `/proc/self/fd/<D's fd>/R/<file name>`
+//!    (Linux), `bindat` / `connectat` (FreeBSD), and for a bind a forked
+//!    child in D. D and R are removed when the call returns, so the spelling
+//!    the kernel keeps for a bound socket names nothing afterwards. A bind
+//!    for which D can be made nowhere forks with R made beside the socket.
+//! 2. **The fallback routes** for a connect ([`fallback`]), which leave no
+//!    spelling behind (a connected socket is not bound): per target, the ones
+//!    of the table in [`fallback`].
+//! 3. **A forked child** in the socket's directory, for the connects that may
+//!    fork ([`fork_beside`]); `ENAMETOOLONG` for the others and for a bind.
 
+use std::cell::{Cell, OnceCell};
+use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::path;
 use crate::sys::{self, Op, SockAddr};
@@ -64,20 +84,7 @@ impl Request {
         matches!(self, Request::Connect(o) if o.nonblocking)
     }
 
-    /// Whether the widened `sockaddr_un` may carry this request's spelling
-    /// (Apple): a connect only. A socket bound through the widened form has
-    /// an address that does not fit `sun_path`, which `getsockname(2)` then
-    /// reports cut short, and readers of it break (CPython appends unrelated
-    /// bytes to it, Go's `net.FileConn` loses the peer's `RemoteAddr`). A
-    /// connect binds nothing of its own, so its own address is not affected
-    /// (DR-0024).
-    #[cfg(target_vendor = "apple")]
-    fn may_widen(self) -> bool {
-        matches!(self, Request::Connect(_))
-    }
-
     /// Whether the fork route may be taken.
-    #[cfg(any(test, not(target_os = "freebsd")))]
     fn may_fork(self) -> bool {
         match self {
             Request::Bind => true,
@@ -90,8 +97,12 @@ impl Request {
 /// rule the fork route out: `ENAMETOOLONG`, the error of a plain connect to a
 /// path longer than `sun_path`. That is what the path is once every other way
 /// around the limit is too long or unavailable.
-#[cfg(any(test, not(target_os = "freebsd")))]
 fn fork_ruled_out() -> io::Error {
+    too_long()
+}
+
+/// `ENAMETOOLONG`: no route reaches the path.
+fn too_long() -> io::Error {
     io::Error::from_raw_os_error(libc::ENAMETOOLONG)
 }
 
@@ -113,44 +124,22 @@ pub(crate) const DIRECT_MAX: usize = sys::SUN_PATH_CAP - 1;
 pub(crate) enum Route {
     /// The path itself, in the plain sockaddr.
     Direct,
-    /// `/proc/self/fd/<dirfd>/<name>`, in the plain sockaddr (Linux).
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    ProcFd,
-    /// The path spelled relative to the cwd, in the plain sockaddr.
-    #[cfg(not(target_os = "freebsd"))]
-    Relative,
-    /// The path itself in a widened `sockaddr_un` (Apple, a connect).
-    #[cfg(target_vendor = "apple")]
-    Wide,
-    /// The relative spelling in a widened `sockaddr_un` (Apple, a connect).
-    #[cfg(target_vendor = "apple")]
-    WideRelative,
-    /// Through a short temporary symlink to the socket's directory, in the
-    /// plain sockaddr (bind).
-    #[cfg(not(target_os = "freebsd"))]
-    SymlinkToDir,
-    /// Through a short temporary symlink to the socket file itself, in the
-    /// plain sockaddr (connect).
-    #[cfg(not(target_os = "freebsd"))]
-    SymlinkToFile,
-    /// [`Route::SymlinkToFile`] in a widened `sockaddr_un` (Apple).
-    #[cfg(target_vendor = "apple")]
-    SymlinkToFileWide,
-    /// Through a symlink to the socket file inside a private directory made
-    /// in a place that is not safe and held by an fd,
-    /// `/proc/self/fd/<fd>/s`, in the plain sockaddr (Linux, a connect;
-    /// [`posix::HeldDir`]).
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    SymlinkInHeldDir,
-    /// `bindat(2)` / `connectat(2)` on the directory fd (FreeBSD).
-    #[cfg(target_os = "freebsd")]
-    At,
-    /// The file name, on a thread of this process whose own working directory
-    /// was moved into the directory (Linux, Apple; [`sys::op_in_dir_on_thread`]).
+    /// The central route: `R/<name>` on a thread whose own working directory
+    /// is D (Linux, Apple; [`sys::op_in_dir_on_thread`]).
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     ThreadCwd,
-    /// A forked child that `fchdir`s into the directory.
-    #[cfg(not(target_os = "freebsd"))]
+    /// The central route: `/proc/self/fd/<D's fd>/R/<name>`, in the plain
+    /// sockaddr (Linux).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    ProcThroughLink,
+    /// The central route: `bindat(2)` / `connectat(2)` with `R/<name>` on D's
+    /// fd (FreeBSD).
+    #[cfg(target_os = "freebsd")]
+    At,
+    /// A forked child that `fchdir`s into a directory and makes the call
+    /// there: D with `R/<name>` (bind), the socket's directory with
+    /// `.sockat.XXXXXXXXXX/<name>` (bind, D made nowhere) or with the file
+    /// name (the connects that may fork).
     Fork {
         /// The pid of the child that made the call ([`sys::op_in_dir_forked`]).
         /// The public API does not return it, only [`Route::forked`]: it is
@@ -159,6 +148,34 @@ pub(crate) enum Route {
         /// peer the server sees is this child.
         child: libc::pid_t,
     },
+    /// Fallback (connect): `/proc/self/fd/<dirfd>/<name>`, in the plain
+    /// sockaddr (Linux).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    ProcFd,
+    /// Fallback (connect): `/proc/self/fd/<D's fd>/s`, `s` a symlink in D to
+    /// the socket file, in the plain sockaddr (Linux).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    ProcFileLink,
+    /// Fallback (connect): the path spelled relative to the cwd, in the plain
+    /// sockaddr.
+    #[cfg(not(target_os = "freebsd"))]
+    Relative,
+    /// Fallback (connect): the path itself in a widened `sockaddr_un`
+    /// (Apple).
+    #[cfg(target_vendor = "apple")]
+    Wide,
+    /// Fallback (connect): the relative spelling in a widened `sockaddr_un`
+    /// (Apple).
+    #[cfg(target_vendor = "apple")]
+    WideRelative,
+    /// Fallback (connect): a short temporary symlink to the socket file in a
+    /// safe place, in the plain sockaddr.
+    #[cfg(not(target_os = "freebsd"))]
+    Symlink,
+    /// Fallback (connect): `connectat(2)` with the file name on the socket's
+    /// directory fd (FreeBSD).
+    #[cfg(target_os = "freebsd")]
+    ConnectAt,
 }
 
 impl Route {
@@ -167,11 +184,7 @@ impl Route {
     /// For a connect, the peer pid the server sees is then that of the child,
     /// a process that has already exited (DR-0007).
     pub(crate) fn forked(self) -> bool {
-        match self {
-            #[cfg(not(target_os = "freebsd"))]
-            Route::Fork { .. } => true,
-            _ => false,
-        }
+        matches!(self, Route::Fork { .. })
     }
 }
 
@@ -186,64 +199,963 @@ impl Route {
 /// and Android, a name in the abstract namespace rather than a file, which is
 /// not sockat's business at any length: it goes as is ([`path::is_abstract`]).
 pub(crate) fn run(req: Request, path: &Path) -> io::Result<(OwnedFd, Route)> {
+    run_with(req, path, false).map(|(fd, route, _)| (fd, route))
+}
+
+/// The socket file a bind made: its real path and `(st_dev, st_ino)`, taken
+/// right after the bind, inside the route (what `sockat::bind_ex` keeps).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Bound {
+    pub(crate) path: PathBuf,
+    pub(crate) id: (u64, u64),
+}
+
+/// A bind as [`run`] makes it, also taking the [`Bound`] of the socket file
+/// right after the bind: for a path handed to std, as soon as std returns; on
+/// the central route, while D and R are still there, by the same spelling the
+/// bind took (`R/<name>` relative to D's fd, the symlink R followed, the
+/// socket file not) and the real path R points to. When that cannot be taken,
+/// the listener is closed and the error returned; the socket file stays.
+pub(crate) fn bind_remembering(path: &Path) -> io::Result<(OwnedFd, Route, Bound)> {
+    let (fd, route, bound) = run_with(Request::Bind, path, true)?;
+    let bound = bound.ok_or_else(|| io::Error::other("the socket file was not looked up"))?;
+    Ok((fd, route, bound))
+}
+
+/// [`run`], and with `remember` the [`Bound`] of a bind.
+fn run_with(
+    req: Request,
+    path: &Path,
+    remember: bool,
+) -> io::Result<(OwnedFd, Route, Option<Bound>)> {
+    let direct = |req, path: &Path| {
+        let fd = plain_op(req, path)?;
+        let bound = match remember {
+            true => Some(bound_at(path)?),
+            false => None,
+        };
+        Ok((fd, Route::Direct, bound))
+    };
     if path::is_abstract(path) {
-        return plain_op(req, path).map(|fd| (fd, Route::Direct));
+        return direct(req, path);
     }
     path::refuse_nul(path)?;
     if path::len(path) <= DIRECT_MAX {
-        return plain_op(req, path).map(|fd| (fd, Route::Direct));
+        return direct(req, path);
     }
-    #[cfg(target_os = "freebsd")]
-    return freebsd::run_long(req, path);
+    run_long_with(req, path, &Config::from_env(), remember)
+}
+
+/// The [`Bound`] of the socket file at `path`, bound just now by std:
+/// `realpath(3)` of `path`, and `lstat(2)` of that.
+fn bound_at(path: &Path) -> io::Result<Bound> {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::fs::canonicalize(path)?;
+    let m = std::fs::symlink_metadata(&path)?;
+    Ok(Bound {
+        path,
+        id: (m.dev(), m.ino()),
+    })
+}
+
+/// What the route order reads from the environment, made explicit so the
+/// tests can vary it without touching the process environment.
+#[derive(Debug, Clone)]
+pub(crate) struct Config {
+    /// Where D may be made, in the order tried ([`Config::from_tmpdir`]).
+    pub(crate) own_dir_places: Vec<Place>,
+    /// Where the temporary symlink of the fallback route may go, in the
+    /// order tried: `TMPDIR` when it is set to an absolute path, then `/tmp`.
     #[cfg(not(target_os = "freebsd"))]
-    return run_long(req, path, &posix::Config::from_env());
+    pub(crate) link_places: Vec<PathBuf>,
+    /// Whether to try the widened `sockaddr_un` at all for a connect
+    /// (Apple; a bind never does). Always `true` outside the tests, which
+    /// turn it off to stand in for a kernel that refuses the widened form.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) wide: bool,
+    /// Where the kernel lists the fds of the process (Linux):
+    /// [`linux::PROC_SELF_FD`] outside the tests, which point it
+    /// elsewhere to stand in for a system without /proc.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) proc_self_fd: PathBuf,
+    /// Whether to try the thread-cwd means at all (Linux, Apple). Always
+    /// `true` outside the tests, which turn it off to stand in for a system
+    /// where it cannot be used (a seccomp filter, `unshare` refused, no
+    /// `pthread_fchdir_np`). Where it is tried and turns out unusable, the
+    /// next means is tried just the same.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    pub(crate) thread_cwd: bool,
+}
+
+/// A place where D may be made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Place {
+    /// A directory by its path. D is named `sockat.XXXXXXXXXX` there.
+    Path(PathBuf),
+    /// The socket's directory, through the fd the route order opened. D is
+    /// named `.sockat.XXXXXXXXXX` there: the directory is the user's, and a
+    /// D left behind by a process that died stays out of plain listings and
+    /// is recognisable as sockat's.
+    SocketDir,
+}
+
+impl Config {
+    pub(crate) fn from_env() -> Self {
+        Self::from_tmpdir(std::env::var_os("TMPDIR"))
+    }
+
+    /// The configuration for a `TMPDIR` of `tmpdir`.
+    ///
+    /// D goes in `${TMPDIR:-/tmp}` (a relative `TMPDIR` too: it is opened
+    /// once and held by its fd, and no spelling names it), then `/tmp` unless
+    /// that is the same spelling, then the socket's directory. A place needs
+    /// neither to be safe nor short: D is held by its fd and checked to be
+    /// the one made.
+    ///
+    /// The temporary symlink of the fallback route goes in `TMPDIR` when it is
+    /// absolute (a relative one would put the link somewhere depending on the
+    /// cwd), then `/tmp`, tried once when `TMPDIR` is `/tmp`.
+    pub(crate) fn from_tmpdir(tmpdir: Option<OsString>) -> Self {
+        let tmp = Path::new("/tmp");
+        let tmpdir = tmpdir
+            .map(PathBuf::from)
+            .filter(|t| !t.as_os_str().is_empty());
+        let first = tmpdir.clone().unwrap_or_else(|| tmp.to_path_buf());
+        let mut own_dir_places = vec![Place::Path(first.clone())];
+        if first != tmp {
+            own_dir_places.push(Place::Path(tmp.to_path_buf()));
+        }
+        own_dir_places.push(Place::SocketDir);
+        #[cfg(not(target_os = "freebsd"))]
+        let link_places = tmpdir
+            .filter(|t| t.is_absolute() && t != tmp)
+            .into_iter()
+            .chain([tmp.to_path_buf()])
+            .collect();
+        Self {
+            own_dir_places,
+            #[cfg(not(target_os = "freebsd"))]
+            link_places,
+            #[cfg(target_vendor = "apple")]
+            wide: true,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            proc_self_fd: PathBuf::from(linux::PROC_SELF_FD),
+            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+            thread_cwd: true,
+        }
+    }
+}
+
+/// One long path being bound / connected, with what the route order has
+/// found out about it so far.
+struct Target<'a> {
+    req: Request,
+    /// The path as given (the fallback routes spell it; FreeBSD's does not).
+    #[cfg_attr(target_os = "freebsd", allow(dead_code))]
+    path: &'a Path,
+    dir: &'a Path,
+    name: &'a OsStr,
+    cfg: &'a Config,
+    /// The socket's directory opened by [`open_dir`], once a route needs its
+    /// fd ([`Target::dir_fd`]); `None` when it cannot be opened.
+    dir_fd: OnceCell<Option<OwnedFd>>,
+    /// Where `/proc/self/fd` is when /proc can be used ([`Target::proc`]).
+    proc: OnceCell<Option<&'a Path>>,
+    /// The real path of the socket's directory, what R points to; `None` when
+    /// it cannot be resolved (then no R can be made).
+    real_dir: OnceCell<Option<PathBuf>>,
+    /// Set once D could be made in none of the places, so the fallback's
+    /// symlink in D is not tried in them again.
+    no_place: Cell<bool>,
+    /// Whether to take the [`Bound`] of a bind ([`bind_remembering`]), and
+    /// where it is kept once taken.
+    remember: bool,
+    bound: OnceCell<Bound>,
+}
+
+impl<'a> Target<'a> {
+    fn real_dir(&self) -> Option<&Path> {
+        self.real_dir
+            .get_or_init(|| std::fs::canonicalize(self.dir).ok())
+            .as_deref()
+    }
+
+    /// The socket's directory's fd, opened the first time a route asks for
+    /// it; `None` when it cannot be opened (then the routes that need it
+    /// cannot be used). Only the /proc and connectat routes, the fork routes
+    /// and D made in the socket's directory need it: the central route
+    /// reaches the directory through R in D, with search permission alone,
+    /// where opening it `O_RDONLY` would need read permission as well.
+    fn dir_fd(&self) -> Option<BorrowedFd<'_>> {
+        self.dir_fd
+            .get_or_init(|| open_dir(self.dir).ok())
+            .as_ref()
+            .map(|fd| fd.as_fd())
+    }
+
+    /// Where `/proc/self/fd` is (`cfg.proc_self_fd`) when /proc can be used:
+    /// the socket's directory can be looked up as `<it>/<its fd>` (Linux).
+    /// Without this check a call through `<it>/<fd>/...` would fail with
+    /// `ENOENT`, which reads as "the directory does not exist" although it
+    /// does. Always `None` elsewhere.
+    fn proc(&self) -> Option<&'a Path> {
+        *self.proc.get_or_init(|| {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            return self
+                .dir_fd()
+                .and_then(|fd| linux::fd_dir(&self.cfg.proc_self_fd, fd))
+                .map(|_| self.cfg.proc_self_fd.as_path());
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            None
+        })
+    }
+}
+
+/// Where a route stands after trying.
+pub(crate) enum Step {
+    /// The route made the call (or failed for real); this is the result.
+    Done(io::Result<(OwnedFd, Route)>),
+    /// The route could not be used; nothing it made is left. Try the next.
+    Next,
+}
+
+/// [`run_long_with`] without the [`Bound`]: the tests' way into the routes for
+/// a long path with inputs of their own.
+#[cfg(test)]
+pub(crate) fn run_long(req: Request, path: &Path, cfg: &Config) -> io::Result<(OwnedFd, Route)> {
+    run_long_with(req, path, cfg, false).map(|(fd, route, _)| (fd, route))
 }
 
 /// The routes for a path longer than [`DIRECT_MAX`], with what they read from
-/// the environment given as `cfg` (the tests pass their own).
+/// the environment given as `cfg` (the tests pass their own), and with
+/// `remember` the [`Bound`] of a bind. See the module doc for the order.
 ///
-/// Linux: `/proc/self/fd/<dirfd>/<name>` with the directory opened `O_PATH`;
-/// when that cannot be used, the POSIX order ([`posix::run`]) with that
-/// directory fd for the thread-cwd and fork routes, and, when /proc is there
-/// (only the spelling was too long), the held-directory form of the symlink
-/// route for a connect. Every other target but FreeBSD: the POSIX order.
-///
-/// The kernel resolves the `/proc/self/fd/<n>` magic link to the directory the
-/// fd refers to, so the socket is created in (or looked up in) that directory
-/// without ever changing the cwd. That route has no length limit on the
-/// directory, needs no temporary file and no fork, and works in multi-threaded
-/// processes, so whenever it can be used nothing else is tried. It cannot be
-/// used when `<proc_self_fd>/<dirfd>` is not there (no /proc mounted, as in
-/// some chroots and minimal containers) or when the spelling does not fit
-/// `sun_path` (a file name of about 90 bytes or more). What a bind / connect
-/// through /proc returns is the result, never retried on another route.
-#[cfg(not(target_os = "freebsd"))]
-pub(crate) fn run_long(
+/// The socket's directory is looked up (`stat`) first, so a missing directory
+/// is `ENOENT` whatever the file name (DR-0012), and a file in its place
+/// `ENOTDIR`, as a bind / connect through the path would answer.
+pub(crate) fn run_long_with(
     req: Request,
     path: &Path,
-    cfg: &posix::Config,
-) -> io::Result<(OwnedFd, Route)> {
+    cfg: &Config,
+    remember: bool,
+) -> io::Result<(OwnedFd, Route, Option<Bound>)> {
     let (dir, name) = path::split(path)?;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        use std::os::fd::AsFd;
-        let opened = open_dir(dir)?;
-        // `opened` stays open until this returns (dropped at the end of
-        // scope), so the /proc spelling keeps naming it.
-        let fd_dir = linux::proc_fd_dir(opened.as_fd(), &cfg.proc_self_fd);
-        if let Some(via) = fd_dir
-            .as_ref()
-            .map(|d| d.join(name))
-            .filter(|via| path::len(via) <= DIRECT_MAX)
-        {
-            return plain_op(req, &via).map(|fd| (fd, Route::ProcFd));
-        }
-        let proc = fd_dir.is_some().then_some(cfg.proc_self_fd.as_path());
-        posix::run(req, path, dir, name, Some(opened.as_fd()), proc, cfg)
+    if !std::fs::metadata(dir)?.is_dir() {
+        return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    posix::run(req, path, dir, name, None, None, cfg)
+    let t = Target {
+        req,
+        path,
+        dir,
+        name,
+        cfg,
+        dir_fd: OnceCell::new(),
+        proc: OnceCell::new(),
+        real_dir: OnceCell::new(),
+        no_place: Cell::new(false),
+        remember,
+        bound: OnceCell::new(),
+    };
+    let done = (|| {
+        if let Step::Done(done) = central(&t) {
+            return done;
+        }
+        let Request::Connect(options) = req else {
+            return Err(too_long());
+        };
+        let mut wide = wide_allowed(cfg);
+        if let Step::Done(done) = fallback(&t, &mut wide) {
+            return done;
+        }
+        fork_beside(options, &t, wide)
+    })();
+    done.map(|(fd, route)| (fd, route, t.bound.into_inner()))
 }
+
+/// Whether a connect may still use the widened `sockaddr_un` (Apple).
+#[cfg(target_vendor = "apple")]
+fn wide_allowed(cfg: &Config) -> bool {
+    cfg.wide
+}
+
+/// No widened `sockaddr_un` outside Apple.
+#[cfg(not(target_vendor = "apple"))]
+fn wide_allowed(_cfg: &Config) -> bool {
+    false
+}
+
+// ---------------------------------------------------------------------------
+// the central route
+// ---------------------------------------------------------------------------
+
+/// A way of making the call with a spelling relative to a directory fd (D's,
+/// or the socket's directory's without D).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Means {
+    /// A thread of its own whose working directory alone is the directory
+    /// (Linux, Apple; [`sys::op_in_dir_on_thread`]).
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    ThreadCwd,
+    /// `/proc/self/fd/<fd>/<spelling>` (Linux).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    Proc,
+    /// `bindat(2)` / `connectat(2)` (FreeBSD).
+    #[cfg(target_os = "freebsd")]
+    At,
+    /// A forked child that `fchdir`s into the directory (a bind only here).
+    Fork,
+}
+
+/// The means a request takes without D, in order: the fork route, for a
+/// bind only (SPEC). Adding the thread-cwd or /proc means here is all it
+/// takes to try them without D as well.
+const MEANS_WITHOUT_OWN_DIR: &[Means] = &[Means::Fork];
+
+/// The central route: D, R, and the means in order (module doc).
+///
+/// The length and whether each means can be used (as far as that can be told
+/// beforehand) are checked before D is made; when no means is left, nothing is
+/// made. Every means but the /proc one takes `R/<name>`, 11 bytes more than
+/// the file name, in the plain sockaddr. A bind never widens a sockaddr: the
+/// address of a socket bound so would not fit `sun_path` and would break its
+/// readers (DR-0027).
+///
+/// D is tried in [`Config::own_dir_places`] in order. Made in none of them, a
+/// bind forks with R made beside the socket ([`without_own_dir`]) and a
+/// connect goes on to the fallback routes.
+fn central(t: &Target<'_>) -> Step {
+    let means = central_means(t);
+    if means.is_empty() {
+        return Step::Next;
+    }
+    let Some(real_dir) = t.real_dir() else {
+        return Step::Next;
+    };
+    match make_own_dir(t, real_dir, own::LinkName::Random) {
+        Some(d) => {
+            let step = through(t, d.anchor(), &means);
+            drop(d);
+            step
+        }
+        None => match t.req {
+            Request::Bind => without_own_dir(t, real_dir),
+            Request::Connect(_) => Step::Next,
+        },
+    }
+}
+
+/// The means of the central route that may be used for `t`, in order.
+fn central_means(t: &Target<'_>) -> Vec<Means> {
+    let mut means = Vec::new();
+    if path::len(&own::spelling_placeholder(OsStr::new(""), t.name)) > DIRECT_MAX {
+        return means;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    if t.cfg.thread_cwd && sys::thread_cwd_available() {
+        means.push(Means::ThreadCwd);
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let (Some(proc), Some(dir_fd)) = (t.proc(), t.dir_fd()) {
+        // D's fd is not known yet; the socket's directory's stands in for
+        // its number of digits, and the spelling is measured again with
+        // D's own fd before it is used.
+        let estimate = proc
+            .join(dir_fd.as_raw_fd().to_string())
+            .join(own::spelling_placeholder(OsStr::new(""), t.name));
+        if path::len(&estimate) <= DIRECT_MAX {
+            means.push(Means::Proc);
+        }
+    }
+    // bindat / connectat cannot turn out unusable, so nothing comes after it.
+    #[cfg(target_os = "freebsd")]
+    means.push(Means::At);
+    #[cfg(not(target_os = "freebsd"))]
+    if t.req == Request::Bind {
+        means.push(Means::Fork);
+    }
+    means
+}
+
+/// A directory fd and the name of a symlink in it to the socket's directory:
+/// the call is made with `<link>/<name>` relative to `fd`.
+#[derive(Clone, Copy)]
+pub(crate) struct Anchor<'a> {
+    pub(crate) fd: BorrowedFd<'a>,
+    pub(crate) link: &'a OsStr,
+}
+
+/// Try `means` in order with `<anchor.link>/<name>` relative to `anchor.fd`.
+/// The first means that can be used makes the call, and its outcome is the
+/// result; [`Step::Next`] when none could be used.
+fn through(t: &Target<'_>, anchor: Anchor<'_>, means: &[Means]) -> Step {
+    let spelling = Path::new(anchor.link).join(t.name);
+    let Ok(addr) = SockAddr::standard(spelling.as_os_str()) else {
+        return Step::Next;
+    };
+    match means.iter().find_map(|&m| by_means(t, anchor, &addr, m)) {
+        Some(Ok(done)) if t.remember && t.req == Request::Bind => {
+            Step::Done(remember_through(t, &spelling, anchor.fd).map(|()| done))
+        }
+        Some(done) => Step::Done(done),
+        None => Step::Next,
+    }
+}
+
+/// Take the [`Bound`] of the socket file just bound by `spelling` relative to
+/// `dir` (D's fd with `R/<name>`, or the socket's directory's with
+/// `.sockat.XXXXXXXXXX/<name>`), while R is still there: `(st_dev, st_ino)`
+/// by that same spelling (R followed, the socket file itself not), and the
+/// real path R points to joined with the file name.
+fn remember_through(t: &Target<'_>, spelling: &Path, dir: BorrowedFd<'_>) -> io::Result<()> {
+    let id = sys::id_at(dir, spelling.as_os_str())?;
+    let real_dir = t
+        .real_dir()
+        .ok_or_else(|| io::Error::other("the socket's directory has no real path"))?;
+    let _ = t.bound.set(Bound {
+        path: real_dir.join(t.name),
+        id,
+    });
+    Ok(())
+}
+
+/// Make the call by `means` with `<anchor.link>/<name>` (in `addr`)
+/// relative to `anchor.fd`; `None` when that means cannot be used, nothing
+/// having been called.
+fn by_means(
+    t: &Target<'_>,
+    anchor: Anchor<'_>,
+    addr: &SockAddr,
+    means: Means,
+) -> Option<io::Result<(OwnedFd, Route)>> {
+    match means {
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        Means::ThreadCwd => match thread_cwd_in(t.req, anchor.fd, addr) {
+            sys::OnThread::Done(done) => Some(done.map(|fd| (fd, Route::ThreadCwd))),
+            sys::OnThread::Unusable(_) => None,
+        },
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        Means::Proc => t
+            .proc()
+            .and_then(|proc| linux::fd_dir(proc, anchor.fd))
+            .map(|fd_dir| fd_dir.join(anchor.link).join(t.name))
+            .filter(|via| path::len(via) <= DIRECT_MAX)
+            .map(|via| plain_op(t.req, &via).map(|fd| (fd, Route::ProcThroughLink))),
+        #[cfg(target_os = "freebsd")]
+        Means::At => Some(freebsd::at(t.req, anchor.fd, addr).map(|fd| (fd, Route::At))),
+        Means::Fork => {
+            Some(fork_in(t.req, anchor.fd, addr).map(|(fd, child)| (fd, Route::Fork { child })))
+        }
+    }
+}
+
+/// Make D in the first of [`Config::own_dir_places`] where it can be made,
+/// with the symlink `link` to `target` in it. `None` when it can be made in
+/// none of them (remembered in `t.no_place`, so the next attempt for `t`
+/// does not try them again).
+///
+/// A place is passed over when it cannot be opened, D cannot be created there
+/// (no free name in [`own::ATTEMPTS`] tries, no random bytes, no write
+/// permission), what was created fails the checks of [`own::OwnDir::hold`],
+/// or the symlink cannot be made in it. What fails the checks is left alone;
+/// everything else made for a place passed over is removed again.
+fn make_own_dir(t: &Target<'_>, target: &Path, link: own::LinkName) -> Option<own::OwnDir> {
+    if t.no_place.get() {
+        return None;
+    }
+    for place in &t.cfg.own_dir_places {
+        if let Ok(d) = own::OwnDir::create(place, t.dir_fd(), t.proc(), target, link) {
+            return Some(d);
+        }
+    }
+    t.no_place.set(true);
+    None
+}
+
+/// A bind for which D could be made in none of the places: R
+/// (`.sockat.XXXXXXXXXX`, to the socket's directory) is made in the socket's
+/// directory itself, and the call is made with `<R>/<name>` relative to the
+/// socket's directory fd by [`MEANS_WITHOUT_OWN_DIR`]. R is removed when this
+/// returns. [`Step::Next`] (and so `ENAMETOOLONG`) when that spelling does
+/// not fit or R cannot be made either.
+fn without_own_dir(t: &Target<'_>, real_dir: &Path) -> Step {
+    let placeholder = own::spelling_placeholder(OsStr::new(own::HIDDEN_PREFIX), t.name);
+    if path::len(&placeholder) > DIRECT_MAX {
+        return Step::Next;
+    }
+    let Some(dir_fd) = t.dir_fd() else {
+        return Step::Next;
+    };
+    let Ok(link) = own::LinkBeside::create(dir_fd, real_dir) else {
+        return Step::Next;
+    };
+    let step = through(t, link.anchor(), MEANS_WITHOUT_OWN_DIR);
+    drop(link);
+    step
+}
+
+/// sockat's own directory D and the symlinks made in it and beside a socket
+/// (SPEC "中心の経路").
+pub(crate) mod own {
+    use super::*;
+
+    /// What D's name starts with in a place other than the socket's
+    /// directory, so a D left behind by a process that died is recognisable
+    /// as sockat's.
+    pub(crate) const PREFIX: &str = "sockat.";
+
+    /// What D's name starts with in the socket's directory, and the name of
+    /// R made there when D can be made nowhere ([`LinkBeside`]).
+    pub(crate) const HIDDEN_PREFIX: &str = ".sockat.";
+
+    /// Length of the random part of every name sockat creates.
+    pub(crate) const RANDOM_LEN: usize = 10;
+
+    /// How many names to try before giving up. Each try is a fresh random
+    /// name from 62^10 possibilities, so exhausting this means something
+    /// other than bad luck (for example a place that refuses every name).
+    pub(crate) const ATTEMPTS: usize = 16;
+
+    /// The name of the symlink in D to the socket file (the fallback route
+    /// [`Route::ProcFileLink`]).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) const FILE_LINK: &str = "s";
+
+    /// `<prefix>XXXXXXXXXX/<name>`: the length of the spelling through a link
+    /// whose name is `prefix` and the random part, before any is made.
+    pub(crate) fn spelling_placeholder(prefix: &OsStr, name: &OsStr) -> PathBuf {
+        let mut link = prefix.to_os_string();
+        link.push("X".repeat(RANDOM_LEN));
+        Path::new(&link).join(name)
+    }
+
+    /// [`RANDOM_LEN`] random letters and digits from the system's secure
+    /// generator ([`sys::random_bytes`]; when it fails, as `getrandom(2)`
+    /// does on a Linux older than 3.17, nothing that needs a name can be
+    /// made).
+    pub(crate) fn random_part() -> io::Result<String> {
+        const ALPHABET: &[u8; 62] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut random = [0u8; RANDOM_LEN];
+        sys::random_bytes(&mut random)?;
+        // 256 is not a multiple of 62, so this is slightly biased; the name
+        // only has to be hard to collide with, not uniform.
+        Ok(random
+            .iter()
+            .map(|b| ALPHABET[*b as usize % 62] as char)
+            .collect())
+    }
+
+    /// `prefix` followed by a fresh [`random_part`].
+    pub(crate) fn named(prefix: &str) -> io::Result<String> {
+        Ok(format!("{prefix}{}", random_part()?))
+    }
+
+    /// Create an entry with `create`, named by `next_name` (called once per
+    /// try; its error ends the attempt), and return its name.
+    ///
+    /// `create` must fail with `EEXIST` rather than replace an existing entry,
+    /// as `symlink(2)` and `mkdir(2)` do (their `O_EXCL`): the entry created is
+    /// always one nobody else had, and a name already taken (by anyone) is
+    /// skipped for the next one, [`ATTEMPTS`] times at most. Any other error
+    /// ends the attempt.
+    pub(crate) fn create_unique(
+        mut create: impl FnMut(&OsStr) -> io::Result<()>,
+        mut next_name: impl FnMut() -> io::Result<String>,
+    ) -> io::Result<OsString> {
+        for _ in 0..ATTEMPTS {
+            let name = OsString::from(next_name()?);
+            match create(&name) {
+                Ok(()) => return Ok(name),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not find a free name for a temporary entry",
+        ))
+    }
+
+    /// Which symlink D holds.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum LinkName {
+        /// R: a random name ([`RANDOM_LEN`] letters and digits, no prefix),
+        /// to the socket's directory (the central route).
+        Random,
+        /// [`FILE_LINK`], to the socket file (the fallback route
+        /// [`Route::ProcFileLink`]).
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        File,
+    }
+
+    /// sockat's own directory D, made in a place, held by an fd, and the
+    /// symlink made in it.
+    ///
+    /// D is reached through the fd, not its name, so someone renaming it
+    /// away and putting their own directory at its name changes nothing: the
+    /// fd keeps naming the directory sockat made. A replacement between
+    /// `mkdirat` and `openat` is what the checks of [`OwnDir::hold`] are for.
+    /// So a place needs to be neither safe nor short.
+    ///
+    /// A value exists only once D passed the checks of [`OwnDir::hold`] (what
+    /// fails them is someone else's and is left alone, its contents included),
+    /// and `link` is set only once this value's own `symlinkat` made the link.
+    /// On drop: the link is removed through the fd if this value made it,
+    /// then D through the place's fd, but only while D's name there is still
+    /// the held directory (same `(st_dev, st_ino)` as the fd, looked up without
+    /// following a symlink), so a directory put in its place is left alone.
+    /// Failures are ignored: the call is made by then, and failing it would
+    /// not remove anything either.
+    pub(crate) struct OwnDir {
+        /// The place D was made in, opened by [`open_dir`].
+        base: OwnedFd,
+        /// D's name in the place.
+        pub(crate) name: OsString,
+        /// D, opened by [`OwnDir::hold`].
+        dir: std::fs::File,
+        /// The symlink this value made in D.
+        link: Option<OsString>,
+    }
+
+    impl OwnDir {
+        /// Make D in `place` ([`OwnDir::make`], [`OwnDir::hold`]) with the
+        /// symlink `link` to `target` in it ([`OwnDir::link`]). `socket_dir`
+        /// is the socket's directory's fd, the base for [`Place::SocketDir`]
+        /// (`None` when it cannot be opened: that place is passed over);
+        /// `proc` is where `/proc/self/fd` is when /proc can be used.
+        pub(crate) fn create(
+            place: &Place,
+            socket_dir: Option<BorrowedFd<'_>>,
+            proc: Option<&Path>,
+            target: &Path,
+            link: LinkName,
+        ) -> io::Result<Self> {
+            let (base, prefix) = match place {
+                Place::Path(p) => (open_dir(p)?, PREFIX),
+                Place::SocketDir => {
+                    let Some(socket_dir) = socket_dir else {
+                        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                    };
+                    (socket_dir.try_clone_to_owned()?, HIDDEN_PREFIX)
+                }
+            };
+            let name = Self::make(base.as_fd(), || named(prefix))?;
+            let mut d = Self::hold(base, name, proc)?;
+            d.link(target, link)?;
+            Ok(d)
+        }
+
+        /// Create a directory of mode 0700 in the place `base` (`mkdirat`),
+        /// named by `next_name` ([`create_unique`]), and return its name.
+        pub(crate) fn make(
+            base: BorrowedFd<'_>,
+            next_name: impl FnMut() -> io::Result<String>,
+        ) -> io::Result<OsString> {
+            create_unique(|name| sys::mkdir_at(base, name, 0o700), next_name)
+        }
+
+        /// Open `name` in the place `base` and, if it is the directory sockat
+        /// made, hold it.
+        ///
+        /// It is opened with `O_DIRECTORY | O_NOFOLLOW` ([`sys::open_dir_at`]),
+        /// so a symlink or anything but a directory put at `name` is refused,
+        /// and with `O_PATH` on Linux, `O_SEARCH` on Apple, `O_RDONLY`
+        /// elsewhere ([`open_own_dir`]). What was opened must be a directory
+        /// owned by the effective uid with no permission for group and others
+        /// (`mode & 0o077 == 0`), as [`OwnDir::make`] makes it: anything else
+        /// was put there by someone else between the two steps, and is neither
+        /// used nor removed (`InvalidData`).
+        ///
+        /// Only the group and other bits are judged because the umask may
+        /// have taken some of the owner's from the 0700 asked for (umask 0277
+        /// makes it 0500, umask 0477 makes it 0300, without read); a umask
+        /// cannot add group or other bits. `O_PATH` and `O_SEARCH` open D
+        /// without read permission, so the check is made whatever the umask
+        /// left (with `O_RDONLY` a umask of 0477 makes the open fail, and D,
+        /// not checked, is left where it is).
+        ///
+        /// Once checked, the owner's bits are set to 0700 ([`OwnDir::set_mode`]).
+        /// When that cannot be done, D is removed again (by drop) and the
+        /// error returned: the place is passed over.
+        pub(crate) fn hold(base: OwnedFd, name: OsString, proc: Option<&Path>) -> io::Result<Self> {
+            use std::os::unix::fs::MetadataExt;
+            let fd = open_own_dir(base.as_fd(), &name)?;
+            let dir = std::fs::File::from(fd);
+            let m = dir.metadata()?;
+            if !(m.is_dir() && m.uid() == sys::effective_uid() && m.mode() & 0o077 == 0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the directory sockat made was replaced",
+                ));
+            }
+            let held = Self {
+                base,
+                name,
+                dir,
+                link: None,
+            };
+            held.set_mode(proc)?;
+            Ok(held)
+        }
+
+        /// Set D's mode to 0700 through what reaches the very directory the
+        /// fd holds, so nothing put at its name meanwhile is changed instead:
+        ///
+        /// * an `O_PATH` fd (Linux) takes no `fchmod` (`EBADF`): with /proc
+        ///   (`proc`), `chmod("<proc>/<fd>")`; without, D is opened again by
+        ///   its name `O_RDONLY` (which needs the owner's read bit), checked
+        ///   to be the same directory (`(st_dev, st_ino)` of both fds), and
+        ///   that fd is `fchmod`ed. A umask without the owner's read bit makes
+        ///   this fail there, and the place is passed over with nothing left;
+        /// * any other fd: `fchmod`.
+        fn set_mode(&self, proc: Option<&Path>) -> io::Result<()> {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::Permissions::from_mode(0o700);
+            if let Some(proc) = proc {
+                return std::fs::set_permissions(self.fd_dir(proc), mode);
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let id = |f: &std::fs::File| f.metadata().map(|m| (m.dev(), m.ino()));
+                let again = std::fs::File::from(sys::open_dir_at(
+                    self.base.as_fd(),
+                    &self.name,
+                    libc::O_RDONLY,
+                )?);
+                if id(&again)? != id(&self.dir)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the directory sockat made was replaced",
+                    ));
+                }
+                again.set_permissions(mode)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            self.dir.set_permissions(mode)
+        }
+
+        /// Make the symlink `link` to `target` in D (`symlinkat` on the fd).
+        /// R's name is drawn as [`create_unique`] does; [`FILE_LINK`] is
+        /// tried once (D is empty).
+        pub(crate) fn link(&mut self, target: &Path, link: LinkName) -> io::Result<()> {
+            let dir = self.dir.as_fd();
+            let create = |name: &OsStr| sys::symlink_at(target, dir, name);
+            let name = match link {
+                LinkName::Random => create_unique(create, random_part)?,
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                LinkName::File => {
+                    let name = OsString::from(FILE_LINK);
+                    create(&name)?;
+                    name
+                }
+            };
+            self.link = Some(name);
+            Ok(())
+        }
+
+        /// D's fd and the symlink made in it.
+        pub(crate) fn anchor(&self) -> Anchor<'_> {
+            Anchor {
+                fd: self.dir.as_fd(),
+                link: self.link.as_deref().unwrap_or_default(),
+            }
+        }
+
+        /// `<proc>/<fd>`: D itself, by its fd, `proc` being where
+        /// `/proc/self/fd` is.
+        pub(crate) fn fd_dir(&self, proc: &Path) -> PathBuf {
+            proc.join(self.dir.as_raw_fd().to_string())
+        }
+    }
+
+    impl Drop for OwnDir {
+        fn drop(&mut self) {
+            use std::os::unix::fs::MetadataExt;
+            if let Some(link) = &self.link {
+                let _ = sys::unlink_at(self.dir.as_fd(), link, false);
+            }
+            let held = self.dir.metadata().map(|m| (m.dev(), m.ino()));
+            let named = sys::id_at(self.base.as_fd(), &self.name);
+            if let (Ok(held), Ok(named)) = (held, named) {
+                if held == named {
+                    let _ = sys::unlink_at(self.base.as_fd(), &self.name, true);
+                }
+            }
+        }
+    }
+
+    /// Open D, `name` in the place `base`, with `O_DIRECTORY | O_NOFOLLOW`
+    /// and: `O_PATH` on Linux, `O_SEARCH` on Apple (a kernel refusing it on a
+    /// directory, `EISDIR` / `EINVAL`, gets `O_RDONLY` instead, as
+    /// [`search_or_read_only`] does for the places), `O_RDONLY` elsewhere.
+    fn open_own_dir(base: BorrowedFd<'_>, name: &OsStr) -> io::Result<OwnedFd> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        return sys::open_dir_at(base, name, libc::O_PATH);
+        #[cfg(target_vendor = "apple")]
+        match sys::open_dir_at(base, name, libc::O_SEARCH) {
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EISDIR | libc::EINVAL)) => {}
+            searched => return searched,
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        sys::open_dir_at(base, name, libc::O_RDONLY)
+    }
+
+    /// R made beside the socket, in its directory, when D can be made in none
+    /// of the places: `.sockat.XXXXXXXXXX` to the socket's directory, removed
+    /// on drop (it is always this value's own: the value exists only once
+    /// `symlinkat` made it).
+    pub(crate) struct LinkBeside<'a> {
+        dir: BorrowedFd<'a>,
+        pub(crate) name: OsString,
+    }
+
+    impl<'a> LinkBeside<'a> {
+        /// Make R in the socket's directory `dir` pointing to `target`.
+        pub(crate) fn create(dir: BorrowedFd<'a>, target: &Path) -> io::Result<Self> {
+            let name = create_unique(
+                |name| sys::symlink_at(target, dir, name),
+                || named(HIDDEN_PREFIX),
+            )?;
+            Ok(Self { dir, name })
+        }
+
+        pub(crate) fn anchor(&self) -> Anchor<'_> {
+            Anchor {
+                fd: self.dir,
+                link: &self.name,
+            }
+        }
+    }
+
+    impl Drop for LinkBeside<'_> {
+        fn drop(&mut self) {
+            let _ = sys::unlink_at(self.dir, &self.name, false);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the fallback routes (connect) and the last fork
+// ---------------------------------------------------------------------------
+
+/// The fallback routes of a connect, tried when the central route cannot be
+/// used, in this order:
+///
+/// | target | order |
+/// |---|---|
+/// | Linux, Android (/proc usable) | /proc, symlink in D, symlink |
+/// | Linux, Android (no /proc) | relative path, symlink |
+/// | Apple | relative path, widened sockaddr, symlink |
+/// | FreeBSD | connectat |
+/// | NetBSD, OpenBSD, illumos, other Unix | relative path, symlink |
+///
+/// None of them puts a random part in the spelling: a connected socket is not
+/// bound, so the spelling is not kept anywhere. `wide` says whether the
+/// widened form may still be used (Apple); the kernel refusing it turns it off
+/// for the fork after this too.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn fallback(t: &Target<'_>, _wide: &mut bool) -> Step {
+    let Some((proc, dir_fd)) = t.proc().zip(t.dir_fd()) else {
+        return match posix::relative(t) {
+            Step::Next => posix::symlinks(t),
+            done => done,
+        };
+    };
+    let via = proc.join(dir_fd.as_raw_fd().to_string()).join(t.name);
+    if path::len(&via) <= DIRECT_MAX {
+        return Step::Done(plain_op(t.req, &via).map(|fd| (fd, Route::ProcFd)));
+    }
+    match linux::file_link_in_own_dir(t, proc) {
+        Step::Next => posix::symlinks(t),
+        done => done,
+    }
+}
+
+/// See the Linux version.
+#[cfg(target_vendor = "apple")]
+fn fallback(t: &Target<'_>, wide: &mut bool) -> Step {
+    let rel = posix::Relative::new(t.path, t.dir);
+    if let Some(rel) = rel.as_ref().filter(|r| path::len(&r.path) <= DIRECT_MAX) {
+        return Step::Done(
+            rel.run(|p| plain_op(t.req, p))
+                .map(|fd| (fd, Route::Relative)),
+        );
+    }
+    if let (true, Request::Connect(o)) = (*wide, t.req) {
+        let attempt = if path::len(t.path) <= sys::WIDE_PATH_MAX {
+            Some(apple::wide_connect(o, t.path).map(|fd| (fd, Route::Wide)))
+        } else {
+            rel.as_ref()
+                .filter(|r| path::len(&r.path) <= sys::WIDE_PATH_MAX)
+                .map(|rel| {
+                    rel.run(|p| apple::wide_connect(o, p))
+                        .map(|fd| (fd, Route::WideRelative))
+                })
+        };
+        match attempt {
+            None => {}
+            Some(Err(e)) if apple::refuses_wide(&e) => *wide = false,
+            Some(done) => return Step::Done(done),
+        }
+    }
+    posix::symlinks(t)
+}
+
+/// See the Linux version.
+#[cfg(target_os = "freebsd")]
+fn fallback(t: &Target<'_>, _wide: &mut bool) -> Step {
+    match (SockAddr::standard(t.name), t.dir_fd()) {
+        (Ok(addr), Some(dir_fd)) => {
+            Step::Done(freebsd::at(t.req, dir_fd, &addr).map(|fd| (fd, Route::ConnectAt)))
+        }
+        _ => Step::Next,
+    }
+}
+
+/// See the Linux version.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd"
+)))]
+fn fallback(t: &Target<'_>, _wide: &mut bool) -> Step {
+    match posix::relative(t) {
+        Step::Next => posix::symlinks(t),
+        done => done,
+    }
+}
+
+/// The last route of a connect: a forked child that `fchdir`s into the
+/// socket's directory and connects by the file name, for the connects that
+/// may fork; `ENAMETOOLONG` for the others ([`fork_in`]), and when the
+/// socket's directory cannot be opened. The file name goes in the plain
+/// sockaddr, or on Apple in the widened one when it is too long for that and
+/// the kernel takes the widened form (`wide`).
+fn fork_beside(
+    options: ConnectOptions,
+    t: &Target<'_>,
+    wide: bool,
+) -> io::Result<(OwnedFd, Route)> {
+    let req = Request::Connect(options);
+    #[cfg(target_vendor = "apple")]
+    let addr = match SockAddr::standard(t.name) {
+        Err(e) if wide && e.raw_os_error() == Some(libc::ENAMETOOLONG) => SockAddr::wide(t.name)?,
+        addr => addr?,
+    };
+    #[cfg(not(target_vendor = "apple"))]
+    let addr = {
+        let _ = wide;
+        SockAddr::standard(t.name)?
+    };
+    let dir_fd = t.dir_fd().ok_or_else(too_long)?;
+    fork_in(req, dir_fd, &addr).map(|(fd, child)| (fd, Route::Fork { child }))
+}
+
+// ---------------------------------------------------------------------------
+// the calls themselves
+// ---------------------------------------------------------------------------
 
 /// Bind (and listen) or connect with `path` as is, in the plain sockaddr.
 ///
@@ -263,7 +1175,6 @@ pub(crate) fn plain_op(req: Request, path: &Path) -> io::Result<OwnedFd> {
 /// Bind (and listen) or connect a fresh socket (`O_NONBLOCK` for a
 /// nonblocking connect) to `addr`.
 pub(crate) fn raw_op(req: Request, addr: &SockAddr) -> io::Result<OwnedFd> {
-    use std::os::fd::AsFd;
     let sock = sys::socket(req.nonblocking())?;
     sys::op(req.op(), sock.as_fd(), addr)?;
     if req == Request::Bind {
@@ -272,29 +1183,25 @@ pub(crate) fn raw_op(req: Request, addr: &SockAddr) -> io::Result<OwnedFd> {
     Ok(sock)
 }
 
-/// Open `dir` to use as the base of a relative bind / connect.
+/// Open `dir`, the socket's directory or a place for D, to use as the base of
+/// `*at` calls, `fchdir` and `/proc/self/fd/<fd>`.
 ///
 /// Apple: `O_SEARCH`, which needs only search permission on the directory,
 /// the same as a plain bind / connect through the path (bind also needs write
 /// permission, checked by the bind itself). An `O_SEARCH` directory fd can be
-/// `fchdir`ed into (checked on macOS 26.5: a mode 0300 directory, which
-/// `O_RDONLY` cannot open, binds fine). A kernel that does not take `O_SEARCH`
-/// on a directory answers `EISDIR` (as it does for `O_EXEC` alone) or
-/// `EINVAL`; then the directory is opened `O_RDONLY`, which needs read
-/// permission.
-///
-/// The same fd serves the thread-cwd route: `pthread_fchdir_np` takes an
-/// `O_SEARCH` directory fd as `fchdir` does (checked on macOS 26.5: the mode
-/// 0300 directory again).
+/// `fchdir`ed into and serves as the base of `mkdirat` / `symlinkat` (checked
+/// on macOS 26.5: a mode 0300 directory, which `O_RDONLY` cannot open, binds
+/// fine). A kernel that does not take `O_SEARCH` on a directory answers
+/// `EISDIR` (as it does for `O_EXEC` alone) or `EINVAL`; then the directory
+/// is opened `O_RDONLY`, which needs read permission.
 ///
 /// Linux: `O_PATH | O_DIRECTORY`, which needs only search permission. The fd
-/// serves the /proc route (`/proc/self/fd/<fd>` names the directory), the
-/// thread-cwd route and the fork route (`fchdir(2)` takes an `O_PATH`
-/// directory fd since Linux 3.5).
+/// serves `/proc/self/fd/<fd>`, `fchdir(2)` (which takes an `O_PATH`
+/// directory fd since Linux 3.5) and the `*at` calls.
 ///
 /// Other targets: `O_RDONLY | O_DIRECTORY`, so the fork route and `bindat`
 /// need read permission on the directory.
-fn open_dir(dir: &Path) -> io::Result<OwnedFd> {
+pub(crate) fn open_dir(dir: &Path) -> io::Result<OwnedFd> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         OpenOptions::new()
@@ -349,28 +1256,23 @@ pub(crate) fn search_or_read_only(
 }
 
 /// Bind (and listen) or connect a fresh socket (`O_NONBLOCK` for a
-/// nonblocking connect) to `name` inside `dir` from a forked child that
-/// `fchdir`s into `dir` ([`sys::op_in_dir_forked`]). Returns the socket and
-/// the child's pid.
-///
-/// `addr` holds `name` (built by the caller, which knows which address forms
-/// the target accepts).
+/// nonblocking connect) to `addr`, resolved relative to `dir`, from a forked
+/// child that `fchdir`s into `dir` ([`sys::op_in_dir_forked`]). The forced
+/// form of the fork route for the tests: `dir` is opened by [`open_dir`].
 #[cfg(test)]
 pub(crate) fn fork_op(
     req: Request,
     dir: &Path,
     addr: &SockAddr,
 ) -> io::Result<(OwnedFd, libc::pid_t)> {
-    use std::os::fd::AsFd;
     fork_in(req, open_dir(dir)?.as_fd(), addr)
 }
 
-/// [`fork_op`] with the directory already opened by [`open_dir`].
+/// The fork route with the directory fd `dir`: returns the socket and the
+/// child's pid.
 ///
 /// When `req` rules the fork route out, this is where it ends, with
-/// [`fork_ruled_out`]: before any socket is created, and after the directory
-/// was opened, so a missing or unreadable directory still comes out as the
-/// real error it is.
+/// [`fork_ruled_out`], before any socket is created.
 ///
 /// The socket is made `O_NONBLOCK` here, before the fork, so the child's
 /// connect runs on a nonblocking socket: the flag belongs to the open file
@@ -380,13 +1282,11 @@ pub(crate) fn fork_op(
 /// child: the process that listens is the one a client's peer-credential
 /// query (`LOCAL_PEERPID`, `SO_PEERCRED`) names as the server, so a child
 /// that listened would leave clients seeing an exited process (DR-0025).
-#[cfg(any(test, not(target_os = "freebsd")))]
 fn fork_in(
     req: Request,
-    dir: std::os::fd::BorrowedFd<'_>,
+    dir: BorrowedFd<'_>,
     addr: &SockAddr,
 ) -> io::Result<(OwnedFd, libc::pid_t)> {
-    use std::os::fd::AsFd;
     if !req.may_fork() {
         return Err(fork_ruled_out());
     }
@@ -399,21 +1299,15 @@ fn fork_in(
 }
 
 /// Bind (and listen) or connect a fresh socket (`O_NONBLOCK` for a
-/// nonblocking connect) to `addr`, the file name, resolved relative to `dir`
-/// on a thread whose own working directory is moved there
-/// ([`sys::op_in_dir_on_thread`]). `Unusable` when the thread's working
-/// directory cannot be moved on its own; the request is then still to be made.
+/// nonblocking connect) to `addr`, resolved relative to `dir`, on a thread
+/// whose own working directory is moved there ([`sys::op_in_dir_on_thread`]).
+/// `Unusable` when the thread's working directory cannot be moved on its own;
+/// the request is then still to be made.
 ///
 /// Every request may take it (no side effect a server or another thread can
-/// see), so it comes before the fork route and before a connect that does not
-/// fork gives up. The listen after a bind is made here, on the calling thread.
+/// see). The listen after a bind is made here, on the calling thread.
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-fn thread_cwd_in(
-    req: Request,
-    dir: std::os::fd::BorrowedFd<'_>,
-    addr: &SockAddr,
-) -> sys::OnThread<OwnedFd> {
-    use std::os::fd::AsFd;
+fn thread_cwd_in(req: Request, dir: BorrowedFd<'_>, addr: &SockAddr) -> sys::OnThread<OwnedFd> {
     let sock = match sys::socket(req.nonblocking()) {
         Ok(sock) => sock,
         Err(e) => return sys::OnThread::Done(Err(e)),
@@ -431,14 +1325,13 @@ fn thread_cwd_in(
     }
 }
 
-/// [`thread_cwd_in`] with the directory `dir` opened by [`open_dir`], as the
-/// route order opens it.
+/// [`thread_cwd_in`] with the directory `dir` opened by [`open_dir`]: the
+/// forced form of the thread-cwd means for the tests.
 #[cfg(all(
     test,
     any(target_os = "linux", target_os = "android", target_vendor = "apple")
 ))]
 pub(crate) fn thread_cwd_op(req: Request, dir: &Path, addr: &SockAddr) -> sys::OnThread<OwnedFd> {
-    use std::os::fd::AsFd;
     match open_dir(dir) {
         Ok(opened) => thread_cwd_in(req, opened.as_fd(), addr),
         Err(e) => sys::OnThread::Done(Err(e)),
@@ -448,56 +1341,66 @@ pub(crate) fn thread_cwd_op(req: Request, dir: &Path, addr: &SockAddr) -> sys::O
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) mod linux {
     use super::*;
-    use std::os::fd::{AsRawFd, BorrowedFd};
-    use std::path::PathBuf;
 
     /// Where the kernel lists the fds of the calling process.
     pub(crate) const PROC_SELF_FD: &str = "/proc/self/fd";
 
-    /// `<proc_self_fd>/<dir>`, or `None` when it cannot be looked up (no
-    /// /proc). Without this check a bind / connect through
-    /// `<proc_self_fd>/<dir>/<name>` would fail with `ENOENT`, which reads as
-    /// "the directory does not exist" although it does. The /proc route also
-    /// needs that spelling to fit `sun_path` (a file name of about 90 bytes or
-    /// less); std would refuse a longer one with its own `InvalidInput`.
-    pub(crate) fn proc_fd_dir(dir: BorrowedFd<'_>, proc_self_fd: &Path) -> Option<PathBuf> {
-        let fd_dir = proc_self_fd.join(dir.as_raw_fd().to_string());
+    /// `<proc_self_fd>/<fd>`, or `None` when it cannot be looked up (no
+    /// /proc).
+    pub(crate) fn fd_dir(proc_self_fd: &Path, fd: BorrowedFd<'_>) -> Option<PathBuf> {
+        let fd_dir = proc_self_fd.join(fd.as_raw_fd().to_string());
         std::fs::metadata(&fd_dir).ok()?;
         Some(fd_dir)
+    }
+
+    /// The fallback route [`Route::ProcFileLink`]: D made as the central route
+    /// makes it, with the symlink [`own::FILE_LINK`] in it to the socket file
+    /// (the path as given, made absolute against the cwd), and the connect by
+    /// `<proc>/<D's fd>/s`. That spelling is about 20 bytes whatever the
+    /// directory depth and the file name. Unusable when D can be made in none
+    /// of the places, or the spelling does not fit. D is removed when this
+    /// returns.
+    pub(super) fn file_link_in_own_dir(t: &Target<'_>, proc: &Path) -> Step {
+        let Some(target) = posix::absolute(t.path) else {
+            return Step::Next;
+        };
+        let Some(d) = make_own_dir(t, &target, own::LinkName::File) else {
+            return Step::Next;
+        };
+        let via = d.fd_dir(proc).join(own::FILE_LINK);
+        if path::len(&via) > DIRECT_MAX {
+            return Step::Next;
+        }
+        Step::Done(plain_op(t.req, &via).map(|fd| (fd, Route::ProcFileLink)))
     }
 }
 
 #[cfg(target_os = "freebsd")]
 pub(crate) mod freebsd {
     use super::*;
-    use std::os::fd::AsFd;
 
-    /// FreeBSD, for a path longer than [`DIRECT_MAX`]: `bindat(2)` /
-    /// `connectat(2)` with the file name relative to the directory fd.
-    pub(crate) fn run_long(req: Request, path: &Path) -> io::Result<(OwnedFd, Route)> {
-        let (dir, name) = path::split(path)?;
-        // The directory first, so a missing directory is ENOENT even when the
-        // name fits no sockaddr (DR-0012).
-        let dir = open_dir(dir)?;
-        let addr = SockAddr::standard(name)?;
+    /// `bindat(2)` / `connectat(2)` of a fresh socket (`O_NONBLOCK` for a
+    /// nonblocking connect) to `addr` relative to the directory fd `dir`,
+    /// then the listen after a bind.
+    pub(crate) fn at(req: Request, dir: BorrowedFd<'_>, addr: &SockAddr) -> io::Result<OwnedFd> {
         let sock = sys::socket(req.nonblocking())?;
-        sys::op_at(req.op(), sock.as_fd(), dir.as_fd(), &addr)?;
+        sys::op_at(req.op(), sock.as_fd(), dir, addr)?;
         if req == Request::Bind {
             sys::listen(sock.as_fd())?;
         }
-        Ok((sock, Route::At))
+        Ok(sock)
     }
 }
 
-/// The widened `sockaddr_un` that XNU takes (Apple), for a connect only
-/// ([`Request::may_widen`]).
+/// The widened `sockaddr_un` that XNU takes (Apple), for a connect only.
 #[cfg(target_vendor = "apple")]
 pub(crate) mod apple {
     use super::*;
 
     /// Connect a fresh socket (`O_NONBLOCK` for a nonblocking connect) to
     /// `path` in a widened `sockaddr_un`. There is no bind counterpart: a
-    /// socket bound so has an address that does not fit `sun_path` (DR-0024).
+    /// socket bound so has an address that does not fit `sun_path`, which
+    /// readers of it break on (DR-0027).
     pub(crate) fn wide_connect(options: ConnectOptions, path: &Path) -> io::Result<OwnedFd> {
         raw_op(
             Request::Connect(options),
@@ -514,206 +1417,58 @@ pub(crate) mod apple {
     }
 }
 
-/// The routes that need nothing but POSIX (plus, on Apple, the widened
-/// `sockaddr_un`, and on Linux and Apple a working directory of the thread's
-/// own), tried in order on every target without a dirfd-relative primitive:
-/// Apple, NetBSD, OpenBSD, illumos and the other Unix targets, and Linux when
-/// the /proc route cannot be used (DR-0001, DR-0008, DR-0020).
+/// The fallback routes that need nothing but POSIX: the relative spelling and
+/// the temporary symlink in a safe place (every target but FreeBSD).
 #[cfg(not(target_os = "freebsd"))]
 pub(crate) mod posix {
     use super::*;
-    use std::ffi::OsStr;
-    use std::os::fd::{AsFd, BorrowedFd};
     use std::os::unix::fs::MetadataExt;
-    use std::path::PathBuf;
 
     #[cfg(target_vendor = "apple")]
     use crate::sys::WIDE_PATH_MAX;
 
-    /// The longest spelling a sockaddr carries on this target: the widened
-    /// form's 253 bytes on Apple, [`DIRECT_MAX`] elsewhere.
+    /// The longest spelling a sockaddr carries for a connect on this target:
+    /// the widened form's 253 bytes on Apple, [`DIRECT_MAX`] elsewhere.
     #[cfg(target_vendor = "apple")]
     const SPELLING_MAX: usize = WIDE_PATH_MAX;
     #[cfg(not(target_vendor = "apple"))]
     const SPELLING_MAX: usize = DIRECT_MAX;
 
-    /// What the route order reads from the environment, made explicit so the
-    /// tests can vary it without touching the process environment.
-    #[derive(Debug, Clone)]
-    pub(crate) struct Config {
-        /// Where the temporary symlink may go, in the order tried: `TMPDIR`
-        /// when it is set to an absolute path, then `/tmp`.
-        pub(crate) tmp_bases: Vec<PathBuf>,
-        /// Whether to try the widened `sockaddr_un` at all for a connect
-        /// (Apple; a bind never does). Always `true` outside the tests, which
-        /// turn it off to stand in for a kernel that refuses the widened form.
-        #[cfg(target_vendor = "apple")]
-        pub(crate) wide: bool,
-        /// Where the kernel lists the fds of the process (Linux):
-        /// [`linux::PROC_SELF_FD`] outside the tests, which point it
-        /// elsewhere to stand in for a system without /proc.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        pub(crate) proc_self_fd: PathBuf,
-        /// Whether to try the thread-cwd route at all (Linux, Apple). Always
-        /// `true` outside the tests, which turn it off to stand in for a
-        /// system where it cannot be used (a seccomp filter, `unshare` refused, no
-        /// `pthread_fchdir_np`). Where it is tried and turns out unusable,
-        /// the next route is tried just the same.
-        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-        pub(crate) thread_cwd: bool,
+    /// `path` made absolute against the cwd, or `None` when the cwd cannot be
+    /// read.
+    pub(crate) fn absolute(path: &Path) -> Option<PathBuf> {
+        if path.is_absolute() {
+            return Some(path.to_path_buf());
+        }
+        std::env::current_dir().ok().map(|cwd| cwd.join(path))
     }
 
-    impl Config {
-        pub(crate) fn from_env() -> Self {
-            Self::from_tmpdir(std::env::var_os("TMPDIR"))
-        }
-
-        /// The configuration for a `TMPDIR` of `tmpdir`: `TMPDIR`, then
-        /// `/tmp`. An unset or empty `TMPDIR` leaves `/tmp` alone; a relative
-        /// one is left out (the link's place would depend on the cwd); one
-        /// that is `/tmp` itself is tried once.
-        pub(crate) fn from_tmpdir(tmpdir: Option<std::ffi::OsString>) -> Self {
-            let tmp = Path::new("/tmp");
-            let mut tmp_bases: Vec<PathBuf> = tmpdir
-                .map(PathBuf::from)
-                .filter(|t| t.is_absolute() && t != tmp)
-                .into_iter()
-                .collect();
-            tmp_bases.push(tmp.to_path_buf());
-            Self {
-                tmp_bases,
-                #[cfg(target_vendor = "apple")]
-                wide: true,
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                proc_self_fd: PathBuf::from(linux::PROC_SELF_FD),
-                #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-                thread_cwd: true,
-            }
+    /// The relative route: the path spelled relative to the cwd when that
+    /// fits the plain sockaddr ([`Relative`]).
+    #[cfg_attr(target_vendor = "apple", allow(dead_code))]
+    pub(super) fn relative(t: &Target<'_>) -> Step {
+        match Relative::new(t.path, t.dir).filter(|r| path::len(&r.path) <= DIRECT_MAX) {
+            Some(rel) => Step::Done(
+                rel.run(|p| plain_op(t.req, p))
+                    .map(|fd| (fd, Route::Relative)),
+            ),
+            None => Step::Next,
         }
     }
 
-    /// Try, in order (DR-0001), for a path longer than
-    /// [`DIRECT_MAX`] whose directory part is `dir` and file name `name`:
-    ///
-    /// 1. the path spelled relative to the cwd, when that is at most
-    ///    [`DIRECT_MAX`] bytes;
-    /// 2. (Apple, a connect) a widened `sockaddr_un` with the path itself,
-    ///    or failing that with the relative spelling, when one of them is at
-    ///    most 253 bytes;
-    /// 3. a short symlink ([`symlink_route`]: to the socket's directory for a
-    ///    bind, to the socket file for a connect) under the first of `TMPDIR`
-    ///    and `/tmp` ([`Config::tmp_bases`]) where the path through it fits
-    ///    (in the plain sockaddr, or on Apple for a connect the widened one)
-    ///    and the symlink can be created. A place that is not safe is passed
-    ///    over, except, for a connect when /proc can be used (`proc`: where
-    ///    `/proc/self/fd` is, Linux), that it is used through a private
-    ///    directory held by an fd ([`HeldDir`]);
-    /// 4. (Linux, Apple) the file name on a thread whose own working directory
-    ///    is moved into the directory ([`thread_cwd_in`]), for every request;
-    /// 5. a forked child that `fchdir`s into the directory, unless the request
-    ///    rules it out (then `ENAMETOOLONG`).
-    ///
-    /// The last two use the directory opened (`opened` when the caller has it
-    /// open already, as Linux does) and the file name in a sockaddr: the plain
-    /// one, or on Apple for a connect the widened one for a name too long for
-    /// it while the kernel takes that form.
-    ///
-    /// A bind on Apple never uses the widened form (DR-0024): every one of its
-    /// spellings is judged against [`DIRECT_MAX`], so a file name over 103
-    /// bytes is `ENAMETOOLONG` there.
-    ///
-    /// A failure of a route ends the search with that error, except where it
-    /// shows that the route itself cannot be used (the kernel refusing the
-    /// widened form, the symlink not being creatable, the thread's working
-    /// directory not being movable on its own); then the next route (or the
-    /// next place for the symlink) is tried.
-    pub(crate) fn run(
-        req: Request,
-        path: &Path,
-        dir: &Path,
-        name: &OsStr,
-        opened: Option<BorrowedFd<'_>>,
-        proc: Option<&Path>,
-        cfg: &Config,
-    ) -> io::Result<(OwnedFd, Route)> {
-        let rel = Relative::new(path, dir);
-
-        if let Some(rel) = rel.as_ref().filter(|r| path::len(&r.path) <= DIRECT_MAX) {
-            return rel
-                .run(|p| plain_op(req, p))
-                .map(|fd| (fd, Route::Relative));
-        }
-
-        // Whether the widened form may still carry a spelling: for a connect
-        // only (a bind never widens, [`Request::may_widen`]), and until the
-        // kernel refuses it.
-        #[cfg(target_vendor = "apple")]
-        let mut wide = cfg.wide && req.may_widen();
-        #[cfg(target_vendor = "apple")]
-        if let (true, Request::Connect(o)) = (wide, req) {
-            let attempt = if path::len(path) <= WIDE_PATH_MAX {
-                Some(apple::wide_connect(o, path).map(|fd| (fd, Route::Wide)))
-            } else {
-                rel.as_ref()
-                    .filter(|r| path::len(&r.path) <= WIDE_PATH_MAX)
-                    .map(|rel| {
-                        rel.run(|p| apple::wide_connect(o, p))
-                            .map(|fd| (fd, Route::WideRelative))
-                    })
-            };
-            match attempt {
-                None => {}
-                Some(Ok(done)) => return Ok(done),
-                Some(Err(e)) if apple::refuses_wide(&e) => wide = false,
-                Some(Err(e)) => return Err(e),
-            }
-        }
-
-        for base in &cfg.tmp_bases {
-            #[cfg(target_vendor = "apple")]
-            let limit = if wide { WIDE_PATH_MAX } else { DIRECT_MAX };
-            #[cfg(not(target_vendor = "apple"))]
-            let limit = DIRECT_MAX;
-            match symlink_route(req, base, path, dir, name, limit, proc) {
-                SymlinkOutcome::Done(done) => return done,
-                #[cfg(target_vendor = "apple")]
-                SymlinkOutcome::WideRefused => wide = false,
-                SymlinkOutcome::Unusable => {}
-            }
-        }
-
-        // The directory is opened before the file name's sockaddr is built,
-        // so a missing directory is ENOENT even when the name fits no
-        // sockaddr (DR-0012).
-        let owned;
-        let dir_fd = match opened {
-            Some(opened) => opened,
-            None => {
-                owned = open_dir(dir)?;
-                owned.as_fd()
-            }
+    /// The symlink route: a temporary symlink to the socket file under the
+    /// first of [`Config::link_places`] where it can be used
+    /// ([`symlink_route`]).
+    pub(super) fn symlinks(t: &Target<'_>) -> Step {
+        let Some(target) = absolute(t.path) else {
+            return Step::Next;
         };
-
-        // The plain sockaddr for the file name, or on Apple the widened one
-        // for a connect's name too long for it when the kernel takes that.
-        #[cfg(target_vendor = "apple")]
-        let addr = match SockAddr::standard(name) {
-            Err(e) if wide && e.raw_os_error() == Some(libc::ENAMETOOLONG) => SockAddr::wide(name)?,
-            addr => addr?,
-        };
-        #[cfg(not(target_vendor = "apple"))]
-        let addr = SockAddr::standard(name)?;
-
-        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-        if cfg.thread_cwd {
-            match thread_cwd_in(req, dir_fd, &addr) {
-                sys::OnThread::Done(done) => return done.map(|fd| (fd, Route::ThreadCwd)),
-                sys::OnThread::Unusable(_) => {}
+        for base in &t.cfg.link_places {
+            if let Step::Done(done) = symlink_route(t.req, base, &target) {
+                return Step::Done(done);
             }
         }
-
-        let (fd, child) = fork_in(req, dir_fd, &addr)?;
-        Ok((fd, Route::Fork { child }))
+        Step::Next
     }
 
     /// A relative spelling of an absolute socket path, checked to name the
@@ -825,15 +1580,14 @@ pub(crate) mod posix {
         /// call, and the cwd is shared by every thread of the process. If
         /// another thread changes it in between, the call went to some other
         /// directory: the result is discarded (a connected socket is closed) and
-        /// an error is returned. A socket file that such a bind created is left
-        /// where it is, because the directory it went to is unknown. The check
-        /// cannot see a change that is undone before it runs; the guarantee is
-        /// for processes that do not change the cwd while binding / connecting.
+        /// an error is returned. The check cannot see a change that is undone
+        /// before it runs; the guarantee is for processes that do not change
+        /// the cwd while connecting.
         pub(crate) fn run<T>(&self, f: impl FnOnce(&Path) -> io::Result<T>) -> io::Result<T> {
             let result = f(&self.path);
             if dir_id(Path::new(".")) != Some(self.cwd) {
                 return Err(io::Error::other(
-                    "the current directory changed while binding / connecting through a path \
+                    "the current directory changed while connecting through a path \
                      relative to it; the result was discarded",
                 ));
             }
@@ -841,114 +1595,36 @@ pub(crate) mod posix {
         }
     }
 
-    pub(crate) enum SymlinkOutcome {
-        /// The route ran; this is its result.
-        Done(io::Result<(OwnedFd, Route)>),
-        /// The connect's path through the symlink needed the widened form and
-        /// the kernel refused it (Apple).
-        #[cfg(target_vendor = "apple")]
-        WideRefused,
-        /// The route could not be used (too long, no usable base, symlink not
-        /// creatable, the held directory not usable).
-        Unusable,
-    }
-
-    /// What the symlink name starts with, so a link left behind by a process
-    /// that died is recognisable as sockat's.
-    pub(crate) const LINK_PREFIX: &str = "sockat.";
-
-    /// Length of the random part of the symlink name (`sockat.XXXXXXXXXX`).
-    pub(crate) const LINK_RANDOM_LEN: usize = 10;
-
-    /// Bind / connect `path` (directory part `dir`, file name `name`) through
-    /// a symlink `<base>/sockat.XXXXXXXXXX`:
+    /// Connect through a symlink `<base>/sockat.XXXXXXXXXX` to `target`, the
+    /// socket file (the path as given, made absolute against the cwd): a
+    /// connect follows a symlink in the last component, so the spelling's
+    /// length depends on neither the directory nor the file name, and the
+    /// kernel resolves the link as it resolves the path.
     ///
-    /// | request | the link points to | spelling handed to the kernel | route |
-    /// |---|---|---|---|
-    /// | bind | `dir` | `<link>/<name>` | [`Route::SymlinkToDir`] |
-    /// | connect | `path` | `<link>` | [`Route::SymlinkToFile`] |
-    ///
-    /// A connect follows a symlink in the last component, so the link to the
-    /// file reaches the socket by a spelling whose length depends on neither
-    /// the directory nor the file name. A bind does not: Linux refuses it with
-    /// `EADDRINUSE`, the link being there already. Both links hold the
-    /// caller's own spelling (made absolute against the cwd), so the kernel
-    /// resolves them as it resolves `path`.
-    ///
-    /// Used when the spelling is at most `limit` bytes ([`DIRECT_MAX`] for the
-    /// plain sockaddr, or on Apple for a connect the widened form's 253: a
-    /// spelling over [`DIRECT_MAX`] then goes in the widened form) and `base`
-    /// is a place where nobody else can replace the symlink ([`safe_base`]).
-    /// Both are checked before anything is created. Nothing is left under
-    /// `base`: the symlink is removed when this returns (including on panic)
-    /// whatever the outcome.
-    ///
-    /// A `base` that is not safe is used for a connect only, and only when
-    /// `proc` says where `/proc/self/fd` is (Linux with /proc): through a
-    /// private directory created in it and held by an fd, with the link to
-    /// the socket file inside ([`HeldDir`], [`Route::SymlinkInHeldDir`]). The
-    /// spelling `/proc/self/fd/<fd>/s` does not depend on `base`, so `limit`
-    /// is not applied to `base` then. Otherwise nothing is created in it.
-    pub(crate) fn symlink_route(
-        req: Request,
-        base: &Path,
-        path: &Path,
-        dir: &Path,
-        name: &OsStr,
-        limit: usize,
-        proc: Option<&Path>,
-    ) -> SymlinkOutcome {
-        let to_file = matches!(req, Request::Connect(_));
-        let target = if to_file { path } else { dir };
-        let target = if target.is_absolute() {
-            target.to_path_buf()
-        } else {
-            match std::env::current_dir() {
-                Ok(cwd) => cwd.join(target),
-                Err(_) => return SymlinkOutcome::Unusable,
-            }
-        };
+    /// Used when the spelling fits the plain sockaddr and `base` is a place
+    /// where nobody else can replace the symlink ([`safe_base`]). Both are
+    /// checked before anything is created. Nothing is left under `base`: the
+    /// symlink is removed when this returns (including on panic) whatever the
+    /// outcome.
+    pub(crate) fn symlink_route(req: Request, base: &Path, target: &Path) -> Step {
         if !safe_base(base) {
-            return match proc {
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                Some(proc) if to_file => held_route(req, base, &target, proc),
-                _ => SymlinkOutcome::Unusable,
-            };
+            return Step::Next;
         }
-        let placeholder = base.join(format!("{LINK_PREFIX}{}", "X".repeat(LINK_RANDOM_LEN)));
-        let spelling_len = if to_file {
-            path::len(&placeholder)
-        } else {
-            path::len(&placeholder.join(name))
-        };
-        if spelling_len > limit {
-            return SymlinkOutcome::Unusable;
+        let placeholder = base.join(format!("{}{}", own::PREFIX, "X".repeat(own::RANDOM_LEN)));
+        if path::len(&placeholder) > DIRECT_MAX {
+            return Step::Next;
         }
-        let Ok(link) = TempLink::create(base, &target) else {
-            return SymlinkOutcome::Unusable;
+        let Ok(link) = TempLink::create(base, target) else {
+            return Step::Next;
         };
-        let (via, plain_route) = if to_file {
-            (link.path.clone(), Route::SymlinkToFile)
-        } else {
-            (link.path.join(name), Route::SymlinkToDir)
-        };
-        // Only a connect's spelling can be over DIRECT_MAX here: a bind's
-        // `limit` is DIRECT_MAX, since a bind never widens.
-        #[cfg(target_vendor = "apple")]
-        if let (true, Request::Connect(o)) = (path::len(&via) > DIRECT_MAX, req) {
-            return match apple::wide_connect(o, &via) {
-                Err(e) if apple::refuses_wide(&e) => SymlinkOutcome::WideRefused,
-                done => SymlinkOutcome::Done(done.map(|fd| (fd, Route::SymlinkToFileWide))),
-            };
-        }
-        SymlinkOutcome::Done(plain_op(req, &via).map(|fd| (fd, plain_route)))
+        Step::Done(plain_op(req, &link.path).map(|fd| (fd, Route::Symlink)))
     }
 
     /// Whether `base`, followed through symlinks (macOS's `/tmp` is one to
     /// `/private/tmp`), is a directory where no other user (root aside) can
     /// remove or rename an entry, so the symlink cannot be replaced between
-    /// its creation and the bind / connect through it ([`only_we_can_replace`]
-    /// on its mode and owner). `false` when it cannot be looked up or is not a
+    /// its creation and the connect through it ([`only_we_can_replace`] on
+    /// its mode and owner). `false` when it cannot be looked up or is not a
     /// directory (a file of ours with mode 0600 passes the mode and owner
     /// test, yet is no place for anything).
     pub(crate) fn safe_base(base: &Path) -> bool {
@@ -983,235 +1659,35 @@ pub(crate) mod posix {
     }
 
     impl TempLink {
-        /// How many names to try before giving up. Each try is a fresh random
-        /// name from 62^10 possibilities, so exhausting this means something
-        /// other than bad luck (for example a base that refuses every name).
-        pub(crate) const ATTEMPTS: usize = 16;
-
         /// Create `<base>/sockat.XXXXXXXXXX` pointing to `target`, with a
         /// fresh random name for each try.
         pub(crate) fn create(base: &Path, target: &Path) -> io::Result<Self> {
-            Self::create_named(base, target, random_name)
+            Self::create_named(base, target, || own::named(own::PREFIX))
         }
 
         /// Create a symlink under `base` pointing to `target`, named by
-        /// `next_name` (called once per try; its error ends the attempt).
-        ///
-        /// `symlink(2)` fails with `EEXIST` instead of replacing an existing
-        /// entry, which is the `O_EXCL` of symlinks: the link that is created is
-        /// always one nobody else had, and a name already taken (by anyone) is
-        /// skipped for the next one. Any other error ends the attempt.
+        /// `next_name` ([`own::create_unique`]: `symlink(2)` fails with
+        /// `EEXIST` instead of replacing an existing entry, which is the
+        /// `O_EXCL` of symlinks).
         pub(crate) fn create_named(
             base: &Path,
             target: &Path,
             next_name: impl FnMut() -> io::Result<String>,
         ) -> io::Result<Self> {
-            create_unique(
-                base,
-                |path| std::os::unix::fs::symlink(target, path),
+            own::create_unique(
+                |name| std::os::unix::fs::symlink(target, base.join(name)),
                 next_name,
             )
-            .map(|path| Self { path })
+            .map(|name| Self {
+                path: base.join(name),
+            })
         }
-    }
-
-    /// Create an entry under `base` with `create`, named by `next_name`
-    /// (called once per try; its error ends the attempt), and return its path.
-    ///
-    /// `create` must fail with `EEXIST` rather than replace an existing entry,
-    /// as `symlink(2)` and `mkdir(2)` do (their `O_EXCL`): the entry created is
-    /// always one nobody else had, and a name already taken (by anyone) is
-    /// skipped for the next one, [`TempLink::ATTEMPTS`] times at most. Any
-    /// other error ends the attempt.
-    fn create_unique(
-        base: &Path,
-        mut create: impl FnMut(&Path) -> io::Result<()>,
-        mut next_name: impl FnMut() -> io::Result<String>,
-    ) -> io::Result<PathBuf> {
-        for _ in 0..TempLink::ATTEMPTS {
-            let path = base.join(next_name()?);
-            match create(&path) {
-                Ok(()) => return Ok(path),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "could not find a free name for a temporary entry",
-        ))
-    }
-
-    /// Connect to `target` through a [`HeldDir`] made in `base`, a place that
-    /// is not safe: by `<proc>/<fd>/s`, `proc` being where `/proc/self/fd` is.
-    /// Unusable when the directory cannot be made or held, or the spelling
-    /// does not fit the plain sockaddr; what was made is removed again then,
-    /// and after the connect whatever its outcome.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn held_route(req: Request, base: &Path, target: &Path, proc: &Path) -> SymlinkOutcome {
-        let Ok(held) = HeldDir::create(base, target, proc) else {
-            return SymlinkOutcome::Unusable;
-        };
-        let via = held.spelling(proc);
-        if path::len(&via) > DIRECT_MAX {
-            return SymlinkOutcome::Unusable;
-        }
-        SymlinkOutcome::Done(plain_op(req, &via).map(|fd| (fd, Route::SymlinkInHeldDir)))
-    }
-
-    /// A private directory `<base>/sockat.XXXXXXXXXX` made in a place that is
-    /// not safe (other users can rename or remove its entries), held by an fd
-    /// and holding the symlink `s` to the socket file (Linux, Android).
-    ///
-    /// The symlink is reached by `/proc/self/fd/<fd>/s`, through the fd rather
-    /// than through the directory's name, so another user renaming the
-    /// directory away and putting their own in its place changes nothing: the
-    /// fd keeps naming the directory sockat made. A replacement between
-    /// `mkdir` and `open` is what the checks of [`HeldDir::hold`] are for.
-    ///
-    /// A value exists only once the directory passed the checks of
-    /// [`HeldDir::hold`] (what fails them is someone else's and is left alone,
-    /// its contents included), and `linked` is set only once this value's own
-    /// `symlinkat` made `s`. On drop: `s` is removed through the fd if this
-    /// value made it, then the directory by its name, but only while that
-    /// name is still the held directory (same `(st_dev, st_ino)` as the fd),
-    /// so a directory put in its place is left alone. Failures are ignored,
-    /// as for [`TempLink`].
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub(crate) struct HeldDir {
-        pub(crate) path: PathBuf,
-        dir: std::fs::File,
-        linked: bool,
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    impl HeldDir {
-        /// The name of the symlink inside the directory.
-        pub(crate) const LINK: &'static std::ffi::CStr = c"s";
-
-        /// Make a private directory in `base` ([`HeldDir::make_private_dir`])
-        /// and hold it with a symlink to `target` in it ([`HeldDir::hold`]),
-        /// `proc` being where `/proc/self/fd` is.
-        pub(crate) fn create(base: &Path, target: &Path, proc: &Path) -> io::Result<Self> {
-            Self::hold(Self::make_private_dir(base, random_name)?, target, proc)
-        }
-
-        /// Create a directory of mode 0700 under `base`, named as the
-        /// temporary symlinks are (`next_name`, a taken name skipped).
-        pub(crate) fn make_private_dir(
-            base: &Path,
-            next_name: impl FnMut() -> io::Result<String>,
-        ) -> io::Result<PathBuf> {
-            use std::os::unix::fs::DirBuilderExt;
-            create_unique(
-                base,
-                |path| std::fs::DirBuilder::new().mode(0o700).create(path),
-                next_name,
-            )
-        }
-
-        /// Open the directory at `path` and, if it is the one sockat made,
-        /// create the symlink `s` to `target` in it.
-        ///
-        /// It is opened `O_PATH | O_DIRECTORY | O_NOFOLLOW`: a symlink put at
-        /// `path` is refused, and no permission on the directory is needed to
-        /// open it. What was opened must be a directory owned by the effective
-        /// uid with no permission for group and others (`mode & 0o077 == 0`),
-        /// as made by [`HeldDir::make_private_dir`]: anything else was put
-        /// there by someone else between the `mkdir` and the `open`, and is
-        /// neither used nor removed (`InvalidData`).
-        ///
-        /// Only the group and other bits are judged because the umask may have
-        /// taken some of the owner's from the 0700 asked for (umask 0277 makes
-        /// it 0500, umask 0477 makes it 0300, without read). The owner's are
-        /// then set to 0700 by `chmod("<proc>/<fd>")`, `proc` being where
-        /// `/proc/self/fd` is: an `O_PATH` fd takes no `fchmod`, and the /proc
-        /// spelling reaches the very directory the fd holds, so nothing put at
-        /// `path` meanwhile can be changed instead. So such a umask neither
-        /// stops the form nor leaves a directory behind on every call.
-        ///
-        /// The symlink is created with `symlinkat(2)` on the fd. When the
-        /// `chmod` or `symlinkat` fails, the directory is removed again (by
-        /// drop).
-        pub(crate) fn hold(path: PathBuf, target: &Path, proc: &Path) -> io::Result<Self> {
-            use std::os::fd::AsFd;
-            let opened = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-                .open(&path)?;
-            let m = opened.metadata()?;
-            if !(m.is_dir() && m.uid() == sys::effective_uid() && m.mode() & 0o077 == 0) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "the directory made for the temporary symlink was replaced",
-                ));
-            }
-            let mut held = Self {
-                path,
-                dir: opened,
-                linked: false,
-            };
-            std::fs::set_permissions(
-                held.fd_dir(proc),
-                std::os::unix::fs::PermissionsExt::from_mode(0o700),
-            )?;
-            sys::symlink_at(target, held.dir.as_fd(), Self::LINK)?;
-            held.linked = true;
-            Ok(held)
-        }
-
-        /// `<proc>/<fd>/s`, `proc` being where `/proc/self/fd` is.
-        pub(crate) fn spelling(&self, proc: &Path) -> PathBuf {
-            use std::os::unix::ffi::OsStrExt;
-            self.fd_dir(proc)
-                .join(OsStr::from_bytes(Self::LINK.to_bytes()))
-        }
-
-        /// `<proc>/<fd>`: the held directory itself, by its fd.
-        fn fd_dir(&self, proc: &Path) -> PathBuf {
-            use std::os::fd::AsRawFd;
-            proc.join(self.dir.as_raw_fd().to_string())
-        }
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    impl Drop for HeldDir {
-        fn drop(&mut self) {
-            use std::os::fd::AsFd;
-            if self.linked {
-                let _ = sys::unlink_at(self.dir.as_fd(), Self::LINK);
-            }
-            let id = |m: std::fs::Metadata| (m.dev(), m.ino());
-            let held = self.dir.metadata().map(id);
-            let named = std::fs::symlink_metadata(&self.path).map(id);
-            if let (Ok(held), Ok(named)) = (held, named) {
-                if held == named {
-                    let _ = std::fs::remove_dir(&self.path);
-                }
-            }
-        }
-    }
-
-    /// `sockat.` followed by [`LINK_RANDOM_LEN`] random letters and digits,
-    /// from the system's secure generator ([`sys::random_bytes`]; when it
-    /// fails, as `getrandom(2)` does on a Linux older than 3.17, the symlink
-    /// route cannot be used).
-    fn random_name() -> io::Result<String> {
-        const ALPHABET: &[u8; 62] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-        let mut random = [0u8; LINK_RANDOM_LEN];
-        sys::random_bytes(&mut random)?;
-        let mut name = String::from(LINK_PREFIX);
-        // 256 is not a multiple of 62, so this is slightly biased; the name only
-        // has to be hard to collide with, not uniform.
-        name.extend(random.iter().map(|b| ALPHABET[*b as usize % 62] as char));
-        Ok(name)
     }
 
     impl Drop for TempLink {
         fn drop(&mut self) {
-            // Best effort: the socket is already bound / connected, and failing
-            // it now would not bring the symlink back either. In a sticky /tmp
+            // Best effort: the socket is already connected, and failing it
+            // now would not bring the symlink back either. In a sticky /tmp
             // or a private TMPDIR nobody else can have replaced the entry.
             let _ = std::fs::remove_file(&self.path);
         }

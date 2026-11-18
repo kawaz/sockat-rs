@@ -38,69 +38,86 @@
 //!
 //! # How a long path is reached
 //!
-//! A path longer than std accepts is tried on these routes, in this order per
-//! platform, and bound / connected on the first route that can be used:
+//! A path longer than std accepts goes first through a directory of sockat's
+//! own (**the central route**), and only when that cannot be used, for a
+//! connect, through **the fallback routes**:
 //!
-//! | Platform | Order tried |
-//! |---|---|
-//! | Linux, Android (`/proc` usable) | /proc, relative path, symlink, thread cwd, fork (only /proc when its spelling fits) |
-//! | Linux, Android (`/proc` not usable) | relative path, symlink, thread cwd, fork |
-//! | FreeBSD | bindat |
-//! | macOS, iOS (Apple), bind | relative path, symlink, thread cwd, fork |
-//! | macOS, iOS (Apple), connects | relative path, widened sockaddr, symlink, thread cwd, fork |
-//! | NetBSD, OpenBSD, illumos, other Unix | relative path, symlink, fork |
+//! | Platform | [`bind`] | [`connect`], [`connect_nonblocking`] |
+//! |---|---|---|
+//! | Linux, Android | thread cwd, /proc, fork (all in D) | thread cwd, /proc (in D), then /proc, symlink in D, symlink |
+//! | Linux, Android without `/proc` | thread cwd, fork (in D) | thread cwd (in D), then relative path, symlink |
+//! | macOS, iOS (Apple) | thread cwd, fork (in D) | thread cwd (in D), then relative path, widened sockaddr, symlink |
+//! | FreeBSD | bindat (in D) | connectat (in D), then connectat |
+//! | NetBSD, OpenBSD, illumos, other Unix | fork (in D) | relative path, symlink |
 //!
-//! * **/proc**: `/proc/self/fd/<dirfd>/<name>`, with the directory opened
-//!   `O_PATH`. The directory may be of any length; the whole spelling must fit
-//!   `sun_path` (a file name of about 90 bytes). Not usable without `/proc` or
-//!   for a longer file name
-//! * **bindat**: `bindat(2)` / `connectat(2)` with the directory fd and the file
-//!   name (up to 103 bytes)
-//! * **relative path**: the path spelled relative to the working directory,
-//!   when std accepts that. Only the path string is rewritten; the
-//!   cwd is never changed
-//! * **widened sockaddr** (connects only): a `sockaddr_un` carrying up to 253
-//!   bytes of path, which XNU accepts: the path itself, or failing that the
-//!   relative spelling. A bind never uses it: the address of a socket bound so
-//!   does not fit `sun_path`, `getsockname(2)` reports it cut short, and
-//!   readers of it break (CPython, Go's `net.FileConn`). So on Apple every
-//!   spelling of a bind, the file name included, fits the plain `sun_path`
-//! * **symlink**: a short symlink under `TMPDIR` or failing that `/tmp`,
-//!   removed right after the call: for a bind, to the socket's directory
-//!   (`<link>/<name>` is passed), for a connect, to the socket file (`<link>`
-//!   is passed). It is created only in a place where no other user can replace
-//!   it before the bind / connect through it: a sticky directory owned by root
-//!   or the calling user (as `/tmp` is), or a directory of the calling user's
-//!   that group and others cannot write to. Through `/tmp`, a connect is
-//!   reached whatever the directory depth and the file name length, a bind for
-//!   a file name of up to 84 bytes (80 where `sun_path` is 104).
-//!   On Linux and Android with `/proc`, a connect also uses a place that is
-//!   not safe: a private directory (mode 0700) is created there, held by an
-//!   fd and checked to be the one created (owned by the calling user, no
-//!   permission for group and others), and the connect goes through a
-//!   symlink inside it as `/proc/self/fd/<fd>/s`, so another user renaming
-//!   the directory changes nothing
+//! `connect_any` and `connect_any_nonblocking` try what [`connect`] does, then
+//! a forked child. The first route that can be used makes the call; a real
+//! failure there (`ENOENT`, `EADDRINUSE`, `ECONNREFUSED`, ...) is the result,
+//! not a reason to try the next.
+//!
+//! **The central route.** sockat makes a directory D of mode 0700 (named
+//! `sockat.XXXXXXXXXX`, 10 random letters and digits) and holds it by an fd,
+//! checked to be the directory it made (owned by the calling user, no
+//! permission for group and others). In D it makes a symlink R with a random
+//! name to the real path of the socket's directory, and makes the call with
+//! `R/<file name>` relative to D's fd, by the first of these means that can be
+//! used:
+//!
 //! * **thread cwd** (Linux, Apple): a thread started for the call alone moves
-//!   its own working directory, and no other thread's, into the socket's
-//!   directory (`unshare(CLONE_FS)` then `fchdir` on Linux,
-//!   `pthread_fchdir_np` on Apple) and makes the call by the file name alone.
-//!   The call is made by this process, so every function takes it. Not usable
-//!   on Linux under a seccomp filter (docker's default installs one; a filter
-//!   may kill the process for `unshare`, so it is not called then) or
-//!   `pthread_fchdir_np` is missing; then the next route is tried
-//! * **fork**: a forked child that `fchdir`s into the socket's directory makes
-//!   the call by the file name alone and exits. Only [`bind`],
-//!   `connect_any` and `connect_any_nonblocking` take it. For a bind the child
-//!   only binds; the listen is made by the calling process, so a client sees
-//!   the calling process as the server, as with any other route
+//!   its own working directory, and no other thread's, into D
+//!   (`unshare(CLONE_FS)` then `fchdir` on Linux, `pthread_fchdir_np` on
+//!   Apple). Not used on Linux under a seccomp filter (docker's default
+//!   installs one; a filter may kill the process for `unshare`, so it is not
+//!   called then) or where `pthread_fchdir_np` is missing
+//! * **/proc** (Linux): `/proc/self/fd/<D's fd>/R/<file name>`, for a file
+//!   name of up to about 79 bytes
+//! * **bindat** (FreeBSD): `bindat(2)` / `connectat(2)` on D's fd
+//! * **fork** ([`bind`] only): a forked child that `fchdir`s into D binds and
+//!   exits; the listen is made by the calling process, so a client sees the
+//!   calling process as the server, as with any other route
 //!
-//! None of these changes the working directory of the calling process, and all
-//! of them can be used from multi-threaded programs. Windows is not supported
-//! (the crate is Unix-only). The details, and where each function stops
-//! reaching a path, are in the
+//! D and R are removed when the call returns, so the spelling the kernel keeps
+//! for a bound socket names nothing afterwards, wherever it is resolved. D goes
+//! in `TMPDIR` (or `/tmp` when it is unset), then `/tmp`, then the socket's
+//! directory (named `.sockat.XXXXXXXXXX` there). None of them needs to be
+//! safe or short: D is held by its fd. When D can be made in none of them, a
+//! bind forks with R (`.sockat.XXXXXXXXXX`) made beside the socket, and a
+//! connect goes on to the fallback routes.
+//!
+//! `R/<file name>` takes 11 bytes, so a bind reaches a file name of up to 96
+//! bytes (Linux, illumos) or 92 (Apple, the BSDs); 88 / 84 without D.
+//!
+//! **The fallback routes** (connects only). A connected socket is not bound,
+//! so its spelling is kept nowhere and needs no random part:
+//!
+//! * **/proc** (Linux): `/proc/self/fd/<dirfd>/<file name>`, for a file name of
+//!   up to about 90 bytes
+//! * **symlink in D** (Linux with `/proc`): D made as above, a symlink `s` in
+//!   it to the socket file, and the connect by `/proc/self/fd/<D's fd>/s`,
+//!   whatever the directory depth and the file name length
+//! * **relative path**: the path spelled relative to the working directory,
+//!   when std accepts that. Only the path string is rewritten; the cwd is
+//!   never changed
+//! * **widened sockaddr** (Apple): a `sockaddr_un` carrying up to 253 bytes of
+//!   path, which XNU accepts: the path itself, or failing that the relative
+//!   spelling. A bind never uses it: the address of a socket bound so does not
+//!   fit `sun_path` and breaks its readers (CPython, Go's `net.FileConn`)
+//! * **symlink**: a short symlink to the socket file under `TMPDIR` or failing
+//!   that `/tmp`, removed right after the call, made only in a place where no
+//!   other user can replace it (a sticky directory owned by root or the calling
+//!   user, as `/tmp` is, or a directory of the calling user's that group and
+//!   others cannot write to). Through `/tmp`, a connect is reached whatever the
+//!   directory depth and the file name length
+//! * **connectat** (FreeBSD): `connectat(2)` on the socket's directory fd with
+//!   the file name (up to 103 bytes)
+//!
+//! None of these changes the working directory of the calling process or of
+//! the calling thread, and all of them can be used from multi-threaded
+//! programs. Windows is not supported (the crate is Unix-only). The details,
+//! and where each function stops reaching a path, are in the
 //! [manual](https://github.com/kawaz/sockat-rs/blob/main/docs/MANUAL.md); the
-//! design and the reasons for the order in
-//! [DR-0001](https://github.com/kawaz/sockat-rs/blob/main/docs/decisions/DR-0001-long-socket-path-routes.md)
+//! design and the reasons in
+//! [DR-0027](https://github.com/kawaz/sockat-rs/blob/main/docs/decisions/DR-0027-own-directory-and-fallback-routes.md)
 //! (in Japanese).
 //!
 //! # The exception: `connect_any`
@@ -110,12 +127,11 @@
 //! server sees is that of a process that has already exited. Where only the
 //! fork route would reach the path, they fail with `ENAMETOOLONG`, as any
 //! connect to a path too long for `sun_path` does. That happens only when the
-//! path fits neither the `/proc` spelling nor a relative path (nor, on Apple,
-//! the widened sockaddr), there is no place for the symlink (a safe one, but
-//! on Linux with `/proc` any place where a directory can be created), and the
-//! thread cwd route cannot be used either: on NetBSD, OpenBSD and illumos,
-//! which do not have it, on Linux under a seccomp filter, and on an Apple
-//! OS without `pthread_fchdir_np`.
+//! central route cannot be used for a connect (no thread cwd means and no
+//! `/proc`: NetBSD, OpenBSD, illumos, Linux under a seccomp filter without
+//! `/proc`, an Apple OS without `pthread_fchdir_np`) and none of the fallback
+//! routes reaches the path (no safe place for the symlink, and the path fits
+//! neither a relative spelling nor, on Apple, the widened sockaddr).
 //!
 //! `connect_any` and `connect_any_nonblocking` are for that rare environment,
 //! when the connection is wanted at the cost of the fork's side effects. They
@@ -132,16 +148,17 @@
 //! * **The address the kernel reports is not the path.** `local_addr()` of the
 //!   listener and of accepted streams, and `peer_addr()` of a connected client,
 //!   report the spelling handed to the kernel when the listener was bound
-//!   (whichever route the client took): a relative path, a
-//!   `/proc/self/fd/...` path, a path through a temporary symlink that no
-//!   longer exists, or a bare file name. Keep the path you passed and use
-//!   that (for example to remove the socket file with
-//!   [`std::fs::remove_file`], which has no length limit). Never remove,
-//!   `stat` or `chmod` by the reported address: it can name another file
-//!   (the fd number in a `/proc/self/fd/...` spelling is closed and may be
-//!   reused by another directory; a relative path or a bare file name
-//!   resolves against the current cwd). The same address shows in `Debug`
-//!   output and in what frameworks log or hand out as the peer address.
+//!   (whichever route the client took): `R/<file name>`,
+//!   `/proc/self/fd/<n>/R/<file name>` or `.sockat.XXXXXXXXXX/<file name>`. R
+//!   is gone by then, so removing, `stat`ing or `chmod`ing by the reported
+//!   address finds nothing rather than another file; it never names the
+//!   socket either. Keep the path you passed and use that (for example to
+//!   remove the socket file with [`std::fs::remove_file`], which has no length
+//!   limit, or with [`bind_ex`]). The same address shows in `Debug` output and
+//!   in what frameworks log or hand out as the peer address.
+//! * **A bind reaches a shorter file name than a connect**: 96 bytes on Linux
+//!   and illumos, 92 on Apple and the BSDs (`R/` takes 11 of `sun_path`),
+//!   where a connect reaches any.
 //! * **A path that does not end with a file name is `InvalidInput`.** A path
 //!   longer than std accepts ending in `/`, `/.` or `/..` (or being `..`)
 //!   cannot be split into a directory and a file name and is refused before
@@ -164,29 +181,41 @@
 //!   `SIGCHLD`, the `pthread_atfork` handlers run, monitoring tools see a
 //!   short-lived child, and a `waitpid(-1)` on another thread may reap the
 //!   child (sockat then reads the outcome off the socket).
-//!   On macOS the fork route opens the socket's directory `O_SEARCH` and on
-//!   Linux `O_PATH`, so it needs no more permission than a plain bind /
-//!   connect; on other Unix targets it (and FreeBSD's `bindat`) opens it
-//!   `O_RDONLY` and needs read permission on the directory as well.
-//! * **The directory is resolved slightly earlier than the call.** The /proc,
-//!   relative, `bindat`, thread cwd and fork routes look the directory up
-//!   first (open it, or resolve it to a real path) and then bind / connect by
-//!   the file name. If a directory along the path is renamed or a symlink
+//! * **Permissions.** On macOS the socket's directory and D are opened
+//!   `O_SEARCH` and on Linux `O_PATH`, so a long path needs no more permission
+//!   than a plain bind / connect; on other Unix targets they are opened
+//!   `O_RDONLY` and need read permission as well.
+//! * **The directory is resolved slightly earlier than the call.** R points to
+//!   the real path of the socket's directory, taken when R is made, and the
+//!   /proc, relative, connectat and fork routes of a connect look the
+//!   directory up first. If a directory along the path is renamed or a symlink
 //!   along it is repointed in between, the socket goes to (or is looked up in)
 //!   the directory as it was when looked up, not as it is at the moment of the
 //!   call.
 //! * **The relative route is exposed to another thread's `chdir`.** sockat
-//!   itself never changes the cwd. The path is
-//!   spelled relative to the cwd only after checking that the spelling names
-//!   the same directory, and the cwd is checked again afterwards; if another
-//!   thread changed it in between, the result is discarded and an error is
-//!   returned. Programs that change the cwd while other threads bind / connect
-//!   are racing every relative path in the process anyway; sockat does not
-//!   make that safe, it only detects the visible case.
-//! * **A temporary symlink can be left behind** if the process dies between
-//!   creating and removing it. It is named `sockat.XXXXXXXXXX` under `TMPDIR`
-//!   or `/tmp` and points to the socket's directory or file (or, held by an
-//!   fd on Linux, is a directory holding such a symlink).
+//!   itself never changes the cwd. The path is spelled relative to the cwd only
+//!   after checking that the spelling names the same directory, and the cwd is
+//!   checked again afterwards; if another thread changed it in between, the
+//!   result is discarded and an error is returned. Programs that change the
+//!   cwd while other threads connect are racing every relative path in the
+//!   process anyway; sockat does not make that safe, it only detects the
+//!   visible case.
+//! * **Something can be left behind** if the process dies in the middle of a
+//!   call: D (`sockat.XXXXXXXXXX`) or the temporary symlink under `TMPDIR` or
+//!   `/tmp`, and D or R (`.sockat.XXXXXXXXXX`) in the socket's directory. On
+//!   the targets that open D `O_RDONLY` (not Linux and Apple), a umask that
+//!   takes the owner's read bit makes D impossible to open and check, and it
+//!   is left as it is.
+//!
+//! # Removing the socket file
+//!
+//! As with std, the socket file stays when the listener is closed. [`bind_ex`]
+//! binds as [`bind`] does and also returns a [`SocketFile`], which removes the
+//! socket file later ([`SocketFile::discard`]), only while it is still the one
+//! the bind made. Closing the listener stays with whoever has it (tokio, a
+//! server framework, ...). A replacement of the file between the check and
+//! the removal, by someone who can write to the directory, cannot be caught:
+//! POSIX has no way to remove a file by its inode.
 //!
 //! # Errors
 //!
@@ -197,15 +226,15 @@
 //! on a nonblocking connect (Linux; macOS answers `ECONNREFUSED` to any
 //! connect on a full backlog, so there `ECONNREFUSED` alone does not mean
 //! nobody listens). When no route can reach the path (for [`bind`], a file
-//! name too long for every route; for [`connect`] and [`connect_nonblocking`],
-//! also when only the fork route would), the error is `ENAMETOOLONG`. A path
-//! longer than std accepts that does not end with a file name is an
-//! `InvalidInput` error. So is a path of any length that contains a NUL byte,
-//! refused before anything is created: the kernel would read the path only up
-//! to the NUL. On Linux and Android a path starting with a NUL names a socket
-//! in the abstract namespace rather than a file; it is handed to std as is,
-//! which refuses it as well (std takes abstract names through
-//! `SocketAddr::from_abstract_name` and `UnixListener::bind_addr` /
+//! name too long for `R/<file name>`; for [`connect`] and
+//! [`connect_nonblocking`], also when only the fork route would), the error is
+//! `ENAMETOOLONG`. A path longer than std accepts that does not end with a
+//! file name is an `InvalidInput` error. So is a path of any length that
+//! contains a NUL byte, refused before anything is created: the kernel would
+//! read the path only up to the NUL. On Linux and Android a path starting with
+//! a NUL names a socket in the abstract namespace rather than a file; it is
+//! handed to std as is, which refuses it as well (std takes abstract names
+//! through `SocketAddr::from_abstract_name` and `UnixListener::bind_addr` /
 //! `UnixStream::connect_addr`).
 //!
 //! A path longer than `PATH_MAX` (1024 on macOS, 4096 on Linux) is
@@ -244,7 +273,8 @@
 //! [`connect_nonblocking`] does not wait for the peer (a Unix-domain connect
 //! completes or fails within the call) and returns the stream still
 //! nonblocking, so it can be called on the runtime's worker threads directly.
-//! [`bind`] does not wait for a peer either.
+//! [`bind`] does not wait for a peer either. [`bind_ex`]'s listener goes to the
+//! runtime the same way; its [`SocketFile`] stays with the caller.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
@@ -254,7 +284,7 @@ compile_error!("sockat supports Unix targets only (Windows is out of scope, see 
 
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use route::ConnectOptions;
 
@@ -284,6 +314,100 @@ mod tests;
 /// a NUL byte.
 pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
     route::run(route::Request::Bind, path.as_ref()).map(|(fd, _)| UnixListener::from(fd))
+}
+
+/// [`bind`], and a [`SocketFile`] that removes the socket file later, only
+/// while it is still the one this bind made.
+///
+/// The listener is std's own type, free to go wherever [`bind`]'s would (into
+/// `tokio::net::UnixListener::from_std`, another thread, a server
+/// framework); closing it stays with its owner. The [`SocketFile`] only
+/// removes the file, by [`SocketFile::discard`], typically once the listener
+/// is closed.
+///
+/// The socket file's real path and its `(st_dev, st_ino)` are taken right
+/// after the bind, before this returns: for a path handed to std, as soon as
+/// std's bind returns (`realpath(3)` of `path`, then `lstat(2)`); for a long
+/// path, inside the route, while sockat's own directory and the symlink in it
+/// are still there, by the same spelling the bind took. Someone who can write
+/// to the socket's directory and replaces the file in the moment between the
+/// bind and that look-up is not caught: POSIX has no way to name a file by
+/// its inode.
+///
+/// ```no_run
+/// let path = "/a/very/long/directory/.../server.sock";
+/// let (listener, file) = sockat::bind_ex(path)?;
+/// // ... serve on `listener` ...
+/// drop(listener);
+/// file.discard()?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// Those of [`bind`], and those of looking the socket file up right after the
+/// bind; then the listener is closed and the socket file stays (as after
+/// [`bind`]), so that no [`SocketFile`] is handed out that could not remove
+/// it.
+pub fn bind_ex<P: AsRef<Path>>(path: P) -> io::Result<(UnixListener, SocketFile)> {
+    let (fd, _, bound) = route::bind_remembering(path.as_ref())?;
+    let file = SocketFile {
+        path: bound.path,
+        id: bound.id,
+    };
+    Ok((UnixListener::from(fd), file))
+}
+
+/// The socket file a [`bind_ex`] made: its real path and `(st_dev, st_ino)`.
+///
+/// Dropping it does nothing: the file is removed only by [`SocketFile::discard`].
+#[derive(Debug)]
+pub struct SocketFile {
+    /// The real path of the socket file, taken right after the bind.
+    path: PathBuf,
+    /// `(st_dev, st_ino)` of the socket file at that path then.
+    id: (u64, u64),
+}
+
+impl SocketFile {
+    /// Remove the socket file, if what is at its real path now is still the
+    /// file the bind made (the same `(st_dev, st_ino)`, looked up without
+    /// following a symlink).
+    ///
+    /// Anything else there (another socket bound at the path since, a file
+    /// or a symlink put in its place) is left alone, and so is nothing at all:
+    /// both are `Ok(())`, the file of the bind being gone either way. The
+    /// listener is not touched; close it first, as a socket file removed under
+    /// a listener that is still open leaves that listener unreachable by path.
+    ///
+    /// The look-up and the removal are two steps: a file put at the path in
+    /// the moment between them, by someone who can write to the directory, is
+    /// removed instead. POSIX has no way to remove a file by its inode, so
+    /// this cannot be closed. An inode number freed by the file's removal and
+    /// given to a new file on the same device makes that file look like the
+    /// bind's.
+    ///
+    /// # Errors
+    ///
+    /// Those of `lstat(2)` (other than `ENOENT`) and `unlink(2)` on the path.
+    pub fn discard(self) -> io::Result<()> {
+        match file_id(&self.path) {
+            Ok(id) if id == self.id => match std::fs::remove_file(&self.path) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                removed => removed,
+            },
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// `(st_dev, st_ino)` of `path`, without following a symlink at it.
+fn file_id(path: &Path) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(path)?;
+    Ok((m.dev(), m.ino()))
 }
 
 /// Connect to the socket at `path`, like [`UnixStream::connect`] but for a path
@@ -380,12 +504,11 @@ pub struct AnyConnection {
 /// Use [`connect`] (or [`connect_nonblocking`]) unless it fails with
 /// `ENAMETOOLONG` in an environment you have to support: it reaches a long
 /// path in any ordinary environment. This is for the rare one where only the
-/// fork route does (a path that fits neither the `/proc` spelling nor a
-/// relative path, nor on Apple the widened sockaddr, where there is no safe
-/// place for the symlink and the thread cwd route cannot be used either), when
-/// the connection is wanted at the cost of the fork's side effects. The order
-/// tried is that of [`connect`], with the fork route last. FreeBSD never
-/// forks.
+/// fork route does (sockat's own directory cannot be used for a connect, and
+/// none of the fallback routes reaches the path; see the
+/// [crate documentation](crate)), when the connection is wanted at the cost of
+/// the fork's side effects. The order tried is that of [`connect`], with the
+/// fork route last.
 ///
 /// The fork route connects from a forked child that `fchdir`s into the
 /// socket's directory and exits at once. [`AnyConnection::forked`] is `true`

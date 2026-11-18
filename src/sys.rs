@@ -14,19 +14,16 @@
 //!   thread of its own whose working directory alone is moved there (Linux:
 //!   `unshare(CLONE_FS)` and `fchdir`; Apple: `pthread_fchdir_np`).
 //! * [`op_in_dir_forked`] — bind / connect relative to a directory fd in a forked
-//!   child that `fchdir`s (the last resort on every target but FreeBSD, and on
-//!   Linux only when the /proc route cannot be used); returns the child's pid.
+//!   child that `fchdir`s; returns the child's pid.
 //! * `op_at` — `bindat(2)` / `connectat(2)` (FreeBSD).
-//! * `random_bytes` — the random part of the temporary symlink's name.
-//! * `symlink_at` / `unlink_at` — the symlink inside the held directory of the
-//!   symlink route (Linux).
-//! * `effective_uid` — the owner a safe place for the temporary symlink may have.
+//! * [`mkdir_at`] / [`open_dir_at`] / [`id_at`] / [`symlink_at`] / [`unlink_at`]
+//!   — the `*at(2)` calls that make, hold and clean up sockat's own directory
+//!   and the symlinks in it, through directory fds rather than names.
+//! * `random_bytes` — the random part of the names sockat creates.
+//! * `effective_uid` — the owner sockat's own directory and a safe place for
+//!   the temporary symlink must have.
 
-// FreeBSD reaches long paths through bindat / connectat, so the fork route is
-// used there only by the tests.
-#![cfg_attr(all(not(test), target_os = "freebsd"), allow(dead_code))]
-
-use std::ffi::OsStr;
+use std::ffi::{CString, OsStr};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -572,6 +569,47 @@ fn pthread_fchdir_np() -> Option<unsafe extern "C" fn(libc::c_int) -> libc::c_in
     })
 }
 
+/// Whether [`op_in_dir_on_thread`] can be used as far as can be told before
+/// anything is made for it: on Linux / Android no seccomp filter on the
+/// calling thread ([`seccomp_mode`] reads 0; a thread started from it inherits
+/// its filters), on Apple `pthread_fchdir_np` found. What only the started
+/// thread can tell (whether it starts, whether `unshare` is refused, whether
+/// `pthread_fchdir_np` fails) [`op_in_dir_on_thread`] reports as
+/// [`OnThread::Unusable`].
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn thread_cwd_available() -> bool {
+    seccomp_mode().ok() == Some(0)
+}
+
+/// See the Linux version.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn thread_cwd_available() -> bool {
+    pthread_fchdir_np().is_some()
+}
+
+/// Set the working directory of the calling thread alone to `dir`
+/// (`pthread_fchdir_np`), Apple. Test-only: stands in for a caller that keeps
+/// a working directory of its own on its thread, which sockat must leave as
+/// it is. Only for a thread started by the test, which ends with it.
+#[cfg(all(test, target_vendor = "apple"))]
+pub(crate) fn set_thread_cwd(dir: BorrowedFd<'_>) -> io::Result<()> {
+    let f = pthread_fchdir_np().ok_or_else(|| io::Error::from(io::ErrorKind::Unsupported))?;
+    // SAFETY: see op_in_dir_on_this_thread; `dir` is a borrowed, live fd.
+    cvt(unsafe { f(dir.as_raw_fd()) }).map(drop)
+}
+
+/// Give the calling thread a working directory of its own
+/// (`unshare(CLONE_FS)`), Linux. Test-only, for the same stand-in as the
+/// Apple `set_thread_cwd`: after it, `std::env::set_current_dir` moves this
+/// thread alone. Only for a thread started by the test, and only where no
+/// seccomp filter is in effect (the caller checks [`seccomp_mode`]).
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) fn unshare_fs() -> io::Result<()> {
+    // SAFETY: plain syscall without pointers; it only detaches this thread's
+    // working directory, root and umask from the rest of the process.
+    cvt(unsafe { libc::unshare(libc::CLONE_FS) }).map(drop)
+}
+
 fn errno_status() -> libc::c_int {
     io::Error::last_os_error()
         .raw_os_error()
@@ -631,33 +669,89 @@ pub(crate) fn op_at(
     cvt(rc).map(drop)
 }
 
+/// `name` as a C string for a system call, or `InvalidInput` when it holds a
+/// NUL byte (which the call would take as the end of the name).
+fn c_name(name: &OsStr) -> io::Result<CString> {
+    CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
+}
+
+/// `mkdirat(2)`: create the directory `name` inside the directory `dir` with
+/// `mode` (less the umask, as `mkdir(2)` does). An existing `name` of any kind
+/// is `EEXIST`, never reused.
+pub(crate) fn mkdir_at(dir: BorrowedFd<'_>, name: &OsStr, mode: u32) -> io::Result<()> {
+    let name = c_name(name)?;
+    // SAFETY: `name` is NUL-terminated and lives for the call; `dir` is a
+    // borrowed, live fd.
+    cvt(unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), mode as libc::mode_t) }).map(drop)
+}
+
+/// `openat(2)` of the directory `name` inside the directory `dir`, with
+/// `flags` (the access mode, `O_PATH` or `O_SEARCH`) plus `O_DIRECTORY`,
+/// `O_NOFOLLOW` and `O_CLOEXEC`: a symlink at `name` is refused (`ELOOP`, or
+/// `ENOTDIR` with `O_DIRECTORY` on Linux), and so is anything but a directory.
+pub(crate) fn open_dir_at(
+    dir: BorrowedFd<'_>,
+    name: &OsStr,
+    flags: libc::c_int,
+) -> io::Result<OwnedFd> {
+    let name = c_name(name)?;
+    let flags = flags | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `name` is NUL-terminated and lives for the call; `dir` is a
+    // borrowed, live fd. No mode is passed: O_CREAT is not among the flags.
+    let fd = cvt(unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) })?;
+    // SAFETY: `fd` is a fresh fd nobody else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `(st_dev, st_ino)` of `name` inside the directory `dir`, without following
+/// a symlink at `name` (`fstatat(2)` with `AT_SYMLINK_NOFOLLOW`). The values
+/// are widened to `u64` as std's `MetadataExt::dev` / `ino` widen them, so
+/// the two compare.
+pub(crate) fn id_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<(u64, u64)> {
+    let name = c_name(name)?;
+    // SAFETY: `stat` is plain old data; zeroed is a valid value.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `name` is NUL-terminated and lives for the call; the kernel
+    // writes at most one `stat` into `st`; `dir` is a borrowed, live fd.
+    cvt(unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    })?;
+    #[allow(clippy::unnecessary_cast)]
+    Ok((st.st_dev as u64, st.st_ino as u64))
+}
+
 /// `symlinkat(2)`: create the symlink `name` inside the directory `dir`,
-/// pointing to `target` (Linux, Android; the held-directory form of the
-/// symlink route).
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// pointing to `target`. An existing `name` is `EEXIST`, never replaced.
 pub(crate) fn symlink_at(
     target: &std::path::Path,
     dir: BorrowedFd<'_>,
-    name: &std::ffi::CStr,
+    name: &OsStr,
 ) -> io::Result<()> {
-    let target = std::ffi::CString::new(target.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    let target = c_name(target.as_os_str())?;
+    let name = c_name(name)?;
     // SAFETY: both strings are NUL-terminated and live for the call; `dir` is
     // a borrowed, live fd.
     cvt(unsafe { libc::symlinkat(target.as_ptr(), dir.as_raw_fd(), name.as_ptr()) }).map(drop)
 }
 
-/// `unlinkat(2)` without flags: remove the non-directory `name` inside the
-/// directory `dir` (Linux, Android).
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub(crate) fn unlink_at(dir: BorrowedFd<'_>, name: &std::ffi::CStr) -> io::Result<()> {
+/// `unlinkat(2)`: remove `name` inside the directory `dir`, a directory
+/// (`AT_REMOVEDIR`, which must be empty) when `remove_dir`, otherwise anything
+/// else (a symlink itself, not what it points to).
+pub(crate) fn unlink_at(dir: BorrowedFd<'_>, name: &OsStr, remove_dir: bool) -> io::Result<()> {
+    let name = c_name(name)?;
+    let flags = if remove_dir { libc::AT_REMOVEDIR } else { 0 };
     // SAFETY: `name` is NUL-terminated and lives for the call; `dir` is a
     // borrowed, live fd.
-    cvt(unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) }).map(drop)
+    cvt(unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), flags) }).map(drop)
 }
 
 /// The effective uid of this process (`geteuid(2)`, which cannot fail).
-#[cfg(not(target_os = "freebsd"))]
 pub(crate) fn effective_uid() -> libc::uid_t {
     // SAFETY: plain syscall without arguments; it always succeeds.
     unsafe { libc::geteuid() }
@@ -667,6 +761,7 @@ pub(crate) fn effective_uid() -> libc::uid_t {
 /// `arc4random_buf(3)`, which never fails and never blocks.
 #[cfg(any(
     target_vendor = "apple",
+    target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
     target_os = "dragonfly",
@@ -782,11 +877,11 @@ pub(crate) fn peer_cred_pid(sock: BorrowedFd<'_>) -> io::Result<libc::pid_t> {
 /// Set the file mode creation mask of the process (`umask(2)`, which cannot
 /// fail). Test-only, and only for a child process of the test binary: the mask
 /// is process-wide.
-#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
-pub(crate) fn set_umask(mask: libc::mode_t) {
+#[cfg(test)]
+pub(crate) fn set_umask(mask: u32) {
     // SAFETY: plain syscall without pointers.
     unsafe {
-        libc::umask(mask);
+        libc::umask(mask as libc::mode_t);
     }
 }
 

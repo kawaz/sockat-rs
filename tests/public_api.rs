@@ -93,13 +93,14 @@ fn bind_and_connect_work_at_any_length() {
 }
 
 // The four connects (the two that may fork with the crate feature
-// `any`) in an ordinary environment (a writable /tmp, the socket
-// under a temporary directory with a short file name): every length is
-// reached without forking on every platform (DR-0006: the symlink route under
-// /tmp takes any directory depth), so the two connects that may fork report
-// that they did not, and the two that may not connect as well. The nonblocking
-// ones hand back a stream that does not wait: a read with nothing to read is
-// WouldBlock.
+// `any`) in an ordinary environment (a writable /tmp, the socket under a
+// temporary directory with a short file name): every length is reached
+// without forking on every platform (through sockat's own directory in /tmp,
+// or on the targets without a central means for a connect the symlink under
+// /tmp, both whatever the directory depth), so the two connects that may fork
+// report that they did not, and the two that may not connect as well. The
+// nonblocking ones hand back a stream that does not wait: a read with nothing
+// to read is WouldBlock.
 #[test]
 fn in_an_ordinary_environment_no_connect_forks() {
     let t = tempfile::Builder::new()
@@ -139,18 +140,16 @@ fn in_an_ordinary_environment_no_connect_forks() {
     }
 }
 
-// A long file name far from the cwd, too long to fit behind
-// /tmp/sockat.XXXXXXXXXX/ (over 84 bytes for the plain sockaddr on Linux, 80
-// on Apple and the BSDs, where a bind never widens the sockaddr) and, on
-// Linux, behind /proc/self/fd/<n>/ (over about 90), but within the plain
-// sockaddr of the thread cwd and fork routes (100 bytes). `bind` reaches it
-// (through the thread cwd route on Linux and Apple where it can be used,
-// otherwise forking; FreeBSD through bindat).
-// The connects reach it through a symlink to the socket file, whose spelling
-// does not contain the file name, so in an ordinary environment (a writable
-// /tmp) none of them forks, and the plain `connect` and `connect_nonblocking`
-// work too (the two that may fork are checked with the crate feature
-// `any`).
+// A long file name far from the cwd that no bind spelling holds: 100 bytes,
+// over the sun_path - 1 - 11 bytes that `R/<file name>` leaves (96 on Linux,
+// 92 on Apple and the BSDs), so `bind` is ENAMETOOLONG. A socket bound under a
+// short name and renamed to it is still reached by every connect: the
+// fallback routes of a connect leave the file name out of the spelling (on
+// Linux a symlink in sockat's own directory, elsewhere a symlink under /tmp;
+// FreeBSD's connectat takes the name, up to 103 bytes). In an ordinary
+// environment (a writable /tmp) none of them forks, and the plain `connect`
+// and `connect_nonblocking` work too (the two that may fork are checked with
+// the crate feature `any`).
 #[test]
 fn a_long_file_name_is_connected_to_without_forking() {
     const NAME_LEN: usize = 100;
@@ -159,8 +158,14 @@ fn a_long_file_name_is_connected_to_without_forking() {
         .tempdir_in("/tmp")
         .unwrap();
     let p = nest(t.path(), 600, &"n".repeat(NAME_LEN));
-    let listener = sockat::bind(&p).unwrap();
-    assert!(is_socket(&p));
+    assert_eq!(
+        sockat::bind(&p).unwrap_err().raw_os_error(),
+        Some(libc::ENAMETOOLONG)
+    );
+    assert!(!is_socket(&p));
+    let short = p.with_file_name("s.sock");
+    let listener = sockat::bind(&short).unwrap();
+    std::fs::rename(&short, &p).unwrap();
     let mut c = sockat::connect(&p).unwrap();
     ping(&listener, &mut c);
     let mut c = sockat::connect_nonblocking(&p).unwrap();
@@ -369,12 +374,13 @@ fn long_path_errors_through_the_public_api() {
 
 // The address a long-path bind leaves on the socket fits sun_path on every
 // platform, so whoever reads it (std's local_addr, CPython's getsockname, Go's
-// net.FileConn) gets it whole: std shows at most std_max bytes. On Apple that
-// is because a bind never takes the widened sockaddr (DR-0024): a socket bound
-// through it has an address of up to 255 bytes, which std shows cut short at
-// sun_path's 104 bytes with no NUL. Checked on the listener, on the stream it
-// accepts and as the client's peer address, for lengths up to 253 bytes (all
-// within the widened form) and past it.
+// net.FileConn) gets it whole: std shows at most std_max bytes. Every bind
+// spelling is in the plain sockaddr (`R/<file name>` and the like); on Apple a
+// socket bound through the widened one would have an address of up to 255
+// bytes, which std shows cut short at sun_path's 104 bytes with no NUL.
+// Checked on the listener, on the stream it accepts and as the client's peer
+// address, for lengths up to 253 bytes (all within the widened form) and past
+// it.
 #[test]
 fn the_address_of_a_long_path_bind_fits_sun_path() {
     let t = tempfile::Builder::new()
@@ -400,24 +406,26 @@ fn the_address_of_a_long_path_bind_fits_sun_path() {
     }
 }
 
-// The longest file name a bind reaches is sun_path less the NUL (std_max: 107
-// on Linux, 103 on Apple and the BSDs), on every platform: every bind route
-// that does not hand the kernel the whole path ends with the file name in the
-// plain sockaddr (on Apple too, a bind never widening it, DR-0024). A name of
-// std_max bytes directly under a short directory binds and is reached; one
-// byte more is ENAMETOOLONG, and nothing is created.
+// The longest file name a bind reaches is sun_path less the NUL less the 11
+// bytes of `R/` (std_max - 11: 96 on Linux, 92 on Apple and the BSDs), on
+// every platform: every bind spelling holds the file name behind a symlink
+// with a random 10-character name in the plain sockaddr, so that the spelling
+// the kernel keeps names nothing once sockat has removed the link. A name of
+// std_max - 11 bytes directly under a short directory binds and is reached;
+// one byte more is ENAMETOOLONG, and nothing is created.
 #[test]
-fn a_bind_reaches_a_file_name_up_to_sun_path_less_the_nul() {
+fn a_bind_reaches_a_file_name_up_to_sun_path_less_the_nul_and_r() {
     let t = tempfile::Builder::new()
         .prefix("sockat-")
         .tempdir_in("/tmp")
         .unwrap();
-    let at = t.path().join("a".repeat(std_max()));
+    let longest = std_max() - 11;
+    let at = t.path().join("a".repeat(longest));
     let listener = sockat::bind(&at).unwrap();
     assert!(is_socket(&at));
     let mut client = sockat::connect(&at).unwrap();
     ping(&listener, &mut client);
-    let over = t.path().join("o".repeat(std_max() + 1));
+    let over = t.path().join("o".repeat(longest + 1));
     assert_eq!(
         sockat::bind(&over).unwrap_err().raw_os_error(),
         Some(libc::ENAMETOOLONG)
@@ -427,9 +435,10 @@ fn a_bind_reaches_a_file_name_up_to_sun_path_less_the_nul() {
 
 // A long path needs no more permission on the socket's directory than std's
 // bind / connect of a short path: search and write, not read. On Linux the
-// /proc route opens the directory O_PATH, which takes no permission at all on
-// the directory itself, so a directory without read permission (mode 0300)
-// must work at any length. Root bypasses permission checks, so under root
+// directory is opened O_PATH, which takes no permission at all on the
+// directory itself, and sockat's own directory reaches it through a symlink
+// that needs search permission only, so a directory without read permission
+// (mode 0300) must work at any length. Root bypasses permission checks, so under root
 // (as in `just test-linux`, docker) the test cannot tell anything and says so;
 // the GitHub Actions runner is not root, which is where it bites.
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -464,4 +473,104 @@ fn a_directory_without_read_permission_is_enough_on_linux() {
     let listener = sockat::bind(&p).unwrap();
     let mut client = sockat::connect(&p).unwrap();
     ping(&listener, &mut client);
+}
+
+// ----- bind_ex: the bind that can remove its socket file later -----
+
+// bind_ex returns the listener and a SocketFile; discard() removes the socket
+// file, by the real path taken right after the bind. For a short path (handed
+// to std unchanged) and long ones alike: the file is there while the listener
+// serves, and gone after the listener is dropped and the file discarded.
+// Dropping a SocketFile without discard() removes nothing (the listener and
+// the file are the caller's to keep, as with bind).
+#[test]
+fn bind_ex_discards_its_socket_file_at_any_length() {
+    let t = tempfile::Builder::new()
+        .prefix("sockat-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    for total in [40, std_max() + 1, 400] {
+        let p = nest(t.path(), total, &format!("{total}.sock"));
+        let (listener, file) = sockat::bind_ex(&p).unwrap();
+        assert!(is_socket(&p), "{total}");
+        let mut c = sockat::connect(&p).unwrap();
+        ping(&listener, &mut c);
+        drop((c, listener));
+        file.discard().unwrap();
+        assert!(std::fs::symlink_metadata(&p).is_err(), "{total}");
+
+        let (listener, file) = sockat::bind_ex(&p).unwrap();
+        drop((file, listener));
+        assert!(is_socket(&p), "{total}: dropping the SocketFile removed it");
+        std::fs::remove_file(&p).unwrap();
+    }
+}
+
+// discard() removes only the file the bind made: whatever is at the path now
+// is compared by (st_dev, st_ino) with what the bind left. Replaced since (by
+// a plain file, by another socket bound at the same path, by a symlink to
+// someone else's file), it is left alone, and so is the other file; with
+// nothing there, there is nothing to do. All of these are Ok: the bind's own
+// file is gone either way.
+#[test]
+fn bind_ex_leaves_a_replaced_socket_file_alone() {
+    let t = tempfile::Builder::new()
+        .prefix("sockat-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let p = nest(t.path(), 400, "s.sock");
+    let theirs = t.path().join("theirs");
+    std::fs::write(&theirs, b"theirs").unwrap();
+    let mut kept = Vec::new();
+    for what in ["a file", "another socket", "a symlink"] {
+        let (listener, file) = sockat::bind_ex(&p).unwrap();
+        drop(listener);
+        std::fs::remove_file(&p).unwrap();
+        match what {
+            "a file" => std::fs::write(&p, b"keep").unwrap(),
+            "another socket" => kept.push(sockat::bind(&p).unwrap()),
+            _ => std::os::unix::fs::symlink(&theirs, &p).unwrap(),
+        }
+        file.discard().unwrap();
+        assert!(std::fs::symlink_metadata(&p).is_ok(), "{what} was removed");
+        std::fs::remove_file(&p).unwrap();
+    }
+    assert_eq!(std::fs::read(&theirs).unwrap(), b"theirs");
+
+    let (listener, file) = sockat::bind_ex(&p).unwrap();
+    drop(listener);
+    std::fs::remove_file(&p).unwrap();
+    file.discard().unwrap();
+}
+
+// The path is remembered as its real path at the time of the bind, so a
+// symlink along the given path repointed afterwards does not send discard()
+// elsewhere: with `<t>/link -> <t>/one`, a socket bound at
+// `<t>/link/.../s.sock` is in `one`; after the link is pointed at `two`,
+// which holds a socket file at the same place, discard() removes the one in
+// `one` and leaves `two`'s.
+#[test]
+fn bind_ex_remembers_the_real_path() {
+    let t = tempfile::Builder::new()
+        .prefix("sockat-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let one = t.path().join("one");
+    let two = t.path().join("two");
+    std::fs::create_dir(&one).unwrap();
+    let link = t.path().join("link");
+    std::os::unix::fs::symlink(&one, &link).unwrap();
+    let p = nest(&link, 400, "s.sock");
+    let below = p.strip_prefix(&link).unwrap().to_path_buf();
+    let (listener, file) = sockat::bind_ex(&p).unwrap();
+    assert!(is_socket(&one.join(&below)));
+    std::fs::create_dir_all(two.join(below.parent().unwrap())).unwrap();
+    let theirs = sockat::bind(two.join(&below)).unwrap();
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&two, &link).unwrap();
+    drop(listener);
+    file.discard().unwrap();
+    assert!(!one.join(&below).exists());
+    assert!(is_socket(&two.join(&below)));
+    drop(theirs);
 }
