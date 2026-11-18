@@ -1440,6 +1440,75 @@ fn a_directory_without_read_permission_is_reached_through_d() {
     assert_empty(links.path());
 }
 
+thread_local! {
+    /// How often [`refuse_socket_dir`] was called on this thread.
+    static SOCKET_DIR_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A stand-in for opening the socket's directory ([`Config::open_socket_dir`])
+/// where that is refused (`EACCES`, as `O_RDONLY` answers for a directory
+/// without read permission), counting the calls ([`socket_dir_opens`]). The
+/// route order opens it on the calling thread, and each test runs on a thread
+/// of its own, so the count is this test's.
+fn refuse_socket_dir(_: &Path) -> io::Result<OwnedFd> {
+    SOCKET_DIR_OPENS.with(|n| n.set(n.get() + 1));
+    Err(io::Error::from_raw_os_error(libc::EACCES))
+}
+
+/// How often the socket's directory was asked for since the last call, by
+/// [`refuse_socket_dir`] on this thread.
+fn socket_dir_opens() -> usize {
+    SOCKET_DIR_OPENS.with(|n| n.replace(0))
+}
+
+// The socket's directory is opened only by the routes that need its fd (the
+// /proc and connectat fallbacks, a fork in it, D or R made in it), so a
+// directory that cannot be opened costs only those (SPEC). With its open
+// refused and one place for D, the central route still binds and connects
+// through D made there, by the platform's default means and, with the
+// thread-cwd means off, by the next one: on Linux the /proc version, which
+// checks /proc without the socket's directory; elsewhere a fork in D for a
+// bind, and for a connect bindat / connectat (FreeBSD) or a fallback that
+// does not fork. None of this even asks for the socket's directory: D in a
+// place other than it needs no fd of it.
+#[test]
+fn a_socket_directory_that_cannot_be_opened_costs_only_the_routes_that_need_its_fd() {
+    let t = tmp();
+    let place = tmp();
+    let links = tmp();
+    socket_dir_opens();
+    for (i, thread) in [thread_here(), false].into_iter().enumerate() {
+        let mut c = config(&[at(place.path())], &[links.path()]);
+        if !thread {
+            c = no_thread_cwd(c);
+        }
+        c.open_socket_dir = refuse_socket_dir;
+        let p = nest(&t.path().join(i.to_string()), 400, "s.sock");
+        let (l, r) = route::run_long(BIND, &p, &c).unwrap();
+        assert!(
+            central_route(BIND, thread, r),
+            "thread {thread}: bind {r:?}"
+        );
+        assert!(is_socket(&p));
+        let listener = UnixListener::from(l);
+        for req in CONNECTS {
+            let (cl, r) = route::run_long(req, &p, &c).unwrap();
+            if central_connects(thread) {
+                assert!(
+                    central_route(req, thread, r),
+                    "thread {thread}: {req:?} {r:?}"
+                );
+            } else {
+                assert!(!r.forked(), "thread {thread}: {req:?} {r:?}");
+            }
+            ping_kept(&listener, cl);
+        }
+        assert_eq!(socket_dir_opens(), 0, "thread {thread}");
+        assert_empty(place.path());
+        assert_empty(links.path());
+    }
+}
+
 // D is tried in its places in order, each passed over when D cannot be made
 // in it, and the first where it can is used (DR-0027): a place that does not
 // exist, a place that is a file, then two directories. The first directory is
@@ -2312,6 +2381,45 @@ mod linux {
             for req in CONNECTS {
                 let (cl, r) = route::run_long(req, &p, &c).unwrap();
                 assert!(want(req, r), "{}: {req:?} {r:?}", name.len());
+                ping_kept(&listener, cl);
+                assert_empty(place.path());
+            }
+        }
+    }
+
+    // The same lengths with the socket's directory's open refused (it is
+    // opened O_PATH here, which a permission does not stop, so a stand-in
+    // refuses it): only the fallback /proc route, which needs that fd, is lost.
+    // Whether /proc can be used is checked without the socket's directory, so
+    // a short name still takes the /proc version of the central route, and the
+    // symlink in D (`/proc/self/fd/<D's fd>/s`) still serves every connect of
+    // 85 and 95 bytes; the bind forks in D as before. Only those connects ask
+    // for the socket's directory, once each (the fallback /proc route); D is
+    // made and removed in the place every time.
+    #[test]
+    fn the_proc_means_and_the_symlink_in_d_need_no_socket_directory_fd() {
+        let t = tmp();
+        let place = tmp();
+        let mut c = no_thread_cwd(config(&[at(place.path())], &[]));
+        c.open_socket_dir = refuse_socket_dir;
+        socket_dir_opens();
+        let proc: fn(Route) -> bool = |r| r == Route::ProcThroughLink;
+        let fork: fn(Route) -> bool = |r| r.forked();
+        for (name, bind, connect, opens) in [
+            ("s.sock".to_string(), proc, Route::ProcThroughLink, 0),
+            ("e".repeat(85), fork, Route::ProcFileLink, 1),
+            ("n".repeat(95), fork, Route::ProcFileLink, 1),
+        ] {
+            let p = nest(t.path(), 400, &name);
+            let (l, r) = route::run_long(BIND, &p, &c).unwrap();
+            assert!(bind(r), "{}: bind {r:?}", name.len());
+            assert!(is_socket(&p));
+            assert_eq!(socket_dir_opens(), 0, "{}: bind", name.len());
+            let listener = UnixListener::from(l);
+            for req in CONNECTS {
+                let (cl, r) = route::run_long(req, &p, &c).unwrap();
+                assert_eq!(r, connect, "{}: {req:?}", name.len());
+                assert_eq!(socket_dir_opens(), opens, "{}: {req:?}", name.len());
                 ping_kept(&listener, cl);
                 assert_empty(place.path());
             }

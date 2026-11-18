@@ -40,7 +40,8 @@
 
 - 最初にソケットのディレクトリを `stat` で引く。無ければ `ENOENT`、ディレクトリでなければ `ENOTDIR` (長さの判定や D を作るより前)
 - 続けてソケットのディレクトリの realpath を取る。引けなければそのエラーを返す (R を作れないことを `ENAMETOOLONG` に化けさせない。試験 `an_unresolvable_socket_directory_reports_its_error_not_enametoolong`、ハブ SPEC ecb61c32)
-- ソケットのディレクトリを開くのは、その fd が要る経路 (/proc、connectat、fork、ソケットのディレクトリに作る D と R) だけ。開けなければその経路は使えない (`O_RDONLY` で開く OS は読み取り権限の無いディレクトリを開けない)
+- ソケットのディレクトリを開くのは、その fd が要る経路 (予備の /proc、connectat、fork、ソケットのディレクトリに作る D と R) だけ。開けなければその経路は使えない (`O_RDONLY` で開く OS は読み取り権限の無いディレクトリを開けない)。中心の経路 (/proc 版を含む) と D の中のファイルへの symlink は、D を他の置き場に作れればソケットのディレクトリを開かない (試験 `a_socket_directory_that_cannot_be_opened_costs_only_the_routes_that_need_its_fd`、`the_proc_means_and_the_symlink_in_d_need_no_socket_directory_fd`)
+- `/proc` を使えるかは、`/` を開いた fd で `/proc/self/fd/<fd>` を引いて確かめる (1 回の呼び出しで 1 度)。D の fd では、D を作る前に要る判断 (中心の経路の手段の選び方、予備の経路の順番) に間に合わない
 - 経路が実際に bind / connect した結果の失敗は返し、次を試さない ([DR-0012](DR-0012-route-failure-handling.md))
 
 ### 中心の経路
@@ -58,7 +59,8 @@
 | bindat / connectat に Dfd | FreeBSD | (無い) |
 | fork: 子が `fchdir(Dfd)` して bind、listen は親 ([DR-0025](DR-0025-fork-bind-listen-by-parent.md)) | 全部 (bind だけ) | |
 
-- 長さと、手段を使えるか (確かめられる所まで: スレッド cwd は呼び出し元のスレッドの seccomp と `pthread_fchdir_np` の有無、/proc 版はソケットのディレクトリの fd の桁で見積もった綴り) は D を作る前に確かめ、使える手段が無ければ何も作らない
+- 長さと、手段を使えるか (確かめられる所まで: スレッド cwd は呼び出し元のスレッドの seccomp と `pthread_fchdir_np` の有無、/proc 版は見積もった綴り) は D を作る前に確かめ、使える手段が無ければ何も作らない
+- /proc 版の綴りは D の fd の桁で変わる。D を作る前は、`/proc` を確かめた時に `/` の fd が取った番号 + 1 (置き場を先に開く) を D の fd とみなして見積もり、D を開いた後に D の fd で引き直して長さを測り直す。収まらなければ D と R を片付けて次の手段へ
 - D の置き場は `${TMPDIR:-/tmp}` (相対パスも可)、`/tmp` (同じ綴りなら飛ばす)、ソケットのディレクトリの順。安全も長さも問わない (D は fd で掴み、綴りに出ない)
 - 置き場で「作れない」のは、開けない、D を作れない、名前を使い切った、乱数が取れない、確認が通らない、0700 にそろえられない、R を作れない時。次の置き場へ進む
 - どこにも D を作れない時、bind はソケットのディレクトリに R (`.sockat.XXXXXXXXXX`) を作り、fork の子がソケットのディレクトリの fd に `fchdir` して `.sockat.XXXXXXXXXX/<ファイル名>` で bind する。綴りが収まらないか R も作れなければ `ENAMETOOLONG`。connect 系は予備の経路へ
@@ -87,7 +89,7 @@
 ### 実装の形
 
 - 経路の順番は `route::run_long_with`。1 回の呼び出しの状態 (ソケットのディレクトリの fd、`/proc` を使えるか、realpath、D をどこにも作れなかったか) は `route::Target` に必要になった時に引いて持つ
-- 環境を読む部分は `route::Config` に集め、試験から差し替える ([DR-0011](DR-0011-routes-not-exposed.md)): D の置き場 (`own_dir_places`。ソケットのディレクトリは `Place::SocketDir`)、symlink の置き場 (`link_places`)、`/proc/self/fd` の場所、スレッド cwd を試すか、広げた sockaddr を試すか
+- 環境を読む部分は `route::Config` に集め、試験から差し替える ([DR-0011](DR-0011-routes-not-exposed.md)): D の置き場 (`own_dir_places`。ソケットのディレクトリは `Place::SocketDir`)、symlink の置き場 (`link_places`)、`/proc/self/fd` の場所、スレッド cwd を試すか、広げた sockaddr を試すか、ソケットのディレクトリの開き方 (`open_socket_dir`。試験は開けないディレクトリの代わりに失敗する関数を置く)
 - bind は広げた sockaddr を使わない。広げた形で渡す関数 (`route::apple::wide_connect`) は connect の options しか受け取らない
 
 ### 長さの上限

@@ -24,7 +24,7 @@ use std::cell::{Cell, OnceCell};
 use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -285,6 +285,11 @@ pub(crate) struct Config {
     /// next means is tried just the same.
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     pub(crate) thread_cwd: bool,
+    /// How the socket's directory is opened once a route needs its fd
+    /// ([`Target::dir_fd`]): [`open_dir`] outside the tests, which put a
+    /// failing one in its place to stand in for a directory that cannot be
+    /// opened (no read permission where it is opened `O_RDONLY`).
+    pub(crate) open_socket_dir: fn(&Path) -> io::Result<OwnedFd>,
 }
 
 /// A place where D may be made.
@@ -342,6 +347,7 @@ impl Config {
             proc_self_fd: PathBuf::from(linux::PROC_SELF_FD),
             #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
             thread_cwd: true,
+            open_socket_dir: open_dir,
         }
     }
 }
@@ -356,11 +362,12 @@ struct Target<'a> {
     dir: &'a Path,
     name: &'a OsStr,
     cfg: &'a Config,
-    /// The socket's directory opened by [`open_dir`], once a route needs its
-    /// fd ([`Target::dir_fd`]); `None` when it cannot be opened.
+    /// The socket's directory opened by `cfg.open_socket_dir`, once a route
+    /// needs its fd ([`Target::dir_fd`]); `None` when it cannot be opened.
     dir_fd: OnceCell<Option<OwnedFd>>,
-    /// Where `/proc/self/fd` is when /proc can be used ([`Target::proc`]).
-    proc: OnceCell<Option<&'a Path>>,
+    /// Where `/proc/self/fd` is when /proc can be used, and the number of the
+    /// fd it was checked with ([`Target::probed_proc`]).
+    proc: OnceCell<Option<(&'a Path, RawFd)>>,
     /// The real path of the socket's directory, what R points to.
     real_dir: PathBuf,
     /// Set once D could be made in none of the places, so the fallback's
@@ -379,29 +386,35 @@ impl<'a> Target<'a> {
 
     /// The socket's directory's fd, opened the first time a route asks for
     /// it; `None` when it cannot be opened (then the routes that need it
-    /// cannot be used). Only the /proc and connectat routes, the fork routes
-    /// and D made in the socket's directory need it: the central route
-    /// reaches the directory through R in D, with search permission alone,
-    /// where opening it `O_RDONLY` would need read permission as well.
+    /// cannot be used). Only the /proc and connectat fallbacks, the fork
+    /// routes in it and D or R made in it need it: the central route reaches
+    /// the directory through R in D, with search permission alone, where
+    /// opening it `O_RDONLY` would need read permission as well.
     fn dir_fd(&self) -> Option<BorrowedFd<'_>> {
         self.dir_fd
-            .get_or_init(|| open_dir(self.dir).ok())
+            .get_or_init(|| (self.cfg.open_socket_dir)(self.dir).ok())
             .as_ref()
             .map(|fd| fd.as_fd())
     }
 
-    /// Where `/proc/self/fd` is (`cfg.proc_self_fd`) when /proc can be used:
-    /// the socket's directory can be looked up as `<it>/<its fd>` (Linux).
-    /// Without this check a call through `<it>/<fd>/...` would fail with
+    /// Where `/proc/self/fd` is (`cfg.proc_self_fd`) when /proc can be used
+    /// ([`Target::probed_proc`]).
+    fn proc(&self) -> Option<&'a Path> {
+        self.probed_proc().map(|(proc, _)| proc)
+    }
+
+    /// Where `/proc/self/fd` is when /proc can be used, checked once with `/`
+    /// ([`linux::probe`]), and the number the fd of `/` got (Linux). The
+    /// socket's directory's fd is not used for this: the /proc means of the
+    /// central route works on D's fd, and the check is needed before D is
+    /// made. Without the check a call through `<it>/<fd>/...` would fail with
     /// `ENOENT`, which reads as "the directory does not exist" although it
     /// does. Always `None` elsewhere.
-    fn proc(&self) -> Option<&'a Path> {
+    fn probed_proc(&self) -> Option<(&'a Path, RawFd)> {
         *self.proc.get_or_init(|| {
             #[cfg(any(target_os = "linux", target_os = "android"))]
-            return self
-                .dir_fd()
-                .and_then(|fd| linux::fd_dir(&self.cfg.proc_self_fd, fd))
-                .map(|_| self.cfg.proc_self_fd.as_path());
+            return linux::probe(&self.cfg.proc_self_fd)
+                .map(|fd| (self.cfg.proc_self_fd.as_path(), fd));
             #[cfg(not(any(target_os = "linux", target_os = "android")))]
             None
         })
@@ -554,12 +567,15 @@ fn central_means(t: &Target<'_>) -> Vec<Means> {
         means.push(Means::ThreadCwd);
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    if let (Some(proc), Some(dir_fd)) = (t.proc(), t.dir_fd()) {
-        // D's fd is not known yet; the socket's directory's stands in for
-        // its number of digits, and the spelling is measured again with
-        // D's own fd before it is used.
+    if let Some((proc, probe)) = t.probed_proc() {
+        // D's fd is not known until D is opened. The fd of `/` opened by the
+        // check got the lowest free number; the place is opened before D, so
+        // one more stands in for the number of digits of D's fd, and the
+        // spelling is measured again with D's own fd before it is used
+        // ([`by_means`]; when it does not fit, D is removed and the next
+        // means taken).
         let estimate = proc
-            .join(dir_fd.as_raw_fd().to_string())
+            .join((probe + 1).to_string())
             .join(own::spelling_placeholder(OsStr::new(""), t.name));
         if path::len(&estimate) <= DIRECT_MAX {
             means.push(Means::Proc);
@@ -660,7 +676,12 @@ fn make_own_dir(t: &Target<'_>, target: &Path, link: own::LinkName) -> Option<ow
         return None;
     }
     for place in &t.cfg.own_dir_places {
-        if let Ok(d) = own::OwnDir::create(place, t.dir_fd(), t.proc(), target, link) {
+        // Only D in the socket's directory needs its fd.
+        let socket_dir = match place {
+            Place::SocketDir => t.dir_fd(),
+            Place::Path(_) => None,
+        };
+        if let Ok(d) = own::OwnDir::create(place, socket_dir, t.proc(), target, link) {
             return Some(d);
         }
     }
@@ -1053,15 +1074,17 @@ pub(crate) mod own {
 /// for the fork after this too.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn fallback(t: &Target<'_>, _wide: &mut bool) -> Step {
-    let Some((proc, dir_fd)) = t.proc().zip(t.dir_fd()) else {
+    let Some(proc) = t.proc() else {
         return match posix::relative(t) {
             Step::Next => posix::symlinks(t),
             done => done,
         };
     };
-    let via = proc.join(dir_fd.as_raw_fd().to_string()).join(t.name);
-    if path::len(&via) <= DIRECT_MAX {
-        return Step::Done(plain_op(t.req, &via).map(|fd| (fd, Route::ProcFd)));
+    if let Some(dir_fd) = t.dir_fd() {
+        let via = proc.join(dir_fd.as_raw_fd().to_string()).join(t.name);
+        if path::len(&via) <= DIRECT_MAX {
+            return Step::Done(plain_op(t.req, &via).map(|fd| (fd, Route::ProcFd)));
+        }
     }
     match linux::file_link_in_own_dir(t, proc) {
         Step::Next => posix::symlinks(t),
@@ -1341,6 +1364,15 @@ pub(crate) mod linux {
 
     /// Where the kernel lists the fds of the calling process.
     pub(crate) const PROC_SELF_FD: &str = "/proc/self/fd";
+
+    /// Whether /proc can be used: `<proc_self_fd>/<fd>` of `/`, opened by
+    /// [`open_dir`], can be looked up. The number that fd got (the lowest free
+    /// one at that moment), or `None` when /proc cannot be used.
+    pub(crate) fn probe(proc_self_fd: &Path) -> Option<RawFd> {
+        let root = open_dir(Path::new("/")).ok()?;
+        fd_dir(proc_self_fd, root.as_fd())?;
+        Some(root.as_raw_fd())
+    }
 
     /// `<proc_self_fd>/<fd>`, or `None` when it cannot be looked up (no
     /// /proc).

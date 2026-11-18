@@ -102,7 +102,7 @@ sockat makes a directory D of its own, holds it by an fd, makes in it a symlink 
   - on Apple `pthread_fchdir_np` is missing or fails (it is not in a public header, so it is looked up at run time)
   - no thread can be started
 - D is opened `O_PATH` on Linux, `O_SEARCH` on Apple OSes, `O_RDONLY` elsewhere. It is set to 0700 by `chmod` of `/proc/self/fd/<fd>` on Linux with `/proc`, by `fchmod` of D opened again by name `O_RDONLY` and checked to be the same directory on Linux without `/proc`, by `fchmod` elsewhere
-- The central route does not open the socket's directory; R reaches it with search permission alone. A directory without read permission is reached with the same permission as a plain bind / connect
+- The central route (the /proc version included) does not open the socket's directory (only D made in it and the fork without D do); R reaches it with search permission alone. A directory without read permission is reached with the same permission as a plain bind / connect
 
 ### The fallback routes (connects)
 
@@ -110,11 +110,11 @@ Tried by the connects only, when the central route cannot be used (no means usab
 
 #### /proc
 
-Linux / Android. The socket's directory is opened `O_PATH` and `/proc/self/fd/<fd>/<file name>` is handed to std. The whole spelling must be at most 107 bytes, so the file name about 90 bytes at most (it depends on the number of digits of the fd).
+Linux / Android. The socket's directory is opened `O_PATH` and `/proc/self/fd/<fd>/<file name>` is handed to std. The whole spelling must be at most 107 bytes, so the file name about 90 bytes at most (it depends on the number of digits of the fd). When the socket's directory cannot be opened, the next route is tried.
 
 #### A symlink to the file in D
 
-Linux / Android with `/proc`. D is made and checked as on the central route, a symlink `s` to the socket file is made in it, and the connect goes through `/proc/self/fd/<D's fd>/s`. The spelling is about 20 bytes whatever the file name length and the directory depth. The places for D are those of the central route (none needs to be safe).
+Linux / Android with `/proc`. D is made and checked as on the central route, a symlink `s` to the socket file is made in it, and the connect goes through `/proc/self/fd/<D's fd>/s`. The spelling is about 20 bytes whatever the file name length and the directory depth. The places for D are those of the central route (none needs to be safe). The socket's directory is not opened.
 
 #### Relative path
 
