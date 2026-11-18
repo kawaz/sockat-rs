@@ -22,7 +22,7 @@
 - fd で掴む形 (`route::posix::HeldDir`)
   0. 何かを作る前に `/proc` を使えるか確かめ、使えなければ何も作らずに次へ (下の判定)
   1. 置き場に mode 0700 のディレクトリを作る。名前と衝突の扱いは symlink と同じ (`sockat.` + 乱数 10 文字、`EEXIST` で引き直し 16 回で打ち切り)
-  2. `O_DIRECTORY | O_NOFOLLOW` で開き、`fstat` で「ディレクトリ・持ち主が実効 uid・group と other に権限が無い (`mode & 0o077 == 0`)」を確かめる。通ったら fd に `fchmod(0700)` して持ち主の権限をそろえる (`File::set_permissions`)
+  2. `O_PATH | O_DIRECTORY | O_NOFOLLOW` で開き (ディレクトリに権限が無くても開ける)、`fstat` で「ディレクトリ・持ち主が実効 uid・group と other に権限が無い (`mode & 0o077 == 0`)」を確かめる。通ったら `chmod("/proc/self/fd/<fd>", 0700)` で持ち主の権限をそろえる (`O_PATH` の fd には `fchmod` できない。/proc の場所は Config の値)
   3. fd の中に `symlinkat` で、ソケットのファイル (元のパス。相対パスなら cwd を前に付ける) を指す `s` を作る
   4. 綴り `/proc/self/fd/<fd>/s` を渡す
   5. 片付け: `unlinkat(fd, "s")`。ディレクトリは、その名前を `lstat` した `(st_dev, st_ino)` が fd と一致する時だけ `rmdir`。fd を閉じる。connect が成功しても失敗しても、panic でもする。片付けの失敗は無視する
@@ -39,13 +39,15 @@
 - 作ってから開くまでのすり替えは `O_NOFOLLOW` と `fstat` の確認で弾く (試験 `a_directory_replaced_before_it_is_held_is_not_used`: mode の違うディレクトリ、別のディレクトリへの symlink、ふつうのファイル、root で他人に chown したディレクトリ)
 - connect の綴りはファイル名の長さにも置き場の深さにもよらず収まる (`/proc/self/fd/<fd>/s` はおよそ 20 バイト)
 - 渡された `TMPDIR` で済むならそれが一番良いので、`TMPDIR` を `/tmp` より先に使い切る
-- group と other の権限だけを見て持ち主の権限は `fchmod` でそろえるのは、umask が持ち主のビットを削る環境 (umask 0277 なら作ったディレクトリは 0500) で毎回確認に落ちて残骸が溜まらないため (試験 `a_umask_that_takes_the_owners_bits_does_not_stop_the_held_directory`。`fchmod` を外すと uid 1000 で落ちることを確かめた。root は権限を無視するので docker の root では見えない)。umask は group と other のビットを足せないので、そこに権限があれば作った物ではない。setuid / setgid / sticky も見ないので、親の setgid のように作る側が決められない bit で使えなくならない
+- group と other の権限だけを見て、持ち主の権限を後からそろえるのは、umask が持ち主のビットを削る環境 (umask 0277 なら作ったディレクトリは 0500、0477 なら読み取りも無い 0300) で毎回確認に落ちて残骸が溜まらないため。umask は group と other のビットを足せないので、そこに権限があれば作った物ではない。setuid / setgid / sticky も見ないので、親の setgid のように作る側が決められない bit で使えなくならない
+- `O_PATH` で開くのは、読み取り権限の無いディレクトリ (umask 0477) も開けるため。`O_PATH` の fd には `fchmod` できないので `/proc/self/fd/<fd>` を `chmod` する。この綴りは fd が掴んだディレクトリそのものに効くので、名前で触る時の差し替えの心配が無い。`fstat`、`symlinkat`、`unlinkat` は `O_PATH` の fd で動く (Linux 7.2 の docker で、片付けと rename の試験が通ることで確認)
+- 試験 `a_umask_that_takes_the_owners_bits_does_not_stop_the_held_directory` は umask 0277 と 0477 の子プロセスで届き片付くことを確かめる。root は権限を無視するので、効くのは他の uid で走らせた時 (docker で `setpriv --reuid=1000`)。そこで `chmod` を外すと、また `O_PATH` を外すと落ちることを確かめた
 
 悪い面:
 
 - `/proc` が要る。`/proc` の無い Linux と他の Unix では使えない。Apple の OS はスレッド cwd の経路で届くので足さない
 - 途中でプロセスが死ぬとディレクトリが残る (名前の `sockat.` で残骸と分かる)
-- 作った後に開けなかった時 (fd が尽きた等。umask が持ち主の読み取りも削る時もここに入る) は、名前で辿るディレクトリが自分の物か確かめられないので消さずに残る
+- 作った後に開けなかった時 (fd が尽きた等) は、名前で辿るディレクトリが自分の物か確かめられないので消さずに残る
 
 ## 却下した案
 
@@ -63,5 +65,5 @@
 ## 判断の出所
 
 - 安全でない置き場を fd で掴む形で使う、順番、connect 系だけ、片付けの条件: kawaz 裁定 (ハブ [DR-0008](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0008-unsafe-base-held-by-fd.md)、2026-11-18)。bind に効かないこと: 統括の裁定 2026-11-18
-- 何かを作る前に `/proc` を確かめる、group と other の権限で判定し `fchmod(0700)` する: ハブの SPEC (統括の裁定 2026-11-18、sockat-go の指摘)
+- 何かを作る前に `/proc` を確かめる、group と other の権限で判定し 0700 にそろえる、`O_PATH` で開き `/proc/self/fd/<fd>` を `chmod` する: ハブの SPEC (統括の裁定 2026-11-18、sockat-go と sockat-rs の指摘)
 - 確認の通らないディレクトリと開けなかったディレクトリを消さない: 実装側の判断 2026-11-18

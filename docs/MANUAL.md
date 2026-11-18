@@ -127,7 +127,7 @@ Only the connects (`connect`, `connect_nonblocking`, the `connect_any` variants)
 
 1. Before anything is created, `/proc` is checked to be usable. If it is not, nothing is created and the next place is tried
 2. A directory `sockat.XXXXXXXXXX` of mode 0700 is created in the place (named as the symlinks are)
-3. It is opened `O_DIRECTORY | O_NOFOLLOW` and checked to be a directory owned by the calling user with no permission for group and others. Anything else (someone replaced it between the creation and the open) is neither used nor removed. Once checked, it is set to 0700 through the fd (so that a umask that takes some of the owner's bits does not stop it)
+3. It is opened `O_PATH | O_DIRECTORY | O_NOFOLLOW` (which needs no permission on the directory) and checked to be a directory owned by the calling user with no permission for group and others. Anything else (someone replaced it between the creation and the open) is neither used nor removed. Once checked, it is set to 0700 through `/proc/self/fd/<fd>` (so that a umask that takes some of the owner's bits does not stop it; that spelling reaches what the fd holds, so nothing can be swapped in)
 4. A symlink `s` to the socket file is created inside through the fd, and the connect goes to `/proc/self/fd/<fd>/s`
 5. Whether the connect succeeds or fails, `s` is removed, and the directory is removed only while its name still names the opened one
 
