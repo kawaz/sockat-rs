@@ -692,6 +692,48 @@ fn long_paths_without_a_file_name_or_with_nul_are_invalid_input() {
 //
 // std itself refuses a NUL anywhere in a path with InvalidInput, so for a
 // short path this is what std answers too.
+// The socket's directory's real path is taken before any route, and when it
+// cannot be resolved that error is what the caller gets (hub SPEC "最初にソケット
+// のディレクトリを引く"): without it no R can be made, and reporting
+// ENAMETOOLONG would blame the length for what is something else. The case
+// built here: the directory is "." in a cwd that was removed, so stat(".")
+// still succeeds while realpath (getcwd) fails with ENOENT. It runs in a
+// child process because it removes the child's own cwd. Nothing is made in
+// the place for D either, since the real path comes before D.
+#[test]
+fn an_unresolvable_socket_directory_reports_its_error_not_enametoolong() {
+    let gone = tmp();
+    let place = tmp();
+    mark_untouched(place.path());
+    run_child(
+        "tests::child_bind_in_a_removed_cwd",
+        gone.path(),
+        &[
+            ("TMPDIR", place.path().as_os_str()),
+            ("SOCKAT_CHILD_PATH", gone.path().as_os_str()),
+        ],
+    );
+    assert_untouched(place.path());
+}
+
+#[test]
+fn child_bind_in_a_removed_cwd() {
+    if !in_child() {
+        return;
+    }
+    std::fs::remove_dir(env_path("SOCKAT_CHILD_PATH")).unwrap();
+    assert!(std::fs::metadata(".").is_ok(), "premise: stat(\".\") works");
+    assert!(
+        std::fs::canonicalize(".").is_err(),
+        "premise: realpath fails"
+    );
+    let p = PathBuf::from(format!("./{}", "n".repeat(120)));
+    for req in [BIND, CONNECT] {
+        let e = route::run(req, &p).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::ENOENT), "{req:?}: {e}");
+    }
+}
+
 #[test]
 fn a_nul_is_invalid_input_at_any_length_and_nothing_is_made() {
     let t = tmp();

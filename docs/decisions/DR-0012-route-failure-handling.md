@@ -21,7 +21,7 @@
   - symlink の置き場が安全でない・作れない ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md))
   - 相対パスの経路で、作った綴りのディレクトリが元と `(st_dev, st_ino)` で一致しない、または cwd が既に変わっている ([DR-0004](DR-0004-relative-path-from-cwd.md))
 - **fork を試さない connect** (`connect` / `connect_nonblocking`) は、予備の経路の後、fork の経路の手前で `ENAMETOOLONG` を返す。ファイルシステムに何も作らず、何も connect しない。専用のエラーや文言は作らない。中心の経路や予備の経路で実際に connect した失敗 (`ENOENT`、`ECONNREFUSED` 等) は、`ENAMETOOLONG` に変えずにそのまま返す
-- ディレクトリが無い時は、どの OS でも、ファイル名の長さによらず `ENOENT` を返す。最初にソケットのディレクトリを `stat` で引き、その後でファイル名が収まるかを判定する。ディレクトリでない物があれば `ENOTDIR`
+- ディレクトリが無い時は、どの OS でも、ファイル名の長さによらず `ENOENT` を返す。最初にソケットのディレクトリを `stat` で引き、その後でファイル名が収まるかを判定する。ディレクトリでない物があれば `ENOTDIR`。続けて realpath を取り、引けなければそのエラーを返す ([DR-0027](DR-0027-own-directory-and-fallback-routes.md))
 
 試験: `a_missing_directory_is_enoent_even_when_the_name_fits_no_sockaddr` (254 バイトのファイル名、bind と各 connect、置き場なしで最後の経路まで進める場合も)、`a_failure_in_the_central_route_is_not_retried` (中心の経路の失敗をそのまま返し、後の置き場と symlink の置き場に何も作らない)、`the_thread_cwd_means_comes_first_and_its_failures_are_final`、`a_failure_through_the_symlink_is_reported_and_not_retried`。
 

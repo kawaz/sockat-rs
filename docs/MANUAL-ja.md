@@ -295,6 +295,7 @@ sockat 自身は cwd を変えない。相対パスを作る時に、それが�
 |---|---|
 | ディレクトリが無い | `ENOENT` |
 | ディレクトリの所にディレクトリでない物がある | `ENOTDIR` |
+| 長いパスで、ソケットのディレクトリの実パス (realpath) を引けない | そのエラー (例: cwd が消された `./<名前>` は `ENOENT`) |
 | connect 先が無い | `ENOENT` |
 | bind 先に既にファイルがある | `EADDRINUSE` |
 | 誰も listen していないソケットファイル | `ECONNREFUSED` |

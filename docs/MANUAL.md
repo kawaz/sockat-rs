@@ -295,6 +295,7 @@ If the process dies in the middle of a call, `sockat.XXXXXXXXXX` (D or a symlink
 |---|---|
 | The directory does not exist | `ENOENT` |
 | Something other than a directory is where the directory should be | `ENOTDIR` |
+| For a long path, the real path (realpath) of the socket's directory cannot be resolved | that error (for example `ENOENT` for `./<name>` in a removed cwd) |
 | Nothing to connect to | `ENOENT` |
 | A file already exists where the bind goes | `EADDRINUSE` |
 | A socket file nobody listens on | `ECONNREFUSED` |

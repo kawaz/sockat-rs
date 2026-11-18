@@ -39,6 +39,7 @@
 | NetBSD / OpenBSD / illumos / その他 | 相対パス → symlink |
 
 - 最初にソケットのディレクトリを `stat` で引く。無ければ `ENOENT`、ディレクトリでなければ `ENOTDIR` (長さの判定や D を作るより前)
+- 続けてソケットのディレクトリの realpath を取る。引けなければそのエラーを返す (R を作れないことを `ENAMETOOLONG` に化けさせない。試験 `an_unresolvable_socket_directory_reports_its_error_not_enametoolong`、ハブ SPEC ecb61c32)
 - ソケットのディレクトリを開くのは、その fd が要る経路 (/proc、connectat、fork、ソケットのディレクトリに作る D と R) だけ。開けなければその経路は使えない (`O_RDONLY` で開く OS は読み取り権限の無いディレクトリを開けない)
 - 経路が実際に bind / connect した結果の失敗は返し、次を試さない ([DR-0012](DR-0012-route-failure-handling.md))
 

@@ -361,9 +361,8 @@ struct Target<'a> {
     dir_fd: OnceCell<Option<OwnedFd>>,
     /// Where `/proc/self/fd` is when /proc can be used ([`Target::proc`]).
     proc: OnceCell<Option<&'a Path>>,
-    /// The real path of the socket's directory, what R points to; `None` when
-    /// it cannot be resolved (then no R can be made).
-    real_dir: OnceCell<Option<PathBuf>>,
+    /// The real path of the socket's directory, what R points to.
+    real_dir: PathBuf,
     /// Set once D could be made in none of the places, so the fallback's
     /// symlink in D is not tried in them again.
     no_place: Cell<bool>,
@@ -374,10 +373,8 @@ struct Target<'a> {
 }
 
 impl<'a> Target<'a> {
-    fn real_dir(&self) -> Option<&Path> {
-        self.real_dir
-            .get_or_init(|| std::fs::canonicalize(self.dir).ok())
-            .as_deref()
+    fn real_dir(&self) -> &Path {
+        &self.real_dir
     }
 
     /// The socket's directory's fd, opened the first time a route asks for
@@ -432,7 +429,10 @@ pub(crate) fn run_long(req: Request, path: &Path, cfg: &Config) -> io::Result<(O
 ///
 /// The socket's directory is looked up (`stat`) first, so a missing directory
 /// is `ENOENT` whatever the file name (DR-0012), and a file in its place
-/// `ENOTDIR`, as a bind / connect through the path would answer.
+/// `ENOTDIR`, as a bind / connect through the path would answer. Its real
+/// path (what R points to) is taken next, before any route is tried; when it
+/// cannot be resolved that error is returned as is, rather than turning into
+/// `ENAMETOOLONG` once no R can be made.
 pub(crate) fn run_long_with(
     req: Request,
     path: &Path,
@@ -443,6 +443,7 @@ pub(crate) fn run_long_with(
     if !std::fs::metadata(dir)?.is_dir() {
         return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
     }
+    let real_dir = std::fs::canonicalize(dir)?;
     let t = Target {
         req,
         path,
@@ -451,7 +452,7 @@ pub(crate) fn run_long_with(
         cfg,
         dir_fd: OnceCell::new(),
         proc: OnceCell::new(),
-        real_dir: OnceCell::new(),
+        real_dir,
         no_place: Cell::new(false),
         remember,
         bound: OnceCell::new(),
@@ -528,9 +529,7 @@ fn central(t: &Target<'_>) -> Step {
     if means.is_empty() {
         return Step::Next;
     }
-    let Some(real_dir) = t.real_dir() else {
-        return Step::Next;
-    };
+    let real_dir = t.real_dir();
     match make_own_dir(t, real_dir, own::LinkName::Random) {
         Some(d) => {
             let step = through(t, d.anchor(), &means);
@@ -608,9 +607,7 @@ fn through(t: &Target<'_>, anchor: Anchor<'_>, means: &[Means]) -> Step {
 /// real path R points to joined with the file name.
 fn remember_through(t: &Target<'_>, spelling: &Path, dir: BorrowedFd<'_>) -> io::Result<()> {
     let id = sys::id_at(dir, spelling.as_os_str())?;
-    let real_dir = t
-        .real_dir()
-        .ok_or_else(|| io::Error::other("the socket's directory has no real path"))?;
+    let real_dir = t.real_dir();
     let _ = t.bound.set(Bound {
         path: real_dir.join(t.name),
         id,
