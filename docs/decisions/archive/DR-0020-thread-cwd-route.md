@@ -1,12 +1,12 @@
 # DR-0020: スレッドだけ cwd を移す経路を symlink の後、fork の前に置く
 
-- Status: Accepted
+- Status: Superseded by DR-0027
 - Date: 2026-11-18
 
 ## Context
 
-- fork の経路 ([DR-0007](DR-0007-fork-child-fchdir.md)) は副作用がある (サーバに見える peer の pid が終了した子の pid になる、子が全 fd の複製を持つ) ので、`connect` / `connect_nonblocking` は試さない ([DR-0010](DR-0010-public-api.md))
-- そのため symlink の経路 ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md)) も使えない時、`connect` は `bind` より手前で `ENAMETOOLONG` になる
+- fork の経路 ([DR-0007](../DR-0007-fork-child-fchdir.md)) は副作用がある (サーバに見える peer の pid が終了した子の pid になる、子が全 fd の複製を持つ) ので、`connect` / `connect_nonblocking` は試さない ([DR-0010](../DR-0010-public-api.md))
+- そのため symlink の経路 ([DR-0006](../DR-0006-symlink-in-safe-temp-dir.md)) も使えない時、`connect` は `bind` より手前で `ENAMETOOLONG` になる
 - Linux と Apple の OS には、プロセスの cwd を変えずに 1 つのスレッドだけ cwd を移す手段がある (Linux の `unshare(CLONE_FS)`、Apple の `pthread_fchdir_np`)
 
 ## Decision
@@ -29,8 +29,8 @@
   - `pthread_fchdir_np` が無い (実行時に `dlsym` で引いて見つからない)、または失敗した
 - seccomp の判定は、作った使い捨てのスレッドの中で `unshare` の直前にする。filter はスレッド単位で掛かり (新しいスレッドは作ったスレッドの filter を継ぎ、1 つのスレッドにだけ足すこともできる)、`unshare` を呼ぶのはそのスレッドだから
 - Linux の `fchdir` の失敗は使えない印にしない。fork の経路の子の `fchdir` と同じく、その errno を本当の失敗として返す
-- bind / connect 自体の失敗はそのまま返し、fork の経路でやり直さない ([DR-0012](DR-0012-route-failure-handling.md))
-- 試験から使えない時を作るため、この経路を試すかを `route::posix::Config` の値にする ([DR-0011](DR-0011-routes-not-exposed.md))。試験の外では常に試す
+- bind / connect 自体の失敗はそのまま返し、fork の経路でやり直さない ([DR-0012](../DR-0012-route-failure-handling.md))
+- 試験から使えない時を作るため、この経路を試すかを `route::posix::Config` の値にする ([DR-0011](../DR-0011-routes-not-exposed.md))。試験の外では常に試す
 - `unsafe` は `src/sys.rs` の `op_in_dir_on_thread` の中だけ。スレッドの起動から bind / connect までを 1 つの関数にし、`unshare` が通る前に `fchdir` へ進む道を作らない
 
 ## 理由

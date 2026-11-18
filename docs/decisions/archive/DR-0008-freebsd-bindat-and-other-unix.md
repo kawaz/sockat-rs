@@ -1,11 +1,11 @@
 # DR-0008: FreeBSD は bindat / connectat、dirfd 基準の primitive の無い Unix は相対パス → symlink → fork
 
-- Status: Accepted
+- Status: Superseded by DR-0027
 - Date: 2026-11-18
 
 ## Context
 
-FreeBSD 10 以降には、ディレクトリの fd を基準にする `bindat(2)` / `connectat(2)` がある。NetBSD / OpenBSD / illumos などにはそれに当たる primitive が無い。相対パスと symlink の経路 ([DR-0004](DR-0004-relative-path-from-cwd.md)、[DR-0006](DR-0006-symlink-in-safe-temp-dir.md)) は POSIX の範囲の手 (`getcwd`、`realpath`、`stat`、`symlink`) だけで組める。
+FreeBSD 10 以降には、ディレクトリの fd を基準にする `bindat(2)` / `connectat(2)` がある。NetBSD / OpenBSD / illumos などにはそれに当たる primitive が無い。相対パスと symlink の経路 ([DR-0004](../DR-0004-relative-path-from-cwd.md)、[DR-0006](../DR-0006-symlink-in-safe-temp-dir.md)) は POSIX の範囲の手 (`getcwd`、`realpath`、`stat`、`symlink`) だけで組める。
 
 ## Decision
 
@@ -15,7 +15,7 @@ FreeBSD 10 以降には、ディレクトリの fd を基準にする `bindat(2)
   - ファイル名は 103 バイトまで。超えると `ENAMETOOLONG`
   - 初回の CI で落ちたら、fork に倒さずに原因を直す
 - NetBSD / OpenBSD / illumos など、ディレクトリの fd を基準にする primitive が無い Unix は、相対パス → symlink → fork の順で試す ([DR-0001](DR-0001-long-socket-path-routes.md))。/proc の無い Linux と Apple の OS は、この順の fork の前にスレッド cwd の経路が入る ([DR-0003](DR-0003-linux-proc-self-fd.md)、[DR-0020](DR-0020-thread-cwd-route.md))
-- NetBSD・OpenBSD・illumos は CI の VM で全部の試験を回す ([DR-0019](DR-0019-ci-targets.md))
+- NetBSD・OpenBSD・illumos は CI の VM で全部の試験を回す ([DR-0019](../DR-0019-ci-targets.md))
 
 ## 理由
 
@@ -27,7 +27,7 @@ FreeBSD 10 以降には、ディレクトリの fd を基準にする `bindat(2)
 
 | 案 | 却下の理由 |
 |---|---|
-| FreeBSD でも広げた sockaddr を使う | [DR-0005](DR-0005-widened-sockaddr-on-macos.md) の却下した案 |
+| FreeBSD でも広げた sockaddr を使う | [DR-0005](../DR-0005-widened-sockaddr-on-macos.md) の却下した案 |
 
 ## 判断の出所
 

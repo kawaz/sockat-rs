@@ -1,11 +1,11 @@
 # DR-0023: /proc を使える Linux の connect は、安全でない置き場に自分専用のディレクトリを作り fd で掴んで symlink の経路に使う
 
-- Status: Accepted
+- Status: Superseded by DR-0027
 - Date: 2026-11-18
 
 ## Context
 
-- Linux で seccomp の filter が掛かり (スレッド cwd の経路が使えない、[DR-0020](DR-0020-thread-cwd-route.md))、`TMPDIR` も `/tmp` も安全な置き場でなく ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md))、ファイル名が `/proc` の綴りに収まらない時 ([DR-0003](DR-0003-linux-proc-self-fd.md))、bind は fork で届くが `connect` / `connect_nonblocking` は `ENAMETOOLONG` になる (hyoui の実測)
+- Linux で seccomp の filter が掛かり (スレッド cwd の経路が使えない、[DR-0020](DR-0020-thread-cwd-route.md))、`TMPDIR` も `/tmp` も安全な置き場でなく ([DR-0006](../DR-0006-symlink-in-safe-temp-dir.md))、ファイル名が `/proc` の綴りに収まらない時 ([DR-0003](DR-0003-linux-proc-self-fd.md))、bind は fork で届くが `connect` / `connect_nonblocking` は `ENAMETOOLONG` になる (hyoui の実測)
 - 安全でない置き場に名前で辿る symlink を置くと、他人がそれを差し替えられる
 
 ## Decision
@@ -14,7 +14,7 @@
 
 | 置き場の候補 | 形 |
 |---|---|
-| 安全 | 置き場に直接 symlink ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md)) |
+| 安全 | 置き場に直接 symlink ([DR-0006](../DR-0006-symlink-in-safe-temp-dir.md)) |
 | 安全でない (`/proc` を使える Linux / Android の connect 系) | fd で掴む形 |
 | 安全でない (それ以外) | 何も作らず次の候補へ |
 
@@ -30,7 +30,7 @@
 - bind は使わない。bind の綴り (`/proc/self/fd/<fd>/s/<ファイル名>`) は /proc の経路の綴り (`/proc/self/fd/<fd>/<ファイル名>`) より `s/` の分長く、それが収まるなら /proc の経路が先に通る。2 つの fd の桁数が違う時だけ例外がありうるが、そのためには足さない
 - 使えないとみなして次の候補へ: ディレクトリを作れない、開けない、`fstat` の確認が通らない、`symlinkat` が失敗した、綴りが標準の `sun_path` に収まらない
 - 確認が通らなかったディレクトリ (他人が置いた物) は、中身も含めて使わず、消さない (中に `s` があっても消さない)。この 2 つの状態は型と値で持つ: `HeldDir` の値は確認が通った時だけ作り、`s` を作ったかは値の `linked` で持つ。Drop はその値の分だけ片付ける。`symlinkat` が失敗した時と綴りが収まらない時は、作ったディレクトリを片付けてから次へ
-- connect した結果の失敗はそのまま返し、次の候補・経路で試さない ([DR-0012](DR-0012-route-failure-handling.md))
+- connect した結果の失敗はそのまま返し、次の候補・経路で試さない ([DR-0012](../DR-0012-route-failure-handling.md))
 - `symlinkat` / `unlinkat` は `src/sys.rs` に置く
 
 ## 理由

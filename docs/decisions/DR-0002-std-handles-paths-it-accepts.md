@@ -5,7 +5,7 @@
 
 ## Context
 
-std の `UnixListener::bind` / `UnixStream::connect` は `sun_path` に収まるパスなら受け付ける。sockat はそれより長いパスに届くための crate で、どこから自前の経路 ([DR-0001](DR-0001-long-socket-path-routes.md)) に回すかの境界を決める必要がある。
+std の `UnixListener::bind` / `UnixStream::connect` は `sun_path` に収まるパスなら受け付ける。sockat はそれより長いパスに届くための crate で、どこから自前の経路 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) に回すかの境界を決める必要がある。
 
 ## Decision
 

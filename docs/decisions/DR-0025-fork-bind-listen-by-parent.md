@@ -5,7 +5,7 @@
 
 ## Context
 
-- fork の経路 ([DR-0007](DR-0007-fork-child-fchdir.md)) の bind に、相手 (connect するクライアント) から見える副作用があるかで、Apple の OS の bind に広げた sockaddr が要るかが決まる ([DR-0024](DR-0024-apple-bind-without-widened-sockaddr.md))
+- fork の経路 ([DR-0007](DR-0007-fork-child-fchdir.md)) の bind に、相手 (connect するクライアント) から見える副作用があるかで、fork を避けるために bind に別の綴り (Apple の OS の広げた sockaddr 等) が要るかが決まる ([DR-0027](DR-0027-own-directory-and-fallback-routes.md))
 - クライアントが自分のソケットに問う peer の資格情報 (macOS の `LOCAL_PEERPID`、Linux の `SO_PEERCRED`) は、サーバ側で listen したプロセスを指す
 - 実測 (ハブ [DR-0010](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0010-fork-bind-listen-by-parent.md)、macOS 26.5.2 と Linux の docker)
 

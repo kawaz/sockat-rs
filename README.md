@@ -18,7 +18,8 @@ Use `sockat::bind` / `sockat::connect` where you would use std's `UnixListener::
 - The results are std's own `UnixListener` / `UnixStream`
 - A path that std accepts is handed to std unchanged, so it behaves exactly as with std
 - Even for a long path, the socket file is created at the path given
-- `connect` too tries every route before the fork route (a short symlink under a temporary directory, and on Linux and the Apple OSes a route that moves the cwd of one thread only), so in an ordinary environment it reaches long paths as well
+- `connect` too tries every route before the fork route, so in an ordinary environment it reaches long paths as well
+- To remove the socket file later, use `sockat::bind_ex`. It returns the listener and a `SocketFile` that removes only the file the bind made
 
 ## Why
 
@@ -33,29 +34,41 @@ A path that std accepts (up to `sun_path` − 1 bytes) is handed to std unchange
 | Linux / Android / illumos | up to 107 bytes |
 | macOS / iOS / FreeBSD / NetBSD / OpenBSD | up to 103 bytes |
 
-A longer path is tried on the routes below, in this order per OS, and bound / connected on the first route that can be used.
+A longer path is reached first by **the central route**. sockat makes a directory D of its own (`sockat.XXXXXXXXXX`, mode 0700) and holds it by an fd, makes in it a symlink R with a random name (pointing to the socket's directory), binds / connects with `R/<file name>` relative to D's fd, and removes R and D. The spelling the kernel keeps is `R/<file name>`; R is gone by then, so wherever it is resolved later, it hits nothing.
 
-| OS | Order tried |
+| OS | Means of going through D's fd (in this order) |
 |---|---|
-| Linux / Android (`/proc` usable) | /proc → relative path → symlink → thread cwd → fork (only /proc when its spelling fits) |
-| Linux / Android (`/proc` not usable) | relative path → symlink → thread cwd → fork |
-| FreeBSD | bindat |
-| macOS / iOS and the other Apple OSes, `bind` | relative path → symlink → thread cwd → fork |
-| macOS / iOS and the other Apple OSes, the `connect` variants | relative path → widened sockaddr → symlink → thread cwd → fork |
-| NetBSD / OpenBSD / illumos / other Unix | relative path → symlink → fork |
+| Linux / Android | thread cwd → /proc version → fork (bind only) |
+| macOS / iOS and the other Apple OSes | thread cwd → fork (bind only) |
+| FreeBSD | bindat / connectat |
+| NetBSD / OpenBSD / illumos / other Unix | fork (bind only) |
 | Windows | not supported (compile error) |
 
-- **/proc**: open the directory and pass `/proc/self/fd/<fd>/<file name>`. Not usable without `/proc`, or when the file name does not fit in it (over about 90 bytes)
-- **bindat**: `bindat(2)` / `connectat(2)`, by the file name relative to the directory fd
+- **thread cwd**: move the cwd of a throwaway thread, and of it alone, into D (Linux: `unshare(CLONE_FS)` and `fchdir`; Apple OSes: `pthread_fchdir_np`). It has no side effects, so every function tries it. Not used on Linux under a seccomp filter
+- **/proc version**: pass `/proc/self/fd/<D's fd>/R/<file name>`
+- **bindat / connectat**: pass D's fd
+- **fork**: fork a child that `fchdir`s into D and binds. The caller listens afterwards, so it has no side effect visible to peers
+- D goes in `TMPDIR`, `/tmp` or the socket's directory (`.sockat.XXXXXXXXXX`), the first where it can be made. A place needs to be neither safe nor short (D is held by its fd). Where D can be made nowhere, a bind makes R in the socket's directory and forks
+
+When the central route cannot be used, the connects alone try **the fallback routes**. The kernel keeps no spelling of a connect, so these carry no random part.
+
+| OS | Fallback routes (in this order) |
+|---|---|
+| Linux / Android (`/proc` usable) | /proc → a symlink to the file in D → symlink |
+| Linux / Android (no `/proc`) | relative path → symlink |
+| macOS / iOS and the other Apple OSes | relative path → widened sockaddr → symlink |
+| FreeBSD | connectat |
+| NetBSD / OpenBSD / illumos / other Unix | relative path → symlink |
+
+- **/proc**: pass `/proc/self/fd/<directory fd>/<file name>`
+- **a symlink to the file in D**: make a symlink to the socket file in D and pass `/proc/self/fd/<D's fd>/s`
 - **relative path**: when std accepts the path relative to the cwd, pass that. Only the path string is rewritten; the cwd is never changed
-- **widened sockaddr**: pass a sockaddr carrying up to 253 bytes, which the macOS kernel accepts. Only the connect variants use it (the address of a socket bound through it is cut short and breaks its readers, so a bind does not)
-- **symlink**: create a short symlink under `TMPDIR` or `/tmp` and go through it. For a bind it points to the socket's directory, for a connect to the socket file. It is created only in a place where no other user can replace it, and removed at once. On Linux with `/proc`, a connect also uses a place that is not safe: it makes a private directory there, holds it by an fd and goes through a symlink inside
-- **thread cwd**: move the cwd of a throwaway thread, and of it alone, into the directory (Linux: `unshare(CLONE_FS)` and `fchdir`; Apple OSes: `pthread_fchdir_np`) and bind / connect by the file name alone. It has no side effects, so every function tries it
-- **fork**: fork a child that `fchdir`s into the directory and binds / connects by the file name alone. **Only `bind` and the `connect_any` variants try it**. The caller listens after a bind, so a bind has no side effect visible to peers
+- **widened sockaddr**: pass a sockaddr carrying up to 253 bytes, which the macOS kernel accepts (the address of a socket bound through it is cut short and breaks its readers, so a bind never uses it)
+- **symlink**: create a short symlink to the socket file under `TMPDIR` or `/tmp`, in a place where no other user can replace it, go through it, and remove it at once
 
-None of the routes changes the calling process's cwd, so they can be used from multi-threaded programs.
+The `connect_any` variants fork last when none of these reaches the path. None of the routes changes the cwd of the calling process or thread, so they can be used from multi-threaded programs.
 
-`connect` / `connect_nonblocking` never fork. Where only the fork route would reach the path, they return `ENAMETOOLONG`, as a plain connect to a path too long for `sun_path` does. That happens only when the path fits neither the `/proc` spelling nor a relative path (nor, on the Apple OSes, the widened sockaddr), there is no place to create the symlink (a safe one, except on Linux with `/proc`), and the thread cwd route cannot be used either (NetBSD / OpenBSD / illumos, Linux under a seccomp filter, an Apple OS without `pthread_fchdir_np`). With a usable `/tmp`, `connect` reaches the path through the symlink whatever the directory depth and the file name length. The length limits of each route, and where `connect` stops reaching a path, are in [docs/MANUAL.md](./docs/MANUAL.md#how-a-long-path-is-reached).
+`connect` / `connect_nonblocking` never fork. Where only the fork route would reach the path, they return `ENAMETOOLONG`, as a plain connect to a path too long for `sun_path` does. That happens only when the central route cannot be used for a connect (NetBSD / OpenBSD / illumos, Linux under a seccomp filter without `/proc`, an Apple OS without `pthread_fchdir_np`) and no fallback route reaches the path either. With a usable `/tmp`, `connect` reaches the path whatever the directory depth and the file name length. The length limits of each route, and where reaching stops, are in [docs/MANUAL.md](./docs/MANUAL.md#how-a-long-path-is-reached).
 
 ## The exception: `connect_any`
 
@@ -67,9 +80,21 @@ After a connect through the fork route, the peer pid the server sees is that of 
 
 ## What differs from std for a long path
 
-- `local_addr()` / `peer_addr()` do not return the path: they return the spelling handed to the kernel at bind time (a relative path, `/proc/self/fd/...`, a path through a symlink that no longer exists, ...). Keep the path yourself
+- `local_addr()` / `peer_addr()` do not return the path: they return the spelling handed to the kernel at bind time (`R/<file name>`, `/proc/self/fd/<fd>/R/<file name>`, ...). R is gone, so it hits nothing. Keep the path yourself
+- A bind reaches shorter file names, by R's length (up to 96 bytes on Linux / illumos, 92 on the Apple OSes / the BSDs)
 - A path longer than std accepts that does not end with a file name (ending in `dir/`, `dir/.`, `..`) is an `InvalidInput` error
-- The rest (the fork's side effects, the directory being looked up first, a symlink that may be left behind) is in [docs/MANUAL.md](./docs/MANUAL.md#what-differs-from-std-for-a-long-path)
+- The rest (the fork's side effects, the directory being looked up first, D or R left behind if the process dies midway) is in [docs/MANUAL.md](./docs/MANUAL.md#what-differs-from-std-for-a-long-path)
+
+## Removing the socket file
+
+`bind_ex` returns the listener and a `SocketFile`. `SocketFile::discard()` removes the socket file taken right after the bind, only while what is at its path has the same `(st_dev, st_ino)` (another socket bound at the path since is left alone). The listener stays std's type and may go to tokio etc.; closing it is up to whoever holds it.
+
+```rust
+let (listener, file) = sockat::bind_ex(&path)?;
+// ...
+drop(listener);
+file.discard()?;
+```
 
 ## Async runtimes
 

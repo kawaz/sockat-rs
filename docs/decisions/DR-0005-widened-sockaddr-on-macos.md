@@ -1,4 +1,4 @@
-# DR-0005: macOS の connect 系では広げた sockaddr で 253 バイトまで渡す (FreeBSD では使わない)
+# DR-0005: Apple の OS の connect 系では広げた sockaddr で 253 バイトまで渡す (bind と FreeBSD では使わない)
 
 - Status: Accepted
 - Date: 2026-11-18
@@ -7,26 +7,31 @@
 
 XNU は `bind(2)` / `connect(2)` で `SOCK_MAXADDRLEN` (255) バイトまでのアドレスを受け付け (`getsockaddr`)、`sun_len - offsetof(sun_path)` バイトをパスとして取る (`unp_bind` / `unp_connect`、それが 255 未満であること)。長さと family の 2 バイトを除いて 253 バイトのパスが、NUL 無しで入る。libuv が #5047 で同じ形を使っている。
 
+広げた形で bind したソケットのアドレスは `struct sockaddr_un` (106 バイト) に入らない。`getsockname` は `2 + パスの長さ` を報告し、`sockaddr_un` の大きさのバッファには NUL 無しで詰めて返す (macOS 26.5、試験 `the_address_of_a_widened_bind_does_not_fit_a_sockaddr_un`: 200 バイトのパスで 202 バイトを報告し、std の `local_addr` は 104 バイトで切れたパスを返す)。CPython の `getsockname` は後ろに無関係なバイトを付け、Go の `net.FileConn` は相手の `RemoteAddr` が nil になる (ハブの観測)。connect は自分のソケットを bind しないので、広げた形で connect しても自分のアドレスは切れない。
+
 ## Decision
 
-- macOS の connect 系では、相対パスで届かない時 ([DR-0004](DR-0004-relative-path-from-cwd.md)) に、元のパス、無理なら相対パスを、253 バイト以内なら広げた sockaddr で渡す
-- bind には使わない。bind の綴りは全部、標準の `sun_path` に入る長さで判定する ([DR-0024](DR-0024-apple-bind-without-widened-sockaddr.md))
+- Apple の OS の connect 系の予備の経路 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) で、相対パスで届かない時 ([DR-0004](DR-0004-relative-path-from-cwd.md)) に、元のパス、無理なら相対パスを、253 バイト以内なら広げた sockaddr で渡す
+- `connect_any` 系の最後の fork では、103 バイトを超えるファイル名を広げた sockaddr で渡す
+- bind には使わない。bind の綴りは全部、標準の `sun_path` に入る長さで判定する。広げた形で渡す関数 (`route::apple::wide_connect`) は connect の options しか受け取らず、bind を広げる口を crate の中に置かない
+- 中心の経路 (`R/<ファイル名>`) と symlink の経路は、connect 系でも標準の `sun_path` に入る長さで判定する
 - `sun_len` とアドレス長はどちらも `2 + パスの長さ` にする
-- カーネルがこの形を受け付けない印は `EINVAL` と `ENAMETOOLONG` とし、それなら symlink の経路 ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md)) に進む。以降は std にそのまま渡せる長さで見る
-- 受け付ける間は、connect 系の symlink の経路の綴りと、スレッド cwd・fork の経路のファイル名 ([DR-0020](DR-0020-thread-cwd-route.md)、[DR-0007](DR-0007-fork-child-fchdir.md)) にも広げた sockaddr を使う
-- FreeBSD では使わない ([DR-0008](DR-0008-freebsd-bindat-and-other-unix.md))
+- カーネルがこの形を受け付けない印は `EINVAL` と `ENAMETOOLONG` とし、それなら symlink の経路 ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md)) に進み、最後の fork でもファイル名を広げない
+- FreeBSD では使わない (connectat がある)
 
 ## 理由
 
 - 253 バイトで connect が通ることを実機で確かめた (試験 `the_widened_sockaddr_carries_253_bytes`)
-- 元のパスをそのままカーネルに解決させるので、ディレクトリを先に引く限界 ([DR-0001](DR-0001-long-socket-path-routes.md)) が無い
+- 元のパスをそのままカーネルに解決させるので、ディレクトリを先に引く限界が無い
+- bind で使うと、できたソケットのアドレスが読む側を壊す。bind は中心の経路と fork で届き、fork の bind は相手から見える副作用が無い ([DR-0025](DR-0025-fork-bind-listen-by-parent.md))
 - 受け付けない印で次へ進むのは、将来の macOS が受け付けなくなった場合の逃げ道。今の macOS では起きない
 
 ## 却下した案
 
 | 案 | 却下の理由 |
 |---|---|
-| FreeBSD でも広げた sockaddr を使う | libuv が #5047 の後に「FreeBSD で uv_pipe_bind が壊れた」(#5134) と報告しており、XNU と同じ前提を置けない。`bindat` の方が副作用も無い |
+| FreeBSD でも広げた sockaddr を使う | libuv が #5047 の後に「FreeBSD で uv_pipe_bind が壊れた」(#5134) と報告しており、XNU と同じ前提を置けない。connectat の方が副作用も無い |
+| bind も広げた sockaddr を使う | できたソケットのアドレスが `sockaddr_un` に入らず、CPython / Go の標準を壊す |
 
 ## 未確定
 
@@ -36,5 +41,6 @@ XNU は `bind(2)` / `connect(2)` で `SOCK_MAXADDRLEN` (255) バイトまでの�
 
 - 広げた sockaddr の経路: kawaz 指示 2026-11-18
 - connect 系だけに使う: kawaz 裁定 (ハブ DR-0009、2026-11-18)
+- 予備の経路と最後の fork に置く: kawaz 裁定 (ハブ DR-0012、2026-11-19)
 - FreeBSD で使わない: 統括の裁定 2026-11-18
 - 上に無い細部: 出所の記録なし

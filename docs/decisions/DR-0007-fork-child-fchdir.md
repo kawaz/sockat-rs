@@ -1,34 +1,41 @@
-# DR-0007: 最後の経路として、ディレクトリに fchdir した子を fork する
+# DR-0007: 最後の手として、ディレクトリに fchdir した子を fork する
 
 - Status: Accepted
 - Date: 2026-11-18
 
 ## Context
 
-相対パス・広げた sockaddr・symlink のどれでも届かない環境 (安全で symlink を作れる置き場が無いサンドボックス等、bind でファイル名が symlink の綴りに収まらない時) が残る。Linux と Apple の OS ではそこにスレッド cwd の経路 ([DR-0020](DR-0020-thread-cwd-route.md)) があるが、それも使えない環境 (seccomp の filter が掛かった Linux、`pthread_fchdir_np` の無い libSystem) と、それの無い Unix (NetBSD・OpenBSD・illumos 等) が残る。cwd はプロセスの全スレッドで共有されるので、呼び出し元のプロセスで `chdir` はできない。hyoui (DR-0041 決定 5) は、ディレクトリの fd に `fchdir` した子を fork してファイル名だけで bind / connect する。
+中心の経路のスレッド cwd と /proc 版 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) が使えない環境 (seccomp の filter が掛かった Linux、`pthread_fchdir_np` の無い libSystem、それらの無い NetBSD・OpenBSD・illumos 等) が残る。cwd はプロセスの全スレッドで共有されるので、呼び出し元のプロセスで `chdir` はできない。hyoui (DR-0041 決定 5) は、ディレクトリの fd に `fchdir` した子を fork してファイル名だけで bind / connect する。
 
 ## Decision
 
-dirfd 基準の primitive の無い Unix と /proc の無い Linux で、他の経路 (Linux と Apple の OS ではスレッド cwd の経路も) が全部使えない時の最後の経路にする ([DR-0001](DR-0001-long-socket-path-routes.md))。試すのは `bind` と `connect_any` 系だけ ([DR-0010](DR-0010-public-api.md))。
+他の手段が全部使えない時の最後の手にする ([DR-0027](DR-0027-own-directory-and-fallback-routes.md))。試すのは `bind` と `connect_any` 系だけ ([DR-0010](DR-0010-public-api.md))。
 
-1. 親がソケットを作り、ディレクトリを開いた fd を持ち、sockaddr を組み立ててから fork する (ブロックしない connect では、ソケットを fork の前に `O_NONBLOCK` にする)
-2. 子は `fchdir(dirfd)` → ファイル名で `bind` / `connect` → `_exit(結果)`
-3. 親はその pid だけを `waitpid` し、終了 status から結果を受け取る (0 が成功、1〜255 が errno)
+| 要求 | 子が `fchdir` する fd | 綴り |
+|---|---|---|
+| bind | D | `R/<ファイル名>` |
+| bind (D をどこにも作れない時) | ソケットのディレクトリ | `.sockat.XXXXXXXXXX/<ファイル名>` (R はソケットのディレクトリの中) |
+| `connect_any` 系 (予備の経路の後) | ソケットのディレクトリ | ファイル名 |
+
+1. 親がソケットを作り、ディレクトリの fd を持ち、sockaddr を組み立ててから fork する (ブロックしない connect では、ソケットを fork の前に `O_NONBLOCK` にする)
+2. 子は `fchdir(dirfd)` → 綴りで `bind` / `connect` → `_exit(結果)`
+3. 親はその pid だけを `waitpid` し、終了 status から結果を受け取る (0 が成功、1〜255 が errno)。それから R と D を片付ける
 
 - bind の後の listen は必ず親がする。子が listen すると、クライアントに見えるサーバの peer が死んだ子になる ([DR-0025](DR-0025-fork-bind-listen-by-parent.md))
 - 子の区間は async-signal-safe な呼び出し (`fchdir` / `bind` / `connect` / errno の読み出し / `_exit`) だけにする。allocation も lock も Rust の destructor も通さない
 - **子の status を他者に刈り取られた時** (`SIGCHLD` が `SIG_IGN`、他のスレッドの `waitpid(-1)`。`waitpid` が `ECHILD` で失敗する) は、ソケットの状態から結果を読む。bind は `getsockname` にパスが入っているか、connect は `getpeername` が通るか。この場合 errno は失われ、失敗は一般のエラー (`Other`) になる (試験で確認)
-- ファイル名は標準の `sun_path` に入れる。macOS の connect 系で広げた sockaddr ([DR-0005](DR-0005-widened-sockaddr-on-macos.md)) が使える時はファイル名にもそれを使う (ファイル名が 103 バイトを超える稀な場合)。bind は使わない ([DR-0024](DR-0024-apple-bind-without-widened-sockaddr.md))
+- 綴りは標準の `sun_path` に入れる。Apple の OS の `connect_any` 系で、カーネルが広げた sockaddr ([DR-0005](DR-0005-widened-sockaddr-on-macos.md)) を断っていなければ、103 バイトを超えるファイル名にそれを使う。bind は使わない
 
 ### ディレクトリの開き方と要る権限
 
-| OS | 開き方 | 要る権限 |
+| OS | ソケットのディレクトリの開き方 | 要る権限 |
 |---|---|---|
-| macOS | `O_SEARCH` | 通常の bind / connect と同じ (検索、bind なら書き込みも) |
-| Linux | /proc の経路のために開いた `O_PATH` の fd ([DR-0003](DR-0003-linux-proc-self-fd.md)) | 検索権限で足りる |
-| その他の Unix | `O_RDONLY` | 読み取り権限も要る |
+| Apple の OS | `O_SEARCH` | 通常の bind / connect と同じ (検索、bind なら書き込みも) |
+| Linux | `O_PATH` | 検索権限で足りる |
+| その他の Unix | `O_RDONLY` | 読み取り権限も要る。開けなければこの経路は使えない |
 
-- macOS で `O_SEARCH` をディレクトリに受け付けない古いカーネルは `EISDIR` / `EINVAL` を返すとみなし、その時は `O_RDONLY` で開き直す (この分岐は手元のカーネルでは通らないので、試験では `O_SEARCH` で開いた結果を値として差し替えて通す)
+- D は中心の経路が開いた fd ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) をそのまま使う
+- Apple の OS で `O_SEARCH` をディレクトリに受け付けない古いカーネルは `EISDIR` / `EINVAL` を返すとみなし、その時は `O_RDONLY` で開き直す (この分岐は手元のカーネルでは通らないので、試験では `O_SEARCH` で開いた結果を値として差し替えて通す)
 
 ### 副作用 (doc に書く)
 
@@ -36,7 +43,7 @@ dirfd 基準の primitive の無い Unix と /proc の無い Linux で、他の�
 
 - **connect では、サーバに見える peer の pid が、もう終了したプロセス (fork した子) の pid になる。** ソケット自体は呼び出し元が持っていて、普通に使える
   - uid / gid は呼び出し元と同じ
-  - macOS の `LOCAL_PEERPID` は、呼び出し元が send すると呼び出し元の pid に変わる (試験 `local_peerpid_of_a_forked_connect_names_the_child_until_the_client_sends`)。Linux の `SO_PEERCRED` は終了した子の pid のままで、send しても変わらない ([DR-0003](DR-0003-linux-proc-self-fd.md))
+  - macOS の `LOCAL_PEERPID` は、呼び出し元が send すると呼び出し元の pid に変わる (試験 `local_peerpid_of_a_forked_connect_names_the_child_until_the_client_sends`)。Linux の `SO_PEERCRED` は終了した子の pid のままで、send しても変わらない (試験 `so_peercred_keeps_the_pid_of_a_forked_connector`)
   - 終了した pid の番号は、後で別のプロセスに再利用されうる。その pid からは、プロセスの情報も ppid も引けない
 - 相手から見えない副作用 (bind でも connect でも)
   - **子は一瞬、プロセスの全 fd の複製を持つ** (fork の性質)。その間に他のスレッドが閉じたソケットやパイプは、子が終わるまで開いたままになる。閉じた listener の backlog にさらに接続が入りうる (並行する試験の fork が、別の試験の閉じたはずの listener を生かしたことがある)
@@ -64,10 +71,10 @@ dirfd 基準の primitive の無い Unix と /proc の無い Linux で、他の�
 ## 未確定
 
 - NetBSD・OpenBSD・illumos で fork の経路で connect した時の peer の資格情報の振る舞いは確かめていない
-- Linux の `O_PATH` の fd で権限が足りることは、/proc の無い環境では常設の試験が無い (試験は docker の root で走り、権限を確かめられない)
 
 ## 判断の出所
 
-- 最後の経路として fork する (hyoui DR-0041 決定 5 を引き継ぐ): kawaz 指示 2026-11-18
+- 最後の手として fork する (hyoui DR-0041 決定 5 を引き継ぐ): kawaz 指示 2026-11-18
+- bind の fork は D の中の R を通す、D をどこにも作れない時は R をソケットのディレクトリに作る: kawaz 裁定 (ハブ DR-0012、2026-11-19)
 - ディレクトリの開き方と要る権限: 統括の裁定 2026-11-18
 - 上に無い細部: 出所の記録なし

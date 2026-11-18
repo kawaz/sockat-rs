@@ -1,11 +1,11 @@
 # DR-0024: Apple の OS の bind は広げた sockaddr を使わない
 
-- Status: Accepted
+- Status: Superseded by DR-0027
 - Date: 2026-11-18
 
 ## Context
 
-- 広げた sockaddr ([DR-0005](DR-0005-widened-sockaddr-on-macos.md)) で bind したソケットのアドレスは `struct sockaddr_un` (106 バイト) に入らない。`getsockname` は `2 + パスの長さ` を報告し、`sockaddr_un` の大きさのバッファには NUL 無しで詰めて返す (macOS 26.5、試験 `the_address_of_a_widened_bind_does_not_fit_a_sockaddr_un`: 200 バイトのパスで 202 バイトを報告し、std の `local_addr` は 104 バイトで切れたパスを返す)
+- 広げた sockaddr ([DR-0005](../DR-0005-widened-sockaddr-on-macos.md)) で bind したソケットのアドレスは `struct sockaddr_un` (106 バイト) に入らない。`getsockname` は `2 + パスの長さ` を報告し、`sockaddr_un` の大きさのバッファには NUL 無しで詰めて返す (macOS 26.5、試験 `the_address_of_a_widened_bind_does_not_fit_a_sockaddr_un`: 200 バイトのパスで 202 バイトを報告し、std の `local_addr` は 104 バイトで切れたパスを返す)
 - それが読む側を壊す (ハブ [DR-0009](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0009-apple-bind-without-widened-sockaddr.md) の観測。sockat-rs では確かめていない)
 
 | 読む側 | 壊れ方 |
@@ -28,7 +28,7 @@
 
 ## 理由
 
-- bind は fork の経路でも相手から見える副作用が無い ([DR-0025](DR-0025-fork-bind-listen-by-parent.md)) ので、広げた sockaddr で fork を避ける理由が無い
+- bind は fork の経路でも相手から見える副作用が無い ([DR-0025](../DR-0025-fork-bind-listen-by-parent.md)) ので、広げた sockaddr で fork を避ける理由が無い
 - bind を広げる口を作らなければ、経路の順番を直した時に bind が広げた形に戻る事故が型の上で起きない
 
 悪い面:

@@ -1,6 +1,6 @@
 # DR-0001: sun_path を超える socket のパスに届く経路と、試す順番
 
-- Status: Accepted
+- Status: Superseded by DR-0027
 - Date: 2026-11-18
 
 ## Context
@@ -16,7 +16,7 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 
 ## Decision
 
-- std が受け付けるパスは std にそのまま渡す ([DR-0002](DR-0002-std-handles-paths-it-accepts.md))
+- std が受け付けるパスは std にそのまま渡す ([DR-0002](../DR-0002-std-handles-paths-it-accepts.md))
 - それを超えるパスは、OS ごとに次の順に試し、最初に使えた経路で bind / connect する
 
   | OS | 試す順番 |
@@ -27,23 +27,23 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
   | macOS / iOS 等 Apple の OS の bind | 相対パス → symlink → スレッド cwd → fork ([DR-0024](DR-0024-apple-bind-without-widened-sockaddr.md)) |
   | macOS / iOS 等 Apple の OS の connect 系 | 相対パス → 広げた sockaddr → symlink → スレッド cwd → fork |
   | NetBSD / OpenBSD / illumos / その他の Unix | 相対パス → symlink → fork |
-  | Windows | 対象外 ([DR-0009](DR-0009-windows-out-of-scope.md)) |
+  | Windows | 対象外 ([DR-0009](../DR-0009-windows-out-of-scope.md)) |
 
-- NUL を含むパスは、長さを見る前に `InvalidInput` にする。Linux / Android の先頭の NUL (abstract namespace) は対象外で std にそのまま渡す ([DR-0021](DR-0021-nul-is-invalid-at-any-length.md))
+- NUL を含むパスは、長さを見る前に `InvalidInput` にする。Linux / Android の先頭の NUL (abstract namespace) は対象外で std にそのまま渡す ([DR-0021](../DR-0021-nul-is-invalid-at-any-length.md))
 - **順番の方針: 副作用の無い安い経路から試し、fork は最後に回す。** ディレクトリの fd を基準にできる primitive (Linux の /proc、FreeBSD の `bindat`) が使える時は、それだけを使う
 - どの経路も呼び出し元のプロセスの cwd を変えない
-- fork の経路を試すのは `bind` と `connect_any` 系だけ ([DR-0010](DR-0010-public-api.md))
-- 経路が使えないのか、経路で本当に失敗したのかの扱いは [DR-0012](DR-0012-route-failure-handling.md)
+- fork の経路を試すのは `bind` と `connect_any` 系だけ ([DR-0010](../DR-0010-public-api.md))
+- 経路が使えないのか、経路で本当に失敗したのかの扱いは [DR-0012](../DR-0012-route-failure-handling.md)
 
 | 経路 | 使う OS | DR |
 |---|---|---|
 | /proc (`/proc/self/fd/<fd>/<ファイル名>`) | Linux / Android | [DR-0003](DR-0003-linux-proc-self-fd.md) |
-| 相対パス (cwd から) | FreeBSD 以外 | [DR-0004](DR-0004-relative-path-from-cwd.md) |
-| 広げた sockaddr (253 バイト) | Apple の OS の connect 系 | [DR-0005](DR-0005-widened-sockaddr-on-macos.md)、[DR-0024](DR-0024-apple-bind-without-widened-sockaddr.md) |
-| symlink (安全な置き場の短い symlink を経由) | FreeBSD 以外 | [DR-0006](DR-0006-symlink-in-safe-temp-dir.md) |
+| 相対パス (cwd から) | FreeBSD 以外 | [DR-0004](../DR-0004-relative-path-from-cwd.md) |
+| 広げた sockaddr (253 バイト) | Apple の OS の connect 系 | [DR-0005](../DR-0005-widened-sockaddr-on-macos.md)、[DR-0024](DR-0024-apple-bind-without-widened-sockaddr.md) |
+| symlink (安全な置き場の短い symlink を経由) | FreeBSD 以外 | [DR-0006](../DR-0006-symlink-in-safe-temp-dir.md) |
 | symlink の fd で掴む形 (安全でない置き場に作った自分専用のディレクトリを fd で辿る) | /proc を使える Linux / Android の connect 系 | [DR-0023](DR-0023-unsafe-base-held-by-fd.md) |
 | スレッド cwd (使い捨てのスレッドだけ cwd を移す) | Linux / Android、Apple の OS | [DR-0020](DR-0020-thread-cwd-route.md) |
-| fork (`fchdir` した子が bind / connect) | FreeBSD 以外 | [DR-0007](DR-0007-fork-child-fchdir.md) |
+| fork (`fchdir` した子が bind / connect) | FreeBSD 以外 | [DR-0007](../DR-0007-fork-child-fchdir.md) |
 | bindat (`bindat(2)` / `connectat(2)`) | FreeBSD | [DR-0008](DR-0008-freebsd-bindat-and-other-unix.md) |
 
 ### 全経路に共通の限界: ディレクトリを先に引く
@@ -52,12 +52,12 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 - その間に途中のディレクトリが rename されたり symlink が張り替えられたりすると、引いた時点のディレクトリにソケットができる (connect ならそこを見る)。呼んだ瞬間のパスの意味とずれうる
 - 広げた sockaddr と symlink の経路は元のパスをそのままカーネルに解決させるので、この点は元のパスと同じに振る舞う
 
-カーネルが返すアドレスが元のパスでないことは [DR-0013](DR-0013-kernel-returned-address.md)。
+カーネルが返すアドレスが元のパスでないことは [DR-0013](../DR-0013-kernel-returned-address.md)。
 
 ## 理由
 
-- fork は副作用がある (connect ではサーバに見える peer の pid が終了した子の pid になる。bind でも connect でも、子が一瞬全 fd の複製を持ち、親に `SIGCHLD` が届く等、相手から見えない副作用がある。[DR-0007](DR-0007-fork-child-fchdir.md)、[DR-0025](DR-0025-fork-bind-listen-by-parent.md))。避けられる経路があるなら、そちらで届かせる
-- ふつうの環境 (`/tmp` が書ける) では symlink の経路までで届く ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md))。Linux と Apple の OS では、それも使えない時にスレッド cwd の経路が副作用無しで届く ([DR-0020](DR-0020-thread-cwd-route.md))。fork が要るのは、それらも使えない時だけになる
+- fork は副作用がある (connect ではサーバに見える peer の pid が終了した子の pid になる。bind でも connect でも、子が一瞬全 fd の複製を持ち、親に `SIGCHLD` が届く等、相手から見えない副作用がある。[DR-0007](../DR-0007-fork-child-fchdir.md)、[DR-0025](../DR-0025-fork-bind-listen-by-parent.md))。避けられる経路があるなら、そちらで届かせる
+- ふつうの環境 (`/tmp` が書ける) では symlink の経路までで届く ([DR-0006](../DR-0006-symlink-in-safe-temp-dir.md))。Linux と Apple の OS では、それも使えない時にスレッド cwd の経路が副作用無しで届く ([DR-0020](DR-0020-thread-cwd-route.md))。fork が要るのは、それらも使えない時だけになる
 
 ## 却下した案
 
@@ -68,7 +68,7 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 ## 未確定
 
 - Android は compile もしていない。macOS 以外の Apple OS は iOS の clippy (試験コード込み) だけ確かめた
-- NetBSD・OpenBSD・illumos の振る舞いは CI の VM の試験で確かめる ([DR-0019](DR-0019-ci-targets.md))。手元では NetBSD・illumos の clippy (試験コード込み) まで。OpenBSD は rustup に std が無く、手元では compile も確かめていない
+- NetBSD・OpenBSD・illumos の振る舞いは CI の VM の試験で確かめる ([DR-0019](../DR-0019-ci-targets.md))。手元では NetBSD・illumos の clippy (試験コード込み) まで。OpenBSD は rustup に std が無く、手元では compile も確かめていない
 
 ## 判断の出所
 

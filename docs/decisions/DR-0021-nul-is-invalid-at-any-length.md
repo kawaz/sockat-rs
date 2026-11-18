@@ -8,7 +8,7 @@
 - std にそのまま渡せる長さのパスは std に渡す ([DR-0002](DR-0002-std-handles-paths-it-accepts.md))
 - カーネルはソケットのパスを最初の NUL までしか読まない。NUL を含むパスを通すと、利用者の指定と別の場所 (NUL の手前まで) にソケットができうる
 - Rust の std (`library/std/src/os/unix/net/addr.rs` の `sockaddr_un`) は、`bytes.contains(&0)` のパスを長さの判定より前に `InvalidInput` ("paths must not contain interior null bytes") で断る。先頭の NUL も断る。Linux の abstract namespace は `Path` でなく `SocketAddr::from_abstract_name` と `bind_addr` / `connect_addr` で扱う
-- 長いパスは経路に回るので、NUL の判定を経路に任せると経路が先に動く。例えば symlink の経路は、置き場に symlink を作ってから、それを通した bind / connect で `InvalidInput` になる (判定を外すと、試験 `a_nul_is_invalid_input_at_any_length_and_nothing_is_made` が macOS で置き場の mtime の変化で落ちる)
+- 長いパスは経路に回るので、NUL の判定を経路に任せると経路が先に動く。例えば中心の経路は、置き場に D と R を作ってから、それを通した bind / connect で `InvalidInput` になる (試験 `a_nul_is_invalid_input_at_any_length_and_nothing_is_made` は置き場とソケットのディレクトリの mtime が変わらないことを確かめる)
 
 ## Decision
 
@@ -20,7 +20,7 @@
 ## 理由
 
 - 利用者の指定と別の場所にソケットができるのを、どの長さでも防ぐ。std は元から NUL を断るので、短いパスの振る舞いは変わらない (種類は同じ `InvalidInput`。文言は sockat のもの)
-- 長いパスでも経路より前に断るので、置き場に一時的な symlink も作らない
+- 長いパスでも経路より前に断るので、置き場に D も一時的な symlink も作らない
 - Linux / Android 以外には abstract namespace が無く、先頭の NUL も「パスの中の NUL」と同じ
 
 ## 却下した案
@@ -28,7 +28,7 @@
 | 案 | 却下の理由 |
 |---|---|
 | 短いパスは NUL を含んでも std にそのまま渡す | 標準が NUL で切り詰める言語では別の場所にソケットができる (ハブ DR-0006 の却下)。Rust では std が断るので結果は同じだが、長さで扱いを分ける理由が無い |
-| 長いパスの NUL は経路に任せる | 経路が symlink を作ってから断られる。どの経路の誰が断るかで文言も変わる |
+| 長いパスの NUL は経路に任せる | 経路が D や symlink を作ってから断られる。どの経路の誰が断るかで文言も変わる |
 
 ## 判断の出所
 
