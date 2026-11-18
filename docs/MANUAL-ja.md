@@ -10,7 +10,7 @@ sockat の使い方と、長いパスにどう届くか、長いパスで std �
 
 ```toml
 [dependencies]
-sockat = "0.2"
+sockat = "0.3"
 ```
 
 std の `bind` / `connect` の代わりに `sockat::bind` / `sockat::connect` を使う。非同期のコードでは `sockat::connect_nonblocking` を使う。
@@ -21,7 +21,7 @@ std の `bind` / `connect` の代わりに `sockat::bind` / `sockat::connect` �
 | `sockat::connect(path)` | `UnixStream::connect(path)` | `io::Result<UnixStream>` |
 | `sockat::connect_nonblocking(path)` | (無し) | `io::Result<UnixStream>` (非ブロッキング) |
 
-この他に、よほど珍しい環境のための `connect_any` / `connect_any_nonblocking` がある ([後述](#例外-connect_any))。
+この他に、よほど珍しい環境のための `connect_any` / `connect_any_nonblocking` が、feature `connect-any` の後ろにある ([後述](#例外-connect_any))。
 
 ```rust
 use std::io::{Read, Write};
@@ -132,7 +132,8 @@ Linux / Android と Apple の OS。この呼び出しのためだけにスレッ
 - ソケットは呼び出し元のスレッドが作り (`connect_nonblocking` 等はここで非ブロッキングにする)、bind の後の listen も呼び出し元のスレッドがする
 - ファイル名と、ディレクトリの開き方・要る権限は [fork](#fork) の経路と同じ
 - 使えない時は次の経路 (`bind` と `connect_any` 系は fork、`connect` / `connect_nonblocking` は `ENAMETOOLONG`) に進む。使えないのは次の時:
-  - Linux で `unshare` が断られた (docker の既定の seccomp は `EPERM` で断る)
+  - Linux で seccomp の filter が掛かっている (docker の既定も掛かっている)。filter には `unshare` をエラーでなくプロセスの kill (SIGSYS) で断るもの (systemd の `SystemCallFilter=` の既定の動作等) があるので、filter が掛かっていれば `unshare` を呼ばない
+  - Linux で `unshare` が断られた
   - Apple の OS で `pthread_fchdir_np` が無い・失敗した (公開ヘッダに無い関数なので、実行時に探す)
   - スレッドを作れない
 
@@ -181,13 +182,15 @@ Linux / Android で先頭が NUL のパスは abstract namespace の名前でフ
 要るのは、安全で symlink を作れる置き場が無く、さらに次のどれかの時だけ:
 
 - NetBSD / OpenBSD / illumos 等、スレッド cwd の経路の無い OS
-- `unshare` が断られる Linux (docker の既定の seccomp 等)
+- seccomp の filter が掛かった Linux (docker の既定、systemd の `SystemCallFilter=` 等)
 - `pthread_fchdir_np` の無い Apple の OS
 
 | 関数 | 戻り値 |
 |---|---|
 | `sockat::connect_any(path)` | `io::Result<(UnixStream, bool)>` (ブロックする) |
 | `sockat::connect_any_nonblocking(path)` | `io::Result<(UnixStream, bool)>` (非ブロッキング) |
+
+既定では無効で、feature `connect-any` を有効にした時だけ使える: `sockat = { version = "0.3", features = ["connect-any"] }`
 
 試す順番は `connect` と同じで、他の経路 ([スレッド cwd](#スレッド-cwd) を含む) が全部使えない時に最後に [fork](#fork) の経路で connect する。`bool` は、fork の経路を通った時に `true`、通らなかった時は `false`。`true` の時は下の副作用が乗っているので、ログに残す・警告するなどに使える。FreeBSD では fork しないので、常に `false` になる。
 
@@ -278,7 +281,7 @@ let stream = tokio::net::UnixStream::from_std(stream)?;
 
 ## 確かめていないこと
 
-- Android は compile もしていない。Linux と同じ経路を使う。スレッド cwd の経路の `unshare` が Android で通るかも確かめていない
+- Android は compile もしていない。Linux と同じ経路を使う。Android のアプリは seccomp の filter の下で動くので、スレッド cwd の経路は使われない見込み (確かめていない)
 - NetBSD・OpenBSD・illumos は CI の VM で試験を回しているが、fork の経路で connect した時の peer の資格情報 (pid) の振る舞いは確かめていない
 - ブロックしない connect が backlog の満杯で返すエラーと、connect が呼び出しの中で終わることは、Linux と macOS でだけ確かめた
 - macOS 以外の Apple の OS (iOS 等) は macOS と同じ経路を使うが、確かめたのは iOS の clippy だけ。`pthread_fchdir_np` があるかも確かめていない (無ければスレッド cwd の経路は使えないとして次へ進む)

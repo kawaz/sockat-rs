@@ -11,13 +11,14 @@
 
 | job | 対象 | 中身 |
 |---|---|---|
-| test | ubuntu-latest、macos-latest | `just ci` (fmt、clippy、unsafe の封じ込め、試験) |
-| freebsd | FreeBSD の VM | `cargo test` |
-| netbsd / openbsd / illumos | NetBSD・OpenBSD・illumos (OmniOS) の VM | `cargo test` |
-| cross-check | x86_64-unknown-netbsd、x86_64-unknown-freebsd、aarch64-apple-ios | `cargo clippy --all-targets -- -D warnings` |
-| msrv | Rust 1.85 | `cargo check` |
+| test | ubuntu-latest、macos-latest | `just ci` (fmt、clippy (全 feature と feature 無し)、unsafe の封じ込め、試験) |
+| freebsd | FreeBSD の VM | `cargo test --all-features` |
+| netbsd / openbsd / illumos | NetBSD・OpenBSD・illumos (OmniOS) の VM | `cargo test --all-features` |
+| cross-check | x86_64-unknown-netbsd、x86_64-unknown-freebsd、aarch64-apple-ios | `cargo clippy --all-targets --all-features -- -D warnings` |
+| msrv | Rust 1.85 | `cargo check --all-features` |
 | audit | RUSTSEC | cargo-audit |
 
+- 試験・clippy・check は `--all-features` で回す (feature `connect-any` の関数も試験する。[DR-0022](DR-0022-connect-any-behind-feature.md))
 - 試験は nextest で回し、試験 1 本の slow-timeout を 60 秒 × 3 にする (`.config/nextest.toml`)。CI で nextest が無ければ失敗させる
 - job の `timeout-minutes` は外側の上限
 - 手元では `just test` (macOS) と `just test-linux` (docker で Linux) の両方で回す

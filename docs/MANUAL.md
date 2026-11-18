@@ -10,7 +10,7 @@ The language-independent behaviour is defined by the [sockat specification](http
 
 ```toml
 [dependencies]
-sockat = "0.2"
+sockat = "0.3"
 ```
 
 Use `sockat::bind` / `sockat::connect` where you would use std's `bind` / `connect`. In async code, use `sockat::connect_nonblocking`.
@@ -21,7 +21,7 @@ Use `sockat::bind` / `sockat::connect` where you would use std's `bind` / `conne
 | `sockat::connect(path)` | `UnixStream::connect(path)` | `io::Result<UnixStream>` |
 | `sockat::connect_nonblocking(path)` | (none) | `io::Result<UnixStream>` (nonblocking) |
 
-There are also `connect_any` / `connect_any_nonblocking`, for rare environments ([below](#the-exception-connect_any)).
+There are also `connect_any` / `connect_any_nonblocking`, for rare environments, behind the feature `connect-any` ([below](#the-exception-connect_any)).
 
 ```rust
 use std::io::{Read, Write};
@@ -132,7 +132,8 @@ Linux / Android and the Apple OSes. A thread is started for this call alone, onl
 - The socket is created by the calling thread (`connect_nonblocking` and the like make it nonblocking there), and the listen after a bind is done by the calling thread too
 - The file name, how the directory is opened and the permission needed are the same as on the [fork](#fork) route
 - When it cannot be used, the next route is tried (the fork route for `bind` and the `connect_any` variants, `ENAMETOOLONG` for `connect` / `connect_nonblocking`). It cannot be used when:
-  - on Linux, `unshare` is refused (docker's default seccomp refuses it with `EPERM`)
+  - on Linux, a seccomp filter is in effect (docker's default installs one). Some filters answer `unshare` by killing the process (SIGSYS) rather than with an error (systemd's `SystemCallFilter=` does by default), so under a filter `unshare` is not called
+  - on Linux, `unshare` is refused
   - on an Apple OS, `pthread_fchdir_np` is missing or fails (it is not in any public header, so it is looked up at run time)
   - no thread can be started
 
@@ -181,13 +182,15 @@ On Linux / Android a path starting with a NUL is a name in the abstract namespac
 They are needed only where there is no safe place where the symlink can be created, and in addition one of:
 
 - an OS without the thread cwd route: NetBSD / OpenBSD / illumos and the like
-- Linux where `unshare` is refused (docker's default seccomp and the like)
+- Linux under a seccomp filter (docker's default, systemd's `SystemCallFilter=` and the like)
 - an Apple OS without `pthread_fchdir_np`
 
 | Function | Returns |
 |---|---|
 | `sockat::connect_any(path)` | `io::Result<(UnixStream, bool)>` (blocking) |
 | `sockat::connect_any_nonblocking(path)` | `io::Result<(UnixStream, bool)>` (nonblocking) |
+
+They are off by default and available only with the feature `connect-any`: `sockat = { version = "0.3", features = ["connect-any"] }`
 
 The order tried is that of `connect`; when no other route (the [thread cwd](#thread-cwd) route included) can be used, the connect is finally made on the [fork](#fork) route. The `bool` is `true` when the fork route was taken, and `false` otherwise. When it is `true` the side effects below apply, so it can be used, for example, to log or warn about it. FreeBSD never forks, so there it is always `false`.
 
@@ -278,7 +281,7 @@ let stream = tokio::net::UnixStream::from_std(stream)?;
 
 ## Not checked
 
-- Android has not even been compiled. It uses the same routes as Linux. Whether the thread cwd route's `unshare` goes through on Android was not checked either
+- Android has not even been compiled. It uses the same routes as Linux. Android apps run under a seccomp filter, so the thread cwd route is expected not to be used there (not checked)
 - NetBSD, OpenBSD and illumos run the tests on VMs in CI, but how the peer credentials (pid) behave after a connect through the fork route was not checked
 - The error a nonblocking connect returns for a full backlog, and that a connect completes within the call, were checked only on Linux and macOS
 - Apple OSes other than macOS (iOS and others) use the same routes as macOS, but only iOS's clippy was checked. Whether they have `pthread_fchdir_np` was not checked either (without it the thread cwd route counts as unusable and the next route is tried)

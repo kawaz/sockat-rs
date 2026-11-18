@@ -15,7 +15,7 @@
   - 広げた sockaddr をカーネルが受け付けない ([DR-0005](DR-0005-widened-sockaddr-on-macos.md))
   - symlink の置き場が安全でない・作れない ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md))
   - 相対パスの経路で、作った綴りのディレクトリが元と `(st_dev, st_ino)` で一致しない、または cwd が既に変わっている ([DR-0004](DR-0004-relative-path-from-cwd.md))
-  - スレッド cwd の経路で、スレッドを作れない、`unshare` が断られた、`pthread_fchdir_np` が無い・失敗した ([DR-0020](DR-0020-thread-cwd-route.md))
+  - スレッド cwd の経路で、スレッドを作れない、seccomp の filter が掛かっている (Linux)、`unshare` が断られた、`pthread_fchdir_np` が無い・失敗した ([DR-0020](DR-0020-thread-cwd-route.md))
   - 長さが足りない
 - **fork を試さない connect** (`connect` / `connect_nonblocking`) は、スレッド cwd の経路の後、fork の経路の手前で `ENAMETOOLONG` を返す。ファイルシステムに何も作らず、何も connect しない。専用のエラーや文言は作らない。スレッド cwd の経路で実際に connect した失敗 (`ENOENT`、`ECONNREFUSED` 等) は、`ENAMETOOLONG` に変えずにそのまま返す
 - ディレクトリが無い時は、どの OS でも、ファイル名の長さによらず `ENOENT` を返す。ディレクトリを先に開いてから、ファイル名が収まるかを判定する (スレッド cwd と fork の経路の手前)

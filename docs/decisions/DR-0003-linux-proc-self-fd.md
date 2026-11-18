@@ -16,7 +16,7 @@ Linux には、ディレクトリの fd を基準にファイル名で bind / co
   - ファイル名が /proc の綴りに収まらない: `/proc/self/fd/<n>/<ファイル名>` が `sun_path` (107 バイト + NUL) を超える (ファイル名がおよそ 90 バイトを超える時)
 - /proc の経路で実際に bind / connect した結果のエラーはそのまま返し、他の経路でやり直さない ([DR-0012](DR-0012-route-failure-handling.md))
 - /proc が使えずスレッド cwd か fork の経路まで進んだ時は、/proc の経路のために開いた `O_PATH` の fd にそのスレッドか子が `fchdir` する。ファイル名の上限はその経路のもの (標準の `sun_path` に入ること) で、/proc の綴りの上限は当てない ([DR-0020](DR-0020-thread-cwd-route.md)、[DR-0007](DR-0007-fork-child-fchdir.md))
-  - connect は先にファイルを指す symlink ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md)) で届く。bind と、symlink の置き場の無い connect は、スレッド cwd の経路で 107 バイトのファイル名まで届く。それが使えない時 (`unshare` を断る seccomp) は、bind と `connect_any` 系は fork で届く
+  - connect は先にファイルを指す symlink ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md)) で届く。bind と、symlink の置き場の無い connect は、スレッド cwd の経路で 107 バイトのファイル名まで届く。それが使えない時 (seccomp の filter が掛かっている等。 seccomp) は、bind と `connect_any` 系は fork で届く
 - fork の副作用は、/proc の経路もスレッド cwd の経路も使えない時に長いパスを bind する時と、`connect_any` 系で fork の経路まで進んだ時だけ乗る。connect では **サーバに見える peer の pid (`SO_PEERCRED`) は、もう終了した子の pid になり、呼び出し元が send しても変わらない** (試験 `without_proc_the_server_sees_the_forked_child_as_the_peer`)
 - Android も同じ扱いにする
 

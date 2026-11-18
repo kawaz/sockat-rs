@@ -54,11 +54,13 @@ A longer path is tried on the routes below, in this order per OS, and bound / co
 
 None of the routes changes the calling process's cwd, so they can be used from multi-threaded programs.
 
-`connect` / `connect_nonblocking` never fork. Where only the fork route would reach the path, they return `ENAMETOOLONG`, as a plain connect to a path too long for `sun_path` does. That happens only when the path fits neither the `/proc` spelling nor a relative path (nor, on the Apple OSes, the widened sockaddr), there is no safe place to create the symlink, and the thread cwd route cannot be used either (NetBSD / OpenBSD / illumos, Linux where `unshare` is refused, an Apple OS without `pthread_fchdir_np`). With a usable `/tmp`, `connect` reaches the path through the symlink whatever the directory depth and the file name length. The length limits of each route, and where `connect` stops reaching a path, are in [docs/MANUAL.md](./docs/MANUAL.md#how-a-long-path-is-reached).
+`connect` / `connect_nonblocking` never fork. Where only the fork route would reach the path, they return `ENAMETOOLONG`, as a plain connect to a path too long for `sun_path` does. That happens only when the path fits neither the `/proc` spelling nor a relative path (nor, on the Apple OSes, the widened sockaddr), there is no safe place to create the symlink, and the thread cwd route cannot be used either (NetBSD / OpenBSD / illumos, Linux under a seccomp filter, an Apple OS without `pthread_fchdir_np`). With a usable `/tmp`, `connect` reaches the path through the symlink whatever the directory depth and the file name length. The length limits of each route, and where `connect` stops reaching a path, are in [docs/MANUAL.md](./docs/MANUAL.md#how-a-long-path-is-reached).
 
 ## The exception: `connect_any`
 
 `connect_any` / `connect_any_nonblocking` are only for the rare environment that hits the `ENAMETOOLONG` above, when you want the connection at the cost of the fork's side effects. When no other route can be used, they have a forked child make the connect (the child exits at once), and they also return whether they took the fork route (`(UnixStream, bool)`, `true` when they did), for example to log or warn about it.
+
+They are off by default and available only with the feature `connect-any`: `sockat = { version = "0.3", features = ["connect-any"] }`
 
 After a connect through the fork route, the peer pid the server sees is that of a process that has already exited (the forked child). Details in [docs/MANUAL.md](./docs/MANUAL.md#the-exception-connect_any).
 

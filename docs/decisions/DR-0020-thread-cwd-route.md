@@ -13,7 +13,7 @@
 
 | OS | やり方 |
 |---|---|
-| Linux / Android | 使い捨てのスレッドで `unshare(CLONE_FS)` → `fchdir(dirfd)` → ファイル名で bind / connect。スレッドは呼び出しと一緒に終わる |
+| Linux / Android | 使い捨てのスレッドで、seccomp の filter が掛かっていないことを確かめ、`unshare(CLONE_FS)` → `fchdir(dirfd)` → ファイル名で bind / connect。スレッドは呼び出しと一緒に終わる |
 | Apple の OS | 使い捨てのスレッドで `pthread_fchdir_np(dirfd)` → ファイル名で bind / connect。スレッドは呼び出しと一緒に終わるので cwd は戻さない |
 | NetBSD / OpenBSD / illumos 等 | 無い |
 
@@ -24,8 +24,10 @@
 - ファイル名は fork の経路と同じ sockaddr に入れる。標準の `sun_path` に入らない時、Apple でカーネルが広げた sockaddr を受け付ける間は広げた形 (253 バイトまで)。入らなければ `ENAMETOOLONG`
 - 使えないとみなして次の経路 (fork、`connect` 系なら `ENAMETOOLONG`) に進むのは次の時
   - スレッドを作れない
-  - `unshare` が断られた (どの errno でも。docker の既定の seccomp は `EPERM`)
+  - Linux で seccomp の filter が掛かっている (`prctl(PR_GET_SECCOMP)` が 0 でない、または読めない)。`unshare` を呼ばない。filter には `unshare` をエラーでなく SIGSYS によるプロセスの kill で断るものがあり、呼ぶとプロセスが死ぬ
+  - `unshare` が断られた (どの errno でも)
   - `pthread_fchdir_np` が無い (実行時に `dlsym` で引いて見つからない)、または失敗した
+- seccomp の判定は、作った使い捨てのスレッドの中で `unshare` の直前にする。filter はスレッド単位で掛かり (新しいスレッドは作ったスレッドの filter を継ぎ、1 つのスレッドにだけ足すこともできる)、`unshare` を呼ぶのはそのスレッドだから
 - Linux の `fchdir` の失敗は使えない印にしない。fork の経路の子の `fchdir` と同じく、その errno を本当の失敗として返す
 - bind / connect 自体の失敗はそのまま返し、fork の経路でやり直さない ([DR-0012](DR-0012-route-failure-handling.md))
 - 試験から使えない時を作るため、この経路を試すかを `route::posix::Config` の値にする ([DR-0011](DR-0011-routes-not-exposed.md))。試験の外では常に試す
@@ -38,7 +40,9 @@
 - Apple でも使い捨てのスレッドにするのは、呼び出し元のスレッドで `pthread_fchdir_np` して戻す形だと、呼び出し元がそのスレッドに自分で設定していたスレッドの cwd を `pthread_fchdir_np(-1)` で消してしまい、戻すのに失敗した時はそのスレッドだけ別の cwd に残るから。Linux と同じ形にもそろう
 - `pthread_fchdir_np` は公開ヘッダに無いので、リンクせず実行時に引く。将来の libSystem から消えても、読み込めない binary にならず、この経路が使えないだけになる
 - `fchdir` は Linux 3.5 以降 `O_PATH` のディレクトリの fd を受け付ける (docker の `seccomp=unconfined` で、uid 1000 が読み取り権限の無い mode 0300 のディレクトリに bind / connect できることを確認)。macOS の `pthread_fchdir_np` も `O_SEARCH` の fd を受け付ける (macOS 26.5 で mode 0300 のディレクトリに bind / connect できることを試験で確認)
-- docker の既定の seccomp は `unshare` を `EPERM` で断る (試験 `the_thread_cwd_route_comes_after_symlink_and_before_fork` がその時に fork の経路へ進むことを確かめる)。`seccomp=unconfined` では使える
+- seccomp の filter が掛かっている時に `unshare` を呼ばないのは、filter の動作がエラーを返すとは限らないから。systemd の `SystemCallFilter=` の既定の動作は SIGSYS でプロセスを kill する。filter の中身は読めないので、filter が掛かっていれば呼ばない。filter の無い普通の環境では使える
+- docker の既定は filter を掛ける (native の arm64 の container で `prctl(PR_GET_SECCOMP)` は 2、`seccomp=unconfined` で 0)。既定ではこの経路を使わずに fork の経路へ、`seccomp=unconfined` では使う (どちらも試験で確認。`the_thread_cwd_route_comes_after_symlink_and_before_fork` 等)
+- Apple silicon の docker で x86_64 の image を動かすと、`prctl(PR_GET_SECCOMP)` は seccomp の有無によらず `EINVAL` を返す (実機で確認)。読めない時も filter があるかもしれないので使わない
 
 ## 却下した案
 
@@ -51,11 +55,13 @@
 
 ## 未確定
 
-- Android は compile もしていない。`unshare(CLONE_FS)` が Android の seccomp で通るかは確かめていない
+- Android は compile もしていない。Android のアプリは seccomp の filter の下で動くので、この経路は使われない見込み (確かめていない)
 - macOS 以外の Apple の OS (iOS 等) に `pthread_fchdir_np` があるかは確かめていない (iOS の clippy だけ)。無ければ次へ進む
 - 使い捨てのスレッドを作るコスト (呼び出しごとに 1 本) は測っていない
 
 ## 判断の出所
 
 - 経路を足す、順番、どの要求でも試す、使えない時は次へ: kawaz 裁定 (ハブ [DR-0005](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0005-thread-cwd-route.md)、HB-Q4、2026-11-18)
-- Apple でも使い捨てのスレッドにする、Linux の `fchdir` の失敗を本当の失敗とする: 実装側の判断 2026-11-18 (ハブの SPEC は「戻すか、スレッドを捨てる」のどちらも認める)
+- どの OS も使い捨てのスレッドで行い呼び出し元のスレッドの cwd に触らない、`unshare` の後の `fchdir` の失敗を本当の失敗とする: ハブの SPEC で確定 (統括 2026-11-18)
+- seccomp の filter が掛かっていれば `unshare` を呼ばない: 統括の裁定 2026-11-18 (ハブの SPEC / DR-0005)
+- seccomp の判定を使い捨てのスレッドの中でする、mode が読めない時も使わない: 実装側の判断 2026-11-18

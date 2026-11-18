@@ -33,5 +33,6 @@ Status は各 DR ファイルの `Status:` 行が正本。
 | [DR-0017](DR-0017-release-flow.md) | ✅ 実装済 | release は ci.yml を呼んで通ってから trusted publishing で publish し、その後に tag と GitHub release |
 | [DR-0018](DR-0018-repo-name-and-spec-hub.md) | N/A | リポは kawaz/sockat-rs、crate 名は sockat、仕様の正本はハブ kawaz/sockat の SPEC |
 | [DR-0019](DR-0019-ci-targets.md) | ✅ 実装済 | CI は macOS / Linux / FreeBSD・NetBSD・OpenBSD・illumos の VM で全試験、cross check、MSRV、cargo-audit |
-| [DR-0020](DR-0020-thread-cwd-route.md) | ✅ 実装済 | Linux と Apple の OS は symlink の後、fork の前に、使い捨てのスレッドだけ cwd を移す経路。connect も試す |
+| [DR-0020](DR-0020-thread-cwd-route.md) | ✅ 実装済 | Linux と Apple の OS は symlink の後、fork の前に、使い捨てのスレッドだけ cwd を移す経路。connect も試す。Linux は seccomp の filter が掛かっていれば unshare を呼ばず使わない |
 | [DR-0021](DR-0021-nul-is-invalid-at-any-length.md) | ✅ 実装済 | NUL を含むパスは長さによらず InvalidInput で何も作らない。Linux の先頭の NUL は std にそのまま渡す |
+| [DR-0022](DR-0022-connect-any-behind-feature.md) | ✅ 実装済 | connect_any 系は feature `connect-any` (既定で無効) の後ろ。docs.rs は全 feature、試験と CI は `--all-features` |

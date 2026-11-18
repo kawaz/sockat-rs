@@ -54,11 +54,13 @@ std が受け付ける長さ (`sun_path` − 1) のパスは std にそのまま
 
 どの経路も呼び出し元のプロセスの cwd を変えないので、マルチスレッドのプログラムから使える。
 
-`connect` / `connect_nonblocking` は fork しない。fork でしか届かない時は、パスが `sun_path` に入らない普通の connect と同じく `ENAMETOOLONG` を返す。そうなるのは、`/proc` の綴りにも相対パス (Apple の OS では広げた sockaddr も) にも収まらず、安全に symlink を作れる置き場も無く、スレッド cwd の経路も使えない時 (NetBSD / OpenBSD / illumos、`unshare` を断られる Linux、`pthread_fchdir_np` の無い Apple の OS) だけである。`/tmp` が使えれば、`connect` はディレクトリの深さにもファイル名の長さにもよらず symlink の経路で届く。各経路の長さの上限と、どこから `connect` では届かなくなるかは [docs/MANUAL-ja.md](./docs/MANUAL-ja.md#長いパスへの届き方) にある。
+`connect` / `connect_nonblocking` は fork しない。fork でしか届かない時は、パスが `sun_path` に入らない普通の connect と同じく `ENAMETOOLONG` を返す。そうなるのは、`/proc` の綴りにも相対パス (Apple の OS では広げた sockaddr も) にも収まらず、安全に symlink を作れる置き場も無く、スレッド cwd の経路も使えない時 (NetBSD / OpenBSD / illumos、seccomp の filter が掛かった Linux、`pthread_fchdir_np` の無い Apple の OS) だけである。`/tmp` が使えれば、`connect` はディレクトリの深さにもファイル名の長さにもよらず symlink の経路で届く。各経路の長さの上限と、どこから `connect` では届かなくなるかは [docs/MANUAL-ja.md](./docs/MANUAL-ja.md#長いパスへの届き方) にある。
 
 ## 例外: `connect_any`
 
 `connect_any` / `connect_any_nonblocking` は、上の `ENAMETOOLONG` に当たるよほど珍しい環境で、fork の副作用を受け入れてでもつなぎたい時だけのもの。他の経路が使えない時は、fork した子に connect させ (子はすぐ終了する)、fork の経路を通ったかも返す (`(UnixStream, bool)`、通った時に `true`)。ログに残す・警告するなどに使える。
+
+既定では無効で、feature `connect-any` を有効にした時だけ使える: `sockat = { version = "0.3", features = ["connect-any"] }`
 
 fork の経路で connect すると、サーバに見える peer の pid は、もう終了したプロセス (fork した子) の pid になる。詳しくは [docs/MANUAL-ja.md](./docs/MANUAL-ja.md#例外-connect_any)。
 
