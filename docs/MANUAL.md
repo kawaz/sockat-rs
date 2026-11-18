@@ -93,7 +93,7 @@ FreeBSD. `bindat(2)` / `connectat(2)` bind / connect by the file name relative t
 
 When std accepts the path spelled relative to the cwd, that is passed to std. Used only when the path given is absolute. Only the path string is rewritten; the cwd is never changed (no `chdir`).
 
-- If the path is below the cwd (`getcwd`, or a `$PWD` that names the same directory as the cwd), the prefix is cut off. Otherwise both sides are resolved to real paths and the spelling climbs with `..`. The shorter one is used
+- If the path is below the cwd (`getcwd`, or a `$PWD` that names the same directory as the cwd), the prefix is cut off. When that does not leave a spelling std accepts (including when the path is not below the cwd), both sides are also resolved to real paths and a spelling that climbs with `..` is made. The shorter one is used
 - The relative spelling is checked to name the same directory as the path before it is used, and the cwd is checked to be unchanged after the bind / connect ([below](#the-relative-route-is-exposed-to-another-threads-chdir))
 
 #### widened sockaddr
