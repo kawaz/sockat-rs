@@ -44,9 +44,9 @@
 //! | Platform | Order tried |
 //! |---|---|
 //! | Linux, Android (`/proc` usable) | /proc |
-//! | Linux, Android (`/proc` not usable) | relative path, symlink, fork |
+//! | Linux, Android (`/proc` not usable) | relative path, symlink, thread cwd, fork |
 //! | FreeBSD | bindat |
-//! | macOS (Apple) | relative path, widened sockaddr, symlink, fork |
+//! | macOS, iOS (Apple) | relative path, widened sockaddr, symlink, thread cwd, fork |
 //! | NetBSD, OpenBSD, illumos, other Unix | relative path, symlink, fork |
 //!
 //! * **/proc**: `/proc/self/fd/<dirfd>/<name>`, with the directory opened
@@ -69,6 +69,13 @@
 //!   that group and others cannot write to. Through `/tmp`, a connect is
 //!   reached whatever the directory depth and the file name length, a bind for
 //!   a file name of up to 84 bytes (80 where `sun_path` is 104, 230 on macOS)
+//! * **thread cwd** (Linux, Apple): a thread started for the call alone moves
+//!   its own working directory, and no other thread's, into the socket's
+//!   directory (`unshare(CLONE_FS)` then `fchdir` on Linux,
+//!   `pthread_fchdir_np` on Apple) and makes the call by the file name alone.
+//!   The call is made by this process, so every function takes it. Not usable
+//!   where `unshare` is refused (docker's default seccomp) or
+//!   `pthread_fchdir_np` is missing; then the next route is tried
 //! * **fork**: a forked child that `fchdir`s into the socket's directory makes
 //!   the call by the file name alone and exits. Only [`bind`],
 //!   [`connect_any`] and [`connect_any_nonblocking`] take it
@@ -89,8 +96,11 @@
 //! server sees is that of a process that has already exited. Where only the
 //! fork route would reach the path, they fail with `ENAMETOOLONG`, as any
 //! connect to a path too long for `sun_path` does. That happens only when the
-//! path fits neither the `/proc` spelling nor a relative path (nor, on macOS,
-//! the widened sockaddr) and there is no safe place for the symlink.
+//! path fits neither the `/proc` spelling nor a relative path (nor, on Apple,
+//! the widened sockaddr), there is no safe place for the symlink, and the
+//! thread cwd route cannot be used either: on NetBSD, OpenBSD and illumos,
+//! which do not have it, on Linux where `unshare` is refused, and on an Apple
+//! OS without `pthread_fchdir_np`.
 //!
 //! [`connect_any`] and [`connect_any_nonblocking`] are for that rare
 //! environment, when the connection is wanted at the cost of the fork's side
@@ -133,11 +143,12 @@
 //!   connect; on other Unix targets it (and FreeBSD's `bindat`) opens it
 //!   `O_RDONLY` and needs read permission on the directory as well.
 //! * **The directory is resolved slightly earlier than the call.** The /proc,
-//!   relative, `bindat` and fork routes look the directory up first (open it, or
-//!   resolve it to a real path) and then bind / connect by the file name. If a
-//!   directory along the path is renamed or a symlink along it is repointed in
-//!   between, the socket goes to (or is looked up in) the directory as it was
-//!   when looked up, not as it is at the moment of the call.
+//!   relative, `bindat`, thread cwd and fork routes look the directory up
+//!   first (open it, or resolve it to a real path) and then bind / connect by
+//!   the file name. If a directory along the path is renamed or a symlink
+//!   along it is repointed in between, the socket goes to (or is looked up in)
+//!   the directory as it was when looked up, not as it is at the moment of the
+//!   call.
 //! * **The relative route is exposed to another thread's `chdir`.** sockat
 //!   itself never changes the cwd. The path is
 //!   spelled relative to the cwd only after checking that the spelling names
@@ -161,8 +172,14 @@
 //! nobody listens). When no route can reach the path (for [`bind`], a file
 //! name too long for every route; for [`connect`] and [`connect_nonblocking`],
 //! also when only the fork route would), the error is `ENAMETOOLONG`. A path
-//! longer than std accepts that does not end with a file name, or any path that
-//! contains a NUL byte, is an `InvalidInput` error.
+//! longer than std accepts that does not end with a file name is an
+//! `InvalidInput` error. So is a path of any length that contains a NUL byte,
+//! refused before anything is created: the kernel would read the path only up
+//! to the NUL. On Linux and Android a path starting with a NUL names a socket
+//! in the abstract namespace rather than a file; it is handed to std as is,
+//! which refuses it as well (std takes abstract names through
+//! `SocketAddr::from_abstract_name` and `UnixListener::bind_addr` /
+//! `UnixStream::connect_addr`).
 //!
 //! # Async runtimes
 //!
@@ -287,10 +304,11 @@ pub fn connect_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
 /// `ENAMETOOLONG` in an environment you have to support: it reaches a long
 /// path in any ordinary environment. This is for the rare one where only the
 /// fork route does (a path that fits neither the `/proc` spelling nor a
-/// relative path, nor on macOS the widened sockaddr, where there is no safe
-/// place for the symlink), when the connection is wanted at the cost of the
-/// fork's side effects. The order tried is that of [`connect`], with the fork
-/// route last. FreeBSD never forks.
+/// relative path, nor on Apple the widened sockaddr, where there is no safe
+/// place for the symlink and the thread cwd route cannot be used either), when
+/// the connection is wanted at the cost of the fork's side effects. The order
+/// tried is that of [`connect`], with the fork route last. FreeBSD never
+/// forks.
 ///
 /// The fork route connects from a forked child that `fchdir`s into the
 /// socket's directory and exits at once. The second value is `true` when the

@@ -14,6 +14,31 @@ pub(crate) fn len(path: &Path) -> usize {
     path.as_os_str().as_bytes().len()
 }
 
+/// Whether `path` is a name in Linux's abstract socket namespace, one that
+/// starts with a NUL byte (Linux, Android). It names no file, so none of
+/// sockat's routes applies to it; it is handed to std as is at any length.
+/// Always `false` on other targets, which have no such namespace.
+pub(crate) fn is_abstract(path: &Path) -> bool {
+    cfg!(any(target_os = "linux", target_os = "android"))
+        && path.as_os_str().as_bytes().first() == Some(&0)
+}
+
+/// `InvalidInput` when `path` contains a NUL byte, at any length.
+///
+/// The kernel takes a socket path up to its first NUL, so a path with a NUL
+/// inside would put the socket (or look it up) at the part before it, not at
+/// the path given. Refused before anything is created. A leading NUL on Linux
+/// ([`is_abstract`]) is to be dealt with before this.
+pub(crate) fn refuse_nul(path: &Path) -> io::Result<()> {
+    if path.as_os_str().as_bytes().contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path must not contain a NUL byte",
+        ));
+    }
+    Ok(())
+}
+
 /// Split a socket path into the directory that holds the socket and the
 /// socket's file name, by the bytes after the last `/`.
 ///
@@ -112,6 +137,40 @@ pub(crate) fn relative(target: &Path, cwd: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A NUL anywhere in the path is an argument error: the kernel would stop
+    // reading the path at it and create (or look up) the socket at the part
+    // before it, somewhere the caller did not name. That holds for a NUL in
+    // the directory part, in the file name, at the end and at the start (the
+    // Linux abstract namespace, a leading NUL, is set aside by the caller with
+    // is_abstract before this is asked). A path without one is left alone, the
+    // empty path included (std and the kernel judge that one).
+    #[test]
+    fn refuse_nul_refuses_a_nul_anywhere() {
+        for bad in [&b"/d\0/s.sock"[..], b"/d/s\0.sock", b"/d/s.sock\0", b"\0s"] {
+            let p = Path::new(OsStr::from_bytes(bad));
+            let e = refuse_nul(p).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{p:?}");
+        }
+        for good in ["/d/s.sock", "s.sock", ""] {
+            refuse_nul(Path::new(good)).unwrap();
+        }
+    }
+
+    // On Linux and Android a path whose first byte is a NUL names a socket in
+    // the abstract namespace, not a file: it is told apart by that first byte
+    // only (a NUL later in the path is not one). Elsewhere there is no abstract
+    // namespace and no path is one.
+    #[test]
+    fn is_abstract_is_a_leading_nul_on_linux_only() {
+        let linux = cfg!(any(target_os = "linux", target_os = "android"));
+        let p = |b: &'static [u8]| Path::new(OsStr::from_bytes(b));
+        assert_eq!(is_abstract(p(b"\0name")), linux);
+        assert_eq!(is_abstract(p(b"\0")), linux);
+        assert!(!is_abstract(p(b"/d/\0name")));
+        assert!(!is_abstract(p(b"name")));
+        assert!(!is_abstract(p(b"")));
+    }
 
     // `split` decides which directory a long path's socket is created in and
     // under which name, for every route that does not hand the whole path to

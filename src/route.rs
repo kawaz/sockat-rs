@@ -130,6 +130,10 @@ pub(crate) enum Route {
     /// `bindat(2)` / `connectat(2)` on the directory fd (FreeBSD).
     #[cfg(target_os = "freebsd")]
     At,
+    /// The file name, on a thread of this process whose own working directory
+    /// was moved into the directory (Linux, Apple; [`sys::op_in_dir_on_thread`]).
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    ThreadCwd,
     /// A forked child that `fchdir`s into the directory.
     #[cfg(not(target_os = "freebsd"))]
     Fork {
@@ -160,7 +164,17 @@ impl Route {
 ///
 /// A path of at most [`DIRECT_MAX`] bytes goes as is, before anything else is
 /// looked at (the environment included).
+///
+/// A NUL byte is looked at before the length: a path with one is an
+/// `InvalidInput` error at any length, and nothing is created
+/// ([`path::refuse_nul`]). The exception is a path starting with a NUL on Linux
+/// and Android, a name in the abstract namespace rather than a file, which is
+/// not sockat's business at any length: it goes as is ([`path::is_abstract`]).
 pub(crate) fn run(req: Request, path: &Path) -> io::Result<(OwnedFd, Route)> {
+    if path::is_abstract(path) {
+        return plain_op(req, path).map(|fd| (fd, Route::Direct));
+    }
+    path::refuse_nul(path)?;
     if path::len(path) <= DIRECT_MAX {
         return plain_op(req, path).map(|fd| (fd, Route::Direct));
     }
@@ -175,8 +189,8 @@ pub(crate) fn run(req: Request, path: &Path) -> io::Result<(OwnedFd, Route)> {
 ///
 /// Linux: `/proc/self/fd/<dirfd>/<name>` with the directory opened `O_PATH`;
 /// when that cannot be used, the POSIX order ([`posix::run`]) with that
-/// directory fd for the fork route. Every other target but FreeBSD: the POSIX
-/// order.
+/// directory fd for the thread-cwd and fork routes. Every other target but
+/// FreeBSD: the POSIX order.
 ///
 /// The kernel resolves the `/proc/self/fd/<n>` magic link to the directory the
 /// fd refers to, so the socket is created in (or looked up in) that directory
@@ -247,9 +261,14 @@ pub(crate) fn raw_op(req: Request, addr: &SockAddr) -> io::Result<OwnedFd> {
 /// `EINVAL`; then the directory is opened `O_RDONLY`, which needs read
 /// permission.
 ///
+/// The same fd serves the thread-cwd route: `pthread_fchdir_np` takes an
+/// `O_SEARCH` directory fd as `fchdir` does (checked on macOS 26.5: the mode
+/// 0300 directory again).
+///
 /// Linux: `O_PATH | O_DIRECTORY`, which needs only search permission. The fd
-/// serves both the /proc route (`/proc/self/fd/<fd>` names the directory) and
-/// the fork route (`fchdir(2)` takes an `O_PATH` directory fd since Linux 3.5).
+/// serves the /proc route (`/proc/self/fd/<fd>` names the directory), the
+/// thread-cwd route and the fork route (`fchdir(2)` takes an `O_PATH`
+/// directory fd since Linux 3.5).
 ///
 /// Other targets: `O_RDONLY | O_DIRECTORY`, so the fork route and `bindat`
 /// need read permission on the directory.
@@ -352,6 +371,53 @@ fn fork_in(
     Ok((sock, child))
 }
 
+/// Bind (and listen) or connect a fresh socket (`O_NONBLOCK` for a
+/// nonblocking connect) to `addr`, the file name, resolved relative to `dir`
+/// on a thread whose own working directory is moved there
+/// ([`sys::op_in_dir_on_thread`]). `Unusable` when the thread's working
+/// directory cannot be moved on its own; the request is then still to be made.
+///
+/// Every request may take it (no side effect a server or another thread can
+/// see), so it comes before the fork route and before a connect that does not
+/// fork gives up. The listen after a bind is made here, on the calling thread.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn thread_cwd_in(
+    req: Request,
+    dir: std::os::fd::BorrowedFd<'_>,
+    addr: &SockAddr,
+) -> sys::OnThread<OwnedFd> {
+    use std::os::fd::AsFd;
+    let sock = match sys::socket(req.nonblocking()) {
+        Ok(sock) => sock,
+        Err(e) => return sys::OnThread::Done(Err(e)),
+    };
+    match sys::op_in_dir_on_thread(req.op(), sock.as_fd(), dir, addr) {
+        sys::OnThread::Done(Ok(())) => {
+            let listened = match req {
+                Request::Bind => sys::listen(sock.as_fd()),
+                Request::Connect(_) => Ok(()),
+            };
+            sys::OnThread::Done(listened.map(|()| sock))
+        }
+        sys::OnThread::Done(Err(e)) => sys::OnThread::Done(Err(e)),
+        sys::OnThread::Unusable(e) => sys::OnThread::Unusable(e),
+    }
+}
+
+/// [`thread_cwd_in`] with the directory `dir` opened by [`open_dir`], as the
+/// route order opens it.
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "android", target_vendor = "apple")
+))]
+pub(crate) fn thread_cwd_op(req: Request, dir: &Path, addr: &SockAddr) -> sys::OnThread<OwnedFd> {
+    use std::os::fd::AsFd;
+    match open_dir(dir) {
+        Ok(opened) => thread_cwd_in(req, opened.as_fd(), addr),
+        Err(e) => sys::OnThread::Done(Err(e)),
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) mod linux {
     use super::*;
@@ -426,9 +492,10 @@ pub(crate) mod apple {
 }
 
 /// The routes that need nothing but POSIX (plus, on Apple, the widened
-/// `sockaddr_un`), tried in order on every target without a dirfd-relative
-/// primitive: Apple, NetBSD, OpenBSD, illumos and the other Unix targets, and
-/// Linux when the /proc route cannot be used (DR-0001, DR-0008).
+/// `sockaddr_un`, and on Linux and Apple a working directory of the thread's
+/// own), tried in order on every target without a dirfd-relative primitive:
+/// Apple, NetBSD, OpenBSD, illumos and the other Unix targets, and Linux when
+/// the /proc route cannot be used (DR-0001, DR-0008, DR-0020).
 #[cfg(not(target_os = "freebsd"))]
 pub(crate) mod posix {
     use super::*;
@@ -464,6 +531,13 @@ pub(crate) mod posix {
         /// elsewhere to stand in for a system without /proc.
         #[cfg(any(target_os = "linux", target_os = "android"))]
         pub(crate) proc_self_fd: PathBuf,
+        /// Whether to try the thread-cwd route at all (Linux, Apple). Always
+        /// `true` outside the tests, which turn it off to stand in for a
+        /// system where it cannot be used (`unshare` refused, no
+        /// `pthread_fchdir_np`). Where it is tried and turns out unusable,
+        /// the next route is tried just the same.
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        pub(crate) thread_cwd: bool,
     }
 
     impl Config {
@@ -489,6 +563,8 @@ pub(crate) mod posix {
                 wide: true,
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 proc_self_fd: PathBuf::from(linux::PROC_SELF_FD),
+                #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+                thread_cwd: true,
             }
         }
     }
@@ -506,14 +582,21 @@ pub(crate) mod posix {
     ///    and `/tmp` ([`Config::tmp_bases`]) where the path through it fits
     ///    (in the plain sockaddr, or on Apple the widened one) and the symlink
     ///    can be created;
-    /// 4. a forked child that `fchdir`s into the directory (`opened` when the
-    ///    caller has it open already, as Linux does), unless the request rules
-    ///    it out (then `ENAMETOOLONG`).
+    /// 4. (Linux, Apple) the file name on a thread whose own working directory
+    ///    is moved into the directory ([`thread_cwd_in`]), for every request;
+    /// 5. a forked child that `fchdir`s into the directory, unless the request
+    ///    rules it out (then `ENAMETOOLONG`).
+    ///
+    /// The last two use the directory opened (`opened` when the caller has it
+    /// open already, as Linux does) and the file name in a sockaddr: the plain
+    /// one, or on Apple the widened one for a name too long for it while the
+    /// kernel takes that form.
     ///
     /// A failure of a route ends the search with that error, except where it
     /// shows that the route itself cannot be used (the kernel refusing the
-    /// widened form, the symlink not being creatable); then the next route (or
-    /// the next place for the symlink) is tried.
+    /// widened form, the symlink not being creatable, the thread's working
+    /// directory not being movable on its own); then the next route (or the
+    /// next place for the symlink) is tried.
     pub(crate) fn run(
         req: Request,
         path: &Path,
@@ -586,6 +669,15 @@ pub(crate) mod posix {
         };
         #[cfg(not(target_vendor = "apple"))]
         let addr = SockAddr::standard(name)?;
+
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        if cfg.thread_cwd {
+            match thread_cwd_in(req, dir_fd, &addr) {
+                sys::OnThread::Done(done) => return done.map(|fd| (fd, Route::ThreadCwd)),
+                sys::OnThread::Unusable(_) => {}
+            }
+        }
+
         let (fd, child) = fork_in(req, dir_fd, &addr)?;
         Ok((fd, Route::Fork { child }))
     }

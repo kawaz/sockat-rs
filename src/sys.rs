@@ -10,6 +10,9 @@
 //! * [`socket`] / [`bind`] / [`connect`] / [`listen`] — a stream socket set up the
 //!   same way std sets up the sockets behind `UnixListener` / `UnixStream`
 //!   (optionally `O_NONBLOCK`, which std cannot connect with).
+//! * `op_in_dir_on_thread` — bind / connect relative to a directory fd on a
+//!   thread of its own whose working directory alone is moved there (Linux:
+//!   `unshare(CLONE_FS)` and `fchdir`; Apple: `pthread_fchdir_np`).
 //! * [`op_in_dir_forked`] — bind / connect relative to a directory fd in a forked
 //!   child that `fchdir`s (the last resort on every target but FreeBSD, and on
 //!   Linux only when the /proc route cannot be used); returns the child's pid.
@@ -397,6 +400,134 @@ pub(crate) fn op_in_dir_forked(
         0 => Ok(pid),
         code => Err(io::Error::from_raw_os_error(code)),
     }
+}
+
+/// What came of a call that first has to move a thread's working directory
+/// ([`op_in_dir_on_thread`]).
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[derive(Debug)]
+pub(crate) enum OnThread<T> {
+    /// The thread's working directory was moved and the call was made; this
+    /// is its outcome.
+    Done(io::Result<T>),
+    /// The thread's working directory could not be moved on its own, so the
+    /// call was not made: no thread could be started, `unshare(CLONE_FS)` was
+    /// refused (Linux; a seccomp filter such as docker's default answers
+    /// `EPERM`), or `pthread_fchdir_np` is missing or failed (Apple). The
+    /// error says which.
+    Unusable(io::Error),
+}
+
+/// Bind or connect `sock` to `addr` resolved relative to the directory `dir`,
+/// on a thread started for this call alone whose working directory, and only
+/// its own, is moved into `dir`. The thread ends with the call.
+///
+/// The working directory is otherwise shared by every thread of the process,
+/// so it is detached for this thread first:
+///
+/// * Linux / Android: `unshare(CLONE_FS)` gives the thread its own copy of the
+///   working directory (and of the root and the umask), then `fchdir(dir)`
+///   moves that copy. `fchdir` is reached only after the `unshare` succeeded,
+///   so a refused `unshare` can never move the cwd of the process. A failing
+///   `fchdir` (no search permission, say) is the real outcome, as it would be
+///   for a bind / connect through the path;
+/// * Apple: `pthread_fchdir_np(dir)` sets a working directory for the calling
+///   thread alone (the `__pthread_fchdir` system call). It is not a public API
+///   of libSystem, so it is looked up when needed; missing, or failing, it
+///   makes this route unusable. The thread ends right
+///   after the call, so its working directory is never set back.
+///
+/// Both leave the working directory of every other thread, and of the
+/// process, as it was. The call is made by this process (the peer pid a server
+/// sees is this process's), on the caller's own socket, and no fd is copied.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+pub(crate) fn op_in_dir_on_thread(
+    op: Op,
+    sock: BorrowedFd<'_>,
+    dir: BorrowedFd<'_>,
+    addr: &SockAddr,
+) -> OnThread<()> {
+    std::thread::scope(|scope| {
+        match std::thread::Builder::new()
+            .spawn_scoped(scope, || op_in_dir_on_this_thread(op, sock, dir, addr))
+        {
+            Ok(thread) => thread
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            Err(e) => OnThread::Unusable(e),
+        }
+    })
+}
+
+/// The body of [`op_in_dir_on_thread`], run on the thread it starts (and only
+/// there: on any other thread it would leave that thread in `dir`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn op_in_dir_on_this_thread(
+    op: Op,
+    sock: BorrowedFd<'_>,
+    dir: BorrowedFd<'_>,
+    addr: &SockAddr,
+) -> OnThread<()> {
+    // SAFETY: plain syscall without pointers; it only detaches this thread's
+    // working directory, root and umask from the rest of the process.
+    if unsafe { libc::unshare(libc::CLONE_FS) } != 0 {
+        return OnThread::Unusable(io::Error::last_os_error());
+    }
+    // SAFETY: fchdir on a borrowed, live fd. After the unshare above it moves
+    // this thread's working directory only.
+    if unsafe { libc::fchdir(dir.as_raw_fd()) } != 0 {
+        return OnThread::Done(Err(io::Error::last_os_error()));
+    }
+    OnThread::Done(self::op(op, sock, addr))
+}
+
+/// The body of [`op_in_dir_on_thread`], run on the thread it starts (and only
+/// there: on any other thread it would leave that thread in `dir`).
+#[cfg(target_vendor = "apple")]
+fn op_in_dir_on_this_thread(
+    op: Op,
+    sock: BorrowedFd<'_>,
+    dir: BorrowedFd<'_>,
+    addr: &SockAddr,
+) -> OnThread<()> {
+    let Some(pthread_fchdir_np) = pthread_fchdir_np() else {
+        return OnThread::Unusable(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "pthread_fchdir_np is not available",
+        ));
+    };
+    // SAFETY: `pthread_fchdir_np` is libSystem's `int pthread_fchdir_np(int)`
+    // (see `pthread_fchdir_np` below), called with a borrowed, live fd. It sets
+    // the working directory of this thread only.
+    if unsafe { pthread_fchdir_np(dir.as_raw_fd()) } != 0 {
+        return OnThread::Unusable(io::Error::last_os_error());
+    }
+    OnThread::Done(self::op(op, sock, addr))
+}
+
+/// libSystem's `int pthread_fchdir_np(int fd)`, looked up at run time, or
+/// `None` when this libSystem does not have it.
+///
+/// It is exported by libsystem_pthread (checked on macOS 26.5) but declared in
+/// no public header, so it may disappear from a future release; looking it up
+/// rather than linking against it turns that into "this route cannot be used"
+/// instead of a binary that does not load.
+#[cfg(target_vendor = "apple")]
+fn pthread_fchdir_np() -> Option<unsafe extern "C" fn(libc::c_int) -> libc::c_int> {
+    // SAFETY: dlsym only looks the NUL-terminated name up in the loaded images.
+    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"pthread_fchdir_np".as_ptr()) };
+    if symbol.is_null() {
+        return None;
+    }
+    // SAFETY: the symbol of that name in libSystem is the function
+    // `int pthread_fchdir_np(int fd)` (libpthread's `pthread_fchdir_np`, a thin
+    // wrapper of the `__pthread_fchdir` system call returning 0 or -1 with
+    // errno set), so the pointer has this type.
+    Some(unsafe {
+        std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn(libc::c_int) -> libc::c_int>(
+            symbol,
+        )
+    })
 }
 
 fn errno_status() -> libc::c_int {
