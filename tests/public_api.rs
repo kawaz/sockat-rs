@@ -151,9 +151,12 @@ fn a_path_only_the_fork_route_reaches_needs_connect_any() {
     assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
 }
 
-// Short paths are std's business: sockat hands them over unchanged, so what
-// std reports (local_addr, peer_addr) is the path itself, exactly as with
-// UnixListener::bind.
+// Short paths are std's business: sockat hands them over unchanged, so the
+// addresses the sockets report (local_addr, peer_addr) are exactly what std
+// reports for the same path. Compared with std's own answer rather than with
+// the path: std's answer is not always the path (on OpenBSD std's local_addr
+// drops the last byte of it, observed in CI), and "the same as std" is the
+// promise.
 #[test]
 fn a_short_path_behaves_exactly_like_std() {
     let t = tempfile::Builder::new()
@@ -161,17 +164,44 @@ fn a_short_path_behaves_exactly_like_std() {
         .tempdir_in("/tmp")
         .unwrap();
     let p = t.path().join("s.sock");
+    let (std_local, std_peer, std_accepted) = {
+        let listener = UnixListener::bind(&p).unwrap();
+        let client = UnixStream::connect(&p).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let addrs = (
+            listener
+                .local_addr()
+                .unwrap()
+                .as_pathname()
+                .map(Path::to_path_buf),
+            client
+                .peer_addr()
+                .unwrap()
+                .as_pathname()
+                .map(Path::to_path_buf),
+            accepted
+                .local_addr()
+                .unwrap()
+                .as_pathname()
+                .map(Path::to_path_buf),
+        );
+        std::fs::remove_file(&p).unwrap();
+        addrs
+    };
     let listener = sockat::bind(&p).unwrap();
     assert_eq!(
         listener.local_addr().unwrap().as_pathname(),
-        Some(p.as_path())
+        std_local.as_deref()
     );
     let client = sockat::connect(&p).unwrap();
-    assert_eq!(client.peer_addr().unwrap().as_pathname(), Some(p.as_path()));
+    assert_eq!(
+        client.peer_addr().unwrap().as_pathname(),
+        std_peer.as_deref()
+    );
     let (accepted, _) = listener.accept().unwrap();
     assert_eq!(
         accepted.local_addr().unwrap().as_pathname(),
-        Some(p.as_path())
+        std_accepted.as_deref()
     );
     drop((client, accepted));
     // And a std client reaches a sockat listener (and the other way round).
