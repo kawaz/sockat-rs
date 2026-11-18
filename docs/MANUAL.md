@@ -80,10 +80,10 @@ FreeBSD. `bindat(2)` / `connectat(2)` bind / connect by the file name relative t
 
 #### relative path
 
-When the path spelled relative to the cwd is at most 100 bytes, that is passed to std. Used only when the path given is absolute.
+When the path spelled relative to the cwd is at most 100 bytes, that is passed to std. Used only when the path given is absolute. Only the path string is rewritten; the cwd is never changed (no `chdir`).
 
 - If the path is below the cwd (`getcwd`, or a `$PWD` that names the same directory as the cwd), the prefix is cut off. Otherwise both sides are resolved to real paths and the spelling climbs with `..`. The shorter one is used
-- The relative spelling is checked to name the same directory as the path before it is used, and the cwd is checked to be unchanged after the bind / connect ([below](#the-relative-route-depends-on-the-cwd))
+- The relative spelling is checked to name the same directory as the path before it is used, and the cwd is checked to be unchanged after the bind / connect ([below](#the-relative-route-is-exposed-to-another-threads-chdir))
 
 #### widened sockaddr
 
@@ -184,9 +184,9 @@ On the fork route (`bind` and the `connect_any` variants), as with any fork, the
 
 The /proc, relative path, bindat and fork routes look the directory up first (open it, or resolve it to a real path), then bind / connect by the file name. If a directory along the path is renamed, or a symlink along it repointed, in between, the socket is created in (or, for a connect, looked up in) the directory as it was when looked up. The widened sockaddr and symlink routes leave the path as given for the kernel to resolve, so in this respect they behave as std does.
 
-### The relative route depends on the cwd
+### The relative route is exposed to another thread's chdir
 
-When the relative spelling is made it is checked to name the same directory, and after the bind / connect the cwd is checked to be unchanged. If another thread changed the cwd in between, the result is discarded and an error (`Other`) is returned (a socket file it may have created is left alone, since where it went is unknown). A change that is undone in between is not visible. A program that changes the cwd while binding / connecting races every relative path in the process anyway; sockat does not make that safe, it only detects the visible case.
+sockat itself never changes the cwd. When the relative spelling is made it is checked to name the same directory, and after the bind / connect the cwd is checked to be unchanged. If another thread changed the cwd in between, the result is discarded and an error (`Other`) is returned (a socket file it may have created is left alone, since where it went is unknown). A change that is undone in between is not visible. A program that changes the cwd while binding / connecting races every relative path in the process anyway; sockat does not make that safe, it only detects the visible case.
 
 ### A symlink can be left behind
 

@@ -48,7 +48,8 @@
 //! * **bindat**: `bindat(2)` / `connectat(2)` with the directory fd and the file
 //!   name (up to 103 bytes)
 //! * **relative path**: the path spelled relative to the working directory,
-//!   when that is at most 100 bytes
+//!   when that is at most 100 bytes. Only the path string is rewritten; the
+//!   cwd is never changed
 //! * **widened sockaddr**: a `sockaddr_un` carrying up to 253 bytes of path,
 //!   which XNU accepts: the path itself, or failing that the relative spelling
 //! * **symlink**: a short symlink to the socket's directory, under `TMPDIR` or
@@ -128,7 +129,8 @@
 //!   directory along the path is renamed or a symlink along it is repointed in
 //!   between, the socket goes to (or is looked up in) the directory as it was
 //!   when looked up, not as it is at the moment of the call.
-//! * **The relative route depends on the working directory.** The path is
+//! * **The relative route is exposed to another thread's `chdir`.** sockat
+//!   itself never changes the cwd. The path is
 //!   spelled relative to the cwd only after checking that the spelling names
 //!   the same directory, and the cwd is checked again afterwards; if another
 //!   thread changed it in between, the result is discarded and an error is

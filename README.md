@@ -37,7 +37,7 @@ A path of at most 100 bytes is handed to std unchanged on every OS. A longer pat
 
 - **/proc**: open the directory and pass `/proc/self/fd/<fd>/<file name>`
 - **bindat**: `bindat(2)` / `connectat(2)`, by the file name relative to the directory fd
-- **relative path**: when the path relative to the cwd is at most 100 bytes, pass that
+- **relative path**: when the path relative to the cwd is at most 100 bytes, pass that. Only the path string is rewritten; the cwd is never changed
 - **widened sockaddr**: pass a sockaddr carrying up to 253 bytes, which the macOS kernel accepts
 - **symlink**: create a short symlink to the socket's directory under `TMPDIR` or `/tmp` and go through it. It is created only in a place where no other user can replace it, and removed at once
 - **fork**: fork a child that `fchdir`s into the directory and binds / connects by the file name alone. **Only `bind` and the `connect_any` variants try it**
