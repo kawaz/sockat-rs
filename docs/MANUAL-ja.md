@@ -35,7 +35,7 @@ server.read_exact(&mut buf)?;
 
 - パスが 100 バイト以内なら std の関数をそのまま呼ぶ (`connect_nonblocking` は std に無いので、std と同じアドレスで自前のソケットを connect する)
 - ソケットファイルは渡したパスにできる。listener を閉じても消えない (std と同じ)。消す時は元のパスで `std::fs::remove_file(path)` する (unlink には `sun_path` の上限が無い)
-- 自前で作るソケットは std と同じ設定 (close-on-exec、macOS では `SO_NOSIGPIPE`、std と同じ listen の backlog)
+- 自前で作るソケットは std と同じ設定 (close-on-exec、std が付ける OS (macOS / iOS、FreeBSD、NetBSD、DragonFly) では `SO_NOSIGPIPE`、std と同じ listen の backlog)
 
 ## connect と connect_nonblocking
 

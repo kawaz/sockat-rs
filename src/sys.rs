@@ -23,7 +23,7 @@
 
 use std::ffi::OsStr;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 
 /// What to do with a socket and an address.
@@ -158,9 +158,8 @@ fn cvt(rc: libc::c_int) -> io::Result<libc::c_int> {
 }
 
 /// A new `AF_UNIX` / `SOCK_STREAM` socket, set up like the ones std creates:
-/// close-on-exec everywhere, and `SO_NOSIGPIPE` on Apple targets (std sets it
-/// there so a write to a closed peer returns `EPIPE` instead of raising
-/// SIGPIPE). `nonblocking` makes it `O_NONBLOCK` as well.
+/// close-on-exec everywhere, and `SO_NOSIGPIPE` where std sets it (see
+/// [`no_sigpipe`]). `nonblocking` makes it `O_NONBLOCK` as well.
 pub(crate) fn socket(nonblocking: bool) -> io::Result<OwnedFd> {
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
     {
@@ -174,7 +173,9 @@ pub(crate) fn socket(nonblocking: bool) -> io::Result<OwnedFd> {
             )
         })?;
         // SAFETY: `fd` is a fresh fd nobody else owns.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        no_sigpipe(fd.as_fd())?;
+        Ok(fd)
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
     {
@@ -190,22 +191,42 @@ pub(crate) fn socket(nonblocking: bool) -> io::Result<OwnedFd> {
             // SAFETY: fcntl on an fd we own.
             cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) })?;
         }
-        #[cfg(target_vendor = "apple")]
-        {
-            let one: libc::c_int = 1;
-            // SAFETY: setsockopt with a pointer to a live c_int and its size.
-            cvt(unsafe {
-                libc::setsockopt(
-                    fd.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_NOSIGPIPE,
-                    (&raw const one).cast(),
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                )
-            })?;
-        }
+        no_sigpipe(fd.as_fd())?;
         Ok(fd)
     }
+}
+
+/// `SO_NOSIGPIPE` where std sets it on its Unix sockets (Apple, FreeBSD,
+/// NetBSD, DragonFly), so a write to a closed peer returns `EPIPE` instead of
+/// raising SIGPIPE, as with std's sockets. Nothing elsewhere.
+fn no_sigpipe(sock: BorrowedFd<'_>) -> io::Result<()> {
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        let one: libc::c_int = 1;
+        // SAFETY: setsockopt with a pointer to a live c_int and its size.
+        cvt(unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                (&raw const one).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        })?;
+    }
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
+    let _ = sock;
+    Ok(())
 }
 
 /// `bind(2)`.
@@ -229,7 +250,6 @@ pub(crate) fn listen(sock: BorrowedFd<'_>) -> io::Result<()> {
     // SOMAXCONN elsewhere.
     #[cfg(any(
         target_os = "linux",
-        target_os = "android",
         target_os = "freebsd",
         target_os = "openbsd",
         target_vendor = "apple"
@@ -237,7 +257,6 @@ pub(crate) fn listen(sock: BorrowedFd<'_>) -> io::Result<()> {
     const BACKLOG: libc::c_int = -1;
     #[cfg(not(any(
         target_os = "linux",
-        target_os = "android",
         target_os = "freebsd",
         target_os = "openbsd",
         target_vendor = "apple"
@@ -574,4 +593,31 @@ pub(crate) fn is_nonblocking(fd: BorrowedFd<'_>) -> io::Result<bool> {
 pub(crate) fn relisten(sock: BorrowedFd<'_>, backlog: libc::c_int) -> io::Result<()> {
     // SAFETY: plain syscall on a borrowed fd.
     cvt(unsafe { libc::listen(sock.as_raw_fd(), backlog) }).map(drop)
+}
+
+/// Whether `SO_NOSIGPIPE` is set on `sock`. Test-only: checks that sockat's
+/// own sockets carry it wherever std's do.
+#[cfg(all(
+    test,
+    any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )
+))]
+pub(crate) fn so_nosigpipe(sock: BorrowedFd<'_>) -> io::Result<bool> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: getsockopt into a live c_int whose size is passed in `len`.
+    cvt(unsafe {
+        libc::getsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            (&raw mut value).cast(),
+            &raw mut len,
+        )
+    })?;
+    Ok(value != 0)
 }

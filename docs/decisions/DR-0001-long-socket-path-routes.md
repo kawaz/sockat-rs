@@ -152,7 +152,7 @@ a と c は POSIX の範囲の手 (`getcwd`、`realpath`、`stat`、`symlink`) �
 - ブロックしない 2 つは、ソケットを connect の前に `O_NONBLOCK` にし、返す stream も非ブロッキングのまま (tokio の `from_std` にそのまま渡せる)。相手の backlog が満杯なら Linux は待たず `EAGAIN` を返す (tokio の connect と同じ)。Unix domain の connect は呼び出しの中で終わるか失敗し、Linux も XNU も `EINPROGRESS` を返さない (確かめた範囲は `route::ConnectOptions` の doc)
 - `bind` は最後は fork でやり切る。子は bind するだけで、listen は親がするので、listener に fork の副作用は残らない
 - 軸は「fork するか」と「ブロックするか」の 2 つで閉じている (タイムアウトはブロックしない connect で足り、bind は待たない) ので、設定の型でなく関数 4 つにした
-- 自前で作るソケットは std と同じ設定にする: close-on-exec、macOS では `SO_NOSIGPIPE`、listen の backlog は std と同じ値 (macOS / Linux / FreeBSD / OpenBSD は -1、他は `SOMAXCONN`)
+- 自前で作るソケットは std と同じ設定にする: close-on-exec、std が付ける OS (Apple、FreeBSD、NetBSD、DragonFly) では `SO_NOSIGPIPE` (閉じた相手への書き込みが SIGPIPE でなく `EPIPE` になる)、listen の backlog は std と同じ値 (macOS / Linux / FreeBSD / OpenBSD は -1、他は `SOMAXCONN`)
 - ソケットファイルは listener を閉じても消さない (std と同じ)。消すのは利用者で、元のパスで `remove_file` すればよい (unlink には `sun_path` の上限が無い)
 
 ### 7. tokio は依存に入れない

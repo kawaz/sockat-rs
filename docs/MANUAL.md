@@ -35,7 +35,7 @@ server.read_exact(&mut buf)?;
 
 - A path of at most 100 bytes goes to the std function unchanged (std has no nonblocking connect, so `connect_nonblocking` connects a socket of its own with the address std would build)
 - The socket file is created at the path given. It is not removed when the listener is closed (as with std). To remove it, call `std::fs::remove_file(path)` with the original path (unlink has no `sun_path` limit)
-- Sockets sockat creates itself are set up like std's (close-on-exec, `SO_NOSIGPIPE` on macOS, the same listen backlog as std)
+- Sockets sockat creates itself are set up like std's (close-on-exec, `SO_NOSIGPIPE` where std sets it (macOS / iOS, FreeBSD, NetBSD, DragonFly), the same listen backlog as std)
 
 ## connect and connect_nonblocking
 

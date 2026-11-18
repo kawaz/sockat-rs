@@ -437,6 +437,37 @@ fn assert_untouched(dir: &Path) {
 // every platform
 // ---------------------------------------------------------------------------
 
+// sockat's own sockets are set up like std's: where std sets SO_NOSIGPIPE on
+// its Unix sockets (Apple, FreeBSD, NetBSD, DragonFly), so does sockat, so a
+// write to a closed peer returns EPIPE instead of raising SIGPIPE on every
+// route. Checked against std's own socket on the same system rather than
+// against a fixed answer, so the promise is "the same as std".
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+#[test]
+fn sockets_carry_so_nosigpipe_where_std_sets_it() {
+    use std::os::fd::AsFd;
+    let t = tmp();
+    let short = t.path().join("std.sock");
+    let std_listener = UnixListener::bind(&short).unwrap();
+    let std_client = UnixStream::connect(&short).unwrap();
+    let std_says = sys::so_nosigpipe(std_client.as_fd()).unwrap();
+    assert_eq!(sys::so_nosigpipe(std_listener.as_fd()).unwrap(), std_says);
+    assert!(std_says, "std sets SO_NOSIGPIPE on this system");
+
+    let long = nest(t.path(), 300, "s.sock");
+    let listener = crate::bind(&long).unwrap();
+    assert_eq!(sys::so_nosigpipe(listener.as_fd()).unwrap(), std_says);
+    let client = crate::connect(&long).unwrap();
+    assert_eq!(sys::so_nosigpipe(client.as_fd()).unwrap(), std_says);
+    let client = crate::connect_nonblocking(&long).unwrap();
+    assert_eq!(sys::so_nosigpipe(client.as_fd()).unwrap(), std_says);
+}
+
 // The plain route is the contract that short paths behave exactly like std:
 // at most DIRECT_MAX (100) bytes goes to std unchanged, one byte more does not.
 // 100 is the same on every platform and below both sun_path sizes (104 / 108
