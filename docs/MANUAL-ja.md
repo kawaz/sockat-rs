@@ -48,12 +48,12 @@ server.read_exact(&mut buf)?;
 
 ## 長いパスへの届き方
 
-std が受け付ける長さ (`sun_path` − 1) のパスは std にそのまま渡す。
+std が受け付ける長さ (標準に渡す長さ) までのパスは std にそのまま渡す。今の std ではどの OS でも、広げていない sockaddr に入る長さ (`sun_path` − 1、以下「sockaddr に入る長さ」) と同じ。
 
 | OS | std にそのまま渡す長さ |
 |---|---|
 | Linux / Android / illumos | 107 バイトまで |
-| macOS / iOS / FreeBSD / NetBSD / OpenBSD | 103 バイトまで |
+| macOS / iOS 等 Apple の OS / FreeBSD / NetBSD / OpenBSD | 103 バイトまで |
 
 それを超えるパスは、OS ごとに次の順に試し、最初に使えた経路で bind / connect する。どの経路も呼び出し元のプロセスの cwd を変えないので、マルチスレッドのプログラムから使える。
 
@@ -64,7 +64,7 @@ std が受け付ける長さ (`sun_path` − 1) のパスは std にそのまま
 | Linux / Android (`/proc` を使える) | [/proc](#proc) |
 | Linux / Android (`/proc` を使えない) | [相対パス](#相対パス) → [symlink](#symlink) → [fork](#fork) |
 | FreeBSD | [bindat](#bindat) |
-| macOS | [相対パス](#相対パス) → [広げた sockaddr](#広げた-sockaddr) → [symlink](#symlink) → [fork](#fork) |
+| macOS / iOS 等 Apple の OS | [相対パス](#相対パス) → [広げた sockaddr](#広げた-sockaddr) → [symlink](#symlink) → [fork](#fork) |
 | NetBSD / OpenBSD / illumos / その他の Unix | [相対パス](#相対パス) → [symlink](#symlink) → [fork](#fork) |
 | Windows | 対象外 (Unix 以外では compile エラー) |
 
@@ -91,14 +91,15 @@ FreeBSD。`bindat(2)` / `connectat(2)` で、ディレクトリの fd を基準�
 
 #### 相対パス
 
-cwd からの相対パスが std にそのまま渡せる長さなら、それを std に渡す。元のパスが絶対パスの時だけ使う。パスを文字列で書き直すだけで、cwd は変えない (`chdir` しない)。
+cwd からの相対パスが sockaddr に入る長さ以内なら、それを std に渡す。元のパスが絶対パスの時だけ使う。パスを文字列で書き直すだけで、cwd は変えない (`chdir` しない)。
 
-- パスが cwd (`getcwd`、または cwd と同じディレクトリを指す `$PWD`) の下にあれば、前を削る。それで std にそのまま渡せる長さにならない時 (cwd の下に無い時も含む) は、両方を実パスに揃えて `..` で上る綴りも作る。短い方を使う
+- パスが cwd (`getcwd`、または cwd と同じディレクトリを指す `$PWD`) の下にあれば、前を削る。それで sockaddr に入る長さにならない時 (cwd の下に無い時も含む) は、両方を実パスに揃えて `..` で上る綴りも作る。短い方を使う
+- 相対パスのディレクトリが元のディレクトリと `(st_dev, st_ino)` で一致しない時と、cwd が既に変わっている時は、エラーにせず、この経路は使えないとして次の経路に進む
 - 相対パスが元のパスと同じディレクトリを指すことを確かめてから使い、bind / connect の後に cwd が変わっていないことも確かめる ([後述](#相対パスの経路は他のスレッドの-chdir-に弱い))
 
 #### 広げた sockaddr
 
-macOS。XNU は `sun_path` が 104 バイトを超えるアドレスも、パスが 253 バイトまでなら受け付ける。元のパスが 253 バイト以内ならそれを、無理なら相対パスが 253 バイト以内ならそれを渡す。
+macOS / iOS 等 Apple の OS。XNU は `sun_path` が 104 バイトを超えるアドレスも、パスが 253 バイトまでなら受け付ける。元のパスが 253 バイト以内ならそれを、無理なら相対パスが 253 バイト以内ならそれを渡す。
 
 #### symlink
 
@@ -106,11 +107,11 @@ macOS。XNU は `sun_path` が 104 バイトを超えるアドレスも、パス
 
 | | symlink の先 | 渡す綴り | `/tmp` で届く範囲 |
 |---|---|---|---|
-| bind | ソケットのディレクトリ | `<置き場>/sockat.XXXXXXXXXX/<ファイル名>` | ファイル名が 84 バイト (`sun_path` が 104 の OS は 80、macOS は 230) 以内 |
+| bind | ソケットのディレクトリ | `<置き場>/sockat.XXXXXXXXXX/<ファイル名>` | ファイル名が 84 バイト (`sun_path` が 104 の OS は 80、カーネルが広げた sockaddr を受け付ける Apple の OS は 230) 以内 |
 | connect | ソケットのファイル | `<置き場>/sockat.XXXXXXXXXX` | ディレクトリの深さにもファイル名の長さにもよらない |
 
 - symlink の先は渡したパスそのものなので、元のパスと同じ場所に解決される
-- 置き場の候補は、`TMPDIR` (空でない絶対パスの時)、`/tmp` の順。渡す綴りが std にそのまま渡せる長さ (macOS は広げた sockaddr で 253 バイト) に収まり、安全で、symlink を作れた最初の候補を使う。`TMPDIR` が深くて収まらない時は `/tmp` を使う
+- 置き場の候補は、`TMPDIR` (空でない絶対パスの時)、`/tmp` の順。渡す綴りが sockaddr に入る長さ (カーネルが広げた sockaddr を受け付ける Apple の OS では 253 バイト) に収まり、安全で、symlink を作れた最初の候補を使う。`TMPDIR` が深くて収まらない時は `/tmp` を使う
 - **安全な置き場**は、他人が中の symlink を差し替えられないディレクトリで、次のどちらか。満たさない候補には何も作らず、次の候補に進む
   - sticky bit が立っていて、持ち主が root か自分 (`/tmp` がこれ)
   - 持ち主が自分で、group と other に書き込み権限が無い (macOS の `$TMPDIR` がこれ)
@@ -122,7 +123,7 @@ macOS。XNU は `sun_path` が 104 バイトを超えるアドレスも、パス
 ディレクトリを開いた fd に `fchdir` した子を fork し、子がファイル名だけで bind / connect して、すぐ終了する。fork の後もソケットは親と子で同じものを指すので、子の bind / connect は呼び出し元のソケットにそのまま効く。bind の後の listen は呼び出し元がする。
 
 - **`bind` と `connect_any` 系だけが試す。** `connect` / `connect_nonblocking` は試さずに `ENAMETOOLONG` を返す (ディレクトリを開いてから判定するので、ディレクトリが無ければ `ENOENT`)
-- ファイル名は `sun_path` に入る長さまで: macOS は広げた sockaddr で 253 バイト、Linux と illumos は 107 バイト、NetBSD / OpenBSD 等の BSD は 103 バイト。超えると `ENAMETOOLONG`
+- ファイル名は sockaddr に入る長さまで: Apple の OS はカーネルが広げた sockaddr を受け付ける時 253 バイト (断った時は 103 バイト)、Linux と illumos は 107 バイト、NetBSD / OpenBSD 等の BSD は 103 バイト。超えると `ENAMETOOLONG`
 - ディレクトリの開き方と要る権限: macOS は `O_SEARCH` で開くので、通常の bind / connect と同じ権限 (検索、bind なら書き込みも) で足りる。Linux は /proc の経路のために `O_PATH` で開いた fd を使うので、読み取り権限は要らない。他の Unix は `O_RDONLY` で開くので、読み取り権限も要る
 - bind は子が bind するだけで listen は呼び出し元なので、fork の経路でも相手から見える副作用が無い。fork しない版の bind は無い
 - 子の区間は async-signal-safe な呼び出し (`fchdir`、`bind` / `connect`、`_exit`) だけなので、マルチスレッドのプロセスから呼べる
@@ -130,7 +131,7 @@ macOS。XNU は `sun_path` が 104 バイトを超えるアドレスも、パス
 
 ### 経路の失敗の扱い
 
-経路が実際に bind / connect して失敗した時 (`ENOENT`、`EADDRINUSE`、`ECONNREFUSED` 等) は、そのエラーを返して次の経路を試さない。次へ進むのは、その経路自体が使えない時 (長さが足りない、`/proc` を使えない、カーネルが広げた sockaddr を受け付けない、置き場が安全でない、symlink が作れない) だけ。symlink の置き場も同じで、ある置き場を通した bind / connect が失敗したら、次の置き場では試さない。
+経路が実際に bind / connect して失敗した時 (`ENOENT`、`EADDRINUSE`、`ECONNREFUSED` 等) は、そのエラーを返して次の経路を試さない。次へ進むのは、その経路自体が使えない時 (長さが足りない、`/proc` を使えない、相対パスのディレクトリが元と一致しない・cwd が既に変わっている、カーネルが広げた sockaddr を受け付けない、置き場が安全でない、symlink が作れない) だけ。symlink の置き場も同じで、ある置き場を通した bind / connect が失敗したら、次の置き場では試さない。
 
 ### どこから届かなくなるか
 
@@ -141,7 +142,7 @@ std にそのまま渡せない長さのパスが `ENAMETOOLONG` になる時。
 | Linux / Android (`/proc` あり) | ファイル名が 107 バイトを超える | ファイル名が `/proc` の綴りに収まらず、相対パスが 107 バイトを超え、symlink の経路も使えない | ファイル名が 107 バイトを超え、symlink の経路も使えない |
 | Linux / Android (`/proc` 無し) | ファイル名が 107 バイトを超える | 相対パスが 107 バイトを超え、symlink の経路も使えない | ファイル名が 107 バイトを超え、symlink の経路も使えない |
 | FreeBSD | ファイル名が 103 バイトを超える | ファイル名が 103 バイトを超える | ファイル名が 103 バイトを超える |
-| macOS | ファイル名が 253 バイトを超える | 元のパスも相対パスも 253 バイトを超え、symlink の経路も使えない | ファイル名が 253 バイトを超え、symlink の経路も使えない |
+| macOS / iOS 等 Apple の OS | ファイル名が 253 バイトを超える | 元のパスも相対パスも 253 バイトを超え、symlink の経路も使えない | ファイル名が 253 バイトを超え、symlink の経路も使えない |
 | NetBSD / OpenBSD / その他の BSD | ファイル名が 103 バイトを超える | 相対パスが 103 バイトを超え、symlink の経路も使えない | ファイル名が 103 バイトを超え、symlink の経路も使えない |
 | illumos | ファイル名が 107 バイトを超える | 相対パスが 107 バイトを超え、symlink の経路も使えない | ファイル名が 107 バイトを超え、symlink の経路も使えない |
 
