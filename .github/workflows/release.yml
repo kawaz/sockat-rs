@@ -1,10 +1,13 @@
 name: Release
 
 on:
-  push:
+  # Release only what CI has passed: run after the CI workflow finishes on main,
+  # and do nothing unless it succeeded. check-version then decides whether
+  # Cargo.toml carries a version newer than the latest tag.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
-    paths:
-      - "Cargo.toml"
   # A version pushed before this workflow existed (or a release that failed
   # half-way) is released by running it by hand; check-version still refuses a
   # version that is already tagged.
@@ -16,13 +19,17 @@ permissions:
 
 jobs:
   check-version:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
     outputs:
+      sha: ${{ steps.version.outputs.sha }}
       version: ${{ steps.version.outputs.current }}
       changed: ${{ steps.version.outputs.changed }}
     steps:
       - uses: actions/checkout@v5
         with:
+          # The commit CI tested (workflow_run), or the branch head (by hand).
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
 
       - name: Install bump-semver
@@ -44,6 +51,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           # [package] version = "X.Y.Z" から抽出
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           CURRENT_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           echo "current=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
 
@@ -102,7 +110,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.check-version.outputs.version }}
-          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_SHA: ${{ needs.check-version.outputs.sha }}
           REPO: ${{ github.repository }}
         run: |
           gh release create "v${VERSION}" \
@@ -121,6 +129,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.check-version.outputs.sha }}
 
       - uses: dtolnay/rust-toolchain@stable
 
