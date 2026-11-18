@@ -25,7 +25,7 @@ Status は各 DR ファイルの `Status:` 行が正本。
 | [DR-0009](DR-0009-windows-out-of-scope.md) | ✅ 実装済 | Windows は対象外 (Unix 以外は compile_error!) |
 | [DR-0010](DR-0010-public-api.md) | ✅ 実装済 | 公開 API は bind と 4 つの connect。`connect` は fork せず、`connect_any` 系は fork したかを bool で返す |
 | [DR-0011](DR-0011-routes-not-exposed.md) | ✅ 実装済 | 経路は公開 API に出さない。試験は crate 内で各経路を強制し、環境を読む部分を値で差し替える |
-| [DR-0012](DR-0012-route-failure-handling.md) | 🟡 部分実装 | 経路の本当の失敗はやり直さない。fork しない connect は ENAMETOOLONG、ディレクトリが無ければどの OS でも ENOENT (Linux 以外は未実装) |
+| [DR-0012](DR-0012-route-failure-handling.md) | ✅ 実装済 | 経路の本当の失敗はやり直さない。fork しない connect は ENAMETOOLONG、ディレクトリが無ければどの OS でも ENOENT |
 | [DR-0013](DR-0013-kernel-returned-address.md) | ✅ 実装済 | local_addr / peer_addr はカーネルに渡した綴りを返すまま。元のパスは利用者が持つ |
 | [DR-0014](DR-0014-no-tokio-dependency.md) | ✅ 実装済 | tokio は依存に入れない (dev-dependency だけ)。std の型から変換する |
 | [DR-0015](DR-0015-own-socket-matches-std.md) | ✅ 実装済 | 自前のソケットは std と同じ設定 (close-on-exec、SO_NOSIGPIPE、backlog)。ソケットファイルは消さない |

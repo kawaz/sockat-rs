@@ -118,7 +118,6 @@ const CONNECT_ANY: Request = Request::Connect(ConnectOptions {
 });
 
 /// A blocking connect that does not fork: what `sockat::connect` does.
-#[cfg(not(target_os = "freebsd"))]
 const CONNECT: Request = Request::Connect(ConnectOptions {
     nonblocking: false,
     fork: false,
@@ -593,6 +592,33 @@ fn long_path_failures_are_the_kernels_errors() {
         let e = route::run(CONNECT_ANY, &stale).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ECONNREFUSED), "{total}: {e}");
     }
+}
+
+// A missing directory is ENOENT even when the file name (254 bytes) fits no
+// sockaddr, for bind and for every connect, on every target (DR-0012): the
+// directory is opened before the name is put in a sockaddr, so the caller
+// learns that the directory is missing, not that the path is too long. Checked
+// through the public order, and (outside FreeBSD) with no place for the symlink
+// so that every request runs down to the fork route's step, where the name's
+// sockaddr is built (and where a connect that does not fork stops).
+#[test]
+fn a_missing_directory_is_enoent_even_when_the_name_fits_no_sockaddr() {
+    let t = tmp();
+    let p = t.path().join("nope").join("n".repeat(254));
+    for req in [BIND, CONNECT, CONNECT_ANY] {
+        let e = route::run(req, &p).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::ENOENT), "{req:?}: {e}");
+        #[cfg(not(target_os = "freebsd"))]
+        {
+            let e = route::run_long(req, &p, &config(&[])).unwrap_err();
+            assert_eq!(
+                errno(&e),
+                Some(libc::ENOENT),
+                "{req:?} with no symlink: {e}"
+            );
+        }
+    }
+    assert!(!t.path().join("nope").exists());
 }
 
 // A file name of 254 bytes (NAME_MAX is 255) directly under a short directory.

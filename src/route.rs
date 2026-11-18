@@ -314,7 +314,7 @@ pub(crate) fn search_or_read_only(
 ///
 /// `addr` holds `name` (built by the caller, which knows which address forms
 /// the target accepts).
-#[cfg(any(test, not(target_os = "freebsd")))]
+#[cfg(test)]
 pub(crate) fn fork_op(
     req: Request,
     dir: &Path,
@@ -392,8 +392,10 @@ pub(crate) mod freebsd {
     /// `connectat(2)` with the file name relative to the directory fd.
     pub(crate) fn run_long(req: Request, path: &Path) -> io::Result<(OwnedFd, Route)> {
         let (dir, name) = path::split(path)?;
-        let addr = SockAddr::standard(name)?;
+        // The directory first, so a missing directory is ENOENT even when the
+        // name fits no sockaddr (DR-0012).
         let dir = open_dir(dir)?;
+        let addr = SockAddr::standard(name)?;
         let sock = sys::socket(req.nonblocking())?;
         sys::op_at(req.op(), sock.as_fd(), dir.as_fd(), &addr)?;
         if req == Request::Bind {
@@ -431,7 +433,7 @@ pub(crate) mod apple {
 pub(crate) mod posix {
     use super::*;
     use std::ffi::OsStr;
-    use std::os::fd::BorrowedFd;
+    use std::os::fd::{AsFd, BorrowedFd};
     use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
 
@@ -563,6 +565,18 @@ pub(crate) mod posix {
             }
         }
 
+        // The directory is opened before the file name's sockaddr is built,
+        // so a missing directory is ENOENT even when the name fits no
+        // sockaddr (DR-0012).
+        let owned;
+        let dir_fd = match opened {
+            Some(opened) => opened,
+            None => {
+                owned = open_dir(dir)?;
+                owned.as_fd()
+            }
+        };
+
         // The plain sockaddr for the file name, or on Apple the widened one
         // for a name too long for it when the kernel takes that.
         #[cfg(target_vendor = "apple")]
@@ -572,10 +586,7 @@ pub(crate) mod posix {
         };
         #[cfg(not(target_vendor = "apple"))]
         let addr = SockAddr::standard(name)?;
-        let (fd, child) = match opened {
-            Some(opened) => fork_in(req, opened, &addr)?,
-            None => fork_op(req, dir, &addr)?,
-        };
+        let (fd, child) = fork_in(req, dir_fd, &addr)?;
         Ok((fd, Route::Fork { child }))
     }
 

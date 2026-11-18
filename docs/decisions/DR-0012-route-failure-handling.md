@@ -18,7 +18,7 @@
 - **fork を試さない connect** (`connect` / `connect_nonblocking`) は、fork の経路の手前で `ENAMETOOLONG` を返す。ソケットは作らず、何も connect しない。専用のエラーや文言は作らない
 - ディレクトリが無い時は、どの OS でも、ファイル名の長さによらず `ENOENT` を返す。ディレクトリを先に開いてから、ファイル名が収まるかを判定する
 
-未実装: Linux 以外は fork の経路 (`route::posix::run`) と FreeBSD の `route::freebsd::run_long` がファイル名の sockaddr をディレクトリを開く前に組み立てるので、ディレクトリが無くファイル名が長すぎると `ENAMETOOLONG` になる。
+試験: `a_missing_directory_is_enoent_even_when_the_name_fits_no_sockaddr` (254 バイトのファイル名、bind と各 connect、symlink の置き場なしで fork の経路の手前まで進める場合も)。
 
 ## 理由
 
