@@ -62,12 +62,14 @@ A longer path is tried on the routes below, in this order per OS, and bound / co
 
 | OS | Order tried |
 |---|---|
-| Linux / Android (`/proc` usable) | [/proc](#proc) |
+| Linux / Android (`/proc` usable) | [/proc](#proc) → [relative path](#relative-path) → [symlink](#symlink) → [thread cwd](#thread-cwd) → [fork](#fork) |
 | Linux / Android (`/proc` not usable) | [relative path](#relative-path) → [symlink](#symlink) → [thread cwd](#thread-cwd) → [fork](#fork) |
 | FreeBSD | [bindat](#bindat) |
 | macOS / iOS and the other Apple OSes | [relative path](#relative-path) → [widened sockaddr](#widened-sockaddr) → [symlink](#symlink) → [thread cwd](#thread-cwd) → [fork](#fork) |
 | NetBSD / OpenBSD / illumos / other Unix | [relative path](#relative-path) → [symlink](#symlink) → [fork](#fork) |
 | Windows | not supported (the crate does not compile on non-Unix targets) |
+
+On Linux / Android with `/proc`, when the /proc route's spelling fits, the /proc route is the only one used. When it does not (a file name over about 90 bytes), the order goes on from the relative path, and the symlink route also uses a place that is not safe, [held by an fd](#a-place-that-is-not-safe-held-by-an-fd) (the connects only).
 
 Every function tries the thread cwd route. Only `bind` and the `connect_any` variants try the fork route. `connect` / `connect_nonblocking` return `ENAMETOOLONG` instead of forking.
 
@@ -113,11 +115,26 @@ A symlink `sockat.XXXXXXXXXX` (10 random characters) is created in a temporary d
 
 - The symlink points to the path as given, so it resolves to the same place as the path
 - The places tried are `TMPDIR` (when it is a non-empty absolute path), then `/tmp`. The first one where the spelling passed is within the sockaddr length (253 bytes on an Apple OS whose kernel takes the widened sockaddr), that is safe, and where the symlink can be created is used. When `TMPDIR` is too deep for it to fit, `/tmp` is used
-- **A safe place** is a directory where no other user can replace the symlink in it, one of the following. Nothing is created in a place that is not safe; the next one is tried
+- **A safe place** is a directory where no other user can replace the symlink in it, one of the following. Nothing is created in a place that is not safe; the next one is tried (the connects on Linux / Android with `/proc` use it in the held form below)
   - sticky and owned by root or by the calling user (as `/tmp` is)
   - owned by the calling user with no write permission for group and others (as macOS's `$TMPDIR` is)
 - Symlinks are followed to judge a place (macOS's `/tmp` is a symlink to `/private/tmp`)
 - When the symlink cannot be created (the place does not exist or is not writable, a sandbox, no free name is found, no random bytes can be had), the next place is tried as well
+
+##### A place that is not safe, held by an fd
+
+Only the connects (`connect`, `connect_nonblocking`, the `connect_any` variants) on Linux / Android with `/proc`. A place that is not safe (a `/tmp` of mode 0777 without the sticky bit, say) is not passed over: a private directory is made in it and reached through an fd rather than its name.
+
+1. A directory `sockat.XXXXXXXXXX` of mode 0700 is created in the place (named as the symlinks are)
+2. It is opened `O_DIRECTORY | O_NOFOLLOW` and checked to be a directory owned by the calling user with permissions 0700. Anything else (someone replaced it between the creation and the open) is neither used nor removed
+3. A symlink `s` to the socket file is created inside through the fd, and the connect goes to `/proc/self/fd/<fd>/s`
+4. Whether the connect succeeds or fails, `s` is removed, and the directory is removed only while its name still names the opened one
+
+- Another user renaming the directory away and putting something else in its place does not affect the connect, which goes through the fd, and what was put there is not removed
+- The spelling is about 20 bytes, whatever the file name length and the depth of the place
+- The order of the places is unchanged: `TMPDIR` is tried (with the symlink when safe, in this form when not) before `/tmp`
+- A bind does not use it (its spelling `/proc/self/fd/<fd>/s/<file name>` is longer than the /proc route's)
+- When it cannot be used (the directory cannot be created or opened, the check fails, the symlink cannot be created), the next place is tried
 
 #### thread cwd
 
@@ -150,7 +167,7 @@ A child is forked that `fchdir`s into the opened directory, binds / connects by 
 
 ### How a failing route is treated
 
-When a route actually binds / connects and fails (`ENOENT`, `EADDRINUSE`, `ECONNREFUSED`, ...), that error is returned and the next route is not tried. The next route is tried only when a route cannot be used at all (too long, `/proc` not usable, the relative spelling's directory not matching or the cwd having already changed, the kernel refusing the widened sockaddr, the place not being safe, the symlink not being creatable, the thread cwd route not being usable). The same goes for the places for the symlink: a bind / connect through one place that fails is not tried again through the next.
+When a route actually binds / connects and fails (`ENOENT`, `EADDRINUSE`, `ECONNREFUSED`, ...), that error is returned and the next route is not tried. The next route is tried only when a route cannot be used at all (too long, `/proc` not usable, the relative spelling's directory not matching or the cwd having already changed, the kernel refusing the widened sockaddr, the place not being safe (where there is no held form), the symlink not being creatable, the held form's directory not being creatable or failing the check, the thread cwd route not being usable). The same goes for the places for the symlink: a bind / connect through one place that fails is not tried again through the next.
 
 ### Where a path stops being reached
 
@@ -158,7 +175,7 @@ When a path longer than std accepts is `ENAMETOOLONG` (given that the directory 
 
 | OS | `bind` | `connect` / `connect_nonblocking` | the `connect_any` variants |
 |---|---|---|---|
-| Linux / Android (with `/proc`) | the file name is over 107 bytes | the file name is over 107 bytes and the symlink route cannot be used<br>when the thread cwd route cannot be used: the file name does not fit the `/proc` spelling, the relative path is over 107 bytes, and the symlink route cannot be used | the file name is over 107 bytes and the symlink route cannot be used |
+| Linux / Android (with `/proc`) | the file name is over 107 bytes | the file name is over 107 bytes and the symlink route cannot be used (safe place or not)<br>when the thread cwd route cannot be used: the file name does not fit the `/proc` spelling, the relative path is over 107 bytes, and the symlink route cannot be used (safe place or not) | the file name is over 107 bytes and the symlink route cannot be used (safe place or not) |
 | Linux / Android (without `/proc`) | the file name is over 107 bytes | the file name is over 107 bytes and the symlink route cannot be used<br>when the thread cwd route cannot be used: the relative path is over 107 bytes and the symlink route cannot be used | the file name is over 107 bytes and the symlink route cannot be used |
 | FreeBSD | the file name is over 103 bytes | the file name is over 103 bytes | the file name is over 103 bytes |
 | macOS / iOS and the other Apple OSes | the file name is over 253 bytes | the file name is over 253 bytes and the symlink route cannot be used<br>when the thread cwd route cannot be used: the path and the relative path are both over 253 bytes and the symlink route cannot be used | the file name is over 253 bytes and the symlink route cannot be used |
@@ -168,6 +185,7 @@ When a path longer than std accepts is `ENAMETOOLONG` (given that the directory 
 - The 253 bytes on the Apple OSes hold while the kernel takes the widened sockaddr; when it refuses it, 103
 - On Linux and the Apple OSes where the thread cwd route can be used, `connect` and `connect_nonblocking` reach as far as the `connect_any` variants
 - For a connect, the symlink route cannot be used only when there is no safe place where the symlink can be created (a sandbox where neither `TMPDIR` nor `/tmp` can be used, and the like). Through `/tmp` the length always fits
+- On Linux with `/proc`, a connect reaches the path the same way even through a place that is not safe, as long as a directory can be created there ([held by an fd](#a-place-that-is-not-safe-held-by-an-fd))
 
 ### A path containing NUL
 
@@ -182,7 +200,7 @@ On Linux / Android a path starting with a NUL is a name in the abstract namespac
 They are needed only where there is no safe place where the symlink can be created, and in addition one of:
 
 - an OS without the thread cwd route: NetBSD / OpenBSD / illumos and the like
-- Linux under a seccomp filter (docker's default, systemd's `SystemCallFilter=` and the like)
+- Linux under a seccomp filter (docker's default, systemd's `SystemCallFilter=` and the like), without `/proc` or with no place where even a directory can be created (with `/proc`, a place that is not safe is used [held by an fd](#a-place-that-is-not-safe-held-by-an-fd))
 - an Apple OS without `pthread_fchdir_np`
 
 | Function | Returns |
@@ -243,7 +261,7 @@ sockat itself never changes the cwd. When the relative spelling is made it is ch
 
 ### A symlink can be left behind
 
-If the process dies between creating and removing the symlink, `sockat.XXXXXXXXXX` (pointing to the socket's directory or file) is left under `TMPDIR` or `/tmp`. The `sockat.` prefix tells it apart as sockat's.
+If the process dies between creating and removing the symlink, `sockat.XXXXXXXXXX` (a symlink to the socket's directory or file, or the directory of the held form) is left under `TMPDIR` or `/tmp`. The `sockat.` prefix tells it apart as sockat's. The held form's directory is also left when it could not be opened after it was created (out of fds, say), since it then cannot be told to be sockat's own.
 
 ## Errors
 

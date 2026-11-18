@@ -37,7 +37,7 @@ std が受け付ける長さ (`sun_path` − 1) のパスは std にそのまま
 
 | OS | 試す順番 |
 |---|---|
-| Linux / Android (`/proc` を使える) | /proc |
+| Linux / Android (`/proc` を使える) | /proc → 相対パス → symlink → スレッド cwd → fork (/proc の綴りが収まる時は /proc だけ) |
 | Linux / Android (`/proc` を使えない) | 相対パス → symlink → スレッド cwd → fork |
 | FreeBSD | bindat |
 | macOS / iOS 等 Apple の OS | 相対パス → 広げた sockaddr → symlink → スレッド cwd → fork |
@@ -48,13 +48,13 @@ std が受け付ける長さ (`sun_path` − 1) のパスは std にそのまま
 - **bindat**: `bindat(2)` / `connectat(2)` で、ディレクトリの fd を基準にファイル名で渡す
 - **相対パス**: cwd からの相対パスが std にそのまま渡せる長さなら、それで渡す。パスを文字列で書き直すだけで、cwd は変えない
 - **広げた sockaddr**: macOS のカーネルが受け付ける、253 バイトまで入る sockaddr で渡す
-- **symlink**: `TMPDIR` か `/tmp` に短い symlink を作り、それを通して渡す。bind はソケットのディレクトリを、connect はソケットのファイルを指す。他人が差し替えられない置き場にだけ作り、すぐ消す
+- **symlink**: `TMPDIR` か `/tmp` に短い symlink を作り、それを通して渡す。bind はソケットのディレクトリを、connect はソケットのファイルを指す。他人が差し替えられない置き場にだけ作り、すぐ消す。`/proc` を使える Linux の connect は、安全でない置き場にも自分専用のディレクトリを作り、fd で掴んでその中の symlink を通す
 - **スレッド cwd**: 使い捨てのスレッドだけ cwd をディレクトリに移し (Linux は `unshare(CLONE_FS)` と `fchdir`、Apple の OS は `pthread_fchdir_np`)、ファイル名だけで bind / connect する。副作用が無いので、どの関数も試す
 - **fork**: ディレクトリに `fchdir` した子を fork し、子がファイル名だけで bind / connect する。**`bind` と `connect_any` 系だけが試す**
 
 どの経路も呼び出し元のプロセスの cwd を変えないので、マルチスレッドのプログラムから使える。
 
-`connect` / `connect_nonblocking` は fork しない。fork でしか届かない時は、パスが `sun_path` に入らない普通の connect と同じく `ENAMETOOLONG` を返す。そうなるのは、`/proc` の綴りにも相対パス (Apple の OS では広げた sockaddr も) にも収まらず、安全に symlink を作れる置き場も無く、スレッド cwd の経路も使えない時 (NetBSD / OpenBSD / illumos、seccomp の filter が掛かった Linux、`pthread_fchdir_np` の無い Apple の OS) だけである。`/tmp` が使えれば、`connect` はディレクトリの深さにもファイル名の長さにもよらず symlink の経路で届く。各経路の長さの上限と、どこから `connect` では届かなくなるかは [docs/MANUAL-ja.md](./docs/MANUAL-ja.md#長いパスへの届き方) にある。
+`connect` / `connect_nonblocking` は fork しない。fork でしか届かない時は、パスが `sun_path` に入らない普通の connect と同じく `ENAMETOOLONG` を返す。そうなるのは、`/proc` の綴りにも相対パス (Apple の OS では広げた sockaddr も) にも収まらず、symlink を作れる置き場も無く (`/proc` を使える Linux 以外では安全な置き場)、スレッド cwd の経路も使えない時 (NetBSD / OpenBSD / illumos、seccomp の filter が掛かった Linux、`pthread_fchdir_np` の無い Apple の OS) だけである。`/tmp` が使えれば、`connect` はディレクトリの深さにもファイル名の長さにもよらず symlink の経路で届く。各経路の長さの上限と、どこから `connect` では届かなくなるかは [docs/MANUAL-ja.md](./docs/MANUAL-ja.md#長いパスへの届き方) にある。
 
 ## 例外: `connect_any`
 

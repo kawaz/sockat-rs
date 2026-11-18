@@ -37,7 +37,7 @@ A longer path is tried on the routes below, in this order per OS, and bound / co
 
 | OS | Order tried |
 |---|---|
-| Linux / Android (`/proc` usable) | /proc |
+| Linux / Android (`/proc` usable) | /proc → relative path → symlink → thread cwd → fork (only /proc when its spelling fits) |
 | Linux / Android (`/proc` not usable) | relative path → symlink → thread cwd → fork |
 | FreeBSD | bindat |
 | macOS / iOS and the other Apple OSes | relative path → widened sockaddr → symlink → thread cwd → fork |
@@ -48,13 +48,13 @@ A longer path is tried on the routes below, in this order per OS, and bound / co
 - **bindat**: `bindat(2)` / `connectat(2)`, by the file name relative to the directory fd
 - **relative path**: when std accepts the path relative to the cwd, pass that. Only the path string is rewritten; the cwd is never changed
 - **widened sockaddr**: pass a sockaddr carrying up to 253 bytes, which the macOS kernel accepts
-- **symlink**: create a short symlink under `TMPDIR` or `/tmp` and go through it. For a bind it points to the socket's directory, for a connect to the socket file. It is created only in a place where no other user can replace it, and removed at once
+- **symlink**: create a short symlink under `TMPDIR` or `/tmp` and go through it. For a bind it points to the socket's directory, for a connect to the socket file. It is created only in a place where no other user can replace it, and removed at once. On Linux with `/proc`, a connect also uses a place that is not safe: it makes a private directory there, holds it by an fd and goes through a symlink inside
 - **thread cwd**: move the cwd of a throwaway thread, and of it alone, into the directory (Linux: `unshare(CLONE_FS)` and `fchdir`; Apple OSes: `pthread_fchdir_np`) and bind / connect by the file name alone. It has no side effects, so every function tries it
 - **fork**: fork a child that `fchdir`s into the directory and binds / connects by the file name alone. **Only `bind` and the `connect_any` variants try it**
 
 None of the routes changes the calling process's cwd, so they can be used from multi-threaded programs.
 
-`connect` / `connect_nonblocking` never fork. Where only the fork route would reach the path, they return `ENAMETOOLONG`, as a plain connect to a path too long for `sun_path` does. That happens only when the path fits neither the `/proc` spelling nor a relative path (nor, on the Apple OSes, the widened sockaddr), there is no safe place to create the symlink, and the thread cwd route cannot be used either (NetBSD / OpenBSD / illumos, Linux under a seccomp filter, an Apple OS without `pthread_fchdir_np`). With a usable `/tmp`, `connect` reaches the path through the symlink whatever the directory depth and the file name length. The length limits of each route, and where `connect` stops reaching a path, are in [docs/MANUAL.md](./docs/MANUAL.md#how-a-long-path-is-reached).
+`connect` / `connect_nonblocking` never fork. Where only the fork route would reach the path, they return `ENAMETOOLONG`, as a plain connect to a path too long for `sun_path` does. That happens only when the path fits neither the `/proc` spelling nor a relative path (nor, on the Apple OSes, the widened sockaddr), there is no place to create the symlink (a safe one, except on Linux with `/proc`), and the thread cwd route cannot be used either (NetBSD / OpenBSD / illumos, Linux under a seccomp filter, an Apple OS without `pthread_fchdir_np`). With a usable `/tmp`, `connect` reaches the path through the symlink whatever the directory depth and the file name length. The length limits of each route, and where `connect` stops reaching a path, are in [docs/MANUAL.md](./docs/MANUAL.md#how-a-long-path-is-reached).
 
 ## The exception: `connect_any`
 

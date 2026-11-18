@@ -1,0 +1,65 @@
+# DR-0023: /proc を使える Linux の connect は、安全でない置き場に自分専用のディレクトリを作り fd で掴んで symlink の経路に使う
+
+- Status: Accepted
+- Date: 2026-11-18
+
+## Context
+
+- Linux で seccomp の filter が掛かり (スレッド cwd の経路が使えない、[DR-0020](DR-0020-thread-cwd-route.md))、`TMPDIR` も `/tmp` も安全な置き場でなく ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md))、ファイル名が `/proc` の綴りに収まらない時 ([DR-0003](DR-0003-linux-proc-self-fd.md))、bind は fork で届くが `connect` / `connect_nonblocking` は `ENAMETOOLONG` になる (hyoui の実測)
+- 安全でない置き場に名前で辿る symlink を置くと、他人がそれを差し替えられる
+
+## Decision
+
+`/proc` を使える Linux / Android の connect 系 (`connect`、`connect_nonblocking`、`connect_any` 系) では、symlink の経路で安全でない置き場の候補を飛ばさず、fd で掴む形で使う。
+
+| 置き場の候補 | 形 |
+|---|---|
+| 安全 | 置き場に直接 symlink ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md)) |
+| 安全でない (`/proc` を使える Linux / Android の connect 系) | fd で掴む形 |
+| 安全でない (それ以外) | 何も作らず次の候補へ |
+
+- 試す順: `TMPDIR` が安全なら symlink → 安全でなければ fd で掴む形 → `/tmp` が安全なら symlink → 安全でなければ fd で掴む形 → スレッド cwd → fork (bind と `connect_any` 系だけ)。`TMPDIR` が `/tmp` と同じなら 1 回だけ
+- fd で掴む形 (`route::posix::HeldDir`)
+  1. 置き場に mode 0700 のディレクトリを作る。名前と衝突の扱いは symlink と同じ (`sockat.` + 乱数 10 文字、`EEXIST` で引き直し 16 回で打ち切り)
+  2. `O_DIRECTORY | O_NOFOLLOW` で開き、`fstat` で「ディレクトリ・持ち主が実効 uid・許可の bit が 0700」を確かめる
+  3. fd の中に `symlinkat` で、ソケットのファイル (元のパス。相対パスなら cwd を前に付ける) を指す `s` を作る
+  4. 綴り `/proc/self/fd/<fd>/s` を渡す
+  5. 片付け: `unlinkat(fd, "s")`。ディレクトリは、その名前を `lstat` した `(st_dev, st_ino)` が fd と一致する時だけ `rmdir`。fd を閉じる。connect が成功しても失敗しても、panic でもする。片付けの失敗は無視する
+- `/proc` を使えるかは、ソケットのディレクトリの fd で `/proc/self/fd/<fd>` を引けるかで決める (/proc の経路と同じ判定)。使えない時は安全でない置き場に何も作らない
+- bind は使わない。bind の綴り (`/proc/self/fd/<fd>/s/<ファイル名>`) は /proc の経路の綴り (`/proc/self/fd/<fd>/<ファイル名>`) より `s/` の分長く、それが収まるなら /proc の経路が先に通る。2 つの fd の桁数が違う時だけ例外がありうるが、そのためには足さない
+- 使えないとみなして次の候補へ: ディレクトリを作れない、開けない、`fstat` の確認が通らない、`symlinkat` が失敗した、綴りが標準の `sun_path` に収まらない
+- 確認が通らなかったディレクトリ (他人が置いた物) は使わず、消さない。`symlinkat` が失敗した時と綴りが収まらない時は、作ったディレクトリを片付けてから次へ
+- connect した結果の失敗はそのまま返し、次の候補・経路で試さない ([DR-0012](DR-0012-route-failure-handling.md))
+- `symlinkat` / `unlinkat` は `src/sys.rs` に置く
+
+## 理由
+
+- 名前でなく fd で辿るので、sticky でない置き場で他人がディレクトリを rename して差し替えても影響を受けない (試験 `a_held_directory_renamed_away_is_still_used_and_its_replacement_is_not_removed`: rename した後も fd の綴りで届き、名前に置かれた別のディレクトリは消さない)
+- 作ってから開くまでのすり替えは `O_NOFOLLOW` と `fstat` の確認で弾く (試験 `a_directory_replaced_before_it_is_held_is_not_used`: mode の違うディレクトリ、別のディレクトリへの symlink、ふつうのファイル、root で他人に chown したディレクトリ)
+- connect の綴りはファイル名の長さにも置き場の深さにもよらず収まる (`/proc/self/fd/<fd>/s` はおよそ 20 バイト)
+- 渡された `TMPDIR` で済むならそれが一番良いので、`TMPDIR` を `/tmp` より先に使い切る
+- 許可の bit (`mode & 0o777`) だけを見るのは、親の setgid のように作る側が決められない bit で使えなくしないため
+
+悪い面:
+
+- `/proc` が要る。`/proc` の無い Linux と他の Unix では使えない。Apple の OS はスレッド cwd の経路で届くので足さない
+- 途中でプロセスが死ぬとディレクトリが残る (名前の `sockat.` で残骸と分かる)
+- 作った後に開けなかった時 (fd が尽きた等) は、名前で辿るディレクトリが自分の物か確かめられないので消さずに残る
+
+## 却下した案
+
+| 案 | 却下の理由 |
+|---|---|
+| 何もしない | bind は届くのに connect は届かないソケットができる |
+| 安全でない置き場に名前で辿るディレクトリや symlink を置く | sticky でない置き場ですり替えられる |
+| bind にも使う | bind の綴りは /proc の経路の綴りより長く、/proc の経路が長さで通らない時はほぼ収まらない |
+
+## 未確定
+
+- Android は compile もしていない
+- 持ち主の違うディレクトリへのすり替えは root (docker) でだけ確かめた。uid 1000 では他人に chown できないので、その場合は飛ばす (他の観点は uid 1000 でも通ることを確かめた)
+
+## 判断の出所
+
+- 安全でない置き場を fd で掴む形で使う、順番、connect 系だけ、片付けの条件: kawaz 裁定 (ハブ [DR-0008](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0008-unsafe-base-held-by-fd.md)、2026-11-18)。bind に効かないこと: 統括の裁定 2026-11-18
+- 許可の bit だけを見る、確認の通らないディレクトリと開けなかったディレクトリを消さない: 実装側の判断 2026-11-18

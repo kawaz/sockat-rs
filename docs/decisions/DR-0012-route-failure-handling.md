@@ -14,6 +14,7 @@
   - /proc を使えない ([DR-0003](DR-0003-linux-proc-self-fd.md))
   - 広げた sockaddr をカーネルが受け付けない ([DR-0005](DR-0005-widened-sockaddr-on-macos.md))
   - symlink の置き場が安全でない・作れない ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md))
+  - fd で掴む形 (/proc を使える Linux の connect 系) で、ディレクトリを作れない・開けない、確かめた結果が違う、`symlinkat` が失敗した、綴りが収まらない ([DR-0023](DR-0023-unsafe-base-held-by-fd.md))
   - 相対パスの経路で、作った綴りのディレクトリが元と `(st_dev, st_ino)` で一致しない、または cwd が既に変わっている ([DR-0004](DR-0004-relative-path-from-cwd.md))
   - スレッド cwd の経路で、スレッドを作れない、seccomp の filter が掛かっている (Linux)、`unshare` が断られた、`pthread_fchdir_np` が無い・失敗した ([DR-0020](DR-0020-thread-cwd-route.md))
   - 長さが足りない

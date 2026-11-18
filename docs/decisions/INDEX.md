@@ -36,3 +36,4 @@ Status は各 DR ファイルの `Status:` 行が正本。
 | [DR-0020](DR-0020-thread-cwd-route.md) | ✅ 実装済 | Linux と Apple の OS は symlink の後、fork の前に、使い捨てのスレッドだけ cwd を移す経路。connect も試す。Linux は seccomp の filter が掛かっていれば unshare を呼ばず使わない |
 | [DR-0021](DR-0021-nul-is-invalid-at-any-length.md) | ✅ 実装済 | NUL を含むパスは長さによらず InvalidInput で何も作らない。Linux の先頭の NUL は std にそのまま渡す |
 | [DR-0022](DR-0022-connect-any-behind-feature.md) | ✅ 実装済 | connect_any 系は feature `connect-any` (既定で無効) の後ろ。docs.rs は全 feature、試験と CI は `--all-features` |
+| [DR-0023](DR-0023-unsafe-base-held-by-fd.md) | ✅ 実装済 | /proc を使える Linux の connect 系は、安全でない置き場に 0700 のディレクトリを作って fd で掴み、`/proc/self/fd/<fd>/s` の symlink で届く |

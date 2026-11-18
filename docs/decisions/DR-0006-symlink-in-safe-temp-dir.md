@@ -15,7 +15,7 @@
   - `TMPDIR` は空でなく絶対パスの時だけ候補に入れる (外すのは `TMPDIR` だけで、`/tmp` は試す)
   - `TMPDIR` が `/tmp` そのもの (`/tmp/` も含め、綴りが同じ) なら 1 回だけ試す。`/private/tmp` のように綴りの違う同じディレクトリは別の候補として扱う
 - 候補を順に見て、最初に使えたもので bind / connect する。何かを作る前に symlink を通した綴りの長さを確かめ、std にそのまま渡せる長さ ([DR-0002](DR-0002-std-handles-paths-it-accepts.md)) 以内なら std に、macOS で広げた sockaddr ([DR-0005](DR-0005-widened-sockaddr-on-macos.md)) が使えるなら 253 以内でそれに渡す。長さが足りない候補には何も作らず次へ進む
-- **他人が symlink を差し替えられない置き場だけを使う。** 置き場を stat し (symlink は辿る。macOS の `/tmp` は `/private/tmp` への symlink)、次のどちらかを満たす時だけ使う。満たさない候補には何も作らず次へ進む
+- **他人が symlink を差し替えられない置き場だけを使う。** 置き場を stat し (symlink は辿る。macOS の `/tmp` は `/private/tmp` への symlink)、次のどちらかを満たす時だけ使う。満たさない候補には何も作らず次へ進む。例外は /proc を使える Linux / Android の connect 系で、安全でない候補を自分専用のディレクトリを fd で掴む形で使う ([DR-0023](DR-0023-unsafe-base-held-by-fd.md))
   - sticky bit が立っていて、持ち主が root か自分の実効 uid (`/tmp` がこれ)
   - 持ち主が自分の実効 uid で、group と other に書き込み権限が無い (`mode & 0o022 == 0`。macOS の `$TMPDIR` がこれ)
 - 確かめるのは置き場そのもので、置き場を含む上位のディレクトリまでは見ない
