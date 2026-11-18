@@ -125,10 +125,11 @@ macOS / iOS 等 Apple の OS。XNU は `sun_path` が 104 バイトを超える�
 
 `/proc` を使える Linux / Android の connect 系 (`connect`、`connect_nonblocking`、`connect_any` 系) だけ。安全でない置き場の候補 (sticky でない 0777 の `/tmp` 等) を飛ばさず、自分専用のディレクトリを作って名前でなく fd で辿る。
 
-1. 置き場に mode 0700 のディレクトリ `sockat.XXXXXXXXXX` を作る (名前の付け方は symlink と同じ)
-2. それを `O_DIRECTORY | O_NOFOLLOW` で開き、ディレクトリで、持ち主が自分で、許可が 0700 であることを確かめる。違えば (作ってから開くまでに他人が差し替えた) 使わず、消さない
-3. 開いた fd の中に、ソケットのファイルを指す symlink `s` を作り、`/proc/self/fd/<fd>/s` で connect する
-4. connect が成功しても失敗しても、`s` を消し、ディレクトリはその名前がまだ開いた物を指す時だけ消す
+1. 何かを作る前に `/proc` を使えるか確かめる。使えなければ何も作らずに次の候補へ
+2. 置き場に mode 0700 のディレクトリ `sockat.XXXXXXXXXX` を作る (名前の付け方は symlink と同じ)
+3. それを `O_DIRECTORY | O_NOFOLLOW` で開き、ディレクトリで、持ち主が自分で、group と other に権限が無いことを確かめる。違えば (作ってから開くまでに他人が差し替えた) 使わず、消さない。通ったら fd で 0700 に直す (umask が持ち主のビットを削っていても使えるように)
+4. 開いた fd の中に、ソケットのファイルを指す symlink `s` を作り、`/proc/self/fd/<fd>/s` で connect する
+5. connect が成功しても失敗しても、`s` を消し、ディレクトリはその名前がまだ開いた物を指す時だけ消す
 
 - 他人がディレクトリを rename して別の物を置いても、fd で辿るので connect には効かず、置かれた物も消さない
 - 綴りはおよそ 20 バイトで、ファイル名の長さにも置き場の深さにもよらない
