@@ -1084,12 +1084,17 @@ pub(crate) mod posix {
         ///
         /// It is opened `O_DIRECTORY | O_NOFOLLOW` (a symlink put at `path` is
         /// refused), and what was opened must be a directory owned by the
-        /// effective uid with permission bits 0700, as made by
-        /// [`HeldDir::make_private_dir`]: anything else was put there by
-        /// someone else between the `mkdir` and the `open`, and is neither
-        /// used nor removed (`InvalidData`). The symlink is created with
-        /// `symlinkat(2)` on the fd. When that fails, the directory is removed
-        /// again (by drop).
+        /// effective uid with no permission for group and others
+        /// (`mode & 0o077 == 0`), as made by [`HeldDir::make_private_dir`]:
+        /// anything else was put there by someone else between the `mkdir`
+        /// and the `open`, and is neither used nor removed (`InvalidData`).
+        /// Only the group and other bits are judged because the umask may
+        /// have taken some of the owner's from the 0700 asked for (umask 0277
+        /// makes it 0500); the owner's are then set to 0700 through the fd
+        /// (`fchmod`), so such a umask does not leave a directory behind on
+        /// every call. The symlink is created with `symlinkat(2)` on the fd.
+        /// When `fchmod` or `symlinkat` fails, the directory is removed again
+        /// (by drop).
         pub(crate) fn hold(path: PathBuf, target: &Path) -> io::Result<Self> {
             use std::os::fd::AsFd;
             let opened = OpenOptions::new()
@@ -1097,7 +1102,7 @@ pub(crate) mod posix {
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
                 .open(&path)?;
             let m = opened.metadata()?;
-            if !(m.is_dir() && m.uid() == sys::effective_uid() && m.mode() & 0o777 == 0o700) {
+            if !(m.is_dir() && m.uid() == sys::effective_uid() && m.mode() & 0o077 == 0) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "the directory made for the temporary symlink was replaced",
@@ -1108,6 +1113,8 @@ pub(crate) mod posix {
                 dir: opened,
                 linked: false,
             };
+            held.dir
+                .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
             sys::symlink_at(target, held.dir.as_fd(), Self::LINK)?;
             held.linked = true;
             Ok(held)

@@ -71,7 +71,8 @@
 //!   a file name of up to 84 bytes (80 where `sun_path` is 104, 230 on macOS).
 //!   On Linux and Android with `/proc`, a connect also uses a place that is
 //!   not safe: a private directory (mode 0700) is created there, held by an
-//!   fd and checked to be the one created, and the connect goes through a
+//!   fd and checked to be the one created (owned by the calling user, no
+//!   permission for group and others), and the connect goes through a
 //!   symlink inside it as `/proc/self/fd/<fd>/s`, so another user renaming
 //!   the directory changes nothing
 //! * **thread cwd** (Linux, Apple): a thread started for the call alone moves

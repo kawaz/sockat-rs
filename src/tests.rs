@@ -1375,12 +1375,13 @@ mod linux {
 
     // Between the mkdir of the private directory and its open, another user
     // of the place can put something else at its name. What is opened must be
-    // a directory owned by the effective uid with permission bits 0700, opened
-    // without following a symlink; anything else is refused before anything
-    // is created in it, and is left where it is (it is not sockat's to
-    // remove). Each replacement is made by hand between the two steps:
+    // a directory owned by the effective uid with no permission for group and
+    // others, opened without following a symlink; anything else is refused
+    // before anything is created in it, and is left where it is (it is not
+    // sockat's to remove). Each replacement is made by hand between the two
+    // steps:
     //
-    // * the directory with another mode (0755);
+    // * the directory with group and others given read and search (0755);
     // * a symlink to another directory (O_NOFOLLOW refuses it, and nothing
     //   appears in that directory);
     // * a plain file;
@@ -1487,6 +1488,59 @@ mod linux {
         assert!(decoy.is_dir(), "the directory put in its place was removed");
         assert_empty(&decoy);
         assert_empty(&moved);
+    }
+
+    // The 0700 asked for when the private directory is made is what the umask
+    // leaves of it. A umask that takes some of the owner's bits (0277 makes it
+    // 0500, without write) must not make the form fail on every call and leave
+    // a directory behind each time: only the group and other bits are judged
+    // (none, as a umask cannot add any), and the owner's are set to 0700
+    // through the fd before the symlink is created in it. So under umask 0277
+    // a connect still goes through the held directory and the place is empty
+    // afterwards. Runs in a child process because the umask is process-wide;
+    // the places and the listener are made here, with the usual umask.
+    #[test]
+    fn a_umask_that_takes_the_owners_bits_does_not_stop_the_held_directory() {
+        let t = tmp();
+        let places = tmp();
+        let bad = unsafe_place(places.path(), "bad");
+        let p = t.path().join("n".repeat(95));
+        let (l, _) = route::run_long(BIND, &p, &held_cfg(&[])).unwrap();
+        let listener = UnixListener::from(l);
+        listener.set_nonblocking(true).unwrap();
+        run_child(
+            "tests::linux::child_connect_under_umask_0277",
+            Path::new("/"),
+            &[
+                ("SOCKAT_CHILD_PATH", p.as_os_str()),
+                ("SOCKAT_CHILD_OTHER", bad.as_os_str()),
+            ],
+        );
+        // The child's connection is in the backlog (its end closed since).
+        listener.accept().unwrap();
+        assert_empty(&bad);
+    }
+
+    #[test]
+    fn child_connect_under_umask_0277() {
+        use crate::route::posix::HeldDir;
+        use std::os::unix::fs::PermissionsExt;
+        if !in_child() {
+            return;
+        }
+        let p = env_path("SOCKAT_CHILD_PATH");
+        let bad = env_path("SOCKAT_CHILD_OTHER");
+        sys::set_umask(0o277);
+        // The premise: the directory comes out 0500.
+        let made =
+            HeldDir::make_private_dir(&bad, || Ok(String::from("sockat.AAAAAAAAAA"))).unwrap();
+        let mode = std::fs::metadata(&made).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o500);
+        std::fs::remove_dir(&made).unwrap();
+
+        let (_c, r) = route::run_long(CONNECT, &p, &held_cfg(&[&bad])).unwrap();
+        assert_eq!(r, Route::SymlinkInHeldDir);
+        assert_empty(&bad);
     }
 
     // Why a bind never goes through a link to the socket file: Linux does not

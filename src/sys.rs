@@ -767,6 +767,17 @@ pub(crate) fn peer_cred_pid(sock: BorrowedFd<'_>) -> io::Result<libc::pid_t> {
     Ok(cred.pid)
 }
 
+/// Set the file mode creation mask of the process (`umask(2)`, which cannot
+/// fail). Test-only, and only for a child process of the test binary: the mask
+/// is process-wide.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) fn set_umask(mask: libc::mode_t) {
+    // SAFETY: plain syscall without pointers.
+    unsafe {
+        libc::umask(mask);
+    }
+}
+
 /// Set `SIGCHLD` to `SIG_IGN`, which makes the kernel reap children on its own
 /// (`waitpid` then fails with `ECHILD`). Test-only, and only for a child
 /// process of the test binary: the disposition is process-wide.
