@@ -92,7 +92,8 @@ fn bind_and_connect_work_at_any_length() {
     }
 }
 
-// The four connects in an ordinary environment (a writable /tmp, the socket
+// The four connects (the two that may fork with the crate feature
+// `connect-any`) in an ordinary environment (a writable /tmp, the socket
 // under a temporary directory with a short file name): every length is
 // reached without forking on every platform (DR-0006: the symlink route under
 // /tmp takes any directory depth), so the two connects that may fork report
@@ -118,25 +119,31 @@ fn in_an_ordinary_environment_no_connect_forks() {
         assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{total}");
         drop(listener.accept().unwrap());
 
-        let (mut c, forked) = sockat::connect_any(&p).unwrap();
-        assert!(!forked, "{total}");
-        ping(&listener, &mut c);
+        #[cfg(feature = "connect-any")]
+        {
+            let (mut c, forked) = sockat::connect_any(&p).unwrap();
+            assert!(!forked, "{total}");
+            ping(&listener, &mut c);
 
-        let (mut c, forked) = sockat::connect_any_nonblocking(&p).unwrap();
-        assert!(!forked, "{total}");
-        let e = c.read(&mut buf).unwrap_err();
-        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{total}");
+            let (mut c, forked) = sockat::connect_any_nonblocking(&p).unwrap();
+            assert!(!forked, "{total}");
+            let e = c.read(&mut buf).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{total}");
+        }
     }
 }
 
 // A long file name far from the cwd, too long to fit behind
 // /tmp/sockat.XXXXXXXXXX/ (over 84 bytes for the plain sockaddr on Linux, 80
 // on the BSDs; on macOS over 230 for the widened one) and, on Linux, behind
-// /proc/self/fd/<n>/ (over about 90), but within the fork route's sockaddr. `bind` reaches it (forking
-// on every target but FreeBSD, where bindat does). The connects reach it
-// through a symlink to the socket file, whose spelling does not contain the
-// file name, so in an ordinary environment (a writable /tmp) none of them
-// forks, and the plain `connect` and `connect_nonblocking` work too.
+// /proc/self/fd/<n>/ (over about 90), but within the sockaddr of the thread
+// cwd and fork routes. `bind` reaches it (through the thread cwd route on Linux
+// and Apple where it can be used, otherwise forking; FreeBSD through bindat).
+// The connects reach it through a symlink to the socket file, whose spelling
+// does not contain the file name, so in an ordinary environment (a writable
+// /tmp) none of them forks, and the plain `connect` and `connect_nonblocking`
+// work too (the two that may fork are checked with the crate feature
+// `connect-any`).
 #[test]
 fn a_long_file_name_is_connected_to_without_forking() {
     #[cfg(target_vendor = "apple")]
@@ -157,11 +164,14 @@ fn a_long_file_name_is_connected_to_without_forking() {
     let e = c.read(&mut buf).unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
     drop(listener.accept().unwrap());
-    let (mut c, forked) = sockat::connect_any(&p).unwrap();
-    assert!(!forked);
-    ping(&listener, &mut c);
-    let (_c, forked) = sockat::connect_any_nonblocking(&p).unwrap();
-    assert!(!forked);
+    #[cfg(feature = "connect-any")]
+    {
+        let (mut c, forked) = sockat::connect_any(&p).unwrap();
+        assert!(!forked);
+        ping(&listener, &mut c);
+        let (_c, forked) = sockat::connect_any_nonblocking(&p).unwrap();
+        assert!(!forked);
+    }
 }
 
 // Short paths are std's business: sockat hands them over unchanged, so the

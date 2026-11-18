@@ -533,7 +533,7 @@ pub(crate) mod posix {
         pub(crate) proc_self_fd: PathBuf,
         /// Whether to try the thread-cwd route at all (Linux, Apple). Always
         /// `true` outside the tests, which turn it off to stand in for a
-        /// system where it cannot be used (`unshare` refused, no
+        /// system where it cannot be used (a seccomp filter, `unshare` refused, no
         /// `pthread_fchdir_np`). Where it is tried and turns out unusable,
         /// the next route is tried just the same.
         #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]

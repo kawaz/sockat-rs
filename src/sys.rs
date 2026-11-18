@@ -411,10 +411,10 @@ pub(crate) enum OnThread<T> {
     /// is its outcome.
     Done(io::Result<T>),
     /// The thread's working directory could not be moved on its own, so the
-    /// call was not made: no thread could be started, `unshare(CLONE_FS)` was
-    /// refused (Linux; a seccomp filter such as docker's default answers
-    /// `EPERM`), or `pthread_fchdir_np` is missing or failed (Apple). The
-    /// error says which.
+    /// call was not made: no thread could be started, a seccomp filter is in
+    /// effect so `unshare(CLONE_FS)` is not called, or it was refused (Linux),
+    /// or `pthread_fchdir_np` is missing or failed (Apple). The error says
+    /// which.
     Unusable(io::Error),
 }
 
@@ -427,7 +427,14 @@ pub(crate) enum OnThread<T> {
 ///
 /// * Linux / Android: `unshare(CLONE_FS)` gives the thread its own copy of the
 ///   working directory (and of the root and the umask), then `fchdir(dir)`
-///   moves that copy. `fchdir` is reached only after the `unshare` succeeded,
+///   moves that copy. Not when a seccomp filter is in effect on the thread
+///   ([`seccomp_mode`] not 0, or not readable): a filter may answer `unshare`
+///   by killing the process with SIGSYS rather than with an error (systemd's
+///   `SystemCallFilter=` does by default), so `unshare` is not called at all
+///   and the route counts as unusable. The check is made on the started thread
+///   itself, right before the `unshare`, since filters are per thread (a
+///   thread inherits its creator's, and one can be added to a single thread).
+///   `fchdir` is reached only after the `unshare` succeeded,
 ///   so a refused `unshare` can never move the cwd of the process. A failing
 ///   `fchdir` (no search permission, say) is the real outcome, as it would be
 ///   for a bind / connect through the path;
@@ -468,6 +475,27 @@ fn op_in_dir_on_this_thread(
     dir: BorrowedFd<'_>,
     addr: &SockAddr,
 ) -> OnThread<()> {
+    match seccomp_mode() {
+        Ok(0) => {}
+        Ok(mode) => {
+            return OnThread::Unusable(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "a seccomp filter is in effect (mode {mode}), so unshare(CLONE_FS) is not \
+                     called: the filter may kill the process for it"
+                ),
+            ));
+        }
+        Err(e) => {
+            return OnThread::Unusable(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "the seccomp mode cannot be read ({e}), so unshare(CLONE_FS) is not called: \
+                     a filter may be in effect"
+                ),
+            ));
+        }
+    }
     // SAFETY: plain syscall without pointers; it only detaches this thread's
     // working directory, root and umask from the rest of the process.
     if unsafe { libc::unshare(libc::CLONE_FS) } != 0 {
@@ -479,6 +507,18 @@ fn op_in_dir_on_this_thread(
         return OnThread::Done(Err(io::Error::last_os_error()));
     }
     OnThread::Done(self::op(op, sock, addr))
+}
+
+/// The seccomp mode of the calling thread (`prctl(PR_GET_SECCOMP)`): 0 without
+/// seccomp, 2 with a filter (Linux, Android). An error means the mode is not
+/// known: a kernel without seccomp answers `EINVAL`, and so does an x86_64
+/// binary emulated on an arm64 Linux (docker on Apple silicon, observed under
+/// seccomp and without it alike).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn seccomp_mode() -> io::Result<libc::c_int> {
+    // SAFETY: PR_GET_SECCOMP takes no further arguments and only reports the
+    // calling thread's mode.
+    cvt(unsafe { libc::prctl(libc::PR_GET_SECCOMP) })
 }
 
 /// The body of [`op_in_dir_on_thread`], run on the thread it starts (and only

@@ -142,10 +142,11 @@ fn config(bases: &[&Path]) -> Config {
 }
 
 /// `c` with the thread-cwd route made unusable, standing in for a system
-/// where it cannot be used (`unshare` refused, as docker's default seccomp
-/// does; no `pthread_fchdir_np`), so that a request getting past the symlink
-/// route reaches the fork route (or, for a connect that may not fork,
-/// `ENAMETOOLONG`). On the targets without the route, `c` as it is.
+/// where it cannot be used (a seccomp filter in effect, as under docker's
+/// default profile; `unshare` refused; no `pthread_fchdir_np`), so that a
+/// request getting past the symlink route reaches the fork route (or, for a
+/// connect that may not fork, `ENAMETOOLONG`). On the targets without the
+/// route, `c` as it is.
 #[cfg(not(target_os = "freebsd"))]
 fn no_thread_cwd(c: Config) -> Config {
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
@@ -160,9 +161,9 @@ fn no_thread_cwd(c: Config) -> Config {
 /// Why the thread-cwd route cannot be used in this environment, or `None`
 /// when it can: one bind through it, in a directory of its own.
 ///
-/// The route depends on the system, not only on the target: Linux refuses
-/// `unshare(CLONE_FS)` under docker's default seccomp profile (`EPERM`) and
-/// allows it elsewhere, and a future Apple libSystem may lack
+/// The route depends on the system, not only on the target: on Linux it is not
+/// used while a seccomp filter is in effect (docker's default profile installs
+/// one) and is used elsewhere, and a future Apple libSystem may lack
 /// `pthread_fchdir_np`. The tests that run it unforced read this to know which
 /// route the order must have taken.
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
@@ -180,13 +181,28 @@ fn thread_cwd_refusal() -> Option<io::Error> {
 }
 
 /// Whether the thread-cwd route can be used on this system, saying which on
-/// stderr (so a run shows the branch its tests took). A refusal must be the one
-/// expected, not just any failure of the route: on Linux `unshare(CLONE_FS)`
-/// answering `EPERM` (a seccomp filter, as docker's default); on macOS none at
-/// all, its libSystem having `pthread_fchdir_np`.
+/// stderr (so a run shows the branch its tests took). The answer must be the
+/// one expected, not just any failure of the route:
+///
+/// * Linux: usable exactly when this thread's seccomp mode reads 0 (the
+///   started thread inherits this thread's filters). With a filter, or a mode
+///   that cannot be read, the route must not even have called `unshare`, so
+///   its refusal carries no errno: a filter may kill the process for that
+///   call (SIGSYS) instead of answering it;
+/// * macOS: always usable, its libSystem having `pthread_fchdir_np`.
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn thread_cwd_usable() -> bool {
-    let Some(e) = thread_cwd_refusal() else {
+    let refusal = thread_cwd_refusal();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let filtered = sys::seccomp_mode().ok() != Some(0);
+        assert_eq!(
+            refusal.is_some(),
+            filtered,
+            "seccomp filter in effect: {filtered}, refusal: {refusal:?}"
+        );
+    }
+    let Some(e) = refusal else {
         eprintln!("the thread-cwd route is usable here");
         return true;
     };
@@ -195,12 +211,11 @@ fn thread_cwd_usable() -> bool {
     #[cfg(not(target_os = "macos"))]
     {
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        assert_eq!(
-            errno(&e),
-            Some(libc::EPERM),
-            "unshare refused otherwise: {e}"
-        );
-        eprintln!("the thread-cwd route is refused here: {e}");
+        {
+            assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e}");
+            assert_eq!(errno(&e), None, "unshare was called: {e}");
+        }
+        eprintln!("the thread-cwd route is not used here: {e}");
         false
     }
 }
@@ -860,20 +875,26 @@ fn the_public_connects_return_the_stream_as_asked_and_report_no_fork_without_one
     let p = nest(t.path(), 200, "s.sock");
     let listener = crate::bind(&p).unwrap();
     type Connect = fn(&Path) -> io::Result<(UnixStream, bool)>;
-    let connects: [(&str, Connect, bool); 4] = [
+    // The two that may fork exist only with the crate feature `connect-any`;
+    // without it the other two are checked alone.
+    #[allow(unused_mut)]
+    let mut connects: Vec<(&str, Connect, bool)> = vec![
         ("connect", |p| crate::connect(p).map(|c| (c, false)), false),
         (
             "connect_nonblocking",
             |p| crate::connect_nonblocking(p).map(|c| (c, false)),
             true,
         ),
-        ("connect_any", |p| crate::connect_any(p), false),
+    ];
+    #[cfg(feature = "connect-any")]
+    connects.extend([
+        ("connect_any", (|p| crate::connect_any(p)) as Connect, false),
         (
             "connect_any_nonblocking",
             |p| crate::connect_any_nonblocking(p),
             true,
         ),
-    ];
+    ]);
     for (what, connect, nb) in connects {
         let (c, forked) = connect(&p).unwrap();
         assert!(!forked, "{what}");
@@ -1069,7 +1090,7 @@ mod linux {
     // the /proc route unusable, as no /proc does (kawaz's ruling), and the
     // POSIX order runs with the real /proc in place (the path is far from the
     // cwd, so not relative). With the thread-cwd route made unusable, as
-    // under docker's default seccomp, it goes down to the fork route (the
+    // under docker's default seccomp filter, it goes down to the fork route (the
     // thread-cwd route on this path is checked in
     // the_thread_cwd_route_comes_after_symlink_and_before_fork):
     //
@@ -1160,7 +1181,7 @@ mod linux {
     // O_RDONLY precisely so that a long path needs no more permission than a
     // short one. Root bypasses permission checks, so under root (as in `just
     // test-linux`, docker) the test cannot tell anything and says so; where
-    // the system refuses the route (docker's default seccomp) there is
+    // the route is not used (a seccomp filter, as docker's default) there is
     // nothing to check either.
     #[test]
     fn the_thread_cwd_route_does_not_need_read_permission_on_the_directory() {
@@ -2193,7 +2214,7 @@ mod posix {
     // With forking ruled out, a path only the fork route reaches (600 bytes,
     // so neither relative nor widened; the only place for a symlink too long
     // for the path through it; the thread-cwd route unusable, as on the
-    // targets without it and where unshare is refused) fails with
+    // targets without it and under a seccomp filter) fails with
     // ENAMETOOLONG, the error of a plain connect to a path too long for
     // sun_path, and nothing happens: no connection reaches the listener (its
     // accept would block), nothing is created in the place for the symlink
@@ -2250,10 +2271,11 @@ mod posix {
     // ----- the thread-cwd route (Linux, Apple) -----
     //
     // Whether the route can be used depends on the system as well as on the
-    // target (Linux refuses unshare under docker's default seccomp), so the
-    // tests that leave it on ask thread_cwd_usable which way the order must
-    // go and check that way. Turning it off (no_thread_cwd) is in the tests'
-    // hands and always leads to the next route.
+    // target (Linux does not use it under a seccomp filter, as docker's
+    // default profile installs one), so the tests that leave it on ask
+    // thread_cwd_usable which way the order must go and check that way.
+    // Turning it off (no_thread_cwd) is in the tests' hands and always leads
+    // to the next route.
 
     // The thread-cwd route forced (the route's own function, with the
     // directory opened as the order opens it): the socket is bound at the
@@ -2408,8 +2430,8 @@ mod posix {
     //   the thread-cwd route is not reached;
     // * with no usable place (one too long for the spelling through it, which
     //   stays untouched), the thread-cwd route takes the bind and all four
-    //   connects. Where this system refuses it (docker's default seccomp),
-    //   the next route is taken just the same: the fork route for the bind
+    //   connects. Where this system does not allow it (a seccomp filter, as
+    //   docker's default), the next route is taken just the same: the fork route for the bind
     //   and the connects that may fork, ENAMETOOLONG for the others;
     // * with the route turned off (no_thread_cwd), that next route, whatever
     //   the system.

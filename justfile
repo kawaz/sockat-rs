@@ -22,9 +22,10 @@ list:
 
 # ---------- lint / test ----------
 
-# cargo fmt --check + clippy (-D warnings) + unsafe 封じ込め
+# cargo fmt --check + clippy (-D warnings、全 feature と feature 無し) + unsafe 封じ込め
 check: lint-unsafe
     cargo fmt --check
+    cargo clippy --all-targets --all-features -- -D warnings
     cargo clippy --all-targets -- -D warnings
 
 # cargo fmt (書き換える)
@@ -53,13 +54,13 @@ lint-unsafe:
 [script]
 test *ARGS: check
     if cargo nextest --version >/dev/null 2>&1; then
-        cargo nextest run --no-fail-fast "$@"
-        cargo test --doc
+        cargo nextest run --all-features --no-fail-fast "$@"
+        cargo test --doc --all-features
     elif [ -n "${CI:-}" ]; then
         echo "error: cargo-nextest が CI に無い (ハング打ち切りが効かない)" >&2
         exit 1
     else
-        cargo test --no-fail-fast "$@"
+        cargo test --all-features --no-fail-fast "$@"
     fi
 
 # Linux の試験を docker で回す (macOS の手元から Linux の経路を確かめる)
@@ -69,7 +70,7 @@ test *ARGS: check
 [doc("Linux の試験を docker (rust:1) で回す")]
 test-linux *ARGS:
     docker run --rm -v "$PWD":/work -w /work -e CARGO_TARGET_DIR=/work/target-linux/docker \
-      -v sockat-cargo-registry:/usr/local/cargo/registry rust:1 cargo test "$@"
+      -v sockat-cargo-registry:/usr/local/cargo/registry rust:1 cargo test --all-features "$@"
 
 # check + test (CI entry point)
 ci: check test

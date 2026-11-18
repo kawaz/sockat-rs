@@ -45,7 +45,7 @@ jobs:
         with:
           usesh: true
           prepare: pkg install -y rust
-          run: cargo test
+          run: cargo test --all-features
 
   # The Unix systems without a dirfd-relative bind / connect. They run the whole
   # suite in a VM so the routes they share with macOS (relative path, symlink)
@@ -60,7 +60,7 @@ jobs:
         with:
           usesh: true
           prepare: /usr/sbin/pkg_add rust
-          run: cargo test
+          run: cargo test --all-features
 
   openbsd:
     name: Test (OpenBSD VM)
@@ -72,7 +72,7 @@ jobs:
         with:
           usesh: true
           prepare: pkg_add rust
-          run: cargo test
+          run: cargo test --all-features
 
   illumos:
     name: Test (illumos / OmniOS VM)
@@ -84,7 +84,7 @@ jobs:
         with:
           usesh: true
           prepare: pkg install ooce/developer/rust build-essential
-          run: cargo test
+          run: cargo test --all-features
 
   cross-check:
     name: Cross check (${{ matrix.target }})
@@ -100,7 +100,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
           components: clippy
-      - run: cargo clippy --target ${{ matrix.target }} --all-targets -- -D warnings
+      - run: cargo clippy --target ${{ matrix.target }} --all-targets --all-features -- -D warnings
 
   msrv:
     name: MSRV check (rust-version = 1.85)
@@ -110,7 +110,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.85"
-      - run: cargo check
+      - run: cargo check --all-features
 
   audit:
     name: cargo-audit (RUSTSEC advisories)
