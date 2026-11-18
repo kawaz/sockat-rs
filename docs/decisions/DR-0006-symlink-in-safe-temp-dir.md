@@ -30,7 +30,7 @@
 | connect | ソケットのファイル (元のパス) | `<置き場>/sockat.XXXXXXXXXX` |
 
 - symlink の先は利用者のパスの綴りそのもの (相対パスは cwd を前に付ける)
-- `/tmp` で届く範囲: connect は `/tmp/sockat.XXXXXXXXXX` (22 バイト) でディレクトリの深さにもファイル名の長さにもよらない。bind はファイル名が 84 バイト (`sun_path` が 104 の OS は 80、macOS は広げた sockaddr で 230) 以内
+- `/tmp` で届く範囲: connect は `/tmp/sockat.XXXXXXXXXX` (22 バイト) でディレクトリの深さにもファイル名の長さにもよらない。bind はファイル名が 84 バイト (`sun_path` が 104 の OS は 80。Apple の OS も bind は広げた sockaddr を使わない、[DR-0024](DR-0024-apple-bind-without-widened-sockaddr.md)) 以内
 
 ### 名前と後始末
 

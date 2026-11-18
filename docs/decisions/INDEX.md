@@ -18,12 +18,12 @@ Status は各 DR ファイルの `Status:` 行が正本。
 | [DR-0002](DR-0002-std-handles-paths-it-accepts.md) | ✅ 実装済 | std が受け付けるパス (OS ごとの sun_path − 1 バイト以内) は std にそのまま渡す |
 | [DR-0003](DR-0003-linux-proc-self-fd.md) | ✅ 実装済 | Linux は `/proc/self/fd/<dirfd>/<name>`。/proc が無い時とファイル名が収まらない時だけ相対パス → symlink → スレッド cwd → fork |
 | [DR-0004](DR-0004-relative-path-from-cwd.md) | ✅ 実装済 | cwd からの相対パスの経路。cwd の接頭辞を削る、だめなら実パスに揃えて `..` で上る |
-| [DR-0005](DR-0005-widened-sockaddr-on-macos.md) | ✅ 実装済 | macOS は広げた sockaddr で 253 バイトまで。FreeBSD では使わない |
+| [DR-0005](DR-0005-widened-sockaddr-on-macos.md) | ✅ 実装済 | macOS の connect 系は広げた sockaddr で 253 バイトまで。FreeBSD では使わない |
 | [DR-0006](DR-0006-symlink-in-safe-temp-dir.md) | ✅ 実装済 | `TMPDIR` → `/tmp` の安全な置き場に `sockat.XXXXXXXXXX` の symlink。bind はディレクトリ、connect はファイルを指す |
 | [DR-0007](DR-0007-fork-child-fchdir.md) | ✅ 実装済 | 最後の経路として fchdir した子を fork する。子は async-signal-safe だけ、副作用は doc に書く |
 | [DR-0008](DR-0008-freebsd-bindat-and-other-unix.md) | ✅ 実装済 | FreeBSD は bindat / connectat。dirfd 基準の primitive の無い Unix は相対パス → symlink → fork |
 | [DR-0009](DR-0009-windows-out-of-scope.md) | ✅ 実装済 | Windows は対象外 (Unix 以外は compile_error!) |
-| [DR-0010](DR-0010-public-api.md) | ✅ 実装済 | 公開 API は bind と 4 つの connect。`connect` は fork せず、`connect_any` 系は fork したかを bool で返す |
+| [DR-0010](DR-0010-public-api.md) | ✅ 実装済 | 公開 API は bind と 4 つの connect。`connect` は fork せず、`connect_any` 系は fork したかを `AnyConnection::forked` で返す |
 | [DR-0011](DR-0011-routes-not-exposed.md) | ✅ 実装済 | 経路は公開 API に出さない。試験は crate 内で各経路を強制し、環境を読む部分を値で差し替える |
 | [DR-0012](DR-0012-route-failure-handling.md) | ✅ 実装済 | 経路の本当の失敗はやり直さない。fork しない connect はスレッド cwd の後で ENAMETOOLONG、ディレクトリが無ければどの OS でも ENOENT |
 | [DR-0013](DR-0013-kernel-returned-address.md) | ✅ 実装済 | local_addr / peer_addr はカーネルに渡した綴りを返すまま。元のパスは利用者が持つ |
@@ -35,5 +35,8 @@ Status は各 DR ファイルの `Status:` 行が正本。
 | [DR-0019](DR-0019-ci-targets.md) | ✅ 実装済 | CI は macOS / Linux / FreeBSD・NetBSD・OpenBSD・illumos の VM で全試験、cross check、MSRV、cargo-audit |
 | [DR-0020](DR-0020-thread-cwd-route.md) | ✅ 実装済 | Linux と Apple の OS は symlink の後、fork の前に、使い捨てのスレッドだけ cwd を移す経路。connect も試す。Linux は seccomp の filter が掛かっていれば unshare を呼ばず使わない |
 | [DR-0021](DR-0021-nul-is-invalid-at-any-length.md) | ✅ 実装済 | NUL を含むパスは長さによらず InvalidInput で何も作らない。Linux の先頭の NUL は std にそのまま渡す |
-| [DR-0022](DR-0022-connect-any-behind-feature.md) | ✅ 実装済 | connect_any 系は feature `connect-any` (既定で無効) の後ろ。docs.rs は全 feature、試験と CI は `--all-features` |
+| [DR-0022](DR-0022-connect-any-behind-feature.md) | ✅ 実装済 | connect_any 系は feature `any` (既定で無効) の後ろ。docs.rs は全 feature、試験と CI は `--all-features` |
 | [DR-0023](DR-0023-unsafe-base-held-by-fd.md) | ✅ 実装済 | /proc を使える Linux の connect 系は、安全でない置き場に 0700 のディレクトリを作って fd で掴み、`/proc/self/fd/<fd>/s` の symlink で届く |
+| [DR-0024](DR-0024-apple-bind-without-widened-sockaddr.md) | ✅ 実装済 | Apple の OS の bind は広げた sockaddr を使わない。bind の綴りは 103 バイトで判定し、できたアドレスは `sockaddr_un` に収まる |
+| [DR-0025](DR-0025-fork-bind-listen-by-parent.md) | ✅ 実装済 | fork の経路の bind は listen を必ず親がする。クライアントに見えるサーバの peer は send の前から親。相手から見えない副作用は残る |
+| [DR-0026](DR-0026-any-connection-and-feature-any.md) | ✅ 実装済 | connect_any 系の戻り値は公開フィールドの struct `AnyConnection { stream, forked }`。feature 名は `any` (0.4.0) |

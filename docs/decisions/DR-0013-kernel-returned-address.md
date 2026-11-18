@@ -15,10 +15,10 @@
   |---|---|
   | /proc | `/proc/self/fd/<fd>/<ファイル名>` (fd はもう閉じている) |
   | 相対パス | 相対パス |
-  | 広げた sockaddr | std のバッファ (106 バイト) で切れたパス (試験で確認、panic はしない) |
   | symlink | もう無い symlink を通したパス |
   | スレッド cwd、fork、bindat | ファイル名だけ |
 
+- どの経路の綴りも `sun_path` に収まるので、返るアドレスは途中で切れない (Apple の OS の bind は広げた sockaddr を使わない、[DR-0024](DR-0024-apple-bind-without-widened-sockaddr.md))
 - 利用者には元のパスを持ってもらう。doc にそう書く
 - OpenBSD では、103 バイト以内の短いパス ([DR-0002](DR-0002-std-handles-paths-it-accepts.md) で std にそのまま渡す) でも、std の `local_addr()` がパスの末尾 1 バイトを欠いて返す (CI の VM で観測、std の `UnixListener::bind` を直接使った場合)。sockat は手を入れない。std がパスそのものを返す前提を見る試験は、OpenBSD では外す
 

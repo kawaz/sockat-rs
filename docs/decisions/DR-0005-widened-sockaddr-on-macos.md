@@ -1,4 +1,4 @@
-# DR-0005: macOS では広げた sockaddr で 253 バイトまで渡す (FreeBSD では使わない)
+# DR-0005: macOS の connect 系では広げた sockaddr で 253 バイトまで渡す (FreeBSD では使わない)
 
 - Status: Accepted
 - Date: 2026-11-18
@@ -9,15 +9,16 @@ XNU は `bind(2)` / `connect(2)` で `SOCK_MAXADDRLEN` (255) バイトまでの�
 
 ## Decision
 
-- macOS では、相対パスで届かない時 ([DR-0004](DR-0004-relative-path-from-cwd.md)) に、元のパス、無理なら相対パスを、253 バイト以内なら広げた sockaddr で渡す
+- macOS の connect 系では、相対パスで届かない時 ([DR-0004](DR-0004-relative-path-from-cwd.md)) に、元のパス、無理なら相対パスを、253 バイト以内なら広げた sockaddr で渡す
+- bind には使わない。bind の綴りは全部、標準の `sun_path` に入る長さで判定する ([DR-0024](DR-0024-apple-bind-without-widened-sockaddr.md))
 - `sun_len` とアドレス長はどちらも `2 + パスの長さ` にする
 - カーネルがこの形を受け付けない印は `EINVAL` と `ENAMETOOLONG` とし、それなら symlink の経路 ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md)) に進む。以降は std にそのまま渡せる長さで見る
-- 受け付ける間は、symlink の経路の綴りと fork の経路のファイル名 ([DR-0007](DR-0007-fork-child-fchdir.md)) にも広げた sockaddr を使う
+- 受け付ける間は、connect 系の symlink の経路の綴りと、スレッド cwd・fork の経路のファイル名 ([DR-0020](DR-0020-thread-cwd-route.md)、[DR-0007](DR-0007-fork-child-fchdir.md)) にも広げた sockaddr を使う
 - FreeBSD では使わない ([DR-0008](DR-0008-freebsd-bindat-and-other-unix.md))
 
 ## 理由
 
-- 253 バイトで bind / connect が通り、socket がそのパスにできることを実機で確かめた (試験 `the_widened_sockaddr_carries_253_bytes`)
+- 253 バイトで connect が通ることを実機で確かめた (試験 `the_widened_sockaddr_carries_253_bytes`)
 - 元のパスをそのままカーネルに解決させるので、ディレクトリを先に引く限界 ([DR-0001](DR-0001-long-socket-path-routes.md)) が無い
 - 受け付けない印で次へ進むのは、将来の macOS が受け付けなくなった場合の逃げ道。今の macOS では起きない
 
@@ -34,5 +35,6 @@ XNU は `bind(2)` / `connect(2)` で `SOCK_MAXADDRLEN` (255) バイトまでの�
 ## 判断の出所
 
 - 広げた sockaddr の経路: kawaz 指示 2026-11-18
+- connect 系だけに使う: kawaz 裁定 (ハブ DR-0009、2026-11-18)
 - FreeBSD で使わない: 統括の裁定 2026-11-18
 - 上に無い細部: 出所の記録なし

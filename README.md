@@ -40,17 +40,18 @@ A longer path is tried on the routes below, in this order per OS, and bound / co
 | Linux / Android (`/proc` usable) | /proc → relative path → symlink → thread cwd → fork (only /proc when its spelling fits) |
 | Linux / Android (`/proc` not usable) | relative path → symlink → thread cwd → fork |
 | FreeBSD | bindat |
-| macOS / iOS and the other Apple OSes | relative path → widened sockaddr → symlink → thread cwd → fork |
+| macOS / iOS and the other Apple OSes, `bind` | relative path → symlink → thread cwd → fork |
+| macOS / iOS and the other Apple OSes, the `connect` variants | relative path → widened sockaddr → symlink → thread cwd → fork |
 | NetBSD / OpenBSD / illumos / other Unix | relative path → symlink → fork |
 | Windows | not supported (compile error) |
 
 - **/proc**: open the directory and pass `/proc/self/fd/<fd>/<file name>`. Not usable without `/proc`, or when the file name does not fit in it (over about 90 bytes)
 - **bindat**: `bindat(2)` / `connectat(2)`, by the file name relative to the directory fd
 - **relative path**: when std accepts the path relative to the cwd, pass that. Only the path string is rewritten; the cwd is never changed
-- **widened sockaddr**: pass a sockaddr carrying up to 253 bytes, which the macOS kernel accepts
+- **widened sockaddr**: pass a sockaddr carrying up to 253 bytes, which the macOS kernel accepts. Only the connect variants use it (the address of a socket bound through it is cut short and breaks its readers, so a bind does not)
 - **symlink**: create a short symlink under `TMPDIR` or `/tmp` and go through it. For a bind it points to the socket's directory, for a connect to the socket file. It is created only in a place where no other user can replace it, and removed at once. On Linux with `/proc`, a connect also uses a place that is not safe: it makes a private directory there, holds it by an fd and goes through a symlink inside
 - **thread cwd**: move the cwd of a throwaway thread, and of it alone, into the directory (Linux: `unshare(CLONE_FS)` and `fchdir`; Apple OSes: `pthread_fchdir_np`) and bind / connect by the file name alone. It has no side effects, so every function tries it
-- **fork**: fork a child that `fchdir`s into the directory and binds / connects by the file name alone. **Only `bind` and the `connect_any` variants try it**
+- **fork**: fork a child that `fchdir`s into the directory and binds / connects by the file name alone. **Only `bind` and the `connect_any` variants try it**. The caller listens after a bind, so a bind has no side effect visible to peers
 
 None of the routes changes the calling process's cwd, so they can be used from multi-threaded programs.
 
@@ -58,9 +59,9 @@ None of the routes changes the calling process's cwd, so they can be used from m
 
 ## The exception: `connect_any`
 
-`connect_any` / `connect_any_nonblocking` are only for the rare environment that hits the `ENAMETOOLONG` above, when you want the connection at the cost of the fork's side effects. When no other route can be used, they have a forked child make the connect (the child exits at once), and they also return whether they took the fork route (`(UnixStream, bool)`, `true` when they did), for example to log or warn about it.
+`connect_any` / `connect_any_nonblocking` are only for the rare environment that hits the `ENAMETOOLONG` above, when you want the connection at the cost of the fork's side effects. When no other route can be used, they have a forked child make the connect (the child exits at once), and they also return whether they took the fork route (`AnyConnection { stream, forked }`, `forked` is `true` when they did), for example to log or warn about it.
 
-They are off by default and available only with the feature `connect-any`: `sockat = { version = "0.3", features = ["connect-any"] }`
+They are off by default and available only with the feature `any`: `sockat = { version = "0.4", features = ["any"] }`
 
 After a connect through the fork route, the peer pid the server sees is that of a process that has already exited (the forked child). Details in [docs/MANUAL.md](./docs/MANUAL.md#the-exception-connect_any).
 

@@ -24,7 +24,8 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
   | Linux / Android (/proc を使える) | /proc → 相対パス → symlink → スレッド cwd → fork (/proc の経路の綴りが収まる時は /proc だけ) |
   | Linux / Android (/proc を使えない) | 相対パス → symlink → スレッド cwd → fork |
   | FreeBSD | bindat |
-  | macOS / iOS 等 Apple の OS | 相対パス → 広げた sockaddr → symlink → スレッド cwd → fork |
+  | macOS / iOS 等 Apple の OS の bind | 相対パス → symlink → スレッド cwd → fork ([DR-0024](DR-0024-apple-bind-without-widened-sockaddr.md)) |
+  | macOS / iOS 等 Apple の OS の connect 系 | 相対パス → 広げた sockaddr → symlink → スレッド cwd → fork |
   | NetBSD / OpenBSD / illumos / その他の Unix | 相対パス → symlink → fork |
   | Windows | 対象外 ([DR-0009](DR-0009-windows-out-of-scope.md)) |
 
@@ -38,7 +39,7 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 |---|---|---|
 | /proc (`/proc/self/fd/<fd>/<ファイル名>`) | Linux / Android | [DR-0003](DR-0003-linux-proc-self-fd.md) |
 | 相対パス (cwd から) | FreeBSD 以外 | [DR-0004](DR-0004-relative-path-from-cwd.md) |
-| 広げた sockaddr (253 バイト) | Apple の OS | [DR-0005](DR-0005-widened-sockaddr-on-macos.md) |
+| 広げた sockaddr (253 バイト) | Apple の OS の connect 系 | [DR-0005](DR-0005-widened-sockaddr-on-macos.md)、[DR-0024](DR-0024-apple-bind-without-widened-sockaddr.md) |
 | symlink (安全な置き場の短い symlink を経由) | FreeBSD 以外 | [DR-0006](DR-0006-symlink-in-safe-temp-dir.md) |
 | symlink の fd で掴む形 (安全でない置き場に作った自分専用のディレクトリを fd で辿る) | /proc を使える Linux / Android の connect 系 | [DR-0023](DR-0023-unsafe-base-held-by-fd.md) |
 | スレッド cwd (使い捨てのスレッドだけ cwd を移す) | Linux / Android、Apple の OS | [DR-0020](DR-0020-thread-cwd-route.md) |
@@ -55,7 +56,7 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 
 ## 理由
 
-- fork は副作用がある (サーバに見える peer の pid が終了した子の pid になる、子が一瞬全 fd の複製を持つ。[DR-0007](DR-0007-fork-child-fchdir.md))。避けられる経路があるなら、そちらで届かせる
+- fork は副作用がある (connect ではサーバに見える peer の pid が終了した子の pid になる。bind でも connect でも、子が一瞬全 fd の複製を持ち、親に `SIGCHLD` が届く等、相手から見えない副作用がある。[DR-0007](DR-0007-fork-child-fchdir.md)、[DR-0025](DR-0025-fork-bind-listen-by-parent.md))。避けられる経路があるなら、そちらで届かせる
 - ふつうの環境 (`/tmp` が書ける) では symlink の経路までで届く ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md))。Linux と Apple の OS では、それも使えない時にスレッド cwd の経路が副作用無しで届く ([DR-0020](DR-0020-thread-cwd-route.md))。fork が要るのは、それらも使えない時だけになる
 
 ## 却下した案
@@ -74,5 +75,6 @@ Unix domain socket のパスは `struct sockaddr_un` の `sun_path` に入れて
 - 経路と試す順番: kawaz 指示 2026-11-18
 - スレッド cwd の経路を symlink の後、fork の前に足す: kawaz 裁定 (ハブ DR-0005、2026-11-18)
 - /proc を使える Linux の connect 系で安全でない置き場を fd で掴む形で使う: kawaz 裁定 (ハブ DR-0008、2026-11-18)
+- Apple の OS の bind は広げた sockaddr を使わない: kawaz 裁定 (ハブ DR-0009、2026-11-18)
 - 副作用の無い安い経路から試し、fork は最後: kawaz 裁定 2026-11-18
 - 上に無い細部: 出所の記録なし

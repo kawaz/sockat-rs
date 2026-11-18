@@ -1,4 +1,4 @@
-# DR-0022: connect_any 系は feature `connect-any` の後ろに置く
+# DR-0022: connect_any 系は feature `any` の後ろに置く
 
 - Status: Accepted
 - Date: 2026-11-18
@@ -10,14 +10,14 @@
 
 ## Decision
 
-- `connect_any` / `connect_any_nonblocking` は crate feature `connect-any` を有効にした時だけ公開する。feature は既定では無効
-- 有効にする書き方: `sockat = { version = "0.3", features = ["connect-any"] }`
-- fork の経路と経路の順番の実装は `bind` も使うので、feature によらずコンパイルする。feature が切り替えるのは公開する 2 つの関数だけ
+- `connect_any` / `connect_any_nonblocking` と、その戻り値の `AnyConnection` ([DR-0026](DR-0026-any-connection-and-feature-any.md)) は crate feature `any` を有効にした時だけ公開する。feature は既定では無効
+- 有効にする書き方: `sockat = { version = "0.4", features = ["any"] }`
+- fork の経路と経路の順番の実装は `bind` も使うので、feature によらずコンパイルする。feature が切り替えるのは公開する 2 つの関数と 1 つの型だけ
 - docs.rs は全 feature を有効にして build する (`[package.metadata.docs.rs] all-features = true`)
-- feature が要ることは doc に stable で書ける形で示す: 2 つの関数の doc の先頭の 1 文 (「Available on crate feature `connect-any` only.」) と、crate doc の Features の節。`doc(cfg)` (nightly) は使わない
+- feature が要ることは doc に stable で書ける形で示す: 2 つの関数と型の doc の先頭の 1 文 (「Available on crate feature `any` only.」) と、crate doc の Features の節。`doc(cfg)` (nightly) は使わない
 - feature を有効にしない時に存在しない関数への intra-doc link を、他の item の doc から張らない (名前だけ書く)
 - 試験と CI は `--all-features` で回す。feature 無しの clippy も `just check` で回す (CI の test job が `just ci` 経由で macOS と Linux で回す)
-- API を壊すので 0.3.0 にする
+- API を壊すので 0.3.0 にする。feature 名を `any` にするのは 0.4.0 ([DR-0026](DR-0026-any-connection-and-feature-any.md))
 
 ## 理由
 
@@ -37,5 +37,6 @@
 
 ## 判断の出所
 
-- connect_any 系を既定の API に出さず feature `connect-any` の後ろに置く、docs.rs では全 feature を有効にし feature が要ることを表示する、0.3.0 にする: kawaz 裁定 (ハブ [DR-0007](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0007-connect-any-is-opt-in.md)、2026-11-18)
+- connect_any 系を既定の API に出さず feature の後ろに置く、docs.rs では全 feature を有効にし feature が要ることを表示する、0.3.0 にする: kawaz 裁定 (ハブ [DR-0007](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0007-connect-any-is-opt-in.md)、2026-11-18)
+- feature 名を `any` にする: kawaz 裁定 (ハブ DR-0007、2026-11-18)
 - `doc(cfg)` を使わず doc の 1 文にする、feature 無しの clippy を `just check` に足す: 実装側の判断 2026-11-18

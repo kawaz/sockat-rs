@@ -18,10 +18,10 @@
 | NetBSD / OpenBSD / illumos 等 | 無い |
 
 - 順番は symlink の後、fork の前 ([DR-0001](DR-0001-long-socket-path-routes.md))。Linux は /proc の経路が使えない時の順に入る。/proc の経路が使える時は /proc だけを使う ([DR-0003](DR-0003-linux-proc-self-fd.md))
-- `bind` / `connect` / `connect_nonblocking` / `connect_any` 系のどれも試す。`connect_any` 系の `bool` は「fork の経路を通ったか」のままで、この経路では `false`
+- `bind` / `connect` / `connect_nonblocking` / `connect_any` 系のどれも試す。`connect_any` 系の `forked` は「fork の経路を通ったか」のままで、この経路では `false`
 - 呼び出し元のスレッドがソケットを作り (ブロックしない connect ではここで `O_NONBLOCK` にする)、使い捨てのスレッドに渡す。bind の後の listen は呼び出し元のスレッドがする
 - ディレクトリの fd は fork の経路と同じもの: Apple は `O_SEARCH` (断られたら `O_RDONLY`)、Linux は /proc の経路のために開いた `O_PATH` の fd
-- ファイル名は fork の経路と同じ sockaddr に入れる。標準の `sun_path` に入らない時、Apple でカーネルが広げた sockaddr を受け付ける間は広げた形 (253 バイトまで)。入らなければ `ENAMETOOLONG`
+- ファイル名は fork の経路と同じ sockaddr に入れる。標準の `sun_path` に入らない時、Apple の connect 系でカーネルが広げた sockaddr を受け付ける間は広げた形 (253 バイトまで)。bind は広げない ([DR-0024](DR-0024-apple-bind-without-widened-sockaddr.md))。入らなければ `ENAMETOOLONG`
 - 使えないとみなして次の経路 (fork、`connect` 系なら `ENAMETOOLONG`) に進むのは次の時
   - スレッドを作れない
   - Linux で seccomp の filter が掛かっている (`prctl(PR_GET_SECCOMP)` が 0 でない、または読めない)。`unshare` を呼ばない。filter には `unshare` をエラーでなく SIGSYS によるプロセスの kill で断るものがあり、呼ぶとプロセスが死ぬ

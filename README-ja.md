@@ -40,17 +40,18 @@ std が受け付ける長さ (`sun_path` − 1) のパスは std にそのまま
 | Linux / Android (`/proc` を使える) | /proc → 相対パス → symlink → スレッド cwd → fork (/proc の綴りが収まる時は /proc だけ) |
 | Linux / Android (`/proc` を使えない) | 相対パス → symlink → スレッド cwd → fork |
 | FreeBSD | bindat |
-| macOS / iOS 等 Apple の OS | 相対パス → 広げた sockaddr → symlink → スレッド cwd → fork |
+| macOS / iOS 等 Apple の OS の `bind` | 相対パス → symlink → スレッド cwd → fork |
+| macOS / iOS 等 Apple の OS の `connect` 系 | 相対パス → 広げた sockaddr → symlink → スレッド cwd → fork |
 | NetBSD / OpenBSD / illumos / その他の Unix | 相対パス → symlink → fork |
 | Windows | 対象外 (compile エラー) |
 
 - **/proc**: ディレクトリを開き、`/proc/self/fd/<fd>/<ファイル名>` で渡す。`/proc` が無い時と、ファイル名がこれに収まらない時 (およそ 90 バイト超) は使えない
 - **bindat**: `bindat(2)` / `connectat(2)` で、ディレクトリの fd を基準にファイル名で渡す
 - **相対パス**: cwd からの相対パスが std にそのまま渡せる長さなら、それで渡す。パスを文字列で書き直すだけで、cwd は変えない
-- **広げた sockaddr**: macOS のカーネルが受け付ける、253 バイトまで入る sockaddr で渡す
+- **広げた sockaddr**: macOS のカーネルが受け付ける、253 バイトまで入る sockaddr で渡す。connect 系だけが使う (広げた形で bind したソケットのアドレスは途中で切れ、読む側を壊すので、bind は使わない)
 - **symlink**: `TMPDIR` か `/tmp` に短い symlink を作り、それを通して渡す。bind はソケットのディレクトリを、connect はソケットのファイルを指す。他人が差し替えられない置き場にだけ作り、すぐ消す。`/proc` を使える Linux の connect は、安全でない置き場にも自分専用のディレクトリを作り、fd で掴んでその中の symlink を通す
 - **スレッド cwd**: 使い捨てのスレッドだけ cwd をディレクトリに移し (Linux は `unshare(CLONE_FS)` と `fchdir`、Apple の OS は `pthread_fchdir_np`)、ファイル名だけで bind / connect する。副作用が無いので、どの関数も試す
-- **fork**: ディレクトリに `fchdir` した子を fork し、子がファイル名だけで bind / connect する。**`bind` と `connect_any` 系だけが試す**
+- **fork**: ディレクトリに `fchdir` した子を fork し、子がファイル名だけで bind / connect する。**`bind` と `connect_any` 系だけが試す**。bind の後の listen は呼び出し元がするので、bind は相手から見える副作用が無い
 
 どの経路も呼び出し元のプロセスの cwd を変えないので、マルチスレッドのプログラムから使える。
 
@@ -58,9 +59,9 @@ std が受け付ける長さ (`sun_path` − 1) のパスは std にそのまま
 
 ## 例外: `connect_any`
 
-`connect_any` / `connect_any_nonblocking` は、上の `ENAMETOOLONG` に当たるよほど珍しい環境で、fork の副作用を受け入れてでもつなぎたい時だけのもの。他の経路が使えない時は、fork した子に connect させ (子はすぐ終了する)、fork の経路を通ったかも返す (`(UnixStream, bool)`、通った時に `true`)。ログに残す・警告するなどに使える。
+`connect_any` / `connect_any_nonblocking` は、上の `ENAMETOOLONG` に当たるよほど珍しい環境で、fork の副作用を受け入れてでもつなぎたい時だけのもの。他の経路が使えない時は、fork した子に connect させ (子はすぐ終了する)、fork の経路を通ったかも返す (`AnyConnection { stream, forked }`、通った時に `forked` が `true`)。ログに残す・警告するなどに使える。
 
-既定では無効で、feature `connect-any` を有効にした時だけ使える: `sockat = { version = "0.3", features = ["connect-any"] }`
+既定では無効で、feature `any` を有効にした時だけ使える: `sockat = { version = "0.4", features = ["any"] }`
 
 fork の経路で connect すると、サーバに見える peer の pid は、もう終了したプロセス (fork した子) の pid になる。詳しくは [docs/MANUAL-ja.md](./docs/MANUAL-ja.md#例外-connect_any)。
 
