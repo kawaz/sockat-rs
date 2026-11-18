@@ -2,7 +2,7 @@
 
 > English | [日本語](./MANUAL-ja.md)
 
-A reference for using sockat: how it reaches a long path, and how it differs from std for long paths. The design decisions and their reasons are in [DR-0001](./decisions/DR-0001-long-socket-path-routes.md) (in Japanese).
+A reference for using sockat: how it reaches a long path, and how it differs from std for long paths. The design decisions and their reasons are in the [decision records](./decisions/INDEX.md) (in Japanese; [DR-0001](./decisions/DR-0001-long-socket-path-routes.md) gives the overview of the routes and the order they are tried in).
 
 The language-independent behaviour is defined by the [sockat specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md); sockat-rs is its Rust implementation.
 

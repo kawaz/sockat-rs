@@ -190,7 +190,7 @@
 #![warn(missing_docs)]
 
 #[cfg(not(unix))]
-compile_error!("sockat supports Unix targets only (Windows is out of scope, see DR-0001)");
+compile_error!("sockat supports Unix targets only (Windows is out of scope, see DR-0009)");
 
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};

@@ -143,8 +143,7 @@ fn config(bases: &[&Path]) -> Config {
 }
 
 /// The symlink route a request takes: a bind goes through a link to the
-/// socket's directory, a connect through a link to the socket file (DR-0001
-/// decision 3 c).
+/// socket's directory, a connect through a link to the socket file (DR-0006).
 #[cfg(not(target_os = "freebsd"))]
 fn symlink(req: Request) -> Route {
     match req {
@@ -530,7 +529,7 @@ fn a_path_std_accepts_goes_to_std_unchanged_and_one_byte_more_does_not() {
     // Not on OpenBSD: there std's own local_addr drops the last byte of the
     // path (seen in CI: "/tmp/sockat-XXXXXX/x.soc" for ".../x.sock"), with
     // std's UnixListener::bind and no sockat involved. This only checks a
-    // premise about std, not something sockat promises (DR-0001 decision 9).
+    // premise about std, not something sockat promises (DR-0013).
     #[cfg(not(target_os = "openbsd"))]
     {
         let l = UnixListener::bind(t.path().join("x.sock")).unwrap();
@@ -1216,7 +1215,7 @@ mod linux {
         }
     }
 
-    // DR-0001 decisions 6 and 8, route by route: only the fork route
+    // DR-0010 and DR-0012, route by route: only the fork route
     // connects from another process (the child, whose pid SO_PEERCRED
     // keeps), so only there do the connects that may fork report a fork and
     // the ones that may not fail with ENAMETOOLONG. Every other route
@@ -2574,7 +2573,7 @@ mod apple {
         assert_empty(d.short_base.path());
     }
 
-    // DR-0001 decisions 6 and 8, route by route: only the fork route
+    // DR-0010 and DR-0012, route by route: only the fork route
     // connects from another process (the child; LOCAL_PEERPID names it until
     // this process sends), so only there do the connects that may fork report
     // a fork and the ones that may not fail with ENAMETOOLONG. Every other

@@ -86,7 +86,7 @@ fn fork_ruled_out() -> io::Error {
 /// The longest path std accepts, `sun_path` less the NUL: 107 on Linux,
 /// Android and illumos, 103 on Apple and the BSDs. A path of at most this many
 /// bytes is handed to std as is, so std alone decides what happens to every
-/// path it can take (DR-0001 decision 1). It is also the limit of every other
+/// path it can take (DR-0002). It is also the limit of every other
 /// spelling that goes in the plain sockaddr.
 pub(crate) const DIRECT_MAX: usize = sys::SUN_PATH_CAP - 1;
 
@@ -136,7 +136,7 @@ pub(crate) enum Route {
         /// The pid of the child that made the call ([`sys::op_in_dir_forked`]).
         /// The public API does not return it, only [`Route::forked`]: it is
         /// the pid of an exited process, of no use to the caller or the
-        /// server (DR-0001 decision 6). The tests read it to check that the
+        /// server (DR-0010). The tests read it to check that the
         /// peer the server sees is this child.
         child: libc::pid_t,
     },
@@ -146,7 +146,7 @@ impl Route {
     /// Whether the route forked: the call was made by a forked child.
     ///
     /// For a connect, the peer pid the server sees is then that of the child,
-    /// a process that has already exited (DR-0001 decision 3 d).
+    /// a process that has already exited (DR-0007).
     pub(crate) fn forked(self) -> bool {
         match self {
             #[cfg(not(target_os = "freebsd"))]
@@ -426,7 +426,7 @@ pub(crate) mod apple {
 /// The routes that need nothing but POSIX (plus, on Apple, the widened
 /// `sockaddr_un`), tried in order on every target without a dirfd-relative
 /// primitive: Apple, NetBSD, OpenBSD, illumos and the other Unix targets, and
-/// Linux when the /proc route cannot be used (DR-0001 decision 3).
+/// Linux when the /proc route cannot be used (DR-0001, DR-0008).
 #[cfg(not(target_os = "freebsd"))]
 pub(crate) mod posix {
     use super::*;
@@ -491,7 +491,7 @@ pub(crate) mod posix {
         }
     }
 
-    /// Try, in order (DR-0001 decision 3), for a path longer than
+    /// Try, in order (DR-0001), for a path longer than
     /// [`DIRECT_MAX`] whose directory part is `dir` and file name `name`:
     ///
     /// 1. the path spelled relative to the cwd, when that is at most

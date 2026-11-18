@@ -6,7 +6,8 @@ sockat は、`sun_path` の上限を超えるパスでも Unix domain socket を
 
 ## 必読
 
-- [docs/decisions/DR-0001](docs/decisions/DR-0001-long-socket-path-routes.md) — 経路と試す順番、各経路の安全性の考え方、却下した案、未確定の点。経路に手を入れる前に読む
+- [docs/decisions/DR-0001](docs/decisions/DR-0001-long-socket-path-routes.md) — 経路と試す順番の総論。各経路の安全性の考え方・却下した案・未確定の点は、そこからリンクした経路ごとの DR にある。経路に手を入れる前に、総論と触る経路の DR を読む
+- [docs/decisions/INDEX.md](docs/decisions/INDEX.md) — 設計判断 (DR) の一覧
 - [docs/MANUAL-ja.md](docs/MANUAL-ja.md) — 利用者に約束している振る舞い (std と違う点、エラー)
 
 ## 構成
@@ -24,10 +25,10 @@ sockat は、`sun_path` の上限を超えるパスでも Unix domain socket を
 
 - **振る舞いを変える時は、先にハブの SPEC を直す。** sockat-rs の docs と実装はその後に追従させる
 - **`unsafe` は `src/sys.rs` にだけ書く。** `just lint-unsafe` が他のファイルの `unsafe` を落とす。`sys.rs` の関数は安全に呼べる形で公開し、各 `unsafe` に `SAFETY:` を添える
-- **std が受け付けるパス (OS ごとの `sun_path` − 1 バイト以内) には何も足さない。** std の関数をそのまま呼ぶ (DR-0001 決定 1)
-- **経路の本当の失敗は次の経路でやり直さない。** 次へ進むのは経路自体が使えない時だけ (DR-0001 決定 3)
+- **std が受け付けるパス (OS ごとの `sun_path` − 1 バイト以内) には何も足さない。** std の関数をそのまま呼ぶ ([DR-0002](docs/decisions/DR-0002-std-handles-paths-it-accepts.md))
+- **経路の本当の失敗は次の経路でやり直さない。** 次へ進むのは経路自体が使えない時だけ ([DR-0012](docs/decisions/DR-0012-route-failure-handling.md))
 - **fork した子の区間は async-signal-safe な呼び出しだけ。** allocation・lock・Rust の destructor を通さない。sockaddr は fork の前に親が組み立てる
-- **経路は公開 API に出さない。** 試験は crate 内で各経路の関数を呼ぶ (DR-0001 決定 8)
+- **経路は公開 API に出さない。** 試験は crate 内で各経路の関数を呼ぶ ([DR-0011](docs/decisions/DR-0011-routes-not-exposed.md))
 - 公開 API・doc・エラーの文言は英語。DR と日本語の docs は日本語
 
 ## 試験

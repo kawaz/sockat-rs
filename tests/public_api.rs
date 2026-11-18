@@ -94,7 +94,7 @@ fn bind_and_connect_work_at_any_length() {
 
 // The four connects in an ordinary environment (a writable /tmp, the socket
 // under a temporary directory with a short file name): every length is
-// reached without forking on every platform (DR-0001: the symlink route under
+// reached without forking on every platform (DR-0006: the symlink route under
 // /tmp takes any directory depth), so the two connects that may fork report
 // that they did not, and the two that may not connect as well. The nonblocking
 // ones hand back a stream that does not wait: a read with nothing to read is
