@@ -1,13 +1,10 @@
 name: Release
 
 on:
-  # Release only what CI has passed: run after the CI workflow finishes on main,
-  # and do nothing unless it succeeded. check-version then decides whether
-  # Cargo.toml carries a version newer than the latest tag.
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
+  push:
     branches: [main]
+    paths:
+      - "Cargo.toml"
   # A version pushed before this workflow existed (or a release that failed
   # half-way) is released by running it by hand; check-version still refuses a
   # version that is already tagged.
@@ -18,8 +15,17 @@ permissions:
   id-token: write
 
 jobs:
+  # Release only what passes CI: the whole suite runs here first (crates.io
+  # trusted publishing refuses the workflow_run trigger, so this workflow cannot
+  # wait for the CI run of the push instead).
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      checks: write # cargo-audit's check run
+
   check-version:
-    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    needs: ci
     runs-on: ubuntu-latest
     outputs:
       sha: ${{ steps.version.outputs.sha }}
@@ -28,8 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          # The commit CI tested (workflow_run), or the branch head (by hand).
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Install bump-semver
@@ -99,8 +104,10 @@ jobs:
             echo "New version detected: v${CURRENT_VERSION}"
           fi
 
+  # The tag and the GitHub release come after the crate is on crates.io, so a
+  # failed publish leaves no tag behind and can be retried by hand.
   release:
-    needs: check-version
+    needs: [check-version, publish-crate]
     if: needs.check-version.outputs.changed == 'true'
     runs-on: ubuntu-latest
     permissions:
