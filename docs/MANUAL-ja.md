@@ -115,6 +115,7 @@ macOS。XNU は `sun_path` が 104 バイトを超えるアドレスも、パス
 - **`bind` と `connect_any` 系だけが試す。** `connect` / `connect_nonblocking` は試さずに `ENAMETOOLONG` を返す (ディレクトリを開いてから判定するので、ディレクトリが無ければ `ENOENT`)
 - ファイル名は `sun_path` に入る長さまで: macOS は広げた sockaddr で 253 バイト、Linux と illumos は 107 バイト、NetBSD / OpenBSD 等の BSD は 103 バイト。超えると `ENAMETOOLONG`
 - ディレクトリの開き方と要る権限: macOS は `O_SEARCH` で開くので、通常の bind / connect と同じ権限 (検索、bind なら書き込みも) で足りる。Linux は /proc の経路のために `O_PATH` で開いた fd を使うので、読み取り権限は要らない。他の Unix は `O_RDONLY` で開くので、読み取り権限も要る
+- bind は子が bind するだけで listen は呼び出し元なので、fork の経路でも相手から見える副作用が無い。fork しない版の bind は無い
 - 子の区間は async-signal-safe な呼び出し (`fchdir`、`bind` / `connect`、`_exit`) だけなので、マルチスレッドのプロセスから呼べる
 - 副作用がある: [connect した時の peer の pid](#fork-の経路で-connect-した時の副作用)、[子が一瞬持つ fd の複製](#fork-した子は一瞬全-fd-の複製を持つ)
 

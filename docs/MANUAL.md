@@ -115,6 +115,7 @@ A child is forked that `fchdir`s into the opened directory, binds / connects by 
 - **Only `bind` and the `connect_any` variants try it.** `connect` / `connect_nonblocking` return `ENAMETOOLONG` instead (decided after opening the directory, so a missing directory is still `ENOENT`)
 - The file name must fit `sun_path`: up to 253 bytes on macOS (in the widened sockaddr), 107 on Linux and illumos, 103 on NetBSD, OpenBSD and the other BSDs. Longer is `ENAMETOOLONG`
 - How the directory is opened, and the permission needed: macOS opens it `O_SEARCH`, so the same permissions as a plain bind / connect suffice (search, plus write for bind). Linux uses the fd opened `O_PATH` for the `/proc` route, so no read permission is needed. Other Unix targets open it `O_RDONLY` and need read permission on the directory as well
+- A bind through the fork route has no side effect visible to peers, since the child only binds and the caller listens. There is no non-forking bind
 - The child makes nothing but async-signal-safe calls (`fchdir`, `bind` / `connect`, `_exit`), so it can be used from multi-threaded processes
 - It has side effects: [the peer pid after a connect](#side-effects-of-connecting-through-the-fork-route), and [the copies of the fds the child briefly holds](#the-forked-child-briefly-holds-copies-of-every-fd)
 

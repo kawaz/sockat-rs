@@ -1,6 +1,6 @@
 # DR-0001: sun_path を超える socket のパスに届く経路と、試す順番
 
-- Status: Accepted (経路と試す順番、相対パスの作り方、Windows を対象外にすることは kawaz 指示 2026-11-18。/proc が無い時に他の Unix と同じ順に倒すこと、symlink の置き場に /tmp を足すことは kawaz 裁定 2026-11-18。公開する connect を「fork するか」「ブロックするか」の 4 つの関数にし、fork するのは `connect_any` 系だけにすること、`connect_any` 系は pid でなく fork の経路を通ったかを返すことは kawaz 裁定 2026-11-18。相対パスと symlink の経路を macOS 以外 (dirfd 基準の primitive の無い Unix、/proc の無い Linux) にも使うことは kawaz 裁定 2026-11-18。symlink の置き場を使う前に安全か確かめることは kawaz 裁定 2026-11-18。connect の symlink をソケットのファイルを指す形にすること、/proc の綴りに収まらないファイル名を決定 3 の順に回すことは kawaz 承認 2026-11-18。symlink の名前、fork の経路の権限、FreeBSD の扱いは統括の裁定 2026-11-18。tokio・観測の仕組みは実装側の判断で、残りは「未確定」)、0.2.1 で実装済み
+- Status: Accepted、実装済み (0.2.4)
 - Date: 2026-11-18
 
 ## Context
@@ -211,8 +211,25 @@ d が要るのは、bind でファイル名がそれより長い時と、安全�
 | FreeBSD でも広げた sockaddr を使う | XNU と同じ前提を置けない (libuv #5134)。`bindat` の方が副作用も無い |
 | tokio を feature で任意にする | 変換は利用者側の 2 行で済む。feature にすると crate が tokio の版を縛る |
 | 経路を公開 API で返す / 強制する feature を作る | 利用者が知る必要が無い。試験は crate 内で足りる |
+| `connect_any` 系の戻り値を名前付きの型 (`Connected { stream, via_fork }` 等) にする | 使う人がごく少なく、`let (stream, forked) = ...` で読める。公開する型が増える割に得るものが小さい (kawaz 裁定 2026-11-18) |
+| fork しない bind を設ける | bind の fork は子が bind するだけで listen は親なので、相手から見える副作用が無い。fork が禁じられた環境 (seccomp 等) では fork の失敗がそのままエラーで返る |
+| symlink の経路でソケットのパスが他人に読めることを注意書きする | bind 済みのソケットのパスは、Linux は誰でも読める /proc/net/unix、macOS は `netstat -f unix` で元々誰にでも見える (統括が実機で確認 2026-11-18)。std より後退していない |
 
 ## 未確定
 
 - Android は compile もしていない。macOS 以外の Apple OS は iOS の clippy (試験コード込み) だけ確かめた
 - NetBSD・OpenBSD・illumos の振る舞いは CI の VM の試験で確かめる。手元では NetBSD・illumos の clippy (試験コード込み) まで。OpenBSD は rustup に std が無く、手元では compile も確かめていない
+
+## 裁定の記録
+
+- 経路と試す順番、相対パスの作り方、Windows を対象外にすること: kawaz 指示 2026-11-18
+- /proc が無い時に他の Unix と同じ順に倒すこと: kawaz 裁定 2026-11-18
+- symlink の置き場に /tmp を足すこと: kawaz 裁定 2026-11-18
+- 公開する connect を「fork するか」「ブロックするか」の 4 つの関数にし、fork するのは `connect_any` 系だけにすること: kawaz 裁定 2026-11-18
+- `connect_any` 系は pid でなく fork の経路を通ったかを返すこと: kawaz 裁定 2026-11-18
+- 相対パスと symlink の経路を macOS 以外 (dirfd 基準の primitive の無い Unix、/proc の無い Linux) にも使うこと: kawaz 裁定 2026-11-18
+- symlink の置き場を使う前に安全か確かめること: kawaz 裁定 2026-11-18
+- connect の symlink をソケットのファイルを指す形にすること、/proc の綴りに収まらないファイル名を決定 3 の順に回すこと: kawaz 承認 2026-11-18
+- symlink の名前、fork の経路の権限、FreeBSD の扱い: 統括の裁定 2026-11-18
+- tokio・観測の仕組み: 実装側の判断 2026-11-18
+- 上に無いものは「未確定」の節
