@@ -11,4 +11,4 @@ Status は各 DR ファイルの `Status:` 行が正本。
 
 | DR | 状態 | 説明 |
 |---|---|---|
-| [DR-0001](DR-0001-long-socket-path-routes.md) | ✅ 実装済 | sun_path を超える socket のパスに届く経路と、試す順番 (Linux は /proc (無ければ fork)、macOS は相対パス → 広げた sockaddr → symlink → fork、FreeBSD は bindat、他の Unix は fork、Windows は対象外) |
+| [DR-0001](DR-0001-long-socket-path-routes.md) | ✅ 実装済 | sun_path を超える socket のパスに届く経路と、試す順番 (Linux は /proc、FreeBSD は bindat、他の Unix と /proc の無い Linux は相対パス → 広げた sockaddr (macOS だけ) → 安全な置き場の symlink → fork。`connect` は fork せず、fork するのは `bind` と `connect_any` 系。Windows は対象外) |
