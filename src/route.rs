@@ -334,8 +334,6 @@ pub(crate) mod names {
     pub(crate) const NO_SAFE_BASE: &str = "no safe base";
     /// The symlink could not be made in any usable place.
     pub(crate) const NO_SYMLINK: &str = "symlink not made";
-    /// The call may not fork (`connect`, `connect_nonblocking`).
-    pub(crate) const FORK_RULED_OUT: &str = "fork not allowed";
 }
 
 /// Available on crate feature `any` only.
@@ -382,12 +380,12 @@ pub(crate) struct Failed {
 }
 
 impl Failed {
-    /// `error` before any route was tried, with `skipped` passed over.
-    fn before_routes(error: io::Error, skipped: Vec<Skipped>) -> Self {
+    /// `error` before any route was tried: no route, nothing passed over.
+    fn before_routes(error: io::Error) -> Self {
         Self {
             error,
             route: None,
-            skipped,
+            skipped: Vec::new(),
         }
     }
 }
@@ -477,7 +475,7 @@ fn run_with(req: Request, path: &Path, remember: bool) -> Result<Reached, Failed
     if path::is_abstract(path) {
         return direct(req, path);
     }
-    path::refuse_nul(path).map_err(|e| Failed::before_routes(e, Vec::new()))?;
+    path::refuse_nul(path).map_err(Failed::before_routes)?;
     if path::len(path) <= DIRECT_MAX {
         return direct(req, path);
     }
@@ -722,19 +720,17 @@ pub(crate) fn run_long(req: Request, path: &Path, cfg: &Config) -> io::Result<(O
 /// path (what R points to) is taken next, before any route is tried; when it
 /// cannot be resolved that error is returned as is, rather than turning into
 /// `ENAMETOOLONG` once no R can be made.
+///
+/// A failure up to there is one before any route, with nothing passed over:
+/// the length is judged only once the directory is looked up, so `standard`
+/// is passed over (its spelling, the path itself, too long) only from then on.
 pub(crate) fn run_long_with(
     req: Request,
     path: &Path,
     cfg: &Config,
     remember: bool,
 ) -> Result<Reached, Failed> {
-    let standard = || {
-        vec![Skipped {
-            name: names::STANDARD,
-            reason: names::TOO_LONG,
-        }]
-    };
-    let before = |e| Failed::before_routes(e, standard());
+    let before = Failed::before_routes;
     let (dir, name) = path::split(path).map_err(before)?;
     if !std::fs::metadata(dir).map_err(before)?.is_dir() {
         return Err(before(io::Error::from_raw_os_error(libc::ENOTDIR)));
@@ -752,7 +748,10 @@ pub(crate) fn run_long_with(
         no_place: Cell::new(false),
         remember,
         bound: OnceCell::new(),
-        skipped: RefCell::new(standard()),
+        skipped: RefCell::new(vec![Skipped {
+            name: names::STANDARD,
+            reason: names::TOO_LONG,
+        }]),
     };
     // The call a route made, or `None` when no route could be used.
     let call = (|| {
@@ -918,10 +917,12 @@ fn central(t: &Target<'_>) -> Step {
     }
 }
 
-/// The means of the central route for `t` in order, each with why it cannot
-/// be used as far as that can be told before D is made: the spelling
-/// `R/<name>` does not fit, the thread-cwd means is off or unavailable, /proc
-/// cannot be used or its spelling would not fit.
+/// The means of the central route for `t` in order, those of this target and
+/// its state (the /proc means only where /proc can be used, as the SPEC's
+/// proc is for a Linux with /proc), each with why it cannot be used as far as
+/// that can be told before D is made: the spelling `R/<name>` does not fit,
+/// the thread-cwd means is off or unavailable, the /proc spelling would not
+/// fit.
 // Design rationale: each push is behind the cfg of the targets that have the
 // means, so on some targets the list is one push after `new`.
 #[allow(clippy::vec_init_then_push)]
@@ -948,11 +949,10 @@ fn central_means(t: &Target<'_>) -> MeansList {
         }),
     ));
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    all.push((
-        Means::Proc,
-        unless_too_long(None).or_else(|| match t.probed_proc() {
-            None => Some(names::PROC_UNUSABLE),
-            Some((proc, probe)) => {
+    if let Some((proc, probe)) = t.probed_proc() {
+        all.push((
+            Means::Proc,
+            unless_too_long(None).or_else(|| {
                 // D's fd is not known until D is opened. The fd of `/` opened
                 // by the check got the lowest free number; the place is opened
                 // before D, so one more stands in for the number of digits of
@@ -963,9 +963,9 @@ fn central_means(t: &Target<'_>) -> MeansList {
                     .join((probe + 1).to_string())
                     .join(own::spelling_placeholder(OsStr::new(""), t.name));
                 (path::len(&estimate) > DIRECT_MAX).then_some(names::TOO_LONG)
-            }
-        }),
-    ));
+            }),
+        ));
+    }
     // bindat / connectat cannot turn out unusable, so nothing comes after it.
     #[cfg(target_os = "freebsd")]
     all.push((Means::At, unless_too_long(None)));
@@ -1553,9 +1553,9 @@ pub(crate) mod own {
 /// for the fork after this too.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn fallback(t: &Target<'_>, _wide: &mut bool) -> Step {
+    // Without /proc the row is that of a Linux without it, with no /proc route
+    // in it to pass over.
     let Some(proc) = t.proc() else {
-        t.skip(names::PROC_DIRECT, names::PROC_UNUSABLE);
-        t.skip(names::PROC_HELD, names::PROC_UNUSABLE);
         return match posix::relative(t) {
             Step::Next => posix::symlinks(t),
             done => done,
@@ -1648,15 +1648,14 @@ fn fallback(t: &Target<'_>, _wide: &mut bool) -> Step {
 
 /// The last route of a connect, fork-direct: a forked child that `fchdir`s
 /// into the socket's directory and connects by the file name, for the
-/// connects that may fork. `None` (and so `ENAMETOOLONG`) for the others, and
-/// when the file name fits no sockaddr or the socket's directory cannot be
-/// opened. The file name goes in the plain sockaddr, or on Apple in the
-/// widened one when it is too long for that and the kernel takes the widened
-/// form (`wide`).
+/// connects that may fork. `None` (and so `ENAMETOOLONG`) for the others, with
+/// nothing noted (fork-direct is not in their order), and when the file name
+/// fits no sockaddr or the socket's directory cannot be opened. The file name
+/// goes in the plain sockaddr, or on Apple in the widened one when it is too
+/// long for that and the kernel takes the widened form (`wide`).
 fn fork_beside(options: ConnectOptions, t: &Target<'_>, wide: bool) -> Option<Call> {
     let req = Request::Connect(options);
     if !req.may_fork() {
-        t.skip(names::FORK_DIRECT, names::FORK_RULED_OUT);
         return None;
     }
     #[cfg(target_vendor = "apple")]

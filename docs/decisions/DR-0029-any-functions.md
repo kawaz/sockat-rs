@@ -85,9 +85,10 @@ impl From<AnyError> for io::Error { /* error をそのまま返す */ }
 | fork-direct | | `Forked` |
 
 - `route` は通った経路の名前 (SPEC の「経路の名前」、`Route::name`)。`skipped` は試して使えなかった経路の並び (試した順)。長いパスでは最初が `standard`
+- `skipped` に入るのは、その呼び出しで試す順の列 (SPEC の「試す順番」と、OS と `/proc` を使えるかで決まる予備の経路の 1 行) にある経路だけ。`/proc` を使えない Linux では proc・proc-sockdir・proc-direct・proc-held を入れず、fork しない connect は fork-direct を入れない
 - `route` より前に試した経路はすべて使えなかったもの (実際に bind / connect して失敗したら、そのエラーを返して次を試さない)。「使えたか」は持たない
 - `Loss` の名前は約束で、足すだけ。`route`・`skipped` の名前と `reason` は診断用で、中身を約束しない (doc にそう書く)
-- 失敗した時は `AnyError`: `error` は既定の関数と同じ `io::Error`、`route` は実際に bind / connect して失敗した経路の名前 (どの経路も使えない `ENAMETOOLONG` と、経路の前に断った時は `None`)、`skipped` は試して使えなかった経路
+- 失敗した時は `AnyError`: `error` は既定の関数と同じ `io::Error`、`route` は実際に bind / connect して失敗した経路の名前 (短いパスで std が失敗した時は `standard`。どの経路も使えない `ENAMETOOLONG` と、経路の前に断った時は `None`)、`skipped` は試して使えなかった経路。経路の前に断った時 (NUL、名前で終わらない、ソケットのディレクトリが無い・ディレクトリでない・realpath を引けない) は `skipped` も空 (長さの判定はディレクトリを引いた後なので、`standard` もまだ試していない)
 - `From<AnyError> for io::Error` は中の `io::Error` をそのまま返す。`io::Result` を返す関数の中で `?` が使え、`raw_os_error()` の errno が残る。`Display` と `source` は中の `io::Error` のもの
 - 4 つの型とも `#[non_exhaustive]` にする。フィールドは公開し、accessor は作らない
 - derive: 戻り値の 2 つと `AnyError` は `Debug` だけ (`UnixListener` / `UnixStream` / `io::Error` が `Clone` / `PartialEq` を持たない)。`Loss` と `Skipped` は `Debug, Clone, Copy, PartialEq, Eq, Hash`
@@ -95,7 +96,7 @@ impl From<AnyError> for io::Error { /* error をそのまま返す */ }
 ### 飛ばした経路の集め方
 
 - 1 回の呼び出しの状態 `route::Target` が `skipped` を持ち、経路が使えないと判断した所で `Target::skip(名前, 理由)` を呼ぶ。経路の名前と理由は `route::names` の定数
-- D を通す経路は、D を作る前に分かる理由 (綴りが収まらない、スレッド cwd が使えない、`/proc` を使えない) を手段ごとに持ち (`route::central_means`)、D を作った後に分かる理由 (スレッドが断られた、D の fd で測り直した `/proc` の綴りが収まらない) と合わせて、試す順に記録する。D をどこにも作れない時は D を通す経路を「no place for D」で記録してから `-sockdir` の経路に進む
+- D を通す経路は、その OS と状態の手段だけを (`/proc` の手段は `/proc` を使える時だけ)、D を作る前に分かる理由 (綴りが収まらない、スレッド cwd が使えない) と一緒に持ち (`route::central_means`)、D を作った後に分かる理由 (スレッドが断られた、D の fd で測り直した `/proc` の綴りが収まらない) と合わせて、試す順に記録する。D をどこにも作れない時は D を通す経路を「no place for D」で記録してから `-sockdir` の経路に進む
 - 記録は長いパスの呼び出しのたびに行う (`route::Reached::skipped`)。読むのは any 系と試験だけ
 
 ## 理由
@@ -133,6 +134,7 @@ impl From<AnyError> for io::Error { /* error をそのまま返す */ }
 
 - any 系の意味、`bind_any` を Rust にも置く、置き場の順、`route`・`skipped` (`{ name, reason }`) を返す、`route`・`skipped` は診断用: kawaz 裁定 (ハブ DR-0013、SPEC e0357cff、2026-11-19)
 - 失ったものを名前の並び `losses` (`respelled` / `forked` / `recreatable-spelling`) で返す、失敗時もエラーに `skipped` と失敗した経路を付け errno を保つ: kawaz 裁定 (ハブ DR-0013、SPEC f00f3217、2026-11-19)
+- `skipped` に入れるのは試す順の列にある経路だけ、短いパスの std の失敗の `route` は `standard`: ハブ SPEC f72b68e7。経路の前の失敗は `skipped` も空: ハブ SPEC ead73a28
 - `cwd-relative` を足す (D13-Q1)、abstract の名前には付けない: kawaz 裁定 (ハブ SPEC 7ab4e31e、8e938ad3、2026-11-19)
 - any 系を feature `any` の後ろに置く、docs.rs は全 feature: kawaz 裁定 (ハブ DR-0013、2026-11-18)
 - 型名 (`AnyListener`、`AnyConnection`、`AnyError`、`Loss`、`Skipped`)、`#[non_exhaustive]`、公開フィールド、`&'static str`、`Target::skip` で集める形、`AnyError` と `From<AnyError> for io::Error`: 実装側の判断 2026-11-19

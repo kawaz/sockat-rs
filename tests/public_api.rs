@@ -376,6 +376,56 @@ fn long_path_errors_through_the_public_api() {
     );
 }
 
+// An any function that fails reports the route that made the call and failed,
+// and none when it failed before any route was tried (SPEC "公開する操作"):
+//
+// * a long path whose directory is missing is ENOENT, and one with a file in
+//   place of its directory ENOTDIR, both found when the directory is looked up
+//   first, before any route: no route, and nothing passed over (the length is
+//   judged only once the directory is looked up, so not even `standard` has
+//   been tried);
+// * a short path whose directory is missing goes to std, which fails with
+//   ENOENT: that is the route `standard` failing for real, so the route is
+//   `standard`, and nothing was passed over before it.
+//
+// The errno is kept through the conversion into io::Error.
+#[cfg(feature = "any")]
+#[test]
+fn an_any_function_that_fails_before_the_routes_reports_no_route() {
+    let t = tempfile::Builder::new()
+        .prefix("sockat-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let p = nest(t.path(), 400, "s.sock");
+    let missing = p.parent().unwrap().join("nope/s.sock");
+    let file = p.parent().unwrap().join("file");
+    std::fs::write(&file, b"").unwrap();
+    let not_dir = file.join("s.sock");
+    for (path, errno) in [(&missing, libc::ENOENT), (&not_dir, libc::ENOTDIR)] {
+        let errors = [
+            sockat::bind_any(path).unwrap_err(),
+            sockat::connect_any(path).unwrap_err(),
+            sockat::connect_any_nonblocking(path).unwrap_err(),
+        ];
+        for e in errors {
+            assert_eq!(e.error.raw_os_error(), Some(errno), "{e:?}");
+            assert_eq!(e.route, None, "{e:?}");
+            assert!(e.skipped.is_empty(), "{e:?}");
+            assert_eq!(std::io::Error::from(e).raw_os_error(), Some(errno));
+        }
+    }
+
+    let short = t.path().join("nope/s.sock");
+    assert!(
+        short.as_os_str().len() <= std_max(),
+        "the premise: {short:?} is short"
+    );
+    let e = sockat::bind_any(&short).unwrap_err();
+    assert_eq!(e.error.raw_os_error(), Some(libc::ENOENT), "{e:?}");
+    assert_eq!(e.route, Some("standard"), "{e:?}");
+    assert!(e.skipped.is_empty(), "{e:?}");
+}
+
 // The address a long-path bind leaves on the socket fits sun_path on every
 // platform, so whoever reads it (std's local_addr, CPython's getsockname, Go's
 // net.FileConn) gets it whole: std shows at most std_max bytes. Every bind

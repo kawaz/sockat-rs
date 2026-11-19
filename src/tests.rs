@@ -2052,8 +2052,9 @@ fn only_what_passes_the_checks_is_removed_for_a_d_not_opened() {
 // * a route fails for real (bind_any through the symlink onto an existing
 //   file: EADDRINUSE; a connect through D to a missing socket: ENOENT): that
 //   route's name, and the ones before it passed over;
-// * the directory is missing: ENOENT before any route, `standard` alone
-//   passed over.
+// * the directory is missing: ENOENT before any route, and nothing passed
+//   over (the length is judged only once the directory is looked up, so not
+//   even `standard` has been tried).
 //
 // Through the public functions the error converts into the io::Error with the
 // same errno (AnyError: From).
@@ -2113,8 +2114,7 @@ fn a_failure_reports_the_routes_tried_and_keeps_the_errno() {
         .unwrap();
     assert_eq!(errno(&f.error), Some(libc::ENOENT), "{f:?}");
     assert_eq!(f.route, None);
-    let names: Vec<&str> = f.skipped.iter().map(|s| s.name).collect();
-    assert_eq!(names, ["standard"]);
+    assert_eq!(f.skipped, []);
 
     #[cfg(feature = "any")]
     {
@@ -2362,15 +2362,7 @@ fn the_routes_passed_over_are_reported_in_the_order_tried() {
             &bare,
             "fork-direct",
             if linux {
-                vec![
-                    "standard",
-                    "thread-cwd",
-                    "proc",
-                    "proc-direct",
-                    "proc-held",
-                    "relative",
-                    "symlink",
-                ]
+                vec!["standard", "thread-cwd", "relative", "symlink"]
             } else {
                 vec!["standard", "thread-cwd", "relative", "widened", "symlink"]
             },
@@ -2422,6 +2414,69 @@ fn the_routes_passed_over_are_reported_in_the_order_tried() {
     }
     assert_empty(place.path());
     assert_empty(links.path());
+}
+
+// skipped holds only the routes of the order this call tries on this platform
+// in its state (SPEC "公開する操作": the order of "試す順番" with the one row of
+// "予備の経路 (connect 系)" that the OS and the state, /proc usable or not,
+// pick), every one of them that could not be used; a route of no such order is
+// not reported. With the thread-cwd means off, /proc looked for where nothing
+// is on Linux (a Linux without /proc), D made nowhere and no place for the
+// fallback's symlink:
+//
+// * a bind passes over standard, thread-cwd and fork through D, then
+//   thread-cwd-sockdir, and is made by fork-sockdir. proc and proc-sockdir
+//   are for a Linux with /proc only (SPEC "経路の名前"), so they are not there;
+// * connect_any passes over standard, thread-cwd and the fallback row of a
+//   Linux without /proc (relative, symlink; no proc-direct or proc-held) or of
+//   Apple (relative, widened, symlink), and is made by fork-direct;
+// * a connect that may not fork passes over the same routes and fails with
+//   ENAMETOOLONG and no route: fork-direct is not in its order (the last row of
+//   its column in "試す順番" is ENAMETOOLONG), so it is not reported either.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[test]
+fn only_the_routes_of_the_order_tried_are_reported() {
+    let t = tmp();
+    let place = tmp();
+    let linux = cfg!(any(target_os = "linux", target_os = "android"));
+    let bare = fork_means_only(config(&[], &[]));
+    let names = |s: &[route::Skipped]| s.iter().map(|s| s.name).collect::<Vec<_>>();
+
+    let p = nest(&t.path().join("bind"), 400, "s.sock");
+    let reached = route::run_long_with(BIND, &p, &bare, false).unwrap();
+    let _bound = UnixListener::from(reached.fd);
+    assert_eq!(
+        reached.route.name(),
+        "fork-sockdir",
+        "{:?}",
+        reached.skipped
+    );
+    assert_eq!(
+        names(&reached.skipped),
+        ["standard", "thread-cwd", "fork", "thread-cwd-sockdir"]
+    );
+    assert!(is_socket(&p));
+
+    let p = nest(&t.path().join("connect"), 600, "s.sock");
+    let (l, _) = route::run_long(BIND, &p, &config(&[at(place.path())], &[])).unwrap();
+    let listener = UnixListener::from(l);
+    let fallback: &[&str] = if linux {
+        &["standard", "thread-cwd", "relative", "symlink"]
+    } else {
+        &["standard", "thread-cwd", "relative", "widened", "symlink"]
+    };
+    let reached = route::run_long_with(CONNECT_ANY, &p, &bare, false).unwrap();
+    assert_eq!(reached.route.name(), "fork-direct", "{:?}", reached.skipped);
+    assert_eq!(names(&reached.skipped), fallback);
+    ping_kept(&listener, reached.fd);
+
+    let f = route::run_long_with(CONNECT, &p, &bare, false)
+        .err()
+        .unwrap();
+    assert_eq!(errno(&f.error), Some(libc::ENAMETOOLONG), "{f:?}");
+    assert_eq!(f.route, None);
+    assert_eq!(names(&f.skipped), fallback);
+    assert_empty(place.path());
 }
 
 // The central route's spelling is `R/<name>`, 11 bytes more than the file
