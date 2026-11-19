@@ -105,13 +105,13 @@ if losses.contains(&Loss::Forked) {
 
 ## ソケットのファイルを消す
 
-`bind_ex` は listener と `SocketFile` を返す (`ExListener` の `listener` と `file`)。`SocketFile::discard()` は、bind の直後に覚えたソケットのファイルを、そのパスの `(st_dev, st_ino)` が同じ時だけ消す (後から同じパスに bind された別のソケットは消さない)。listener は std の型のままで tokio 等へ渡せ、閉じるのは利用者。
+`bind_ex` は listener と `SocketFile` を返す (`ExListener` の `listener` と `file`)。`SocketFile::discard()` は、bind の直後に覚えたソケットのファイルを、そのパスの `(st_dev, st_ino)` が同じ時だけ消す (後から同じパスに bind された別のソケットは消さない)。listener は std の型のままで tokio 等へ渡せ、閉じるのは利用者。`discard()` は listener を閉じる前に呼ぶ (約束するのは「listener を開いている間に置き換えられた物は消さない」まで。listener を閉じた後に消して作り直された物は、ext4 や BSD の UFS / FFS では inode 番号が使い回されて見分けられず、消しうる (元のパスで消すのと同じ))。
 
 ```rust
 let bound = sockat::bind_ex(&path, sockat::LastResort::Avoid)?;
 // ...
-drop(bound.listener);
 bound.file.discard()?;
+drop(bound.listener);
 ```
 
 ## async ランタイム

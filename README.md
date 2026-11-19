@@ -105,13 +105,13 @@ Details in [docs/MANUAL.md](./docs/MANUAL.md#the-_ex-functions-clean-up-and-diag
 
 ## Removing the socket file
 
-`bind_ex` returns the listener and a `SocketFile` (`listener` and `file` of `ExListener`). `SocketFile::discard()` removes the socket file taken right after the bind, only while what is at its path has the same `(st_dev, st_ino)` (another socket bound at the path since is left alone). The listener stays std's type and may go to tokio etc.; closing it is up to whoever holds it.
+`bind_ex` returns the listener and a `SocketFile` (`listener` and `file` of `ExListener`). `SocketFile::discard()` removes the socket file taken right after the bind, only while what is at its path has the same `(st_dev, st_ino)` (another socket bound at the path since is left alone). The listener stays std's type and may go to tokio etc.; closing it is up to whoever holds it. Call `discard()` before closing the listener (the promise: what replaced the file while the listener was open is not removed; once the listener is closed, a file removed and made again at the path may get the same inode number on ext4 or the BSDs' UFS / FFS, cannot be told apart, and may be removed (as removing by the path would)).
 
 ```rust
 let bound = sockat::bind_ex(&path, sockat::LastResort::Avoid)?;
 // ...
-drop(bound.listener);
 bound.file.discard()?;
+drop(bound.listener);
 ```
 
 ## Async runtimes

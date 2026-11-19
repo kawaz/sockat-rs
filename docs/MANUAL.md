@@ -256,8 +256,8 @@ use sockat::LastResort;
 
 let bound = sockat::bind_ex(path, LastResort::Avoid)?;
 // use bound.listener (it may go to tokio etc.)
-drop(bound.listener);
 bound.file.discard()?;
+drop(bound.listener);
 ```
 
 - `LastResort::Avoid` is the `Default`. The last resort is only for the rare environment where `bind` / `connect` are `ENAMETOOLONG` and the path must be reached anyway; passing `LastResort::Allow` is the choice to accept what it gives up
@@ -305,7 +305,7 @@ On FreeBSD at-direct reaches file names of up to 103 bytes, so fork-cwd-direct i
 - `bind_ex` takes the socket file's real path and `(st_dev, st_ino)` right after the bind, inside the route, before it returns the listener (on the routes through D and the form without D while R is still there, by the spelling the bind took; on symlink-file and symlink-dir by the real path of the socket's directory and the file name). When that cannot be done, the listener is closed and the error returned; the socket file stays
 - For a relative path, the process's cwd `(st_dev, st_ino)` is compared before the bind and the realpath and after both; when they differ, it is handled as when the file cannot be looked up (the error is `Other`). Another thread changing the cwd in between would put the bound file and the remembered one under different cwds, and `discard()` could remove an unrelated file of the same name. A change and change back is not seen
 - `SocketFile::discard()` removes what is at that real path only when its `(st_dev, st_ino)` is the same. Anything else (another socket bound at the path since, a file, a symlink) is left alone, and with nothing there (a directory along the path removed or replaced by something that is not a directory included) nothing is done. Both are `Ok(())`. When what is there cannot be looked up for another reason (`EACCES`, say) or the removal fails, that is an error (not knowing whether the file was removed is never `Ok(())`)
-- `discard()` does not close the listener. The listener is std's `UnixListener` and may go to tokio etc.; whoever holds it closes it, and `discard()` comes after that
+- `discard()` does not close the listener. The listener is std's `UnixListener` and may go to tokio etc.; whoever holds it closes it. Call `discard()` before closing the listener. The promise is that what replaced the file while the listener was open is not removed. Once the listener is closed, a file removed and made again at the path may get the same inode number on ext4 or the BSDs' UFS / FFS, cannot be told apart, and may be removed (as removing by the path would)
 - Dropping a `SocketFile` does nothing
 - The same for a short path (handed to std unchanged)
 - Limits: someone who can write to the socket's directory and replaces the file between the check and the removal, or between the bind and the look-up, is not caught (POSIX has no way to remove a file by its inode). An inode number freed by the file's removal and given to a new file on the same device makes that file look like the bind's
@@ -406,8 +406,9 @@ use std::path::Path;
 fn serve(path: &Path) -> io::Result<()> {
     let bound = sockat::bind_ex(path, sockat::LastResort::Avoid)?;
     // accept on bound.listener (it may go to tokio etc.)
+    let removed = bound.file.discard(); // removes the file only while it is still the one bound
     drop(bound.listener);
-    bound.file.discard() // removes the file only while it is still the one bound
+    removed
 }
 
 fn serve_and_remove(path: &Path) -> io::Result<()> {
@@ -432,8 +433,9 @@ fn serve(path: &Path) -> io::Result<()> {
     let path = std::path::absolute(path)?; // make it absolute before the bind
     let bound = sockat::bind_ex(&path, sockat::LastResort::Avoid)?;
     // accept on bound.listener
+    let removed = bound.file.discard();
     drop(bound.listener);
-    bound.file.discard()
+    removed
 }
 ```
 
@@ -472,8 +474,9 @@ use std::path::Path;
 fn serve(path: &Path) -> io::Result<()> {
     let bound = sockat::bind_ex(path, sockat::LastResort::Allow)?;
     // accept on bound.listener
+    let removed = bound.file.discard(); // by the path it keeps, not local_addr()'s spelling
     drop(bound.listener);
-    bound.file.discard() // by the path it keeps, not local_addr()'s spelling
+    removed
 }
 ```
 

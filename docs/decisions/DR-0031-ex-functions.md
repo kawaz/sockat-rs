@@ -105,6 +105,7 @@ impl SocketFile { pub fn discard(self) -> io::Result<()>; }
 - 相対パスでは、bind と realpath を引くことの前と両方の後でプロセスの cwd の `(st_dev, st_ino)` を比べ (`route::run_with`)、違えば (取れなければ) 覚えられない時と同じに扱う。エラーは `io::ErrorKind::Other`。既定の `bind` は覚えない (`route::run` は `Bound` を取らない) ので比べない (ハブ SPEC の `_ex`)
 - `discard()` は realpath を `lstat` し、`(st_dev, st_ino)` が同じ時だけ `unlink` する。違う物があれば触らず、何も無ければ (`ENOENT` / `ENOTDIR`) 何もしない。どちらも `Ok(())`。確かめられない時とそれ以外の `unlink` の失敗はエラー
 - `discard()` は listener を閉じない。`SocketFile` を drop しても何もしない
+- 約束は「listener を開いている間に置き換えられた物は消さない」まで。`discard()` は listener を閉じる前に呼ぶ。閉じた後に消して作り直された物は、ext4 や BSD の UFS / FFS では inode 番号がすぐ使い回されて `(st_dev, st_ino)` で見分けられず、消しうる (元のパスで消すのと同じ)。同一性の判定は `(st_dev, st_ino)` のまま (試験 `bind_ex_leaves_a_replaced_socket_file_alone` は listener を開いたまま置き換える)
 
 ### 飛ばした経路の集め方
 
@@ -142,6 +143,7 @@ impl SocketFile { pub fn discard(self) -> io::Result<()>; }
 ## 判断の出所
 
 - any 系を作らず既定の操作ごとに `_ex` を置く、引数は最終手段を使うかの 1 つだけ、最終手段 (bind は symlink-dir、connect は fork-cwd-direct)、置き場の順、`losses`・`route`・`skipped` を返す、失敗時も `skipped` と失敗した経路を付け errno を保つ、`discard` は消すだけ: kawaz 裁定 (ハブ DR-0015、2026-11-19)
+- `discard()` の約束を listener を開いている間の置き換えまでとし、同一性の判定を `(st_dev, st_ino)` のままにすること: kawaz 裁定 (ハブ DS-Q1、SPEC cb1149a6、2026-11-19)
 - 経路の名前 (fork-cwd、fork-cwd-sockdir、fork-cwd-direct、symlink-file、symlink-dir): kawaz 裁定 (ハブ DR-0016、2026-11-19)
 - `LastResort` の enum、型名 (`ExListener`、`ExStream`、`ExError`)、feature を外す、`#[non_exhaustive]` と公開フィールド: 実装側の判断 2026-11-19
 - `SocketFile` の決まり (bind の直後に覚える、覚えられなければエラー、同じ時だけ消す、確かめられない時はエラー): ハブ SPEC の「公開する操作」

@@ -256,8 +256,8 @@ use sockat::LastResort;
 
 let bound = sockat::bind_ex(path, LastResort::Avoid)?;
 // bound.listener を使う (tokio 等に渡してもよい)
-drop(bound.listener);
 bound.file.discard()?;
+drop(bound.listener);
 ```
 
 - `LastResort::Avoid` が `Default`。最終手段は、`bind` / `connect` がよほど珍しい環境で `ENAMETOOLONG` になり、それでも届かせたい時だけのもの。`LastResort::Allow` を渡すことが、失うものを受け入れる意思表示になる
@@ -305,7 +305,7 @@ FreeBSD では at-direct がファイル名 103 バイトまで届くので、fo
 - `bind_ex` は bind が通った直後、経路の中で listener を返す前に、ソケットのファイルの realpath と `(st_dev, st_ino)` を覚える (D を通す経路と D 無しの形では R が残っている間に、bind と同じ綴りで引く。symlink-file と symlink-dir ではソケットのディレクトリの realpath とファイル名で引く)。覚えられなければ listener を閉じ、ファイルは消さずにエラーを返す
 - 相対パスでは、bind と realpath を引くことの前と両方の後でプロセスの cwd の `(st_dev, st_ino)` を比べ、違えば覚えられない時と同じに扱う (エラーは `Other`)。他のスレッドが間に cwd を変えると bind した所と覚える所が別の cwd の下になり、`discard()` が同じ名前の無関係なファイルを消しうるため。変えて戻した場合は見えない
 - `SocketFile::discard()` は、その realpath にある物の `(st_dev, st_ino)` が同じ時だけ消す。別の物 (後から同じパスに bind された別のソケット、ファイル、symlink) は消さず、何も無ければ (途中のディレクトリが消された・ディレクトリでない物に置き換わった時も) 何もしない。どちらも `Ok(())`。それ以外の理由で確かめられない時 (`EACCES` 等) と消そうとして失敗した時はエラー (消せたか分からないのを `Ok(())` にしない)
-- `discard()` は listener を閉じない。listener は std の `UnixListener` で、tokio 等へ渡せる。閉じるのは listener を持っている側で、閉じてから `discard()` する
+- `discard()` は listener を閉じない。listener は std の `UnixListener` で、tokio 等へ渡せる。閉じるのは listener を持っている側。`discard()` は listener を閉じる前に呼ぶ。約束するのは「listener を開いている間に置き換えられた物は消さない」まで。listener を閉じた後に消して作り直された物は、ext4 や BSD の UFS / FFS では inode 番号が使い回されて見分けられず、消しうる (元のパスで消すのと同じ)
 - `SocketFile` を drop しても何もしない
 - 短いパス (std にそのまま渡す) でも同じ
 - 限界: 確かめてから消すまでと、bind してから覚えるまでの間に、ソケットのディレクトリに書ける者がファイルをすり替えるのは防げない (inode を指定して消す手段が POSIX に無い)。消されたファイルの inode 番号が同じデバイスの新しいファイルに使い回されると、そのファイルを bind したものと見なす
@@ -406,8 +406,9 @@ use std::path::Path;
 fn serve(path: &Path) -> io::Result<()> {
     let bound = sockat::bind_ex(path, sockat::LastResort::Avoid)?;
     // bound.listener で受ける (tokio 等へ渡してもよい)
+    let removed = bound.file.discard(); // bind したファイルがまだそこにある時だけ消す
     drop(bound.listener);
-    bound.file.discard() // bind したファイルがまだそこにある時だけ消す
+    removed
 }
 
 fn serve_and_remove(path: &Path) -> io::Result<()> {
@@ -432,8 +433,9 @@ fn serve(path: &Path) -> io::Result<()> {
     let path = std::path::absolute(path)?; // bind の前に絶対パスにする
     let bound = sockat::bind_ex(&path, sockat::LastResort::Avoid)?;
     // bound.listener で受ける
+    let removed = bound.file.discard();
     drop(bound.listener);
-    bound.file.discard()
+    removed
 }
 ```
 
@@ -472,8 +474,9 @@ use std::path::Path;
 fn serve(path: &Path) -> io::Result<()> {
     let bound = sockat::bind_ex(path, sockat::LastResort::Allow)?;
     // bound.listener で受ける
+    let removed = bound.file.discard(); // local_addr() の綴りでなく、覚えた元のパスで消す
     drop(bound.listener);
-    bound.file.discard() // local_addr() の綴りでなく、覚えた元のパスで消す
+    removed
 }
 ```
 

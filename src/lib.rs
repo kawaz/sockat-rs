@@ -281,8 +281,9 @@
 //! fn serve(path: &Path) -> io::Result<()> {
 //!     let bound = sockat::bind_ex(path, sockat::LastResort::Avoid)?;
 //!     // accept on bound.listener (it may go to tokio etc.)
+//!     let removed = bound.file.discard(); // removes the file only while it is still the one bound
 //!     drop(bound.listener);
-//!     bound.file.discard() // removes the file only while it is still the one bound
+//!     removed
 //! }
 //!
 //! fn serve_and_remove(path: &Path) -> io::Result<()> {
@@ -316,8 +317,9 @@
 //!     let path = std::path::absolute(path)?; // make it absolute before the bind
 //!     let bound = sockat::bind_ex(&path, sockat::LastResort::Avoid)?;
 //!     // accept on bound.listener
+//!     let removed = bound.file.discard();
 //!     drop(bound.listener);
-//!     bound.file.discard()
+//!     removed
 //! }
 //! # let dir = tempfile::tempdir()?;
 //! # serve(&dir.path().join("s.sock"))?;
@@ -375,8 +377,9 @@
 //! fn serve(path: &Path) -> io::Result<()> {
 //!     let bound = sockat::bind_ex(path, sockat::LastResort::Allow)?;
 //!     // accept on bound.listener
+//!     let removed = bound.file.discard(); // not by local_addr()'s spelling
 //!     drop(bound.listener);
-//!     bound.file.discard() // not by local_addr()'s spelling
+//!     removed
 //! }
 //! # let dir = tempfile::tempdir()?;
 //! # let deep = dir.path().join("d".repeat(100));
@@ -706,8 +709,8 @@ fn losses(bind: bool, route: Route, path: &Path) -> Vec<Loss> {
 ///     // the address the kernel reports is not `path`: remove by `file`
 /// }
 /// // ... serve on `listener` ...
+/// file.discard()?; // before the listener is closed
 /// drop(listener);
-/// file.discard()?;
 /// # Ok::<(), std::io::Error>(())
 /// ```
 #[non_exhaustive]
@@ -716,8 +719,8 @@ pub struct ExListener {
     /// The listening socket, std's own type, as [`bind`] returns it.
     pub listener: UnixListener,
     /// Removes the socket file later, only while it is still the one this
-    /// bind made ([`SocketFile::discard`]). Closing the listener stays with
-    /// whoever has it.
+    /// bind made ([`SocketFile::discard`]); call it before the listener is
+    /// closed. Closing the listener stays with whoever has it.
     pub file: SocketFile,
     /// What was given up to bind it ([`Loss`]), empty when nothing was.
     /// Branch on this.
@@ -872,8 +875,8 @@ fn ex_error(f: route::Failed) -> ExError {
 /// let path = "/a/very/long/directory/.../server.sock";
 /// let bound = sockat::bind_ex(path, sockat::LastResort::Avoid)?;
 /// // ... serve on `bound.listener` ...
-/// drop(bound.listener);
 /// bound.file.discard()?;
+/// drop(bound.listener);
 /// # Ok::<(), std::io::Error>(())
 /// ```
 ///
@@ -1003,15 +1006,18 @@ impl SocketFile {
     /// the bind being gone either way. When what is at the path cannot be
     /// looked up for another reason (`EACCES`, say), whether the file is
     /// still there is unknown, and that is an error rather than `Ok(())`. The
-    /// listener is not touched; close it first, as a socket file removed under
-    /// a listener that is still open leaves that listener unreachable by path.
+    /// listener is not touched; call this before closing it.
+    ///
+    /// The promise is that what replaced the file while the listener was open
+    /// is not removed. Once the listener is closed, a file removed and made
+    /// again at the path may be given the same inode number (ext4, the BSDs'
+    /// UFS / FFS), cannot be told apart, and may be removed, as removing by the
+    /// path would.
     ///
     /// The look-up and the removal are two steps: a file put at the path in
     /// the moment between them, by someone who can write to the directory, is
     /// removed instead. POSIX has no way to remove a file by its inode, so
-    /// this cannot be closed. An inode number freed by the file's removal and
-    /// given to a new file on the same device makes that file look like the
-    /// bind's.
+    /// this cannot be closed.
     ///
     /// # Errors
     ///

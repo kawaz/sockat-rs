@@ -602,11 +602,15 @@ fn bind_ex_discards_its_socket_file_at_any_length() {
 }
 
 // discard() removes only the file the bind made: whatever is at the path now
-// is compared by (st_dev, st_ino) with what the bind left. Replaced since (by
-// a plain file, by another socket bound at the same path, by a symlink to
-// someone else's file), it is left alone, and so is the other file; with
-// nothing there, there is nothing to do. All of these are Ok: the bind's own
-// file is gone either way.
+// is compared by (st_dev, st_ino) with what the bind left. Replaced while the
+// listener is still open (by a plain file, by another socket bound at the
+// same path, by a symlink to someone else's file), it is left alone, and so
+// is the other file; with nothing there, there is nothing to do. All of these
+// are Ok: the bind's own file is gone either way. The listener is closed only
+// after discard(): that is the promise (hub SPEC cb1149a6, DR-0015). Once it
+// is closed, ext4 and the BSDs' UFS / FFS may give the inode number of the
+// removed file straight to the replacement, and the replacement cannot be told
+// apart; that case is not promised, so it is not tested.
 #[test]
 fn bind_ex_leaves_a_replaced_socket_file_alone() {
     let t = tempfile::Builder::new()
@@ -620,7 +624,6 @@ fn bind_ex_leaves_a_replaced_socket_file_alone() {
     for what in ["a file", "another socket", "a symlink"] {
         let sockat::ExListener { listener, file, .. } =
             sockat::bind_ex(&p, sockat::LastResort::Avoid).unwrap();
-        drop(listener);
         std::fs::remove_file(&p).unwrap();
         match what {
             "a file" => std::fs::write(&p, b"keep").unwrap(),
@@ -628,6 +631,7 @@ fn bind_ex_leaves_a_replaced_socket_file_alone() {
             _ => std::os::unix::fs::symlink(&theirs, &p).unwrap(),
         }
         file.discard().unwrap();
+        drop(listener);
         assert!(std::fs::symlink_metadata(&p).is_ok(), "{what} was removed");
         std::fs::remove_file(&p).unwrap();
     }
@@ -635,9 +639,9 @@ fn bind_ex_leaves_a_replaced_socket_file_alone() {
 
     let sockat::ExListener { listener, file, .. } =
         sockat::bind_ex(&p, sockat::LastResort::Avoid).unwrap();
-    drop(listener);
     std::fs::remove_file(&p).unwrap();
     file.discard().unwrap();
+    drop(listener);
 }
 
 // discard() reports Ok(()) only when it knows the bind's file is gone: a
