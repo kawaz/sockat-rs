@@ -12,7 +12,7 @@
 
 ## Decision
 
-- `examples/conformance.rs`。`sockat::bind_ex(path, LastResort::Avoid)` と `sockat::connect_ex(path, LastResort::Avoid)` (ブロックする) を呼ぶ。crate の中に CLI 専用の口は置かない
+- `examples/conformance.rs`。入力の `last_resort` (省略時 false) が true なら `LastResort::Allow`、それ以外は `LastResort::Avoid` で `sockat::bind_ex` / `sockat::connect_ex` (ブロックする) を呼ぶ (ハブ conformance.md eb1e1dfc)。crate の中に CLI 専用の口は置かない
 - 入力の JSON は dev-dependency の `serde_json` で読む。出力は項目を conformance.md の順に並べて組み立て、文字列は `serde_json` でエスケープする
 - `error`: errno のあるエラーは POSIX の errno の表で引いた名前 (同じ値の名前が 2 つある時は表の先の方。`EAGAIN`、`EOPNOTSUPP`、表に無い errno は `errno-<番号>`)。errno の無いエラーは `InvalidInput` なら `invalid-argument`、他は `general`
 - bind が通ったら listener を閉じる (ソケットのファイルは消さない。`SocketFile` は使わない)。connect が通ったら `x` を 1 バイト送って閉じる

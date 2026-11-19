@@ -1,10 +1,12 @@
 //! The conformance CLI that the hub's language-independent conformance test
 //! runs (the hub's `docs/design/conformance.md`, DR-0030). Not part of sockat.
 //!
-//! Reads one JSON object from stdin, `{ "op": "bind" | "connect", "path": ".." }`,
-//! makes one bind / connect by `sockat::bind_ex` / `sockat::connect_ex`
-//! without the last resort (`LastResort::Avoid`: the route order of
-//! `sockat::bind` / `sockat::connect`), and writes one JSON object to stdout:
+//! Reads one JSON object from stdin,
+//! `{ "op": "bind" | "connect", "path": "..", "last_resort": true | false }`
+//! (`last_resort` may be left out, meaning false), makes one bind / connect by
+//! `sockat::bind_ex` / `sockat::connect_ex` with `LastResort::Allow` when
+//! `last_resort` is true and `LastResort::Avoid` (the route order of
+//! `sockat::bind` / `sockat::connect`) otherwise, and writes one JSON object to stdout:
 //! `{ "ok", "error", "route", "losses", "skipped" }`. A listener is closed
 //! (the socket file stays); a connected stream sends one byte `x` and is
 //! closed.
@@ -39,7 +41,7 @@ mod cli {
     }
 
     pub(crate) fn main() -> ExitCode {
-        let (op, path) = match read_input() {
+        let (op, path, last_resort) = match read_input() {
             Ok(input) => input,
             Err(message) => {
                 eprintln!("conformance: {message}");
@@ -48,7 +50,7 @@ mod cli {
         };
         let path = Path::new(&path);
         let report = match op {
-            Op::Bind => match sockat::bind_ex(path, LastResort::Avoid) {
+            Op::Bind => match sockat::bind_ex(path, last_resort) {
                 Ok(l) => {
                     drop(l.listener);
                     Report {
@@ -61,7 +63,7 @@ mod cli {
                 }
                 Err(e) => failed(e),
             },
-            Op::Connect => match sockat::connect_ex(path, LastResort::Avoid) {
+            Op::Connect => match sockat::connect_ex(path, last_resort) {
                 Ok(mut c) => {
                     if let Err(e) = c.stream.write_all(b"x") {
                         eprintln!("conformance: connected, but sending `x` failed: {e}");
@@ -97,8 +99,9 @@ mod cli {
         Connect,
     }
 
-    /// `op` and `path` of the JSON object on stdin.
-    fn read_input() -> Result<(Op, String), String> {
+    /// `op`, `path` and `last_resort` (false when left out) of the JSON
+    /// object on stdin.
+    fn read_input() -> Result<(Op, String, LastResort), String> {
         let mut text = String::new();
         io::stdin()
             .read_to_string(&mut text)
@@ -114,7 +117,13 @@ mod cli {
             .get("path")
             .and_then(|p| p.as_str())
             .ok_or("`path` must be a string")?;
-        Ok((op, path.to_owned()))
+        let last_resort = match v.get("last_resort") {
+            None => LastResort::Avoid,
+            Some(serde_json::Value::Bool(false)) => LastResort::Avoid,
+            Some(serde_json::Value::Bool(true)) => LastResort::Allow,
+            Some(_) => return Err("`last_resort` must be true or false".into()),
+        };
+        Ok((op, path.to_owned(), last_resort))
     }
 
     /// The errno's name for an OS error, `invalid-argument` for sockat's
