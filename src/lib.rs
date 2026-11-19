@@ -42,7 +42,7 @@
 //! # How a long path is reached
 //!
 //! A path longer than std accepts is bound through a symlink to the socket
-//! file where a bind follows one (**symlink-file**; not Linux), else through
+//! file where a bind follows one (**symlink-file**; macOS, NetBSD), else through
 //! a directory of sockat's own, D (**the routes through D**), and only when
 //! that cannot be used, through the socket's directory itself (**the form
 //! without D**). A connect tries **the connect routes** that need neither
@@ -55,8 +55,9 @@
 //! | Linux, Android | thread-cwd, proc, fork-cwd | proc-direct, thread-cwd, proc, proc-held, symlink-file |
 //! | Linux, Android without `/proc` | thread-cwd, fork-cwd | relative, thread-cwd, symlink-file |
 //! | macOS, iOS (Apple) | symlink-file, thread-cwd, fork-cwd | relative, widened, thread-cwd, symlink-file |
-//! | FreeBSD | symlink-file, at | at-direct, at |
-//! | NetBSD, OpenBSD, illumos, other Unix | symlink-file, fork-cwd | relative, symlink-file |
+//! | FreeBSD | at | at-direct, at |
+//! | NetBSD, other Unix | symlink-file, fork-cwd | relative, symlink-file |
+//! | OpenBSD, illumos | fork-cwd | relative, symlink-file |
 //!
 //! [`bind_ex`], [`connect_ex`] and [`connect_nonblocking_ex`] try the same,
 //! and with [`LastResort::Allow`] a last resort after it: symlink-dir for
@@ -64,15 +65,17 @@
 //! used makes the call; a real failure there (`ENOENT`, `EADDRINUSE`,
 //! `ECONNREFUSED`, ...) is the result, not a reason to try the next.
 //!
-//! **symlink-file** (a bind, not Linux; a connect, not FreeBSD): a short
+//! **symlink-file** (a bind, not Linux, FreeBSD, OpenBSD or illumos; a
+//! connect, not FreeBSD): a short
 //! symlink `sockat.XXXXXXXXXX` to the socket file under `TMPDIR` or failing
 //! that `/tmp`, removed right after the call, made only in a place where no
 //! other user can replace it (a sticky directory owned by root or the calling
 //! user, as `/tmp` is, or a directory of the calling user's that group and
 //! others cannot write to). The spelling holds no file name, so it reaches any
 //! file name length. A bind through it reaches the path only where the kernel
-//! follows the symlink (macOS; Linux does not, and the route is not tried
-//! there; the other targets are told at run time): when such a bind fails with
+//! follows the symlink (macOS, NetBSD; Linux, FreeBSD, OpenBSD and illumos do
+//! not, and the route is not tried there; the other targets are told at run
+//! time): when such a bind fails with
 //! something at the path, that is the failure (`EADDRINUSE`, ...); with
 //! nothing there, the kernel is taken not to have followed the symlink, and the
 //! next route is tried.

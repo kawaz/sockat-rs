@@ -68,13 +68,14 @@ A longer path is bound through a symlink to the socket file ([symlink-file](#sym
 | Linux / Android | [thread-cwd](#thread-cwd) → [proc](#proc) → [fork-cwd](#fork-cwd) | [proc-direct](#proc-direct) → thread-cwd → proc → [proc-held](#proc-held) → [symlink-file](#symlink-file) |
 | Linux / Android (no `/proc`) | thread-cwd → fork-cwd | [relative](#relative) → thread-cwd → symlink-file |
 | macOS / iOS and other Apple OSes | symlink-file → thread-cwd → fork-cwd | relative → [widened](#widened) → thread-cwd → symlink-file |
-| FreeBSD | symlink-file → [at](#at) | [at-direct](#at-direct) → at |
-| NetBSD / OpenBSD / illumos / other Unix | symlink-file → fork-cwd | relative → symlink-file |
+| FreeBSD | [at](#at) | [at-direct](#at-direct) → at |
+| NetBSD / other Unix | symlink-file → fork-cwd | relative → symlink-file |
+| OpenBSD / illumos | fork-cwd | relative → symlink-file |
 | Windows | not supported (compile error outside Unix) | |
 
 - [standard](#standard) is tried before these and cannot be used for the length
 - A connect tries the routes that need neither writing nor a thread (proc-direct, relative, widened, at-direct) first, and after them the routes that make D (thread-cwd, proc, proc-held, at), the one that starts a thread (thread-cwd) and the one that makes a symlink. When an earlier route reaches the socket, neither D nor a symlink is made
-- A bind does not try symlink-file on Linux / Android, where a bind does not follow a symlink. Elsewhere whether it does is told at run time ([symlink-file](#symlink-file))
+- A bind does not try symlink-file on the OSes checked not to follow a symlink in a bind (Linux / Android, FreeBSD, OpenBSD, illumos). macOS and NetBSD were checked to follow. Elsewhere whether it does is told at run time ([symlink-file](#symlink-file))
 - A bind for which D can be made nowhere tries the order of the routes through D in [the form without D](#the-form-without-d) (the `-sockdir` routes)
 - The `_ex` functions with `LastResort::Avoid` try the order of the plain function. With `LastResort::Allow` they try the last resort after it: [symlink-dir](#symlink-dir) for `bind_ex`, [fork-cwd-direct](#fork-cwd-direct) for the `connect_ex` ones ([The _ex functions](#the-_ex-functions-clean-up-and-diagnostics))
 - The socket's directory is looked up (`stat`) first. If it is missing, the error is `ENOENT` (whatever the file name length)
@@ -98,7 +99,7 @@ sockat makes a directory D of its own, holds it by an fd, makes in it a symlink 
 - **The places for D** are `TMPDIR` (`/tmp` when unset; a relative one is fine), `/tmp`, then the socket's directory (named `.sockat.XXXXXXXXXX` there), the first where D can be made. A place needs to be neither safe (sticky, ...) nor short: D is held by its fd and no spelling names the place
 - When a place cannot be opened, D cannot be created, the check fails, D cannot be set to 0700 or R (`s` when proc-held asks for D first) cannot be created, the next place is tried
 - When D just made cannot be opened (a umask took the owner's bits: search on Apple OSes, read on targets other than Linux and Apple OSes), it is looked up by its name and removed if it passes the checks of 2, and the next place is tried. Should it be replaced between that look-up and the removal, only an empty directory can be removed
-- The spelling is `R/<file name>`, so the file name has R's 11 bytes less than the sockaddr length (up to 96 bytes on Linux / illumos, 92 on Apple OSes / the BSDs; about 79 for proc). A bind on macOS reaches longer ones first by [symlink-file](#symlink-file)
+- The spelling is `R/<file name>`, so the file name has R's 11 bytes less than the sockaddr length (up to 96 bytes on Linux / illumos, 92 on Apple OSes / the BSDs; about 79 for proc). A bind on macOS and NetBSD reaches longer ones first by [symlink-file](#symlink-file)
 - D is opened `O_PATH` on Linux, `O_SEARCH` on Apple OSes, `O_RDONLY` elsewhere. It is set to 0700 by `chmod` of `/proc/self/fd/<fd>` on Linux with `/proc`, by `fchmod` of D opened again by name `O_RDONLY` and checked to be the same directory on Linux without `/proc`, by `fchmod` elsewhere
 - The routes through D do not open the socket's directory (only D made in it does); R reaches it with search permission alone. A directory without read permission is reached with the same permission as a plain bind / connect
 
@@ -164,7 +165,7 @@ A `bind` never uses it: the address of a socket bound so does not fit `sockaddr_
 A symlink `sockat.XXXXXXXXXX` to the socket file is made in a place, the bind / connect goes by its spelling `<place>/sockat.XXXXXXXXXX`, and it is removed at once. The spelling holds no file name, so neither the file name length nor the directory depth matters (22 bytes through `/tmp`).
 
 - connect: last in the connect order (not on FreeBSD)
-- bind: right after standard (not on Linux / Android). It puts the socket at the path only where a bind follows a symlink in the last component (checked on macOS; Linux does not, so it is not tried there; other OSes are told at run time). When the bind fails, the path is looked up (`lstat`): something there makes that error (`EADDRINUSE`, ...) the result, and nothing later is tried; nothing there, or nothing that can be told, is taken for a kernel that did not follow the symlink, and the next route is tried (a real failure fails that route the same way and is returned there)
+- bind: right after standard (not on Linux / Android, FreeBSD, OpenBSD or illumos). It puts the socket at the path only where a bind follows a symlink in the last component (checked on macOS and NetBSD; Linux / Android, FreeBSD, OpenBSD and illumos do not, so it is not tried there; other OSes are told at run time). When the bind fails, the path is looked up (`lstat`): something there makes that error (`EADDRINUSE`, ...) the result, and nothing later is tried; nothing there, or nothing that can be told, is taken for a kernel that did not follow the symlink, and the next route is tried (a real failure fails that route the same way and is returned there)
 - The address the kernel reports for a bind is the symlink's spelling. Removing by it does not follow the symlink in the last component and removes only the entry in the place (another user's entry in a shared sticky place cannot be removed), so all that is given up is `respelled`
 - The symlink points to the socket file's spelling (made absolute against the cwd when relative)
 
@@ -222,10 +223,11 @@ When a path too long for std is `ENAMETOOLONG` (assuming the directory exists an
 | FreeBSD | file name over 92 bytes | file name over 103 bytes | file name over 103 bytes |
 | macOS | always reached (symlink-file); without symlink-file, file name over 92 bytes | the path and the relative path over 253 bytes, thread-cwd unusable (file name over 92 bytes, or the thread cwd unusable), and no symlink-file | file name over 253 bytes, and no symlink-file |
 | iOS and the other Apple OSes | file name over 92 bytes | as macOS | as macOS |
-| NetBSD / OpenBSD / other BSDs | file name over 92 bytes | relative over 103 bytes, and no symlink-file | file name over 103 bytes, and no symlink-file |
+| NetBSD | always reached (symlink-file); without symlink-file, file name over 92 bytes | relative over 103 bytes, and no symlink-file | file name over 103 bytes, and no symlink-file |
+| OpenBSD / other BSDs | file name over 92 bytes | relative over 103 bytes, and no symlink-file | file name over 103 bytes, and no symlink-file |
 | illumos | file name over 96 bytes | relative over 107 bytes, and no symlink-file | file name over 107 bytes, and no symlink-file |
 
-- The bind column counts symlink-file on macOS only. Linux does not follow a symlink in a bind, so it is not tried there; on the other OSes whether a bind follows it has not been checked, and the column does not count it (where it does, the path is reached)
+- The bind column counts symlink-file only on macOS and NetBSD, where a bind was checked to follow a symlink. Linux, FreeBSD, OpenBSD and illumos do not, so it is not tried there; on the other OSes whether a bind follows it has not been checked, and the column does not count it (where it does, the path is reached)
 - On Linux without the thread cwd (a seccomp filter, ...), a bind takes proc for a file name of up to about 79 bytes and fork-cwd up to 96
 - When D can be made nowhere, a bind reaches a file name of up to 88 bytes (84 on Apple OSes / the BSDs) by the form without D (when the socket's directory can be opened and R made in it). The connects reach what the routes of the connect order that do not use D reach (proc-direct, relative, widened, symlink-file, at-direct; without proc-held either)
 - symlink-dir's spelling (`bind_ex` with `LastResort::Allow`) is longer than those through D, so it does not reach a longer file name than `bind`. It reaches the path when neither D nor the form without D can be used; it is `ENAMETOOLONG` as well when no place makes the spelling fit 103 / 107 bytes
@@ -336,11 +338,13 @@ On FreeBSD at-direct reaches file names of up to 103 bytes, so fork-cwd-direct i
 
 R (and `.sockat.XXXXXXXXXX`, the place's symlink) is gone once the bind has returned, so removing, `stat`ing or `chmod`ing by the reported address normally hits nothing (however the fd number is reused). Others can see the spelling, though, and once they make it again it can hit something ([respelled](#respelled); for symlink-dir in a shared place [recreatable-spelling](#recreatable-spelling)). Removing by symlink-file's spelling removes only the entry in the place (the symlink's name). It does not reach the socket either: keep the path you passed and use that (or `bind_ex` to remove the file; [Patterns not to use](#patterns-not-to-use)). The same spelling shows in `Debug` output and in what frameworks log or hand out as the peer address.
 
+On illumos, `peer_addr()` of a connected stream reports not the spelling the listener was bound by but the spelling the connect handed to the kernel (observed in CI: a connect through symlink-file got `<place>/sockat.XXXXXXXXXX`). This is illumos's `getpeername`; as on the other OSes, it is not the path.
+
 On OpenBSD, std's `local_addr()` drops the last byte of the path even for a short path of up to 103 bytes (which sockat hands to std unchanged), as observed in CI. This is std's / the OS's behaviour, not sockat's: std's `UnixListener::bind` alone does the same.
 
 ### A bind reaches a shorter file name than a connect
 
-A spelling through D carries R's 11 bytes, so a bind through D reaches file names of up to 96 bytes on Linux / illumos and 92 on Apple OSes / the BSDs. On macOS a bind reaches any file name length through symlink-file. A connect normally reaches any file name length through the routes without R (proc-held, symlink-file, ...).
+A spelling through D carries R's 11 bytes, so a bind through D reaches file names of up to 96 bytes on Linux / illumos and 92 on Apple OSes / the BSDs. On macOS and NetBSD a bind reaches any file name length through symlink-file. A connect normally reaches any file name length through the routes without R (proc-held, symlink-file, ...).
 
 ### A path that does not end with a file name is InvalidInput
 
@@ -562,6 +566,6 @@ let stream = tokio::net::UnixStream::from_std(stream)?;
 ## Not checked
 
 - Android has not even been compiled. It uses the same routes as Linux. Android apps run under a seccomp filter, so thread-cwd is not expected to be used there (not checked)
-- NetBSD, OpenBSD, illumos and FreeBSD run the tests in CI VMs. Whether a bind follows a symlink there (symlink-file), the peer credentials (pid) of a connect through fork-cwd-direct and the server's peer a client sees after a fork-route bind have not been checked there
+- NetBSD, OpenBSD, illumos and FreeBSD run the tests in CI VMs. The peer credentials (pid) of a connect through fork-cwd-direct and the server's peer a client sees after a fork-route bind have not been checked there
 - The error of a nonblocking connect on a full backlog, and that a connect completes within the call, have been checked on Linux and macOS only
 - Apple OSes other than macOS (iOS, ...) use the same routes as macOS, but only iOS's clippy has been run. Whether they have `pthread_fchdir_np` has not been checked either (without it, thread-cwd counts as unusable and the next is tried)

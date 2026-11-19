@@ -15,7 +15,8 @@
 //! A path longer than [`DIRECT_MAX`] goes:
 //!
 //! * **bind** ([`bind_order`]): symlink-file where a bind may follow a symlink
-//!   (not Linux), then the means through D in order ([`bind_through_d`]).
+//!   (not Linux, FreeBSD, OpenBSD or illumos, measured not to), then the
+//!   means through D in order ([`bind_through_d`]).
 //!   When D can be made nowhere, R is made beside the socket instead and the
 //!   same means are tried with `.sockat.XXXXXXXXXX/<file name>` relative to
 //!   the socket's directory's fd. Then, as the last resort, symlink-dir, or
@@ -204,8 +205,9 @@ pub(crate) enum Route {
     WidenedRelative,
     /// symlink-file: a short temporary symlink to the socket file in a safe
     /// place, in the plain sockaddr ([`links::symlink_file`]). A connect's
-    /// route (not FreeBSD), and a bind's where the bind follows the symlink
-    /// (not Linux).
+    /// route (not FreeBSD), and a bind's where the bind may follow the
+    /// symlink ([`bind_order`]).
+    #[cfg(not(target_os = "freebsd"))]
     SymlinkFile,
     /// symlink-dir (`bind_ex`'s last resort only): a temporary symlink in a
     /// place to the socket's directory, and the bind by `<link>/<name>`
@@ -276,6 +278,7 @@ impl Route {
             Route::Relative => names::RELATIVE,
             #[cfg(target_vendor = "apple")]
             Route::Widened | Route::WidenedRelative => names::WIDENED,
+            #[cfg(not(target_os = "freebsd"))]
             Route::SymlinkFile => names::SYMLINK_FILE,
             Route::SymlinkDir { .. } => names::SYMLINK_DIR,
             #[cfg(target_os = "freebsd")]
@@ -562,13 +565,23 @@ pub(crate) struct Config {
     /// Where D may be made, in the order tried ([`Config::from_vars`]).
     pub(crate) own_dir_places: Vec<Place>,
     /// Where the temporary symlink of symlink-file (a connect's, and a
-    /// bind's where the bind follows it) may go, in the order tried: `TMPDIR`
-    /// when it is set to an absolute path, then `/tmp`.
+    /// bind's where the bind may follow it) may go, in the order tried:
+    /// `TMPDIR` when it is set to an absolute path, then `/tmp`. Not on
+    /// FreeBSD, which has no symlink-file.
+    #[cfg(not(target_os = "freebsd"))]
     pub(crate) file_link_places: Vec<PathBuf>,
-    /// Whether a bind tries symlink-file at all (not Linux, where a bind does
-    /// not follow a symlink and the route is not in the order). Always `true`
-    /// outside the tests, which turn it off to look at the routes after it.
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    /// Whether a bind tries symlink-file at all (only where the route is in
+    /// the bind's order: not on the OSes whose bind was measured not to
+    /// follow a symlink, Linux / Android, FreeBSD, OpenBSD and illumos).
+    /// Always `true` outside the tests, which turn it off to look at the
+    /// routes after it.
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "illumos"
+    )))]
     pub(crate) symlink_file_bind: bool,
     /// Where the temporary symlink of symlink-dir (`bind_ex`'s last resort)
     /// may go, the candidates in order: `XDG_RUNTIME_DIR`, then `TMPDIR`, each
@@ -666,6 +679,7 @@ impl Config {
             own_dir_places.push(Place::Path(tmp.to_path_buf()));
         }
         own_dir_places.push(Place::SocketDir);
+        #[cfg(not(target_os = "freebsd"))]
         let file_link_places = tmpdir
             .filter(|t| t.is_absolute() && t != tmp)
             .into_iter()
@@ -673,8 +687,15 @@ impl Config {
             .collect();
         Self {
             own_dir_places,
+            #[cfg(not(target_os = "freebsd"))]
             file_link_places,
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "illumos"
+            )))]
             symlink_file_bind: true,
             dir_link_places,
             #[cfg(target_vendor = "apple")]
@@ -695,7 +716,8 @@ impl Config {
 struct Target<'a> {
     req: Request,
     /// The path as given (relative, widened, proc-held and symlink-file
-    /// spell it).
+    /// spell it; FreeBSD has none of them).
+    #[cfg(not(target_os = "freebsd"))]
     path: &'a Path,
     dir: &'a Path,
     name: &'a OsStr,
@@ -818,6 +840,7 @@ pub(crate) fn run_long_with(
     (cfg.between_cwd_lookups)();
     let mut t = Target {
         req,
+        #[cfg(not(target_os = "freebsd"))]
         path,
         dir,
         name,
@@ -951,12 +974,20 @@ fn skip_all(
     }
 }
 
-/// The routes of a bind: symlink-file where a bind may follow a symlink (not
-/// Linux; [`links::symlink_file`]), [`bind_through_d`], then the last resort
+/// The routes of a bind: symlink-file where a bind may follow a symlink
+/// ([`links::symlink_file`]; the Apple OSes and NetBSD, measured to follow,
+/// and the OSes not measured; not Linux / Android, FreeBSD, OpenBSD or
+/// illumos, measured not to), [`bind_through_d`], then the last resort
 /// symlink-dir ([`links::bind_through`]) when the options allow it. `None`
 /// (and so `ENAMETOOLONG`) when no route could be used.
 fn bind_order(t: &Target<'_>, options: BindOptions) -> Option<Call> {
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "illumos"
+    )))]
     if t.cfg.symlink_file_bind {
         if let Step::Done(call) = links::symlink_file(t) {
             return Some(call);
@@ -1164,6 +1195,7 @@ fn remember_by_real_path(t: &Target<'_>) -> io::Result<()> {
 
 /// `path` made absolute against the cwd, or `None` when the cwd cannot be
 /// read: what symlink-file and proc-held point to.
+#[cfg(not(target_os = "freebsd"))]
 fn absolute(path: &Path) -> Option<PathBuf> {
     if path.is_absolute() {
         return Some(path.to_path_buf());
@@ -2348,13 +2380,14 @@ pub(crate) mod links {
     /// ([`symlink_file_at`]).
     ///
     /// A bind through it reaches the path only where the kernel follows the
-    /// symlink in the last component (macOS; not Linux, where the route is
-    /// not in the order). When the bind fails, what is at the path decides
+    /// symlink in the last component (macOS, NetBSD; the route is in the
+    /// bind's order only where it may, [`bind_order`]). When the bind fails, what is at the path decides
     /// (hub DR-0016): something there makes it the real failure, returned as
     /// it is (`EADDRINUSE`, ...); nothing there, or nothing that can be told,
     /// means the kernel did not follow the symlink, and the route is passed
     /// over (a real failure fails the next route the same way and is returned
     /// there).
+    #[cfg(not(target_os = "freebsd"))]
     pub(super) fn symlink_file(t: &Target<'_>) -> Step {
         let Some(target) = absolute(t.path) else {
             t.skip(names::SYMLINK_FILE, names::CWD_UNREADABLE);
@@ -2399,6 +2432,7 @@ pub(crate) mod links {
     /// anything is created. Nothing is left under `base`: the symlink is
     /// removed when this returns (including on panic) whatever the outcome.
     /// `Err` with why when `base` cannot be used ([`names`]).
+    #[cfg(not(target_os = "freebsd"))]
     pub(crate) fn symlink_file_at(
         req: Request,
         base: &Path,

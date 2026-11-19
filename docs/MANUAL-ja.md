@@ -68,13 +68,14 @@ std が受け付ける長さ (標準に渡す長さ) までのパスは std に�
 | Linux / Android | [thread-cwd](#thread-cwd) → [proc](#proc) → [fork-cwd](#fork-cwd) | [proc-direct](#proc-direct) → thread-cwd → proc → [proc-held](#proc-held) → [symlink-file](#symlink-file) |
 | Linux / Android (`/proc` 無し) | thread-cwd → fork-cwd | [relative](#relative) → thread-cwd → symlink-file |
 | macOS / iOS 等 Apple の OS | symlink-file → thread-cwd → fork-cwd | relative → [widened](#widened) → thread-cwd → symlink-file |
-| FreeBSD | symlink-file → [at](#at) | [at-direct](#at-direct) → at |
-| NetBSD / OpenBSD / illumos / その他の Unix | symlink-file → fork-cwd | relative → symlink-file |
+| FreeBSD | [at](#at) | [at-direct](#at-direct) → at |
+| NetBSD / その他の Unix | symlink-file → fork-cwd | relative → symlink-file |
+| OpenBSD / illumos | fork-cwd | relative → symlink-file |
 | Windows | 対象外 (Unix 以外では compile エラー) | |
 
 - 長いパスの前に [standard](#standard) が試され、長さで使えない
 - connect は、書き込みもスレッドも要らない経路 (proc-direct・relative・widened・at-direct) を先に、D を作る経路 (thread-cwd・proc・proc-held・at) とスレッドを立てる経路 (thread-cwd)、symlink を作る経路をその後に試す。前の経路で届けば D も symlink も作らない
-- `bind` の symlink-file は、bind が symlink を辿らない Linux / Android では試さない。他の OS では、辿るかを実行時に見分ける ([symlink-file](#symlink-file))
+- `bind` の symlink-file は、bind が symlink を辿らないと確かめた OS (Linux / Android、FreeBSD、OpenBSD、illumos) では試さない。辿ると確かめたのは macOS と NetBSD。他の OS では、辿るかを実行時に見分ける ([symlink-file](#symlink-file))
 - `bind` は D をどこにも作れない時、D を通す経路と同じ順を [D 無しの形](#d-無しの形) (`-sockdir`) で試す
 - `_ex` は `LastResort::Avoid` なら既定の関数と同じ順に試す。`LastResort::Allow` なら、その後に最終手段を試す: `bind_ex` は [symlink-dir](#symlink-dir)、`connect_ex` 系は [fork-cwd-direct](#fork-cwd-direct) ([後始末と診断つきの _ex](#後始末と診断つきの-_ex))
 - 最初にソケットのディレクトリを `stat` で引く。無ければ `ENOENT` (ファイル名の長さによらない)
@@ -98,7 +99,7 @@ std にそのまま渡す。パスが std にそのまま渡す長さ以下の�
 - **D の置き場**は `TMPDIR` (未設定なら `/tmp`。相対パスでもよい)、`/tmp`、ソケットのディレクトリ (名前は `.sockat.XXXXXXXXXX`) の順。最初に D を作れた所を使う。置き場は安全 (sticky 等) でなくても深くてもよい (D は fd で掴み、綴りに置き場が出ない)
 - 置き場を開けない、D を作れない、確かめた結果が違う、0700 にそろえられない、R (proc-held が最初に D を求めた時は `s`) を作れない時は、次の置き場に進む
 - 作った直後の D を開けない時 (umask が持ち主のビットを削り、Apple の OS は検索、Linux と Apple の OS 以外は読み取りの権限が無い) は、名前で引いて 2 の条件を満たせば消し、次の置き場に進む。名前で確かめてから消すまでに差し替えられても、空のディレクトリしか消えない
-- 綴りは `R/<ファイル名>` で、R の 11 バイトの分、ファイル名は sockaddr に入る長さより短くなる (Linux / illumos 96 バイト、Apple の OS / BSD 92 バイトまで。proc はおよそ 79 バイトまで)。macOS の bind は [symlink-file](#symlink-file) が先に届くので、この上限は効かない
+- 綴りは `R/<ファイル名>` で、R の 11 バイトの分、ファイル名は sockaddr に入る長さより短くなる (Linux / illumos 96 バイト、Apple の OS / BSD 92 バイトまで。proc はおよそ 79 バイトまで)。macOS と NetBSD の bind は [symlink-file](#symlink-file) が先に届くので、この上限は効かない
 - D は Linux では `O_PATH`、Apple の OS では `O_SEARCH`、他の OS では `O_RDONLY` で開く。0700 にそろえるのは、`/proc` を使える Linux は `/proc/self/fd/<fd>` の `chmod`、`/proc` の無い Linux は名前で `O_RDONLY` で開き直して同じ物か照合してから `fchmod`、他は `fchmod`
 - D を通す経路はソケットのディレクトリを開かず (開くのは D をソケットのディレクトリに作る時だけ)、R を通して検索権限だけで届く。読み取り権限の無いディレクトリでも、通常の bind / connect と同じ権限で届く
 
@@ -164,7 +165,7 @@ Apple の OS。relative の次。XNU は `sun_path` が 104 バイトを超え�
 置き場に、ソケットのファイルを指す `sockat.XXXXXXXXXX` の symlink を作り、その綴り `<置き場>/sockat.XXXXXXXXXX` で bind / connect して、すぐ消す。綴りにファイル名が出ないので、ファイル名の長さにもディレクトリの深さにもよらない (`/tmp` なら 22 バイト)。
 
 - connect: connect の順の最後 (FreeBSD 以外)
-- bind: standard の次 (Linux / Android 以外)。bind が最後の要素の symlink を辿る OS でだけ元のパスにソケットができる (macOS で確かめた。Linux は辿らないので試さない。他の OS は実行時に見分ける)。bind が失敗した時は元のパスを `lstat` し、物があればそのエラー (`EADDRINUSE` 等) を返して次を試さない。無いか確かめられなければ、カーネルが辿らなかったとみなして次の経路に進む (本当の失敗なら次の経路でも同じ失敗になり、そこで返る)
+- bind: standard の次 (Linux / Android、FreeBSD、OpenBSD、illumos 以外)。bind が最後の要素の symlink を辿る OS でだけ元のパスにソケットができる (macOS と NetBSD で確かめた。Linux / Android、FreeBSD、OpenBSD、illumos は辿らないので試さない。他の OS は実行時に見分ける)。bind が失敗した時は元のパスを `lstat` し、物があればそのエラー (`EADDRINUSE` 等) を返して次を試さない。無いか確かめられなければ、カーネルが辿らなかったとみなして次の経路に進む (本当の失敗なら次の経路でも同じ失敗になり、そこで返る)
 - bind でカーネルが返すアドレスは symlink の綴り。その綴りで消しても、最後の要素の symlink は辿られず置き場の中の項目が消えるだけ (共有の sticky な置き場では他人の項目は消せない) なので、失うのは `respelled` だけ
 - symlink の先はソケットのファイルの綴り (相対パスなら cwd を前に付ける)
 
@@ -222,10 +223,11 @@ std にそのまま渡せない長さのパスが `ENAMETOOLONG` になる時 (�
 | FreeBSD | ファイル名が 92 バイトを超える | ファイル名が 103 バイトを超える | ファイル名が 103 バイトを超える |
 | macOS | 届く (symlink-file)。symlink-file が使えない時はファイル名が 92 バイトを超える | 元のパスも相対パスも 253 バイトを超え、thread-cwd が使えず (ファイル名が 92 バイトを超えるかスレッド cwd が使えない)、symlink-file も使えない | ファイル名が 253 バイトを超え、symlink-file も使えない |
 | iOS 等 macOS 以外の Apple の OS | ファイル名が 92 バイトを超える | macOS と同じ | macOS と同じ |
-| NetBSD / OpenBSD / その他の BSD | ファイル名が 92 バイトを超える | relative が 103 バイトを超え、symlink-file も使えない | ファイル名が 103 バイトを超え、symlink-file も使えない |
+| NetBSD | 届く (symlink-file)。symlink-file が使えない時はファイル名が 92 バイトを超える | relative が 103 バイトを超え、symlink-file も使えない | ファイル名が 103 バイトを超え、symlink-file も使えない |
+| OpenBSD / その他の BSD | ファイル名が 92 バイトを超える | relative が 103 バイトを超え、symlink-file も使えない | ファイル名が 103 バイトを超え、symlink-file も使えない |
 | illumos | ファイル名が 96 バイトを超える | relative が 107 バイトを超え、symlink-file も使えない | ファイル名が 107 バイトを超え、symlink-file も使えない |
 
-- bind の欄で symlink-file を数えているのは macOS だけ。Linux は bind が symlink を辿らないので試さない。他の OS は辿るかを確かめていないので、欄は symlink-file を数えていない (辿れば届く)
+- bind の欄で symlink-file を数えているのは、bind が symlink を辿ると確かめた macOS と NetBSD だけ。Linux・FreeBSD・OpenBSD・illumos は辿らないので試さない。他の OS は辿るかを確かめていないので、欄は symlink-file を数えていない (辿れば届く)
 - Linux でスレッド cwd が使えない時 (seccomp の filter 等)、bind はファイル名およそ 79 バイトまで proc、その先 96 バイトまでは fork-cwd
 - D をどこにも作れない時、bind は D 無しの形でファイル名 88 バイト (Apple の OS / BSD は 84) まで届く (ソケットのディレクトリを開けて R を作れる時)。connect 系は connect の順のうち D を使わない経路 (proc-direct・relative・widened・symlink-file・at-direct) の分だけ届く (proc-held も使えない)
 - `LastResort::Allow` の `bind_ex` の symlink-dir の綴りは D を通す経路の綴りより長いので、`bind` より長いファイル名には届かない。届くのは、D も D 無しの形も使えない時。綴りが 103 / 107 バイトに収まる置き場が無い時も `ENAMETOOLONG`
@@ -336,11 +338,13 @@ FreeBSD では at-direct がファイル名 103 バイトまで届くので、fo
 
 R (と `.sockat.XXXXXXXXXX`、置き場の symlink) は bind の後に消えているので、返ってきた綴りでファイルを消す・`stat` する・`chmod` しても、普段は何にも当たらない (fd の番号が使い回されても)。ただし綴りは他の利用者に見えうるので、作り直されると当たりうる ([respelled](#respelled)、共有の置き場の symlink-dir は [recreatable-spelling](#recreatable-spelling))。symlink-file の綴りで消しても、置き場の中の項目 (symlink の名前) が消えるだけ。ソケット自体にも当たらないので、元のパスは自分で持っておき、それを使う (消すなら `bind_ex` も使える。[使ってはいけない書き方](#使ってはいけない書き方))。同じ綴りは `Debug` の表示や、フレームワークのログ・接続元の情報にも出る。
 
+illumos では、connect したストリームの `peer_addr()` が、listener を bind した綴りでなく、connect した時にカーネルに渡した綴りを返す (CI で観測。symlink-file で connect して `<置き場>/sockat.XXXXXXXXXX` が返った)。illumos の `getpeername` の振る舞いで、元のパスでない点は他の OS と同じ。
+
 OpenBSD では、103 バイト以内の短いパス (sockat は std にそのまま渡す) でも、std の `local_addr()` がパスの末尾 1 バイトを欠いて返す (CI で観測)。sockat ではなく std / OS の振る舞いで、std の `UnixListener::bind` を直接使っても同じになる。
 
 ### bind できるファイル名は connect より短い
 
-D を通す経路の綴りには R の 11 バイトが入るので、それで bind できるファイル名は Linux / illumos で 96 バイト、Apple の OS / BSD で 92 バイトまで。macOS の bind は symlink-file で、ファイル名の長さによらず届く。connect は R を挟まない経路 (proc-held、symlink-file 等) で、ふつうはファイル名の長さによらず届く。
+D を通す経路の綴りには R の 11 バイトが入るので、それで bind できるファイル名は Linux / illumos で 96 バイト、Apple の OS / BSD で 92 バイトまで。macOS と NetBSD の bind は symlink-file で、ファイル名の長さによらず届く。connect は R を挟まない経路 (proc-held、symlink-file 等) で、ふつうはファイル名の長さによらず届く。
 
 ### 名前で終わらないパスは InvalidInput
 
@@ -562,6 +566,6 @@ let stream = tokio::net::UnixStream::from_std(stream)?;
 ## 確かめていないこと
 
 - Android は compile もしていない。Linux と同じ経路を使う。Android のアプリは seccomp の filter の下で動くので、スレッド cwd は使われない見込み (確かめていない)
-- NetBSD・OpenBSD・illumos・FreeBSD は CI の VM で試験を回している。bind が symlink を辿るか (symlink-file)、fork-cwd-direct で connect した時の peer の資格情報 (pid) の振る舞いと、fork の経路で bind した時にクライアントに見えるサーバの peer は確かめていない
+- NetBSD・OpenBSD・illumos・FreeBSD は CI の VM で試験を回している。fork-cwd-direct で connect した時の peer の資格情報 (pid) の振る舞いと、fork の経路で bind した時にクライアントに見えるサーバの peer は確かめていない
 - ブロックしない connect が backlog の満杯で返すエラーと、connect が呼び出しの中で終わることは、Linux と macOS でだけ確かめた
 - macOS 以外の Apple の OS (iOS 等) は macOS と同じ経路を使うが、確かめたのは iOS の clippy だけ。`pthread_fchdir_np` があるかも確かめていない (無ければ thread-cwd は使えないとして次へ進む)

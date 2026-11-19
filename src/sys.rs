@@ -688,8 +688,9 @@ pub(crate) fn mkdir_at(dir: BorrowedFd<'_>, name: &OsStr, mode: u32) -> io::Resu
 
 /// `openat(2)` of the directory `name` inside the directory `dir`, with
 /// `flags` (the access mode, `O_PATH` or `O_SEARCH`) plus `O_DIRECTORY`,
-/// `O_NOFOLLOW` and `O_CLOEXEC`: a symlink at `name` is refused (`ELOOP`, or
-/// `ENOTDIR` with `O_DIRECTORY` on Linux), and so is anything but a directory.
+/// `O_NOFOLLOW` and `O_CLOEXEC`: a symlink at `name` is refused (`ELOOP`;
+/// `ENOTDIR` with `O_DIRECTORY` on Linux, `EMLINK` on FreeBSD, `EFTYPE` on
+/// NetBSD), and so is anything but a directory.
 pub(crate) fn open_dir_at(
     dir: BorrowedFd<'_>,
     name: &OsStr,

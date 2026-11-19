@@ -34,17 +34,18 @@ std が受け付ける長さ (`sun_path` − 1) のパスは std にそのまま
 | Linux / Android / illumos | 107 バイトまで |
 | macOS / iOS / FreeBSD / NetBSD / OpenBSD | 103 バイトまで |
 
-それを超えるパスの bind は、bind が symlink を辿る OS (macOS 等。Linux は辿らない) では、まず**symlink-file** (置き場に作った、ソケットのファイルを指す symlink を通す。綴りにファイル名が出ないので、ファイル名の長さによらず届く) で、それが使えなければ**D を通す経路**で届く。自分専用のディレクトリ D (`sockat.XXXXXXXXXX`、mode 0700) を作って fd で掴み、その中に乱数の名前の symlink R (ソケットのディレクトリを指す) を作り、D の fd を基準に `R/<ファイル名>` で bind して、R と D を消す。カーネルが覚える綴りは `R/<ファイル名>` で、R はもう無いので、後でどこで解決されても何にも当たらない。経路の名前は [sockat の仕様](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md) の「経路の名前」と同じ。
+それを超えるパスの bind は、bind が symlink を辿る OS (macOS・NetBSD 等。Linux・FreeBSD・OpenBSD・illumos は辿らない) では、まず**symlink-file** (置き場に作った、ソケットのファイルを指す symlink を通す。綴りにファイル名が出ないので、ファイル名の長さによらず届く) で、それが使えなければ**D を通す経路**で届く。自分専用のディレクトリ D (`sockat.XXXXXXXXXX`、mode 0700) を作って fd で掴み、その中に乱数の名前の symlink R (ソケットのディレクトリを指す) を作り、D の fd を基準に `R/<ファイル名>` で bind して、R と D を消す。カーネルが覚える綴りは `R/<ファイル名>` で、R はもう無いので、後でどこで解決されても何にも当たらない。経路の名前は [sockat の仕様](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md) の「経路の名前」と同じ。
 
 | OS | bind (この順) |
 |---|---|
 | Linux / Android | thread-cwd → proc → fork-cwd |
 | macOS / iOS 等 Apple の OS | symlink-file → thread-cwd → fork-cwd |
-| FreeBSD | symlink-file → at |
-| NetBSD / OpenBSD / illumos / その他の Unix | symlink-file → fork-cwd |
+| FreeBSD | at |
+| NetBSD / その他の Unix | symlink-file → fork-cwd |
+| OpenBSD / illumos | fork-cwd |
 | Windows | 対象外 (compile エラー) |
 
-- **symlink-file**: bind が失敗した時に元のパスに物があれば、それが本当の失敗 (`EADDRINUSE` 等)。無ければカーネルが symlink を辿らなかったとみなして次の経路へ進む (辿るかを確かめたのは macOS だけ)
+- **symlink-file**: bind が失敗した時に元のパスに物があれば、それが本当の失敗 (`EADDRINUSE` 等)。無ければカーネルが symlink を辿らなかったとみなして次の経路へ進む (辿ると確かめたのは macOS と NetBSD。辿らないと確かめた OS では試さない)
 
 - **thread-cwd**: 使い捨てのスレッドだけ cwd を D に移す (Linux は `unshare(CLONE_FS)` と `fchdir`、Apple の OS は `pthread_fchdir_np`)。副作用が無いので、どの関数も試す。seccomp の filter が掛かった Linux では使わない
 - **proc**: `/proc/self/fd/<D の fd>/R/<ファイル名>` で渡す
@@ -97,8 +98,8 @@ if losses.contains(&Loss::Forked) {
 
 ## 長いパスで std と違う点
 
-- `local_addr()` / `peer_addr()` は元のパスを返さず、bind の時にカーネルに渡した綴り (`R/<ファイル名>`、`/proc/self/fd/<fd>/R/<ファイル名>`、symlink-file の `<置き場>/sockat.XXXXXXXXXX` 等) を返す。R も置き場の symlink ももう無いので何にも当たらない。元のパスは自分で持っておく
-- D を通す経路で bind できるファイル名は R の分だけ短い (Linux / illumos 96 バイト、Apple の OS / BSD 92 バイトまで)。macOS の bind は symlink-file で、ファイル名の長さによらず届く
+- `local_addr()` / `peer_addr()` は元のパスを返さず、bind の時にカーネルに渡した綴り (`R/<ファイル名>`、`/proc/self/fd/<fd>/R/<ファイル名>`、symlink-file の `<置き場>/sockat.XXXXXXXXXX` 等) を返す (illumos の `peer_addr()` は connect の時に渡した綴り)。R も置き場の symlink ももう無いので何にも当たらない。元のパスは自分で持っておく
+- D を通す経路で bind できるファイル名は R の分だけ短い (Linux / illumos 96 バイト、Apple の OS / BSD 92 バイトまで)。macOS と NetBSD の bind は symlink-file で、ファイル名の長さによらず届く
 - std にそのまま渡せない長さのパスで、名前で終わらないもの (`dir/`、`dir/.`、`..` で終わるもの) は `InvalidInput` になる
 - その他 (fork の副作用、ディレクトリを先に引くこと、途中でプロセスが死ぬと D や R が残りうること) は [docs/MANUAL-ja.md](./docs/MANUAL-ja.md#長いパスで-std-と違う点)
 

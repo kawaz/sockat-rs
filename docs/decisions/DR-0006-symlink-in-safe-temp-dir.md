@@ -9,7 +9,7 @@
 
 ## Decision
 
-connect の順 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) の最後に置く (FreeBSD 以外)。bind が最後の要素の symlink を辿る OS では、bind でも standard の次に試す (Linux / Android 以外。辿るかの見分け方は DR-0027)。bind でカーネルが返すアドレスは symlink の綴りで、その綴りで消しても置き場の中の項目が消えるだけなので、失うのは `respelled` だけ。ソケットのディレクトリを指す symlink (symlink-dir) は綴りを他人が作り直せるので、既定の bind には使わない ([DR-0031](DR-0031-ex-functions.md) の最終手段だけ)。
+connect の順 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) の最後に置く (FreeBSD 以外)。bind が最後の要素の symlink を辿る OS では、bind でも standard の次に試す (辿らないと実測した Linux / Android、FreeBSD、OpenBSD、illumos 以外。辿るかの見分け方は DR-0027)。bind でカーネルが返すアドレスは symlink の綴りで、その綴りで消しても置き場の中の項目が消えるだけなので、失うのは `respelled` だけ。ソケットのディレクトリを指す symlink (symlink-dir) は綴りを他人が作り直せるので、既定の bind には使わない ([DR-0031](DR-0031-ex-functions.md) の最終手段だけ)。
 
 ### 置き場
 

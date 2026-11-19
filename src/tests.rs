@@ -166,22 +166,41 @@ fn at(p: &Path) -> Place {
 /// among them as [`Place::SocketDir`]) and a connect's symlink may go in
 /// `links` (not on FreeBSD, which has no such route). The widened sockaddr is
 /// on (Apple), /proc is looked for where it is (Linux), the thread-cwd means
-/// is on (Linux, Apple).
+/// is on (Linux, Apple). A bind's symlink-file, where the bind's order has
+/// it, is off ([`with_symlink_file_bind`]).
 fn config(places: &[Place], links: &[&Path]) -> Config {
     let mut c = Config::from_vars(None, None);
     c.own_dir_places = places.to_vec();
-    c.file_link_places = links.iter().map(|b| b.to_path_buf()).collect();
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        c.file_link_places = links.iter().map(|b| b.to_path_buf()).collect();
+    }
+    #[cfg(target_os = "freebsd")]
+    let _ = links;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "illumos"
+    )))]
     {
         c.symlink_file_bind = false;
     }
     c
 }
 
-/// `c` with a bind's symlink-file on (where a bind may follow a symlink: not
-/// Linux), as outside the tests: [`config`] turns it off so a bind goes on to
-/// the routes through D.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+/// `c` with a bind's symlink-file on, as outside the tests: [`config`] turns
+/// it off so a bind goes on to the routes through D. Only where the bind's
+/// order has the route: not on the OSes whose bind was measured not to follow
+/// a symlink (Linux / Android, FreeBSD, OpenBSD, illumos).
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "illumos"
+)))]
 fn with_symlink_file_bind(c: Config) -> Config {
     Config {
         symlink_file_bind: true,
@@ -687,8 +706,10 @@ fn a_missing_directory_is_enoent_even_when_the_name_fits_no_sockaddr() {
 // * bind: the spellings through D and beside the socket hold the file name in
 //   the plain sockaddr (`R/<name>`, `.sockat.XXXXXXXXXX/<name>`), so they do
 //   not reach it: ENAMETOOLONG, and nothing is created, where a bind does not
-//   follow a symlink (Linux). On macOS the bind goes through symlink-file,
-//   whose spelling holds no file name, and reaches it (hub DR-0016).
+//   follow a symlink (Linux / Android, FreeBSD, OpenBSD, illumos; symlink-file
+//   is not in their bind's order). On macOS and NetBSD the bind goes through
+//   symlink-file, whose spelling holds no file name, and reaches it (hub
+//   DR-0016).
 // * connect: the routes that keep the file name out of the spelling reach the
 //   socket file (on Linux with /proc the symlink in D, `/proc/self/fd/<n>/s`;
 //   elsewhere the symlink to the file under /tmp), so the name's length does
@@ -702,7 +723,7 @@ fn a_file_name_of_254_bytes_is_bound_only_through_symlink_file_but_connected_to(
     let t = tmp();
     let name = "n".repeat(254);
     let p = t.path().join(&name);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "netbsd"))]
     {
         let (l, r) = route::run(BIND, &p).unwrap();
         assert_eq!(r, Route::SymlinkFile);
@@ -710,14 +731,28 @@ fn a_file_name_of_254_bytes_is_bound_only_through_symlink_file_but_connected_to(
         drop(l);
         std::fs::remove_file(&p).unwrap();
     }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "illumos"
+    ))]
     {
         let e = route::run(BIND, &p).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ENAMETOOLONG), "{e}");
         assert!(!is_socket(&p));
     }
-    // Whether a bind follows the symlink is not known here: either way.
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    // Whether a bind follows the symlink is not measured here: either way.
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "macos",
+        target_os = "netbsd"
+    )))]
     match route::run(BIND, &p) {
         Ok((_l, r)) => {
             assert_eq!(r, Route::SymlinkFile);
@@ -791,10 +826,17 @@ fn long_paths_without_a_file_name_or_with_nul_are_invalid_input() {
 // cannot be resolved that error is what the caller gets (hub SPEC "最初にソケット
 // のディレクトリを引く"): without it no R can be made, and reporting
 // ENAMETOOLONG would blame the length for what is something else. The case
-// built here: the directory is "." in a cwd that was removed, so stat(".")
-// still succeeds while realpath (getcwd) fails with ENOENT. It runs in a
-// child process because it removes the child's own cwd. Nothing is made in
-// the place for D either, since the real path comes before D.
+// built here: the directory is "." in a cwd that was removed. On Linux, the
+// Apple OSes and FreeBSD stat(".") still succeeds there while realpath
+// (getcwd) fails with ENOENT, which is the case this is about. NetBSD and
+// OpenBSD cannot look a removed cwd up at all (stat(".") fails, observed in
+// the CI's VMs), so there the case cannot be built and what is checked is the
+// lookup before it: the call answers the error of stat("."). On illumos,
+// which of the two fails is not observed yet, so the error of whichever does
+// is expected. It runs in a child process because it removes the child's own
+// cwd; another process (rmdir, run in "/") removes it, since illumos refuses
+// to remove the caller's own cwd (rmdir(2): EINVAL). Nothing is made in the
+// place for D either, since the real path comes before D.
 #[test]
 fn an_unresolvable_socket_directory_reports_its_error_not_enametoolong() {
     let gone = tmp();
@@ -816,16 +858,38 @@ fn child_bind_in_a_removed_cwd() {
     if !in_child() {
         return;
     }
-    std::fs::remove_dir(env_path("SOCKAT_CHILD_PATH")).unwrap();
-    assert!(std::fs::metadata(".").is_ok(), "premise: stat(\".\") works");
-    assert!(
-        std::fs::canonicalize(".").is_err(),
-        "premise: realpath fails"
-    );
+    let rmdir = Command::new("rmdir")
+        .arg(env_path("SOCKAT_CHILD_PATH"))
+        .current_dir("/")
+        .status()
+        .unwrap();
+    assert!(rmdir.success(), "rmdir: {rmdir}");
+    let stat = std::fs::metadata(".").map(drop);
+    let real = std::fs::canonicalize(".").map(drop);
+    #[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+    let expected = {
+        let e = stat.expect_err("premise: stat(\".\") fails");
+        errno(&e)
+    };
+    #[cfg(target_os = "illumos")]
+    let expected = match (stat, real) {
+        (Err(e), _) | (Ok(()), Err(e)) => errno(&e),
+        (Ok(()), Ok(())) => panic!("premise: stat(\".\") or realpath fails"),
+    };
+    #[cfg(not(any(target_os = "netbsd", target_os = "openbsd", target_os = "illumos")))]
+    let expected = {
+        assert!(stat.is_ok(), "premise: stat(\".\") works");
+        let e = real.expect_err("premise: realpath fails");
+        assert_eq!(errno(&e), Some(libc::ENOENT), "{e}");
+        errno(&e)
+    };
+    #[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+    drop(real);
+    assert_ne!(expected, Some(libc::ENAMETOOLONG));
     let p = PathBuf::from(format!("./{}", "n".repeat(120)));
     for req in [BIND, CONNECT] {
         let e = route::run(req, &p).unwrap_err();
-        assert_eq!(errno(&e), Some(libc::ENOENT), "{req:?}: {e}");
+        assert_eq!(errno(&e), expected, "{req:?}: {e}");
     }
 }
 
@@ -1413,8 +1477,13 @@ fn holds_r(shown: &Path, prefix: &str, name: &str) -> bool {
 // R's random part in it: never the path given (which sockat does not hand to
 // the kernel) and never the bare file name (which would resolve against
 // whatever cwd it is read in). The client connects as the platform's order
-// takes it; what it reports is the server's address all the same. OpenBSD's
-// std drops the last byte of what it reports, so the check is left out there.
+// takes it; what it reports is the server's address all the same, except on
+// illumos, whose getpeername reports the address the client connected by
+// (observed in the CI's VM): there the client's peer is the spelling of the
+// connect, symlink-file's `<links>/sockat.XXXXXXXXXX` (the path is too long
+// for relative), which is not the path given or the bare file name either.
+// OpenBSD's std drops the last byte of what it reports, so the check is left
+// out there.
 #[cfg(not(target_os = "openbsd"))]
 #[test]
 fn the_addresses_of_a_socket_bound_through_r_hold_its_random_part() {
@@ -1436,7 +1505,9 @@ fn the_addresses_of_a_socket_bound_through_r_hold_its_random_part() {
         let p = nest(t.path(), 600, &name);
         let (l, r) = route::run_long(BIND, &p, &c).unwrap();
         let listener = UnixListener::from(l);
-        let (cl, _) = route::run_long(CONNECT, &p, &c).unwrap();
+        let (cl, by) = route::run_long(CONNECT, &p, &c).unwrap();
+        #[cfg(not(target_os = "illumos"))]
+        let _ = by;
         let client = UnixStream::from(cl);
         let (accepted, _) = listener.accept().unwrap();
         for (whose, addr) in [
@@ -1445,6 +1516,17 @@ fn the_addresses_of_a_socket_bound_through_r_hold_its_random_part() {
             ("client's peer", client.peer_addr().unwrap()),
         ] {
             let shown = addr.as_pathname().unwrap();
+            #[cfg(target_os = "illumos")]
+            if whose == "client's peer" {
+                assert_eq!(by, Route::SymlinkFile, "{what}");
+                assert_eq!(shown.parent(), Some(links.path()), "{what}: {shown:?}");
+                assert!(
+                    is_drawn(shown.file_name().unwrap(), own::PREFIX),
+                    "{what}: {shown:?}"
+                );
+                assert_ne!(shown, p.as_path(), "{what} {whose}");
+                continue;
+            }
             assert!(
                 holds_r(shown, prefix, &name),
                 "{what} {r:?} {whose}: {shown:?}"
@@ -2118,9 +2200,14 @@ fn only_what_passes_the_checks_is_removed_for_a_d_not_opened() {
 //   place for symlink-dir (bind_ex's last resort)): ENAMETOOLONG, no route, every route
 //   passed over, the symlink last;
 // * a route fails for real (bind_ex with the last resort through the symlink onto an existing
-//   file: EADDRINUSE; a connect to a missing socket by the first route of the
-//   platform's connect order that can be used: ENOENT): that route's name,
-//   and the ones before it passed over;
+//   file: EADDRINUSE, after the routes beside the socket, the last of which
+//   is at-sockdir on FreeBSD and fork-cwd-sockdir elsewhere; a connect to a
+//   missing socket by the first route of the platform's connect order that
+//   can be used: ENOENT): that route's name, and the ones before it passed
+//   over. The connect is given a place for its symlink as well as one for D:
+//   on the OSes whose connect order is relative → symlink-file alone (no
+//   route through D: NetBSD, OpenBSD, illumos), symlink-file is then the
+//   route that can be used when the cwd is not an ancestor of the path;
 // * the directory is missing: ENOENT before any route, and nothing passed
 //   over (the length is judged only once the directory is looked up, so not
 //   even `standard` has been tried).
@@ -2131,6 +2218,7 @@ fn only_what_passes_the_checks_is_removed_for_a_d_not_opened() {
 fn a_failure_reports_the_routes_tried_and_keeps_the_errno() {
     let t = tmp();
     let place = tmp();
+    let links = tmp();
     let p = nest(t.path(), 400, "s.sock");
     let f = route::run_long_with(BIND_LAST, &p, &bind_nowhere(&[]), false)
         .err()
@@ -2148,14 +2236,15 @@ fn a_failure_reports_the_routes_tried_and_keeps_the_errno() {
         .unwrap();
     assert_eq!(errno(&f.error), Some(libc::EADDRINUSE), "{f:?}");
     assert_eq!(f.route, Some("symlink-dir"));
-    assert_eq!(
-        f.skipped.last().map(|s| s.name),
-        Some("fork-cwd-sockdir"),
-        "{f:?}"
-    );
+    let last_beside = if cfg!(target_os = "freebsd") {
+        "at-sockdir"
+    } else {
+        "fork-cwd-sockdir"
+    };
+    assert_eq!(f.skipped.last().map(|s| s.name), Some(last_beside), "{f:?}");
     assert_empty(place.path());
 
-    let c = config(&[at(place.path())], &[]);
+    let c = config(&[at(place.path())], &[links.path()]);
     let missing = p.with_file_name("missing.sock");
     let f = route::run_long_with(CONNECT, &missing, &c, false)
         .err()
@@ -2178,6 +2267,8 @@ fn a_failure_reports_the_routes_tried_and_keeps_the_errno() {
         "{name}"
     );
     assert_eq!(f.skipped.first().map(|s| s.name), Some("standard"));
+    assert_empty(place.path());
+    assert_empty(links.path());
 
     let gone = nest(&t.path().join("gone"), 400, "s.sock");
     std::fs::remove_dir(gone.parent().unwrap()).unwrap();
@@ -2264,7 +2355,7 @@ fn child_bind_ex_relative() {
 //   resort) symlink-dir: the bind goes to the socket's directory's real path
 //   taken before the change, so it is under the first cwd; the unrelated file
 //   is under the second;
-// * long path through symlink-file (macOS, where a bind follows it): the
+// * long path through symlink-file (macOS and NetBSD, where a bind follows it): the
 //   symlink points to the path made absolute against the second cwd, where
 //   the bind is, and the real path kept is under the first, where the
 //   unrelated file is.
@@ -2362,7 +2453,7 @@ fn child_cwd_changes_in_between() {
             false,
         ),
     ];
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "netbsd"))]
     cases.push(case(
         "long through symlink-file",
         BIND,
@@ -3169,27 +3260,40 @@ fn d_made_once_child() {
 // ----- a bind through symlink-file (hub DR-0016) -----
 
 // A bind tries symlink-file right after standard where a bind may follow a
-// symlink (not Linux, where a bind does not and the route is not in the
-// order at all): with the bind's symlink-file on and no place for its
-// symlink, a long path's bind passes over standard, then symlink-file, and
-// goes on through D. On Linux symlink-file is not reported (not in its
-// order) and the bind goes through D after standard.
+// symlink (the Apple OSes and NetBSD, measured to follow, and the OSes not
+// measured): with the bind's symlink-file on and no place for its symlink, a
+// long path's bind passes over standard, then symlink-file, and goes on
+// through D. On the OSes measured not to follow (Linux / Android, FreeBSD,
+// OpenBSD, illumos) the route is not in the bind's order: symlink-file is not
+// reported and the bind goes through D after standard.
 #[test]
 fn a_bind_tries_symlink_file_right_after_standard_where_a_bind_may_follow_it() {
     let t = tmp();
     let place = tmp();
     let c = config(&[at(place.path())], &[]);
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "illumos"
+    )))]
     let c = with_symlink_file_bind(c);
     let p = nest(t.path(), 400, "s.sock");
     let reached = route::run_long_with(BIND, &p, &c, false).unwrap();
     let names: Vec<&str> = reached.skipped.iter().map(|s| s.name).collect();
-    if cfg!(any(target_os = "linux", target_os = "android")) {
-        assert_eq!(names.first(), Some(&"standard"), "{names:?}");
-        assert!(!names.contains(&"symlink-file"), "{names:?}");
-    } else {
+    if cfg!(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "illumos"
+    ))) {
         assert_eq!(names[..2], ["standard", "symlink-file"], "{names:?}");
         assert_eq!(reached.skipped[1].reason, route::names::NO_SAFE_BASE);
+    } else {
+        assert_eq!(names.first(), Some(&"standard"), "{names:?}");
+        assert!(!names.contains(&"symlink-file"), "{names:?}");
     }
     assert!(
         route_through_d(BIND, thread_here(), reached.route),
@@ -3199,11 +3303,11 @@ fn a_bind_tries_symlink_file_right_after_standard_where_a_bind_may_follow_it() {
     assert!(is_socket(&p));
 }
 
-// On macOS a bind follows a symlink in the last component, so the bind
-// through symlink-file reaches the path whatever the file name length: the
-// spelling, `<place>/sockat.XXXXXXXXXX`, holds no file name (hub DR-0016).
-// File names of 92 bytes (the longest the routes through D take on Apple),
-// 93 (one more), 200 and 254 (NAME_MAX - 1) each bind by symlink-file, with
+// On macOS and NetBSD a bind follows a symlink in the last component, so the
+// bind through symlink-file reaches the path whatever the file name length:
+// the spelling, `<place>/sockat.XXXXXXXXXX`, holds no file name (hub
+// DR-0016). File names of 92 bytes (the longest the routes through D take on
+// both), 93 (one more), 200 and 254 (NAME_MAX - 1) each bind by symlink-file, with
 // the socket at the path given and reached; what it gives up is `respelled`
 // alone (the place is private here; a shared one gives up nothing more); the
 // address the kernel reports is the symlink's spelling in the place, which
@@ -3211,7 +3315,7 @@ fn a_bind_tries_symlink_file_right_after_standard_where_a_bind_may_follow_it() {
 // socket file stays); what bind_ex keeps is the socket file at the path; the
 // place for D is untouched (no D was made) and the place for the symlink is
 // empty again.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "netbsd"))]
 #[test]
 fn a_bind_through_symlink_file_reaches_any_file_name_length() {
     use std::os::unix::fs::MetadataExt;
@@ -3258,7 +3362,7 @@ fn a_bind_through_symlink_file_reaches_any_file_name_length() {
 // the path, the bind is EADDRINUSE by the route symlink-file, the file is
 // left as it was, and no later route is tried (the place for D stays
 // untouched) nor a later place for the symlink.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "netbsd"))]
 #[test]
 fn a_bind_through_symlink_file_onto_an_existing_file_is_the_failure() {
     let t = tmp();
@@ -3287,10 +3391,11 @@ fn a_bind_through_symlink_file_onto_an_existing_file_is_the_failure() {
 // passed over ("did not follow"), and the next route is tried; a real failure
 // fails that one the same way and is returned there. A socket's directory
 // without write permission (0500) makes the bind through the symlink fail
-// with EACCES and nothing at the path, so the bind goes on to thread-cwd,
-// which fails with EACCES for real. Root bypasses permission checks, so as
-// root the test cannot tell anything and says so.
-#[cfg(target_os = "macos")]
+// with EACCES and nothing at the path, so the bind goes on to the next route
+// (thread-cwd on macOS, fork-cwd on NetBSD), which fails with EACCES for
+// real. Root bypasses permission checks, so as root the test cannot tell
+// anything and says so.
+#[cfg(any(target_os = "macos", target_os = "netbsd"))]
 #[test]
 fn a_bind_through_symlink_file_failing_with_nothing_at_the_path_goes_on() {
     use std::os::unix::fs::PermissionsExt;
@@ -3315,7 +3420,12 @@ fn a_bind_through_symlink_file_failing_with_nothing_at_the_path_goes_on() {
     let p = dir.join("s".repeat(80));
     let f = route::run_long_with(BIND, &p, &c, false).err().unwrap();
     assert_eq!(errno(&f.error), Some(libc::EACCES), "{f:?}");
-    assert_eq!(f.route, Some("thread-cwd"), "{f:?}");
+    let next = if cfg!(target_os = "macos") {
+        "thread-cwd"
+    } else {
+        "fork-cwd"
+    };
+    assert_eq!(f.route, Some(next), "{f:?}");
     let skipped: Vec<_> = f.skipped.iter().map(|s| (s.name, s.reason)).collect();
     assert_eq!(
         skipped,
@@ -3334,9 +3444,13 @@ fn a_bind_through_symlink_file_failing_with_nothing_at_the_path_goes_on() {
 // fd; no spelling names it) or far too deep for any sockaddr (D is never in a
 // spelling). Two children of this binary run with such a TMPDIR and the public
 // order (Config::from_env): a call through D makes D in TMPDIR (its mtime
-// changes, it is empty afterwards). On Linux the bind goes through D; on
-// macOS the bind takes symlink-file first, and the connect (600 bytes, too
-// long for relative and widened) goes through D. A relative TMPDIR is left out of the places for a
+// changes, it is empty afterwards). On Linux, FreeBSD, OpenBSD and illumos the
+// bind goes through D; on macOS the bind takes symlink-file first, and the
+// connect (600 bytes, too long for relative and widened) goes through D. On
+// NetBSD the bind takes symlink-file first and the connect order has no route
+// through D (relative, symlink-file, fork-cwd-direct), so no call of the public
+// order goes through D there: the child turns the bind's symlink-file off,
+// and the bind goes through D with the places read from TMPDIR as before. A relative TMPDIR is left out of the places for a
 // connect's symlink, a deep one is passed over there (the spelling would not
 // fit); that is checked with the symlink route.
 #[test]
@@ -3373,7 +3487,12 @@ fn child_bind_and_connect_from_env() {
         return;
     }
     let p = env_path("SOCKAT_CHILD_PATH");
-    let c = Config::from_env();
+    #[allow(unused_mut)]
+    let mut c = Config::from_env();
+    #[cfg(target_os = "netbsd")]
+    {
+        c.symlink_file_bind = false;
+    }
     let (l, r) = route::run_long(BIND, &p, &c).unwrap();
     println!("sockat-child: bind {r:?}");
     let (cl, r) = route::run_long(CONNECT_LAST, &p, &c).unwrap();
@@ -3530,13 +3649,17 @@ fn a_directory_replaced_before_it_is_held_is_not_used() {
     std::fs::remove_dir(&d).unwrap();
     std::os::unix::fs::symlink(other.path(), &d).unwrap();
     let e = hold(&d).err().unwrap();
-    // With O_DIRECTORY as well, Linux answers ENOTDIR for the symlink
-    // (observed in docker, Linux 7.2) where O_NOFOLLOW alone would be
-    // ELOOP; either is the refusal that matters here.
-    assert!(
-        matches!(errno(&e), Some(libc::ENOTDIR | libc::ELOOP)),
-        "{e}"
-    );
+    // The errno of O_NOFOLLOW on a symlink differs per OS; any of them is the
+    // refusal that matters here. POSIX says ELOOP; with O_DIRECTORY as well,
+    // Linux answers ENOTDIR (observed in docker, Linux 7.2); FreeBSD answers
+    // EMLINK and NetBSD EFTYPE (their open(2), observed in the CI's VMs).
+    #[cfg(target_os = "freebsd")]
+    let refusals = [libc::ENOTDIR, libc::ELOOP, libc::EMLINK];
+    #[cfg(target_os = "netbsd")]
+    let refusals = [libc::ENOTDIR, libc::ELOOP, libc::EFTYPE];
+    #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
+    let refusals = [libc::ENOTDIR, libc::ELOOP];
+    assert!(errno(&e).is_some_and(|n| refusals.contains(&n)), "{e}");
     assert_empty(other.path());
     assert!(
         std::fs::symlink_metadata(&d)

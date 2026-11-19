@@ -34,17 +34,18 @@ A path that std accepts (up to `sun_path` − 1 bytes) is handed to std unchange
 | Linux / Android / illumos | up to 107 bytes |
 | macOS / iOS / FreeBSD / NetBSD / OpenBSD | up to 103 bytes |
 
-A longer path is bound, where a bind follows a symlink (macOS and the like; not Linux), first through **symlink-file** (a symlink to the socket file made in a place; its spelling holds no file name, so any file name length is reached), and else through **the routes through D**. sockat makes a directory D of its own (`sockat.XXXXXXXXXX`, mode 0700) and holds it by an fd, makes in it a symlink R with a random name (pointing to the socket's directory), binds with `R/<file name>` relative to D's fd, and removes R and D. The spelling the kernel keeps is `R/<file name>`; R is gone by then, so wherever it is resolved later, it hits nothing. The routes' names are those of the [sockat specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md) ("route names").
+A longer path is bound, where a bind follows a symlink (macOS, NetBSD and the like; not Linux, FreeBSD, OpenBSD or illumos), first through **symlink-file** (a symlink to the socket file made in a place; its spelling holds no file name, so any file name length is reached), and else through **the routes through D**. sockat makes a directory D of its own (`sockat.XXXXXXXXXX`, mode 0700) and holds it by an fd, makes in it a symlink R with a random name (pointing to the socket's directory), binds with `R/<file name>` relative to D's fd, and removes R and D. The spelling the kernel keeps is `R/<file name>`; R is gone by then, so wherever it is resolved later, it hits nothing. The routes' names are those of the [sockat specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md) ("route names").
 
 | OS | bind (in this order) |
 |---|---|
 | Linux / Android | thread-cwd → proc → fork-cwd |
 | macOS / iOS and the other Apple OSes | symlink-file → thread-cwd → fork-cwd |
-| FreeBSD | symlink-file → at |
-| NetBSD / OpenBSD / illumos / other Unix | symlink-file → fork-cwd |
+| FreeBSD | at |
+| NetBSD / other Unix | symlink-file → fork-cwd |
+| OpenBSD / illumos | fork-cwd |
 | Windows | not supported (compile error) |
 
-- **symlink-file**: when the bind fails with something at the path, that is the real failure (`EADDRINUSE`, ...); with nothing there, the kernel is taken not to have followed the symlink, and the next route is tried (that a bind follows it is checked on macOS only)
+- **symlink-file**: when the bind fails with something at the path, that is the real failure (`EADDRINUSE`, ...); with nothing there, the kernel is taken not to have followed the symlink, and the next route is tried (checked to follow on macOS and NetBSD; not tried on the OSes checked not to)
 
 - **thread-cwd**: move the cwd of a throwaway thread, and of it alone, into D (Linux: `unshare(CLONE_FS)` and `fchdir`; Apple OSes: `pthread_fchdir_np`). It has no side effects, so every function tries it. Not used on Linux under a seccomp filter
 - **proc**: pass `/proc/self/fd/<D's fd>/R/<file name>`
@@ -97,8 +98,8 @@ Details in [docs/MANUAL.md](./docs/MANUAL.md#the-_ex-functions-clean-up-and-diag
 
 ## What differs from std for a long path
 
-- `local_addr()` / `peer_addr()` do not return the path: they return the spelling handed to the kernel at bind time (`R/<file name>`, `/proc/self/fd/<fd>/R/<file name>`, symlink-file's `<place>/sockat.XXXXXXXXXX`, ...). R and the place's symlink are gone, so it hits nothing. Keep the path yourself
-- A bind through D reaches shorter file names, by R's length (up to 96 bytes on Linux / illumos, 92 on the Apple OSes / the BSDs). A bind on macOS reaches any file name length through symlink-file
+- `local_addr()` / `peer_addr()` do not return the path: they return the spelling handed to the kernel at bind time (`R/<file name>`, `/proc/self/fd/<fd>/R/<file name>`, symlink-file's `<place>/sockat.XXXXXXXXXX`, ...; illumos's `peer_addr()` returns the spelling of the connect). R and the place's symlink are gone, so it hits nothing. Keep the path yourself
+- A bind through D reaches shorter file names, by R's length (up to 96 bytes on Linux / illumos, 92 on the Apple OSes / the BSDs). A bind on macOS and NetBSD reaches any file name length through symlink-file
 - A path longer than std accepts that does not end with a file name (ending in `dir/`, `dir/.`, `..`) is an `InvalidInput` error
 - The rest (the fork's side effects, the directory being looked up first, D or R left behind if the process dies midway) is in [docs/MANUAL.md](./docs/MANUAL.md#what-differs-from-std-for-a-long-path)
 
