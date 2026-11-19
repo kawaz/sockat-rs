@@ -12,7 +12,7 @@ XNU は `bind(2)` / `connect(2)` で `SOCK_MAXADDRLEN` (255) バイトまでの�
 ## Decision
 
 - Apple の OS の connect の順 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) で、相対パスで届かない時 ([DR-0004](DR-0004-relative-path-from-cwd.md)) に、元のパス、無理なら相対パスを、253 バイト以内なら広げた sockaddr で渡す
-- `connect_any` 系の最後の fork では、103 バイトを超えるファイル名を広げた sockaddr で渡す
+- 最終手段を使う `connect_ex` 系の fork-cwd-direct では、103 バイトを超えるファイル名を広げた sockaddr で渡す
 - bind には使わない。bind の綴りは全部、標準の `sun_path` に入る長さで判定する。広げた形で渡す関数 (`route::apple::wide_connect`) は connect の options しか受け取らず、bind を広げる口を crate の中に置かない
 - D を通す経路 (`R/<ファイル名>`) と symlink の経路は、connect 系でも標準の `sun_path` に入る長さで判定する
 - `sun_len` とアドレス長はどちらも `2 + パスの長さ` にする

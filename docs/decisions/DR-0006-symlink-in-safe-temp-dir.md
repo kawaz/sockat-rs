@@ -1,4 +1,4 @@
-# DR-0006: connect 系に、安全な置き場の短い symlink を経由する経路
+# DR-0006: 安全な置き場の、ソケットのファイルを指す短い symlink を経由する経路 (symlink-file)
 
 - Status: Accepted
 - Date: 2026-11-18
@@ -9,7 +9,7 @@
 
 ## Decision
 
-connect の順 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) の最後に置く (FreeBSD 以外)。bind には使わない (カーネルが覚える綴りが置き場を通り、後でその名前を他人が作り直せる)。
+connect の順 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) の最後に置く (FreeBSD 以外)。bind が最後の要素の symlink を辿る OS では、bind でも standard の次に試す (Linux / Android 以外。辿るかの見分け方は DR-0027)。bind でカーネルが返すアドレスは symlink の綴りで、その綴りで消しても置き場の中の項目が消えるだけなので、失うのは `respelled` だけ。ソケットのディレクトリを指す symlink (symlink-dir) は綴りを他人が作り直せるので、既定の bind には使わない ([DR-0031](DR-0031-ex-functions.md) の最終手段だけ)。
 
 ### 置き場
 
@@ -21,7 +21,7 @@ connect の順 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) の最�
   - sticky bit が立っていて、持ち主が root か自分の実効 uid (`/tmp` がこれ)
   - 持ち主が自分の実効 uid で、group と other に書き込み権限が無い (`mode & 0o022 == 0`。macOS の `$TMPDIR` がこれ)
 - 確かめるのは置き場そのもので、置き場を含む上位のディレクトリまでは見ない
-- symlink を作れない時 (置き場が無い、書けない、サンドボックス、名前を使い切った、乱数が取れない) も次の候補へ進む。候補が尽きたら、`connect_any` 系は fork の経路 ([DR-0007](DR-0007-fork-child-fchdir.md)) に、他は `ENAMETOOLONG`
+- symlink を作れない時 (置き場が無い、書けない、サンドボックス、名前を使い切った、乱数が取れない) も次の候補へ進む。候補が尽きたら、connect は最終手段を使う `connect_ex` 系なら fork-cwd-direct ([DR-0007](DR-0007-fork-child-fchdir.md)) に、他は `ENAMETOOLONG`。bind は D を通す経路に進む
 - symlink を作った後の connect の失敗は、その結果を返し、次の候補で試し直さない ([DR-0012](DR-0012-route-failure-handling.md)。試験は後の候補のディレクトリの mtime が変わらないことで、そこに何も作られていないことを確かめる)
 
 ### symlink の先と、カーネルに渡す綴り
@@ -64,5 +64,5 @@ connect の順 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) の最�
 - 置き場を使う前に安全か確かめる: kawaz 裁定 2026-11-18
 - 置き場がディレクトリであることも確かめる: ハブの SPEC (sockat-py の指摘、2026-11-18)
 - 名前 (`sockat.` の接頭辞): 統括の裁定 2026-11-18。kawaz は接頭辞を支持
-- connect 系の経路だけに使い (`bind_any` の最後を除く)、bind に使わない: kawaz 裁定 (ハブ DR-0012、2026-11-19)
+- connect 系の経路に使う: kawaz 裁定 (ハブ DR-0012、2026-11-19)。bind が symlink を辿る OS で bind にも使う: kawaz 裁定 (ハブ DR-0016、2026-11-19)
 - 上に無い細部: 出所の記録なし

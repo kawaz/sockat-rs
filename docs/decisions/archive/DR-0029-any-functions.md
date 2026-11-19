@@ -1,11 +1,11 @@
 # DR-0029: any 系 (bind_any、connect_any 系) は何かを失ってでも届かせる opt-in で、失ったものと通った経路・飛ばした経路を返す
 
-- Status: Accepted
+- Status: Superseded by DR-0031
 - Date: 2026-11-19
 
 ## Context
 
-- 既定の bind / connect は、標準と同じに振る舞い、安全でない綴りを残さない経路だけを使う ([DR-0027](DR-0027-own-directory-and-fallback-routes.md))。そのため届かない環境が残る
+- 既定の bind / connect は、標準と同じに振る舞い、安全でない綴りを残さない経路だけを使う ([DR-0027](../DR-0027-own-directory-and-fallback-routes.md))。そのため届かない環境が残る
   - bind: D をどこにも作れず、ソケットのディレクトリも開けない (R を作れない) 時
   - connect: fork-direct でしか届かない時
 - 届かせる手はあるが、どれも何かを失う (他の利用者が作り直せる綴り、fork の副作用)

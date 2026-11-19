@@ -14,16 +14,16 @@
 //!
 //! A path longer than [`DIRECT_MAX`] goes:
 //!
-//! * **bind** ([`bind_order`]): the means through D in order
-//!   ([`bind_through_d`]).
+//! * **bind** ([`bind_order`]): symlink-file where a bind may follow a symlink
+//!   (not Linux), then the means through D in order ([`bind_through_d`]).
 //!   When D can be made nowhere, R is made beside the socket instead and the
 //!   same means are tried with `.sockat.XXXXXXXXXX/<file name>` relative to
-//!   the socket's directory's fd. Then `bind_any`'s symlink, or
+//!   the socket's directory's fd. Then, as the last resort, symlink-dir, or
 //!   `ENAMETOOLONG`.
 //! * **connect** ([`connect_order`]): per target, the routes that need
 //!   neither writing nor a thread first, then those through D and the
-//!   temporary symlink; then a forked child in the socket's directory for the
-//!   connects that may fork ([`fork_beside`]), `ENAMETOOLONG` for the others.
+//!   symlink-file; then, as the last resort, a forked child in the socket's
+//!   directory ([`fork_beside`]), or `ENAMETOOLONG`.
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::ffi::{OsStr, OsString};
@@ -37,11 +37,12 @@ use std::path::{Path, PathBuf};
 use crate::path;
 use crate::sys::{self, Op, SockAddr};
 
-/// How a connect is made. The four public connects are its four values.
+/// How a connect is made: blocking or not, and whether the last resort may be
+/// taken (`connect_ex` / `connect_nonblocking_ex` with [`crate::LastResort`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConnectOptions {
     /// Make the socket `O_NONBLOCK` before connecting, on every route, and
-    /// leave it so (`connect_nonblocking`, `connect_any_nonblocking`).
+    /// leave it so (`connect_nonblocking`, `connect_nonblocking_ex`).
     ///
     /// A full backlog then fails the connect at once instead of waiting for
     /// room: Linux answers `EAGAIN` (where a blocking connect waits), macOS
@@ -58,20 +59,22 @@ pub(crate) struct ConnectOptions {
     /// the socket is closed, rather than handing back a stream that is not
     /// connected yet.
     pub(crate) nonblocking: bool,
-    /// Whether the fork route may be taken (`connect_any`,
-    /// `connect_any_nonblocking`). Without it, a path that only the fork route
-    /// can reach is an error ([`fork_ruled_out`]) and nothing is created or
-    /// connected; every other route, and its real failures, stay as they are.
-    pub(crate) fork: bool,
+    /// Whether the last resort, fork-cwd-direct, may be taken once every
+    /// route of the connect order is unusable. Without it, a path that only
+    /// fork-cwd-direct can reach is an error ([`fork_ruled_out`]) and nothing
+    /// is created or connected; every other route, and its real failures, stay
+    /// as they are.
+    pub(crate) last_resort: bool,
 }
 
-/// How a bind is made: `sockat::bind` / `bind_ex`, or `bind_any`.
+/// How a bind is made: whether the last resort may be taken (`bind_ex` with
+/// [`crate::LastResort`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BindOptions {
-    /// Whether the symlink route may be taken once every other bind route is
-    /// unusable (`bind_any`, [`links::bind_through`]). Without it, that is
+    /// Whether the last resort, symlink-dir ([`links::bind_through`]), may
+    /// be taken once every other bind route is unusable. Without it, that is
     /// `ENAMETOOLONG`.
-    pub(crate) symlink: bool,
+    pub(crate) last_resort: bool,
 }
 
 /// What to do at a path.
@@ -103,11 +106,12 @@ impl Request {
         matches!(self, Request::Connect(o) if o.nonblocking)
     }
 
-    /// Whether the fork route may be taken.
+    /// Whether a fork route may be taken: fork-cwd for a bind (one of its
+    /// routes), fork-cwd-direct for a connect only as the last resort.
     fn may_fork(self) -> bool {
         match self {
             Request::Bind(_) => true,
-            Request::Connect(o) => o.fork,
+            Request::Connect(o) => o.last_resort,
         }
     }
 }
@@ -133,8 +137,8 @@ fn too_long() -> io::Error {
 pub(crate) const DIRECT_MAX: usize = sys::SUN_PATH_CAP - 1;
 
 /// Which way a bind / connect went, one variant per route of the SPEC
-/// ("経路の名前"; its `Display` is the name). The public API does not
-/// show it; the `any` functions show what it cost (`sockat::Loss`).
+/// ("経路の名前", [`Route::name`]). The `_ex` functions report its name and
+/// what it cost (`sockat::Loss`).
 ///
 /// "In the plain sockaddr" means through std, except for a nonblocking
 /// connect, which std cannot make: that one is sockat's own socket, set up as
@@ -154,11 +158,11 @@ pub(crate) enum Route {
     /// (Linux).
     #[cfg(any(target_os = "linux", target_os = "android"))]
     Proc,
-    /// fork: a forked child that `fchdir`s into D and binds `R/<name>`
+    /// fork-cwd: a forked child that `fchdir`s into D and binds `R/<name>`
     /// (not FreeBSD, where bindat cannot turn out unusable).
     #[cfg(not(target_os = "freebsd"))]
-    Fork {
-        /// As [`Route::ForkDirect`]'s.
+    ForkCwd {
+        /// As [`Route::ForkCwdDirect`]'s.
         child: libc::pid_t,
     },
     /// thread-cwd-sockdir: thread-cwd without D, `.sockat.XXXXXXXXXX/<name>`
@@ -173,10 +177,10 @@ pub(crate) enum Route {
     /// .sockat.XXXXXXXXXX/<name>` (Linux, a bind only).
     #[cfg(any(target_os = "linux", target_os = "android"))]
     ProcSockdir,
-    /// fork-sockdir: fork without D (a bind only; not FreeBSD).
+    /// fork-cwd-sockdir: fork-cwd without D (a bind only; not FreeBSD).
     #[cfg(not(target_os = "freebsd"))]
-    ForkSockdir {
-        /// As [`Route::ForkDirect`]'s.
+    ForkCwdSockdir {
+        /// As [`Route::ForkCwdDirect`]'s.
         child: libc::pid_t,
     },
     /// proc-direct (connect): `/proc/self/fd/<the socket's directory's
@@ -198,14 +202,15 @@ pub(crate) enum Route {
     /// widened (connect), with the relative spelling (Apple).
     #[cfg(target_vendor = "apple")]
     WidenedRelative,
-    /// symlink (connect): a short temporary symlink to the socket file in a
-    /// safe place, in the plain sockaddr.
-    #[cfg(not(target_os = "freebsd"))]
-    Symlink,
-    /// symlink (`bind_any` only): a temporary symlink in a place to the
-    /// socket's directory, and the bind by `<link>/<name>`
+    /// symlink-file: a short temporary symlink to the socket file in a safe
+    /// place, in the plain sockaddr ([`links::symlink_file`]). A connect's
+    /// route (not FreeBSD), and a bind's where the bind follows the symlink
+    /// (not Linux).
+    SymlinkFile,
+    /// symlink-dir (`bind_ex`'s last resort only): a temporary symlink in a
+    /// place to the socket's directory, and the bind by `<link>/<name>`
     /// ([`links::bind_through`]).
-    SymlinkBind {
+    SymlinkDir {
         /// Whether the place is a shared one (sticky, as `/tmp` is) rather
         /// than one only this user can write to: others can then make the
         /// spelling again ([`links::PlaceKind`]).
@@ -215,9 +220,9 @@ pub(crate) enum Route {
     /// socket's directory fd (FreeBSD).
     #[cfg(target_os = "freebsd")]
     AtDirect,
-    /// fork-direct (`connect_any` only): a forked child that `fchdir`s into
-    /// the socket's directory and connects by the file name.
-    ForkDirect {
+    /// fork-cwd-direct (the connects' last resort only): a forked child that
+    /// `fchdir`s into the socket's directory and connects by the file name.
+    ForkCwdDirect {
         /// The pid of the child that made the call ([`sys::op_in_dir_forked`]),
         /// as in every fork route. The public API does not return it: it is
         /// the pid of an exited process, of no use to the caller or the server
@@ -232,13 +237,12 @@ impl Route {
     ///
     /// For a connect, the peer pid the server sees is then that of the child,
     /// a process that has already exited (DR-0007).
-    #[cfg(any(test, feature = "any"))]
     pub(crate) fn forked(self) -> bool {
         #[cfg(not(target_os = "freebsd"))]
-        if matches!(self, Route::Fork { .. } | Route::ForkSockdir { .. }) {
+        if matches!(self, Route::ForkCwd { .. } | Route::ForkCwdSockdir { .. }) {
             return true;
         }
-        matches!(self, Route::ForkDirect { .. })
+        matches!(self, Route::ForkCwdDirect { .. })
     }
 }
 
@@ -255,7 +259,7 @@ impl Route {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             Route::Proc => names::PROC,
             #[cfg(not(target_os = "freebsd"))]
-            Route::Fork { .. } => names::FORK,
+            Route::ForkCwd { .. } => names::FORK_CWD,
             #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
             Route::ThreadCwdSockdir => names::THREAD_CWD_SOCKDIR,
             #[cfg(target_os = "freebsd")]
@@ -263,7 +267,7 @@ impl Route {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             Route::ProcSockdir => names::PROC_SOCKDIR,
             #[cfg(not(target_os = "freebsd"))]
-            Route::ForkSockdir { .. } => names::FORK_SOCKDIR,
+            Route::ForkCwdSockdir { .. } => names::FORK_CWD_SOCKDIR,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             Route::ProcDirect => names::PROC_DIRECT,
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -272,12 +276,11 @@ impl Route {
             Route::Relative => names::RELATIVE,
             #[cfg(target_vendor = "apple")]
             Route::Widened | Route::WidenedRelative => names::WIDENED,
-            #[cfg(not(target_os = "freebsd"))]
-            Route::Symlink => names::SYMLINK,
-            Route::SymlinkBind { .. } => names::SYMLINK,
+            Route::SymlinkFile => names::SYMLINK_FILE,
+            Route::SymlinkDir { .. } => names::SYMLINK_DIR,
             #[cfg(target_os = "freebsd")]
             Route::AtDirect => names::AT_DIRECT,
-            Route::ForkDirect { .. } => names::FORK_DIRECT,
+            Route::ForkCwdDirect { .. } => names::FORK_CWD_DIRECT,
         }
     }
 }
@@ -293,18 +296,19 @@ pub(crate) mod names {
     pub(crate) const THREAD_CWD: &str = "thread-cwd";
     pub(crate) const AT: &str = "at";
     pub(crate) const PROC: &str = "proc";
-    pub(crate) const FORK: &str = "fork";
+    pub(crate) const FORK_CWD: &str = "fork-cwd";
     pub(crate) const THREAD_CWD_SOCKDIR: &str = "thread-cwd-sockdir";
     pub(crate) const AT_SOCKDIR: &str = "at-sockdir";
     pub(crate) const PROC_SOCKDIR: &str = "proc-sockdir";
-    pub(crate) const FORK_SOCKDIR: &str = "fork-sockdir";
+    pub(crate) const FORK_CWD_SOCKDIR: &str = "fork-cwd-sockdir";
     pub(crate) const PROC_DIRECT: &str = "proc-direct";
     pub(crate) const PROC_HELD: &str = "proc-held";
     pub(crate) const RELATIVE: &str = "relative";
     pub(crate) const WIDENED: &str = "widened";
-    pub(crate) const SYMLINK: &str = "symlink";
+    pub(crate) const SYMLINK_FILE: &str = "symlink-file";
+    pub(crate) const SYMLINK_DIR: &str = "symlink-dir";
     pub(crate) const AT_DIRECT: &str = "at-direct";
-    pub(crate) const FORK_DIRECT: &str = "fork-direct";
+    pub(crate) const FORK_CWD_DIRECT: &str = "fork-cwd-direct";
 
     /// The spelling would not fit the sockaddr.
     pub(crate) const TOO_LONG: &str = "spelling too long";
@@ -337,13 +341,14 @@ pub(crate) mod names {
     pub(crate) const NO_SAFE_BASE: &str = "no safe base";
     /// The symlink could not be made in any usable place.
     pub(crate) const NO_SYMLINK: &str = "symlink not made";
+    /// The bind through symlink-file failed and nothing is at the path: the
+    /// kernel did not follow the symlink.
+    pub(crate) const SYMLINK_NOT_FOLLOWED: &str = "bind did not follow the symlink";
 }
 
-/// Available on crate feature `any` only.
-///
 /// A route that was tried and could not be used, with why: one of the routes
 /// passed over before the one that reached the path (`skipped` of
-/// `AnyListener` and `AnyConnection`), in the order tried. Only for
+/// `ExListener`, `ExStream` and `ExError`), in the order tried. Only for
 /// diagnostics: routes may be added, renamed or changed, and so may the
 /// reasons, so do not branch on them.
 #[non_exhaustive]
@@ -364,9 +369,8 @@ pub(crate) struct Reached {
     pub(crate) bound: Option<Bound>,
     // Design rationale: collected on every long path (a few entries, no
     // allocation for a short one) rather than only when asked for, so every
-    // route records the same way; only the `any` functions and the tests
+    // route records the same way; only the `_ex` functions and the tests
     // read it.
-    #[cfg_attr(not(any(test, feature = "any")), allow(dead_code))]
     pub(crate) skipped: Vec<Skipped>,
 }
 
@@ -376,9 +380,7 @@ pub(crate) struct Reached {
 #[derive(Debug)]
 pub(crate) struct Failed {
     pub(crate) error: io::Error,
-    #[cfg_attr(not(any(test, feature = "any")), allow(dead_code))]
     pub(crate) route: Option<&'static str>,
-    #[cfg_attr(not(any(test, feature = "any")), allow(dead_code))]
     pub(crate) skipped: Vec<Skipped>,
 }
 
@@ -427,9 +429,18 @@ pub(crate) fn run(req: Request, path: &Path) -> io::Result<(OwnedFd, Route)> {
 }
 
 /// [`run`], with the route and the routes passed over, on success
-/// ([`Reached`]) and on failure ([`Failed`]).
+/// ([`Reached`]) and on failure ([`Failed`]), and for a bind the [`Bound`] of
+/// the socket file (what `sockat::bind_ex` keeps).
+///
+/// The [`Bound`] is taken right after the bind: for a path handed to std, as
+/// soon as std returns; on a route through D (or R beside the socket), while
+/// R is still there, by the same spelling the bind took (`R/<name>` relative
+/// to D's fd, the symlink R followed, the socket file not) and the real path R
+/// points to; on symlink-file and symlink-dir, by the real path of the socket's
+/// directory and the file name. When that cannot be taken, the listener is
+/// closed and the error returned with the route's name; the socket file stays.
 pub(crate) fn run_reporting(req: Request, path: &Path) -> Result<Reached, Failed> {
-    run_with(req, path, false)
+    run_with(req, path, req.is_bind())
 }
 
 /// The socket file a bind made: its real path and `(st_dev, st_ino)`, taken
@@ -438,21 +449,6 @@ pub(crate) fn run_reporting(req: Request, path: &Path) -> Result<Reached, Failed
 pub(crate) struct Bound {
     pub(crate) path: PathBuf,
     pub(crate) id: (u64, u64),
-}
-
-/// A bind as [`run`] makes it, also taking the [`Bound`] of the socket file
-/// right after the bind: for a path handed to std, as soon as std returns; on
-/// a route through D, while D and R are still there, by the same spelling the
-/// bind took (`R/<name>` relative to D's fd, the symlink R followed, the
-/// socket file not) and the real path R points to. When that cannot be taken,
-/// the listener is closed and the error returned; the socket file stays.
-pub(crate) fn bind_remembering(path: &Path) -> io::Result<(OwnedFd, Route, Bound)> {
-    let r =
-        run_with(Request::Bind(BindOptions { symlink: false }), path, true).map_err(|f| f.error)?;
-    let bound = r
-        .bound
-        .ok_or_else(|| io::Error::other("the socket file was not looked up"))?;
-    Ok((r.fd, r.route, bound))
 }
 
 /// [`run`], and with `remember` the [`Bound`] of a bind.
@@ -503,16 +499,21 @@ fn bound_at(path: &Path) -> io::Result<Bound> {
 pub(crate) struct Config {
     /// Where D may be made, in the order tried ([`Config::from_vars`]).
     pub(crate) own_dir_places: Vec<Place>,
-    /// Where the temporary symlink of a connect's symlink route may go, in
-    /// the order tried: `TMPDIR` when it is set to an absolute path, then
-    /// `/tmp`.
-    #[cfg(not(target_os = "freebsd"))]
-    pub(crate) link_places: Vec<PathBuf>,
-    /// Where the temporary symlink of `bind_any`'s symlink route may go, the
-    /// candidates in order: `XDG_RUNTIME_DIR`, then `TMPDIR`, each when set to
-    /// an absolute path, then `/tmp`, a spelling once ([`links::bind_through`]
-    /// tries the places only this user can write to among them first).
-    pub(crate) bind_link_places: Vec<PathBuf>,
+    /// Where the temporary symlink of symlink-file (a connect's, and a
+    /// bind's where the bind follows it) may go, in the order tried: `TMPDIR`
+    /// when it is set to an absolute path, then `/tmp`.
+    pub(crate) file_link_places: Vec<PathBuf>,
+    /// Whether a bind tries symlink-file at all (not Linux, where a bind does
+    /// not follow a symlink and the route is not in the order). Always `true`
+    /// outside the tests, which turn it off to look at the routes after it.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(crate) symlink_file_bind: bool,
+    /// Where the temporary symlink of symlink-dir (`bind_ex`'s last resort)
+    /// may go, the candidates in order: `XDG_RUNTIME_DIR`, then `TMPDIR`, each
+    /// when set to an absolute path, then `/tmp`, a spelling once
+    /// ([`links::bind_through`] tries the places only this user can write to
+    /// among them first).
+    pub(crate) dir_link_places: Vec<PathBuf>,
     /// Whether to try the widened `sockaddr_un` at all for a connect
     /// (Apple; a bind never does). Always `true` outside the tests, which
     /// turn it off to stand in for a kernel that refuses the widened form.
@@ -571,24 +572,24 @@ impl Config {
     /// neither to be safe nor short: D is held by its fd and checked to be
     /// the one made.
     ///
-    /// The temporary symlink of a connect's symlink route goes in `TMPDIR`
-    /// when it is absolute (a relative one would put the link somewhere depending on the
+    /// The temporary symlink of symlink-file goes in `TMPDIR` when it is
+    /// absolute (a relative one would put the link somewhere depending on the
     /// cwd), then `/tmp`, tried once when `TMPDIR` is `/tmp`. That of
-    /// `bind_any` goes in `XDG_RUNTIME_DIR`, `TMPDIR` (each when absolute)
+    /// symlink-dir goes in `XDG_RUNTIME_DIR`, `TMPDIR` (each when absolute)
     /// and `/tmp`, a spelling once.
     pub(crate) fn from_vars(tmpdir: Option<OsString>, runtime_dir: Option<OsString>) -> Self {
         let tmp = Path::new("/tmp");
         let set = |v: Option<OsString>| v.map(PathBuf::from).filter(|t| !t.as_os_str().is_empty());
         let tmpdir = set(tmpdir);
-        let mut bind_link_places: Vec<PathBuf> = Vec::new();
+        let mut dir_link_places: Vec<PathBuf> = Vec::new();
         for place in set(runtime_dir)
             .into_iter()
             .chain(tmpdir.clone())
             .filter(|p| p.is_absolute())
             .chain([tmp.to_path_buf()])
         {
-            if !bind_link_places.contains(&place) {
-                bind_link_places.push(place);
+            if !dir_link_places.contains(&place) {
+                dir_link_places.push(place);
             }
         }
         let first = tmpdir.clone().unwrap_or_else(|| tmp.to_path_buf());
@@ -597,17 +598,17 @@ impl Config {
             own_dir_places.push(Place::Path(tmp.to_path_buf()));
         }
         own_dir_places.push(Place::SocketDir);
-        #[cfg(not(target_os = "freebsd"))]
-        let link_places = tmpdir
+        let file_link_places = tmpdir
             .filter(|t| t.is_absolute() && t != tmp)
             .into_iter()
             .chain([tmp.to_path_buf()])
             .collect();
         Self {
             own_dir_places,
-            #[cfg(not(target_os = "freebsd"))]
-            link_places,
-            bind_link_places,
+            file_link_places,
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            symlink_file_bind: true,
+            dir_link_places,
             #[cfg(target_vendor = "apple")]
             wide: true,
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -624,9 +625,8 @@ impl Config {
 /// found out about it so far.
 struct Target<'a> {
     req: Request,
-    /// The path as given (relative, widened, proc-held and symlink spell it;
-    /// FreeBSD's routes do not).
-    #[cfg_attr(target_os = "freebsd", allow(dead_code))]
+    /// The path as given (relative, widened, proc-held and symlink-file
+    /// spell it).
     path: &'a Path,
     dir: &'a Path,
     name: &'a OsStr,
@@ -645,7 +645,7 @@ struct Target<'a> {
     /// returns.
     own_dir: OnceCell<Option<own::OwnDir>>,
     /// Whether a connect may still use the widened `sockaddr_un` (Apple): the
-    /// kernel refusing it turns it off for fork-direct too.
+    /// kernel refusing it turns it off for fork-cwd-direct too.
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     wide: Cell<bool>,
     /// Whether to take the [`Bound`] of a bind ([`bind_remembering`]), and
@@ -835,7 +835,7 @@ pub(crate) enum Means {
     /// FreeBSD has none: bindat cannot turn out unusable, so nothing comes
     /// after it.
     #[cfg(not(target_os = "freebsd"))]
-    Fork,
+    ForkCwd,
 }
 
 impl Means {
@@ -856,9 +856,9 @@ impl Means {
             #[cfg(target_os = "freebsd")]
             (Means::At, true) => names::AT_SOCKDIR,
             #[cfg(not(target_os = "freebsd"))]
-            (Means::Fork, false) => names::FORK,
+            (Means::ForkCwd, false) => names::FORK_CWD,
             #[cfg(not(target_os = "freebsd"))]
-            (Means::Fork, true) => names::FORK_SOCKDIR,
+            (Means::ForkCwd, true) => names::FORK_CWD_SOCKDIR,
         }
     }
 }
@@ -881,14 +881,21 @@ fn skip_all(
     }
 }
 
-/// The routes of a bind: [`bind_through_d`], then `bind_any`'s symlink
-/// ([`links::bind_through`]) when the options allow it. `None` (and so
-/// `ENAMETOOLONG`) when no route could be used.
+/// The routes of a bind: symlink-file where a bind may follow a symlink (not
+/// Linux; [`links::symlink_file`]), [`bind_through_d`], then the last resort
+/// symlink-dir ([`links::bind_through`]) when the options allow it. `None`
+/// (and so `ENAMETOOLONG`) when no route could be used.
 fn bind_order(t: &Target<'_>, options: BindOptions) -> Option<Call> {
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    if t.cfg.symlink_file_bind {
+        if let Step::Done(call) = links::symlink_file(t) {
+            return Some(call);
+        }
+    }
     if let Step::Done(call) = bind_through_d(t) {
         return Some(call);
     }
-    if options.symlink {
+    if options.last_resort {
         if let Step::Done(call) = links::bind_through(t) {
             return Some(call);
         }
@@ -987,7 +994,7 @@ fn means_check(t: &Target<'_>, m: Means) -> Option<&'static str> {
         #[cfg(target_os = "freebsd")]
         Means::At => None,
         #[cfg(not(target_os = "freebsd"))]
-        Means::Fork => None,
+        Means::ForkCwd => None,
     }
 }
 
@@ -1009,7 +1016,7 @@ fn bind_means(t: &Target<'_>) -> MeansList {
     #[cfg(target_os = "freebsd")]
     all.push((Means::At, means_check(t, Means::At)));
     #[cfg(not(target_os = "freebsd"))]
-    all.push((Means::Fork, means_check(t, Means::Fork)));
+    all.push((Means::ForkCwd, means_check(t, Means::ForkCwd)));
     all
 }
 
@@ -1070,6 +1077,30 @@ fn remember_through(t: &Target<'_>, spelling: &Path, dir: BorrowedFd<'_>) -> io:
     Ok(())
 }
 
+/// Take the [`Bound`] of the socket file just bound through a symlink in a
+/// place (symlink-file, symlink-dir): the real path of the socket's directory
+/// joined with the file name, and `(st_dev, st_ino)` of what is there, looked
+/// up without following a symlink.
+fn remember_by_real_path(t: &Target<'_>) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let path = t.real_dir().join(t.name);
+    let m = std::fs::symlink_metadata(&path)?;
+    let _ = t.bound.set(Bound {
+        path,
+        id: (m.dev(), m.ino()),
+    });
+    Ok(())
+}
+
+/// `path` made absolute against the cwd, or `None` when the cwd cannot be
+/// read: what symlink-file and proc-held point to.
+fn absolute(path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    std::env::current_dir().ok().map(|cwd| cwd.join(path))
+}
+
 /// Make the call by `means` with `<anchor.link>/<name>` (in `addr`)
 /// relative to `anchor.fd`; `None` when that means cannot be used, nothing
 /// having been called (noted in `t` with why).
@@ -1116,12 +1147,12 @@ fn by_means(t: &Target<'_>, anchor: Anchor<'_>, addr: &SockAddr, means: Means) -
             Some(Call::made(route, freebsd::at(t.req, anchor.fd, addr)))
         }
         #[cfg(not(target_os = "freebsd"))]
-        Means::Fork => Some(Call {
+        Means::ForkCwd => Some(Call {
             name: means.name(anchor.sockdir),
             result: fork_in(t.req, anchor.fd, addr).map(|(fd, child)| {
                 let route = match anchor.sockdir {
-                    false => Route::Fork { child },
-                    true => Route::ForkSockdir { child },
+                    false => Route::ForkCwd { child },
+                    true => Route::ForkCwdSockdir { child },
                 };
                 (fd, route)
             }),
@@ -1585,11 +1616,11 @@ type ConnectRoute = fn(&Target<'_>) -> Step;
 ///
 /// | target | order |
 /// |---|---|
-/// | Linux, Android (/proc usable) | proc-direct, thread-cwd, proc, proc-held, symlink |
-/// | Linux, Android (no /proc) | relative, thread-cwd, symlink |
-/// | Apple | relative, widened, thread-cwd, symlink |
+/// | Linux, Android (/proc usable) | proc-direct, thread-cwd, proc, proc-held, symlink-file |
+/// | Linux, Android (no /proc) | relative, thread-cwd, symlink-file |
+/// | Apple | relative, widened, thread-cwd, symlink-file |
 /// | FreeBSD | at-direct, at |
-/// | NetBSD, OpenBSD, illumos, other Unix | relative, symlink |
+/// | NetBSD, OpenBSD, illumos, other Unix | relative, symlink-file |
 ///
 /// The routes that need neither writing nor a thread come first, those that
 /// make D (or a symlink) or start a thread after them, so D is made only when
@@ -1609,9 +1640,9 @@ fn connect_routes(t: &Target<'_>) -> &'static [ConnectRoute] {
             thread_cwd_route,
             proc_route,
             linux::proc_held,
-            posix::symlinks,
+            links::symlink_file,
         ],
-        None => &[posix::relative, thread_cwd_route, posix::symlinks],
+        None => &[posix::relative, thread_cwd_route, links::symlink_file],
     }
 }
 
@@ -1622,7 +1653,7 @@ fn connect_routes(_t: &Target<'_>) -> &'static [ConnectRoute] {
         posix::relative,
         apple::widened,
         thread_cwd_route,
-        posix::symlinks,
+        links::symlink_file,
     ]
 }
 
@@ -1640,7 +1671,7 @@ fn connect_routes(_t: &Target<'_>) -> &'static [ConnectRoute] {
     target_os = "freebsd"
 )))]
 fn connect_routes(_t: &Target<'_>) -> &'static [ConnectRoute] {
-    &[posix::relative, posix::symlinks]
+    &[posix::relative, links::symlink_file]
 }
 
 /// The call of the first of `routes` that made one, trying them in order.
@@ -1682,10 +1713,10 @@ fn at_route(t: &Target<'_>) -> Step {
     through_own_dir_by(t, Means::At)
 }
 
-/// The last route of a connect, fork-direct: a forked child that `fchdir`s
+/// The last route of a connect, fork-cwd-direct: a forked child that `fchdir`s
 /// into the socket's directory and connects by the file name, for the
 /// connects that may fork. `None` (and so `ENAMETOOLONG`) for the others, with
-/// nothing noted (fork-direct is not in their order), and when the file name
+/// nothing noted (fork-cwd-direct is not in their order), and when the file name
 /// fits no sockaddr or the socket's directory cannot be opened. The file name
 /// goes in the plain sockaddr, or on Apple in the widened one when it is too
 /// long for that and the kernel takes the widened form (`t.wide`).
@@ -1704,16 +1735,16 @@ fn fork_beside(options: ConnectOptions, t: &Target<'_>) -> Option<Call> {
     #[cfg(not(target_vendor = "apple"))]
     let addr = SockAddr::standard(t.name);
     let Ok(addr) = addr else {
-        t.skip(names::FORK_DIRECT, names::TOO_LONG);
+        t.skip(names::FORK_CWD_DIRECT, names::TOO_LONG);
         return None;
     };
     let Some(dir_fd) = t.dir_fd() else {
-        t.skip(names::FORK_DIRECT, names::SOCKDIR_UNOPENABLE);
+        t.skip(names::FORK_CWD_DIRECT, names::SOCKDIR_UNOPENABLE);
         return None;
     };
     Some(Call {
-        name: names::FORK_DIRECT,
-        result: fork_in(req, dir_fd, &addr).map(|(fd, child)| (fd, Route::ForkDirect { child })),
+        name: names::FORK_CWD_DIRECT,
+        result: fork_in(req, dir_fd, &addr).map(|(fd, child)| (fd, Route::ForkCwdDirect { child })),
     })
 }
 
@@ -1978,7 +2009,7 @@ pub(crate) mod linux {
         if !fits(estimate.to_string()) {
             return skip(names::TOO_LONG);
         }
-        let Some(target) = posix::absolute(t.path) else {
+        let Some(target) = absolute(t.path) else {
             return skip(names::CWD_UNREADABLE);
         };
         let Some(d) = own_dir(t, |d| d.with_file_link(&target)) else {
@@ -2048,7 +2079,7 @@ pub(crate) mod apple {
     /// The connect route widened: the path itself in a widened
     /// `sockaddr_un` when it is at most [`sys::WIDE_PATH_MAX`] bytes, else its
     /// spelling relative to the cwd when that is. Unusable when the kernel
-    /// refuses the widened form (which turns it off for fork-direct too:
+    /// refuses the widened form (which turns it off for fork-cwd-direct too:
     /// `t.wide`) or neither spelling fits.
     pub(super) fn widened(t: &Target<'_>) -> Step {
         let Request::Connect(o) = t.req else {
@@ -2085,8 +2116,8 @@ pub(crate) mod apple {
     }
 }
 
-/// The connect routes that need nothing but POSIX: the relative spelling and
-/// the temporary symlink in a safe place (every target but FreeBSD).
+/// The connect route relative: the path spelled relative to the cwd (every
+/// target but FreeBSD).
 #[cfg(not(target_os = "freebsd"))]
 pub(crate) mod posix {
     use super::*;
@@ -2102,15 +2133,6 @@ pub(crate) mod posix {
     #[cfg(not(target_vendor = "apple"))]
     const SPELLING_MAX: usize = DIRECT_MAX;
 
-    /// `path` made absolute against the cwd, or `None` when the cwd cannot be
-    /// read.
-    pub(crate) fn absolute(path: &Path) -> Option<PathBuf> {
-        if path.is_absolute() {
-            return Some(path.to_path_buf());
-        }
-        std::env::current_dir().ok().map(|cwd| cwd.join(path))
-    }
-
     /// The relative route: the path spelled relative to the cwd when that
     /// fits the plain sockaddr ([`Relative`]).
     pub(super) fn relative(t: &Target<'_>) -> Step {
@@ -2121,25 +2143,6 @@ pub(crate) mod posix {
                 Step::Next
             }
         }
-    }
-
-    /// The symlink route: a temporary symlink to the socket file under the
-    /// first of [`Config::link_places`] where it can be used
-    /// ([`symlink_route`]).
-    pub(super) fn symlinks(t: &Target<'_>) -> Step {
-        let Some(target) = absolute(t.path) else {
-            t.skip(names::SYMLINK, names::CWD_UNREADABLE);
-            return Step::Next;
-        };
-        let mut why = names::NO_SAFE_BASE;
-        for base in &t.cfg.link_places {
-            match symlink_route(t.req, base, &target) {
-                Ok(done) => return Step::Done(done),
-                Err(reason) => why = reason,
-            }
-        }
-        t.skip(names::SYMLINK, why);
-        Step::Next
     }
 
     /// A relative spelling of an absolute socket path, checked to name the
@@ -2265,43 +2268,89 @@ pub(crate) mod posix {
             result
         }
     }
+}
 
-    /// Connect through a symlink `<base>/sockat.XXXXXXXXXX` to `target`, the
-    /// socket file (the path as given, made absolute against the cwd): a
-    /// connect follows a symlink in the last component, so the spelling's
-    /// length depends on neither the directory nor the file name, and the
-    /// kernel resolves the link as it resolves the path.
+/// The temporary symlink in a place (SPEC "symlink の置き場と名前"), for
+/// symlink-file ([`symlink_file`], a connect's and a bind's) and symlink-dir
+/// ([`bind_through`], `bind_ex`'s last resort), and who can replace an entry
+/// in a place.
+pub(crate) mod links {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    /// The route symlink-file: a temporary symlink to the socket file (the
+    /// path as given, made absolute against the cwd) under the first of
+    /// [`Config::file_link_places`] where it can be used
+    /// ([`symlink_file_at`]).
+    ///
+    /// A bind through it reaches the path only where the kernel follows the
+    /// symlink in the last component (macOS; not Linux, where the route is
+    /// not in the order). When the bind fails, what is at the path decides
+    /// (hub DR-0016): something there makes it the real failure, returned as
+    /// it is (`EADDRINUSE`, ...); nothing there, or nothing that can be told,
+    /// means the kernel did not follow the symlink, and the route is passed
+    /// over (a real failure fails the next route the same way and is returned
+    /// there).
+    pub(super) fn symlink_file(t: &Target<'_>) -> Step {
+        let Some(target) = absolute(t.path) else {
+            t.skip(names::SYMLINK_FILE, names::CWD_UNREADABLE);
+            return Step::Next;
+        };
+        let mut why = names::NO_SAFE_BASE;
+        for base in &t.cfg.file_link_places {
+            let call = match symlink_file_at(t.req, base, &target) {
+                Ok(call) => call,
+                Err(reason) => {
+                    why = reason;
+                    continue;
+                }
+            };
+            return match (t.req, &call.result) {
+                (Request::Bind(_), Err(_)) if std::fs::symlink_metadata(&target).is_err() => {
+                    t.skip(names::SYMLINK_FILE, names::SYMLINK_NOT_FOLLOWED);
+                    Step::Next
+                }
+                (Request::Bind(_), Ok(_)) if t.remember => {
+                    let Call { name, result } = call;
+                    Step::Done(Call {
+                        name,
+                        result: remember_by_real_path(t).and(result),
+                    })
+                }
+                _ => Step::Done(call),
+            };
+        }
+        t.skip(names::SYMLINK_FILE, why);
+        Step::Next
+    }
+
+    /// Bind / connect through a symlink `<base>/sockat.XXXXXXXXXX` to
+    /// `target`, the socket file: the spelling's length depends on neither
+    /// the directory nor the file name, and a connect (or a bind that follows
+    /// it) resolves the link as it resolves the path.
     ///
     /// Used when the spelling fits the plain sockaddr and `base` is a place
-    /// where nobody else can replace the symlink ([`links::place_kind_of`]:
-    /// only this user can write to it, or it is shared). Both are
-    /// checked before anything is created. Nothing is left under `base`: the
-    /// symlink is removed when this returns (including on panic) whatever the
-    /// outcome. `Err` with why when `base` cannot be used ([`names`]).
-    pub(crate) fn symlink_route(
+    /// where nobody else can replace the symlink ([`place_kind_of`]: only this
+    /// user can write to it, or it is shared). Both are checked before
+    /// anything is created. Nothing is left under `base`: the symlink is
+    /// removed when this returns (including on panic) whatever the outcome.
+    /// `Err` with why when `base` cannot be used ([`names`]).
+    pub(crate) fn symlink_file_at(
         req: Request,
         base: &Path,
         target: &Path,
     ) -> Result<Call, &'static str> {
-        if links::place_kind_of(base).is_none() {
+        if place_kind_of(base).is_none() {
             return Err(names::NO_SAFE_BASE);
         }
-        if path::len(&links::placeholder(base)) > DIRECT_MAX {
+        if path::len(&placeholder(base)) > DIRECT_MAX {
             return Err(names::TOO_LONG);
         }
-        let Ok(link) = links::TempLink::create(base, target) else {
+        let Ok(link) = TempLink::create(base, target) else {
             return Err(names::NO_SYMLINK);
         };
-        Ok(Call::made(Route::Symlink, plain_op(req, &link.path)))
+        Ok(Call::made(Route::SymlinkFile, plain_op(req, &link.path)))
     }
-}
-
-/// The temporary symlink in a place (SPEC "symlink の置き場と名前"), for the
-/// symlink route of a connect (`posix::symlink_route`) and of `bind_any`
-/// (`links::bind_through`), and who can replace an entry in a place.
-pub(crate) mod links {
-    use super::*;
-    use std::os::unix::fs::MetadataExt;
 
     /// A place where only this user (and root) can remove or rename the
     /// entries this user creates, by who else can write to it.
@@ -2352,21 +2401,21 @@ pub(crate) mod links {
         base.join(format!("{}{}", own::PREFIX, "X".repeat(own::RANDOM_LEN)))
     }
 
-    /// The symlink route of `bind_any`, tried once every other bind route is
-    /// unusable: a symlink `<base>/sockat.XXXXXXXXXX` to the real path of the
-    /// socket's directory, the bind by `<link>/<name>`, and the symlink
-    /// removed when the bind returns, whatever the outcome.
+    /// The route symlink-dir, `bind_ex`'s last resort, tried once every other
+    /// bind route is unusable: a symlink `<base>/sockat.XXXXXXXXXX` to the real
+    /// path of the socket's directory, the bind by `<link>/<name>`, and the
+    /// symlink removed when the bind returns, whatever the outcome.
     ///
-    /// The places of [`Config::bind_link_places`] that only this user can
+    /// The places of [`Config::dir_link_places`] that only this user can
     /// write to come first, in order, then the shared ones, in order (the
-    /// route is [`Route::SymlinkBind`] with `shared` saying which). A place
+    /// route is [`Route::SymlinkDir`] with `shared` saying which). A place
     /// that is neither, where the spelling would not fit the plain sockaddr,
     /// or where the symlink cannot be made, is passed over with nothing made
     /// in it. [`Step::Next`] (and so `ENAMETOOLONG`) when every place is.
     pub(super) fn bind_through(t: &Target<'_>) -> Step {
         let kinds: Vec<(&Path, PlaceKind)> = t
             .cfg
-            .bind_link_places
+            .dir_link_places
             .iter()
             .filter_map(|base| place_kind_of(base).map(|k| (base.as_path(), k)))
             .collect();
@@ -2381,13 +2430,18 @@ pub(crate) mod links {
                 why = names::NO_SYMLINK;
                 continue;
             };
-            let route = Route::SymlinkBind {
+            let route = Route::SymlinkDir {
                 shared: kind == PlaceKind::Shared,
             };
             let via = link.path.join(t.name);
-            return Step::Done(Call::made(route, plain_op(t.req, &via)));
+            let result = plain_op(t.req, &via);
+            let result = match result {
+                Ok(fd) if t.remember => remember_by_real_path(t).map(|()| fd),
+                result => result,
+            };
+            return Step::Done(Call::made(route, result));
         }
-        t.skip(names::SYMLINK, why);
+        t.skip(names::SYMLINK_DIR, why);
         Step::Next
     }
 

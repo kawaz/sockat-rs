@@ -19,7 +19,7 @@
 
 - R (と D 無しの fork の `.sockat.XXXXXXXXXX`) は bind の後に消えているので、返った綴りで消す・`stat` する・`chmod` しても何にも当たらない (`/proc/self/fd/<n>` の番号が使い回されても、どの cwd から解決しても)
 - どの綴りも `sun_path` に収まるので、返るアドレスは途中で切れない (bind は広げた sockaddr を使わない、[DR-0027](DR-0027-own-directory-and-fallback-routes.md))
-- 利用者には元のパスを持ってもらう。doc にそう書く。ソケットのファイルを消すなら元のパスか `bind_ex` ([DR-0028](DR-0028-bind-ex-and-socket-file.md)) で。同じ綴りが `Debug` やフレームワークのログ・接続元の情報にも出ることも書く
+- 利用者には元のパスを持ってもらう。doc にそう書く。ソケットのファイルを消すなら元のパスか `bind_ex` ([DR-0031](DR-0031-ex-functions.md)) で。同じ綴りが `Debug` やフレームワークのログ・接続元の情報にも出ることも書く
 - OpenBSD では、103 バイト以内の短いパス ([DR-0002](DR-0002-std-handles-paths-it-accepts.md) で std にそのまま渡す) でも、std の `local_addr()` がパスの末尾 1 バイトを欠いて返す (CI の VM で観測、std の `UnixListener::bind` を直接使った場合)。sockat は手を入れない。std が綴りそのものを返す前提を見る試験は、OpenBSD では外す
 
 ## 理由

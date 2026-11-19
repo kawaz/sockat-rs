@@ -1,13 +1,13 @@
 # DR-0028: 後始末つきの bind は `bind_ex` で、listener と消す口 `SocketFile` を返す。listener を閉じるのは利用者
 
-- Status: Accepted
+- Status: Superseded by DR-0031
 - Date: 2026-11-19
 
 ## Context
 
-- 長いパスの bind では、カーネルが覚える綴りは元のパスでない ([DR-0027](DR-0027-own-directory-and-fallback-routes.md))。上のライブラリが綴りでソケットのファイルを消す後始末 (Go の `UnixListener.Close` 等) は効かない
+- 長いパスの bind では、カーネルが覚える綴りは元のパスでない ([DR-0027](../DR-0027-own-directory-and-fallback-routes.md))。上のライブラリが綴りでソケットのファイルを消す後始末 (Go の `UnixListener.Close` 等) は効かない
 - 利用者が元のパスで `remove_file` すると、間に同じパスへ別のソケットが bind されていた時に、それを消す
-- listener は std の `UnixListener` のまま返し、tokio 等へ move できる必要がある ([DR-0010](DR-0010-public-api.md)、[DR-0014](DR-0014-no-tokio-dependency.md))
+- listener は std の `UnixListener` のまま返し、tokio 等へ move できる必要がある ([DR-0010](../DR-0010-public-api.md)、[DR-0014](../DR-0014-no-tokio-dependency.md))
 - ハブの SPEC は `_ex` を「bind したソケットのファイルの realpath と `(st_dev, st_ino)` を覚え、`discard()` でそのパスの `(st_dev, st_ino)` が同じ時だけ消す」とする。discard が listener を閉じるかはハブ QUESTIONS.md D12-Q4 で kawaz 確認中
 
 ## Decision

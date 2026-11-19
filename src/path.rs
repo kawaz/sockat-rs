@@ -174,7 +174,7 @@ mod tests {
 
     // `split` decides which directory a long path's socket is created in and
     // under which name, for every route that does not hand the whole path to
-    // the kernel (the /proc fd route, the symlink route, the fork route,
+    // the kernel (proc-direct, symlink-file, the fork routes,
     // bindat). A wrong split creates the socket somewhere else than the path
     // says, so each row of the table in its doc comment is pinned here.
     #[test]

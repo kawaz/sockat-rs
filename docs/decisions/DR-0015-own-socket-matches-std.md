@@ -13,7 +13,7 @@
   - close-on-exec
   - `SO_NOSIGPIPE`: std が付ける OS (Apple、FreeBSD、NetBSD、DragonFly) で付ける (閉じた相手への書き込みが SIGPIPE でなく `EPIPE` になる)
   - listen の backlog: std と同じ値 (macOS / Linux / FreeBSD / OpenBSD は -1、他は `SOMAXCONN`)
-- ソケットファイルは listener を閉じても消さない (std と同じ)。消すのは利用者で、元のパスで `remove_file` するか、`bind_ex` の `SocketFile::discard` を使う ([DR-0028](DR-0028-bind-ex-and-socket-file.md))。unlink には `sun_path` の上限が無い
+- ソケットファイルは listener を閉じても消さない (std と同じ)。消すのは利用者で、元のパスで `remove_file` するか、`bind_ex` の `SocketFile::discard` を使う ([DR-0031](DR-0031-ex-functions.md))。unlink には `sun_path` の上限が無い
 
 ## 理由
 

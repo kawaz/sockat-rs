@@ -1,4 +1,4 @@
-# DR-0027: 長いパスは自分専用のディレクトリ D の中の乱数の symlink R を通して bind し、connect は書き込みもスレッドも要らない経路を先に試す
+# DR-0027: 長いパスは bind が symlink を辿る OS ではソケットのファイルを指す symlink、他は自分専用のディレクトリ D の中の乱数の symlink R を通して bind し、connect は書き込みもスレッドも要らない経路を先に試す
 
 - Status: Accepted
 - Date: 2026-11-19
@@ -23,7 +23,7 @@
 
 ### 経路の名前
 
-経路はハブ SPEC の「経路の名前」で呼び、`route::Route` の variant と 1 対 1 にする (`Route::name`)。名前は any 系の戻り値 ([DR-0029](DR-0029-any-functions.md)) と試験に出る。
+経路はハブ SPEC の「経路の名前」で呼び、`route::Route` の variant と 1 対 1 にする (`Route::name`)。名前は `_ex` の戻り値 ([DR-0031](DR-0031-ex-functions.md)) と試験に出る。
 
 | 名前 | `Route` | 中身 |
 |---|---|---|
@@ -31,51 +31,56 @@
 | thread-cwd | `ThreadCwd` | 使い捨てのスレッドの cwd を D に移し `R/<ファイル名>` (Linux / Android、Apple の OS) |
 | at | `At` | `bindat` / `connectat` に Dfd と `R/<ファイル名>` (FreeBSD) |
 | proc | `Proc` | `/proc/self/fd/<Dfd>/R/<ファイル名>` (`/proc` を使える Linux / Android) |
-| fork | `Fork` | fork した子が `fchdir(Dfd)` して `R/<ファイル名>` で bind (FreeBSD 以外) |
-| thread-cwd-sockdir / at-sockdir / proc-sockdir / fork-sockdir | `ThreadCwdSockdir` / `AtSockdir` / `ProcSockdir` / `ForkSockdir` | 上の 4 つを D 無しの形で (bind だけ) |
+| fork-cwd | `ForkCwd` | fork した子が `fchdir(Dfd)` して `R/<ファイル名>` で bind (FreeBSD 以外) |
+| thread-cwd-sockdir / at-sockdir / proc-sockdir / fork-cwd-sockdir | `ThreadCwdSockdir` / `AtSockdir` / `ProcSockdir` / `ForkCwdSockdir` | 上の 4 つを D 無しの形で (bind だけ) |
 | proc-direct | `ProcDirect` | `/proc/self/fd/<ソケットのディレクトリの fd>/<ファイル名>` (connect) |
 | proc-held | `ProcHeld` | D の中のソケットのファイルへの symlink `s` を `/proc/self/fd/<Dfd>/s` で (connect) |
 | relative | `Relative` | cwd からの相対パス (connect、[DR-0004](DR-0004-relative-path-from-cwd.md)) |
 | widened | `Widened` / `WidenedRelative` | 広げた sockaddr に元のパス / 相対パス (connect、[DR-0005](DR-0005-widened-sockaddr-on-macos.md)) |
-| symlink | `Symlink` / `SymlinkBind { shared }` | 置き場の symlink。connect ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md)) と `bind_any` の最後 ([DR-0029](DR-0029-any-functions.md)) |
+| symlink-file | `SymlinkFile` | 置き場のソケットのファイルを指す symlink。connect と、bind が symlink を辿る OS の bind ([DR-0006](DR-0006-symlink-in-safe-temp-dir.md)) |
+| symlink-dir | `SymlinkDir { shared }` | 置き場のソケットのディレクトリを指す symlink。`bind_ex` の最終手段 ([DR-0031](DR-0031-ex-functions.md)) |
 | at-direct | `AtDirect` | `connectat(<ソケットのディレクトリの fd>, <ファイル名>)` (FreeBSD、connect) |
-| fork-direct | `ForkDirect` | fork した子がソケットのディレクトリに `fchdir` してファイル名で connect (`connect_any` 系の最後) |
+| fork-cwd-direct | `ForkCwdDirect` | fork した子がソケットのディレクトリに `fchdir` してファイル名で connect (`connect_ex` 系の最終手段) |
+
+- 名前は「手段 + 何についてか」(ハブ DR-0016)。接尾辞 `-sockdir` は R をソケットのディレクトリに置く形、`-direct` は R を通さずファイル名で渡す形
 
 ### 試す順番
 
 | 順 | bind |
 |---|---|
 | 1 | standard (std に渡す長さ以下) |
-| 2 | thread-cwd (FreeBSD は at) |
-| 3 | proc |
-| 4 | fork |
-| 5 | `ENAMETOOLONG` (`bind_any` は symlink) |
+| 2 | symlink-file (Linux / Android 以外) |
+| 3 | thread-cwd (FreeBSD は at) |
+| 4 | proc |
+| 5 | fork-cwd |
+| 6 | `ENAMETOOLONG` (最終手段を使う `bind_ex` は symlink-dir) |
 
-- D をどこにも作れない bind は、2〜4 を D 無しの形で試す (thread-cwd-sockdir (FreeBSD は at-sockdir) → proc-sockdir → fork-sockdir)
+- D をどこにも作れない bind は、3〜5 を D 無しの形で試す (thread-cwd-sockdir (FreeBSD は at-sockdir) → proc-sockdir → fork-cwd-sockdir)
+- bind の symlink-file: 安全な置き場 (connect の symlink-file と同じ候補と条件、`Config::file_link_places`) にソケットのファイル (渡されたパス、相対パスなら cwd を前に付ける) を指す symlink `<置き場>/sockat.XXXXXXXXXX` を作り、その綴りで bind して、すぐ消す (`route::links::symlink_file`)。bind が最後の要素の symlink を辿る OS (macOS で実測) でだけ元のパスにソケットができる。辿らない Linux / Android では列に入れない (cfg で外す)。他の OS では、bind が失敗した時に元のパスを `lstat` し、物があればそのエラーを返して次を試さず、無いか確かめられなければ辿らなかったとみなして「bind did not follow the symlink」で飛ばす (ハブ DR-0016。試験 `a_bind_through_symlink_file_reaches_any_file_name_length`、`a_bind_through_symlink_file_onto_an_existing_file_is_the_failure`、`a_bind_through_symlink_file_failing_with_nothing_at_the_path_goes_on`)。綴りにファイル名が出ないので、macOS の bind はファイル名の長さによらず届く。失うのは `respelled` だけ
 
-| 順 | `connect` / `connect_nonblocking` | `connect_any` 系 |
+| 順 | `connect` / `connect_nonblocking`、`LastResort::Avoid` の `connect_ex` 系 | `LastResort::Allow` の `connect_ex` 系 |
 |---|---|---|
 | 1 | standard (std に渡す長さ以下) | 同じ |
 | 2 | OS ごとの順 (下の表) | 同じ |
-| 3 | `ENAMETOOLONG` | fork-direct |
+| 3 | `ENAMETOOLONG` | fork-cwd-direct |
 
 | OS | connect の順 |
 |---|---|
-| Linux / Android (`/proc` あり) | proc-direct → thread-cwd → proc → proc-held → symlink |
-| Linux / Android (`/proc` 無し) | relative → thread-cwd → symlink |
-| Apple の OS | relative → widened → thread-cwd → symlink |
+| Linux / Android (`/proc` あり) | proc-direct → thread-cwd → proc → proc-held → symlink-file |
+| Linux / Android (`/proc` 無し) | relative → thread-cwd → symlink-file |
+| Apple の OS | relative → widened → thread-cwd → symlink-file |
 | FreeBSD | at-direct → at |
-| NetBSD / OpenBSD / illumos / その他 | relative → symlink |
+| NetBSD / OpenBSD / illumos / その他 | relative → symlink-file |
 
 - connect は、書き込み (D・R・symlink を作る) もスレッドも要らない経路を先に、D を作る経路とスレッドを立てる経路をその後に試す
 
 - 最初にソケットのディレクトリを `stat` で引く。無ければ `ENOENT`、ディレクトリでなければ `ENOTDIR` (長さの判定や D を作るより前)
 - 続けてソケットのディレクトリの realpath を取る。引けなければそのエラーを返す (R を作れないことを `ENAMETOOLONG` に化けさせない。試験 `an_unresolvable_socket_directory_reports_its_error_not_enametoolong`、ハブ SPEC ecb61c32)
-- ソケットのディレクトリを開くのは、その fd が要る経路 (proc-direct、at-direct、fork-direct、`-sockdir` の経路、ソケットのディレクトリに作る D) だけ。開けなければその経路は使えない (`O_RDONLY` で開く OS は読み取り権限の無いディレクトリを開けない)。D を通す経路と proc-held は、D を他の置き場に作れればソケットのディレクトリを開かない (試験 `a_socket_directory_that_cannot_be_opened_costs_only_the_routes_that_need_its_fd`、`proc_and_proc_held_need_no_socket_directory_fd`)
+- ソケットのディレクトリを開くのは、その fd が要る経路 (proc-direct、at-direct、fork-cwd-direct、`-sockdir` の経路、ソケットのディレクトリに作る D) だけ。開けなければその経路は使えない (`O_RDONLY` で開く OS は読み取り権限の無いディレクトリを開けない)。D を通す経路と proc-held は、D を他の置き場に作れればソケットのディレクトリを開かない (試験 `a_socket_directory_that_cannot_be_opened_costs_only_the_routes_that_need_its_fd`、`proc_and_proc_held_need_no_socket_directory_fd`)
 - `/proc` を使えるかは、`/` を開いた fd で `/proc/self/fd/<fd>` を引いて確かめる (1 回の呼び出しで 1 度)。D の fd では、D を作る前に要る判断 (connect の順の選び方、proc と proc-held の綴りの見積もり) に間に合わない
 - 経路が実際に bind / connect した結果の失敗は返し、次を試さない ([DR-0012](DR-0012-route-failure-handling.md))
 
-### D を通す経路 (thread-cwd・at・proc・fork・proc-held)
+### D を通す経路 (thread-cwd・at・proc・fork-cwd・proc-held)
 
 D は 1 回の呼び出しで 1 度だけ作り、D を使う経路で共有する (`route::own_dir`、`route::Target` が持つ)。最初に D を求めた経路が、D と自分の要る物 (R、proc-held は `s`) を作れた置き場の D を使い、後の経路は同じ D に要る物を足す。どこにも作れなかったら、それを覚えて、後の D を使う経路はどれも理由 `no place for D` で飛ばし、作り直さない。D を使う経路より前の経路で届けば D は作らない。D と中身は呼び出しが返る前に片付ける (試験 `a_connect_by_a_route_that_needs_no_writing_makes_nothing`、`d_is_made_once_for_the_routes_through_it`、`with_d_made_nowhere_every_route_through_d_is_passed_over_and_d_tried_once`)
 
@@ -92,7 +97,7 @@ D は 1 回の呼び出しで 1 度だけ作り、D を使う経路で共有す�
 | thread-cwd: 使い捨てのスレッドで `unshare(CLONE_FS)` → `fchdir(Dfd)` (Linux)、`pthread_fchdir_np(Dfd)` (Apple) | Linux / Android、Apple の OS | seccomp の filter が掛かっている (`prctl(PR_GET_SECCOMP)` が 0 以外か失敗。filter が SIGSYS でプロセスを kill しうるので `unshare` を呼ばない)、`unshare` が断られた、`pthread_fchdir_np` が無い・失敗した、スレッドを作れない |
 | proc: `/proc/self/fd/<Dfd>/R/<ファイル名>` | `/proc` を使える Linux / Android | `/proc/self/fd/<Dfd>` を引けない、綴りが 107 バイトを超える (ファイル名およそ 79 まで) |
 | at: bindat / connectat に Dfd | FreeBSD | (無い) |
-| fork: 子が `fchdir(Dfd)` して bind、listen は親 ([DR-0025](DR-0025-fork-bind-listen-by-parent.md)) | FreeBSD 以外 (bind だけ) | |
+| fork-cwd: 子が `fchdir(Dfd)` して bind、listen は親 ([DR-0025](DR-0025-fork-bind-listen-by-parent.md)) | FreeBSD 以外 (bind だけ) | |
 
 - 長さと、経路を使えるか (確かめられる所まで: thread-cwd は呼び出し元のスレッドの seccomp と `pthread_fchdir_np` の有無、proc と proc-held は見積もった綴り) は D を作る前に確かめ、使えなければ何も作らずに次へ
 - proc と proc-held の綴りは D の fd の桁で変わる。D がまだ無ければ、`/proc` を確かめた時に `/` の fd が取った番号 + 1 (置き場を先に開く) を D の fd とみなして見積もり、D を開いた後に D の fd で引き直して長さを測り直す。収まらなければその経路を飛ばして次の経路へ (D は後の経路のために残す)
@@ -101,7 +106,7 @@ D は 1 回の呼び出しで 1 度だけ作り、D を使う経路で共有す�
 
 ### D 無しの形 (`-sockdir`)
 
-- どこにも D を作れない時、bind はソケットのディレクトリに R (`.sockat.XXXXXXXXXX`、ソケットのディレクトリの realpath を指す) を作り、D の fd の代わりにソケットのディレクトリの fd を基準に `.sockat.XXXXXXXXXX/<ファイル名>` で bind する。経路は D の時と同じ並び (thread-cwd-sockdir (FreeBSD は at-sockdir) → proc-sockdir `/proc/self/fd/<fd>/.sockat.XXXXXXXXXX/<ファイル名>` → fork-sockdir)。ソケットのディレクトリを開けない、綴りが収まらない、R も作れなければ `ENAMETOOLONG` (`bind_any` は symlink へ。試験 `with_d_made_nowhere_a_bind_takes_the_sockdir_routes`)。connect は D 無しの形を使わず、connect の順の次の経路へ
+- どこにも D を作れない時、bind はソケットのディレクトリに R (`.sockat.XXXXXXXXXX`、ソケットのディレクトリの realpath を指す) を作り、D の fd の代わりにソケットのディレクトリの fd を基準に `.sockat.XXXXXXXXXX/<ファイル名>` で bind する。経路は D の時と同じ並び (thread-cwd-sockdir (FreeBSD は at-sockdir) → proc-sockdir `/proc/self/fd/<fd>/.sockat.XXXXXXXXXX/<ファイル名>` → fork-cwd-sockdir)。ソケットのディレクトリを開けない、綴りが収まらない、R も作れなければ `ENAMETOOLONG` (最終手段を使う `bind_ex` は symlink-dir へ。試験 `with_d_made_nowhere_a_bind_takes_the_sockdir_routes`)。connect は D 無しの形を使わず、connect の順の次の経路へ
 - D 無しの形は D を通す経路と同じ並び (`route::bind_means` の結果) をそのまま使う (`route::without_own_dir`)。proc-sockdir は D の綴りで見積もった後、`.sockat.XXXXXXXXXX/<ファイル名>` とソケットのディレクトリの fd で測り直す (D 無しの綴りは 8 バイト長いので、D の見積もりで外れた proc が D 無しで収まることは無い)
 
 ### connect の経路
@@ -113,11 +118,11 @@ D を通す経路 (thread-cwd・proc・at) は bind と同じ手順で R を通�
 | proc-direct | `/proc/self/fd/<ソケットのディレクトリの fd>/<ファイル名>` (ファイル名およそ 90 まで)。`/proc/self/fd/<fd>` を引けなければ使えない |
 | proc-held | D (上の「D を通す経路」の D、無ければ手順 1・2・5 で作る) の中に `symlinkat` でソケットのファイル (渡されたパス、相対パスなら cwd を前に付ける) を指す `s` を作り、`/proc/self/fd/<Dfd>/s` で connect |
 | relative | [DR-0004](DR-0004-relative-path-from-cwd.md) |
-| widened | [DR-0005](DR-0005-widened-sockaddr-on-macos.md)。カーネルが断ったら、fork-direct も広げた sockaddr を使わない |
-| symlink | [DR-0006](DR-0006-symlink-in-safe-temp-dir.md) |
+| widened | [DR-0005](DR-0005-widened-sockaddr-on-macos.md)。カーネルが断ったら、fork-cwd-direct も広げた sockaddr を使わない |
+| symlink-file | [DR-0006](DR-0006-symlink-in-safe-temp-dir.md) |
 | at-direct | `connectat(ソケットのディレクトリの fd, <ファイル名>)` (103 バイトまで) |
 
-### fork-direct (`connect_any` 系)
+### fork-cwd-direct (`connect_ex` 系の最終手段)
 
 - 子がソケットのディレクトリの fd に `fchdir` してファイル名で connect する ([DR-0007](DR-0007-fork-child-fchdir.md))。Apple の OS で、カーネルが広げた sockaddr を断っていなければ、103 バイトを超えるファイル名は広げた sockaddr で渡す
 - ソケットのディレクトリを開けなければ `ENAMETOOLONG`
@@ -125,8 +130,8 @@ D を通す経路 (thread-cwd・proc・at) は bind と同じ手順で R を通�
 ### 実装の形
 
 - 経路の順番は `route::run_long_with` から、bind は `route::bind_order`、connect は `route::connect_order` (OS ごとの経路の列 `connect_routes` を順に試す)。1 回の呼び出しの状態 (ソケットのディレクトリの fd、`/proc` を使えるか、realpath、D (どこにも作れなかったことも)、広げた sockaddr をまだ使えるか、飛ばした経路) は `route::Target` に必要になった時に引いて持つ
-- 経路が使えないと判断した所で `Target::skip(名前, 理由)` を呼び、試した順に集める (`route::Reached::skipped`、[DR-0029](DR-0029-any-functions.md))
-- 環境を読む部分は `route::Config` に集め、試験から差し替える ([DR-0011](DR-0011-routes-not-exposed.md)): D の置き場 (`own_dir_places`。ソケットのディレクトリは `Place::SocketDir`)、connect の symlink の置き場 (`link_places`)、`bind_any` の symlink の置き場 (`bind_link_places`)、`/proc/self/fd` の場所、スレッド cwd を試すか、広げた sockaddr を試すか、ソケットのディレクトリの開き方 (`open_socket_dir`)、D の開き方 (`open_own_dir`)。開き方の 2 つは、試験が開けない状況の代わりに失敗する関数を置く
+- 経路が使えないと判断した所で `Target::skip(名前, 理由)` を呼び、試した順に集める (`route::Reached::skipped`、[DR-0031](DR-0031-ex-functions.md))
+- 環境を読む部分は `route::Config` に集め、試験から差し替える ([DR-0011](DR-0011-routes-not-exposed.md)): D の置き場 (`own_dir_places`。ソケットのディレクトリは `Place::SocketDir`)、symlink-file の置き場 (`file_link_places`)、bind で symlink-file を試すか (`symlink_file_bind`、Linux 以外)、symlink-dir の置き場 (`dir_link_places`)、`/proc/self/fd` の場所、スレッド cwd を試すか、広げた sockaddr を試すか、ソケットのディレクトリの開き方 (`open_socket_dir`)、D の開き方 (`open_own_dir`)。開き方の 2 つは、試験が開けない状況の代わりに失敗する関数を置く
 - bind は広げた sockaddr を使わない。広げた形で渡す関数 (`route::apple::wide_connect`) は connect の options しか受け取らない
 
 ### 長さの上限
@@ -155,7 +160,7 @@ D を通す経路 (thread-cwd・proc・at) は bind と同じ手順で R を通�
 | 案 | 却下の理由 |
 |---|---|
 | bind の綴りにランダムな部品を挟まない (/proc、相対パス、ファイル名だけ) | 後で解決すると無関係なファイルに当たる。消すのは上のライブラリで、利用者が避けられない |
-| 置き場の安全 (sticky 等) を確かめて名前で辿る symlink を置く形を bind に使う | D を fd で掴めば置き場の安全も長さも関係しない。処理と試験が増えるだけ |
+| 置き場の安全 (sticky 等) を確かめて名前で辿る、ソケットのディレクトリを指す symlink を置く形を既定の bind に使う | 他の利用者が綴りを作り直せる (`recreatable-spelling`)。D を fd で掴めば置き場の安全も長さも関係しない。最終手段 (symlink-dir) にだけ使う |
 | Apple の OS の bind で広げた sockaddr を使う | アドレスが切れて CPython / Go の標準を壊す。fork の bind は相手から見える副作用が無い ([DR-0025](DR-0025-fork-bind-listen-by-parent.md)) |
 | connect の R を挟まない経路も D を通す | connect の綴りは残らないので R を挟む理由が無く、届くファイル名が 11 バイト短くなるだけ |
 | connect も D を通す経路を先に試す (bind と同じ並び) | 書き込みとスレッドが要る経路を、要らない経路で届く場面でも使うことになる。relative と widened が D を通す経路より遠くまで届く場面で、遠回りになる |
@@ -165,14 +170,15 @@ D を通す経路 (thread-cwd・proc・at) は bind と同じ手順で R を通�
 
 ## 悪い面
 
-- bind のファイル名の上限が `R/` の 11 バイト分短い (Linux / illumos 96、Apple の OS / BSD 92)
+- D を通す bind のファイル名の上限が `R/` の 11 バイト分短い (Linux / illumos 96、Apple の OS / BSD 92)。symlink-file で届く macOS には効かない
+- bind が symlink を辿るかを確かめたのは macOS と Linux だけ。他の OS は実行時に見分ける (辿らないのに bind が `EADDRINUSE` 以外を返しても、元のパスに物が無ければ次の経路へ進む)
 - 長いパスの bind のたびに D と R を作って消す。connect も書き込みの要らない経路で届かなければ同じ
 - connect で D を使う経路が続く時、D は最後の経路が終わるまで残る (呼び出しの中だけ)
 - 途中でプロセスが死ぬと D や R が残る (置き場に `sockat.XXXXXXXXXX`、ソケットのディレクトリに `.sockat.XXXXXXXXXX`)
 - R はソケットのディレクトリの realpath を指すので、R を作った後のディレクトリの rename や symlink の張り替えは反映されない
 - 開けない D を名前で確かめて消す時、確かめてから消すまでにすり替えられると、他人の空のディレクトリが 1 つ消えうる
 - `pthread_fchdir_np` は libSystem の非公開 API で、将来消えうる (消えたら次の手段へ進む)
-- 上のライブラリが元のパスのソケットのファイルを自動で消すことは効かない (消すのは `bind_ex` の `discard()`、[DR-0028](DR-0028-bind-ex-and-socket-file.md))
+- 上のライブラリが元のパスのソケットのファイルを自動で消すことは効かない (消すのは `bind_ex` の `SocketFile::discard()`、[DR-0031](DR-0031-ex-functions.md))
 
 ## 未確定
 
@@ -187,5 +193,6 @@ D を通す経路 (thread-cwd・proc・at) は bind と同じ手順で R を通�
 - 経路の名前: ハブ SPEC (ed04caa6)
 - 作った直後に開けない D は名前で確かめて消す (D12-Q5): kawaz 裁定 2026-11-19 (ハブ DR-0012)
 - D の開き方 (Linux は `/proc` の有無によらず `O_PATH`、Apple の OS は `O_SEARCH`)、ソケットのディレクトリを `stat` で引き fd が要る経路だけが開く: ハブの SPEC (2026-11-19)
-- D をどこにも作れない時の bind も D 無しの形でスレッド cwd → /proc 版 → fork の順に試す (D12-Q1)、`connect_any` 系の fork と FreeBSD の at-direct は D を通さない (D12-Q2): kawaz 裁定 2026-11-19 (ハブ DR-0012・SPEC 0412b609)
+- D をどこにも作れない時の bind も D 無しの形でスレッド cwd → /proc 版 → fork の順に試す (D12-Q1)、connect の fork-cwd-direct と FreeBSD の at-direct は D を通さない (D12-Q2): kawaz 裁定 2026-11-19 (ハブ DR-0012・SPEC 0412b609)
 - `ENOTDIR`、`Config` の項目、`Route` の variant を経路の名前に 1 対 1 にする: 実装側の判断 2026-11-19
+- bind が symlink を辿る OS で standard の次に symlink-file を試す、経路の名前を「手段 + 何についてか」にそろえる: kawaz 裁定 (ハブ DR-0016、2026-11-19)。Linux / Android では試さず、他の OS では失敗時に元のパスに物が無ければ次へ進む: 統括の判断 (ハブ DR-0016、b413a5a)

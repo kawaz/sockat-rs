@@ -22,12 +22,10 @@ list:
 
 # ---------- lint / test ----------
 
-# cargo fmt --check + clippy (-D warnings、全 feature と feature 無しと cfg sockat_conformance) + unsafe 封じ込め
+# cargo fmt --check + clippy (-D warnings) + unsafe 封じ込め
 check: lint-unsafe
     cargo fmt --check
-    cargo clippy --all-targets --all-features -- -D warnings
     cargo clippy --all-targets -- -D warnings
-    RUSTFLAGS='--cfg sockat_conformance' cargo clippy --all-targets --all-features --target-dir '{{conformance_target}}' -- -D warnings
 
 # cargo fmt (書き換える)
 fmt:
@@ -55,13 +53,13 @@ lint-unsafe:
 [script]
 test *ARGS: check
     if cargo nextest --version >/dev/null 2>&1; then
-        cargo nextest run --all-features --no-fail-fast "$@"
-        cargo test --doc --all-features
+        cargo nextest run --no-fail-fast "$@"
+        cargo test --doc
     elif [ -n "${CI:-}" ]; then
         echo "error: cargo-nextest が CI に無い (ハング打ち切りが効かない)" >&2
         exit 1
     else
-        cargo test --all-features --no-fail-fast "$@"
+        cargo test --no-fail-fast "$@"
     fi
 
 # Linux の試験を docker で回す (macOS の手元から Linux の経路を確かめる)
@@ -71,16 +69,16 @@ test *ARGS: check
 [doc("Linux の試験を docker (rust:1) で回す")]
 test-linux *ARGS:
     docker run --rm -v "$PWD":/work -w /work -e CARGO_TARGET_DIR=/work/target-linux/docker \
-      -v sockat-cargo-registry:/usr/local/cargo/registry rust:1 cargo test --all-features "$@"
+      -v sockat-cargo-registry:/usr/local/cargo/registry rust:1 cargo test "$@"
 
 # ---------- 適合試験 (ハブの conformance) ----------
 
-# 適合試験の CLI の target。RUSTFLAGS が通常の build と違うので分ける
-conformance_target := env("CARGO_TARGET_DIR", justfile_directory() / "target") / "conformance"
+# 適合試験の CLI の target
+conformance_target := env("CARGO_TARGET_DIR", justfile_directory() / "target")
 
-# 適合試験の CLI を build する (RUSTFLAGS で cfg sockat_conformance を立てる)
+# 適合試験の CLI を build する
 conformance-build:
-    RUSTFLAGS='--cfg sockat_conformance' cargo build -q --features any --example conformance --target-dir '{{conformance_target}}'
+    cargo build -q --example conformance --target-dir '{{conformance_target}}'
 
 # 適合試験の CLI を起こす。標準入力の JSON 1 つで 1 回 bind / connect し、結果の JSON を標準出力に出す。cwd と環境は呼んだ所のまま (DR-0030)
 [no-cd]

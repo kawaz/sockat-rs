@@ -12,3 +12,5 @@
 | [DR-0024](DR-0024-apple-bind-without-widened-sockaddr.md) | Apple の OS の bind は広げた sockaddr を使わない | [DR-0027](../DR-0027-own-directory-and-fallback-routes.md) |
 | [DR-0022](DR-0022-connect-any-behind-feature.md) | connect_any 系は feature `any` (既定で無効) の後ろ。docs.rs は全 feature、試験と CI は `--all-features` | [DR-0029](../DR-0029-any-functions.md) |
 | [DR-0026](DR-0026-any-connection-and-feature-any.md) | connect_any 系の戻り値は公開フィールドの struct `AnyConnection { stream, forked }`。feature 名は `any` | [DR-0029](../DR-0029-any-functions.md) |
+| [DR-0028](DR-0028-bind-ex-and-socket-file.md) | 後始末つきの bind `bind_ex` は `(UnixListener, SocketFile)` を返す | [DR-0031](../DR-0031-ex-functions.md) |
+| [DR-0029](DR-0029-any-functions.md) | any 系 (bind_any、connect_any 系) は feature `any` の後ろで、失ったものと経路を返す | [DR-0031](../DR-0031-ex-functions.md) |

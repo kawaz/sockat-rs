@@ -15,16 +15,6 @@ readme = "README.md"
 # in the repository.
 include = ["src/**", "README.md", "LICENSE", "Cargo.toml"]
 
-[features]
-# bind_any / connect_any / connect_any_nonblocking (and the types they
-# return): reach the path at the cost of something, a symlink others may make
-# again or a fork, as the last resort (DR-0029). Off by default; enabling it
-# is the choice to accept those costs.
-any = []
-
-[package.metadata.docs.rs]
-all-features = true
-
 [dependencies]
 libc = "0.2"
 
@@ -33,12 +23,8 @@ serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["net", "rt", "io-util", "macros"] }
 
-# The conformance CLI the hub's conformance test runs (DR-0030). Built only
-# with RUSTFLAGS='--cfg sockat_conformance' (`just conformance`); not in the
-# published crate (`include` leaves examples/ out).
+# The conformance CLI the hub's conformance test runs (DR-0030), built by
+# `just conformance`; not in the published crate (`include` leaves examples/
+# out).
 [[example]]
 name = "conformance"
-required-features = ["any"]
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sockat_conformance)"] }

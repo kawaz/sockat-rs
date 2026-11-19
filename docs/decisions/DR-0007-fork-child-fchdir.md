@@ -9,13 +9,13 @@ D を通す経路のスレッド cwd と /proc 版 ([DR-0027](DR-0027-own-direct
 
 ## Decision
 
-他の手段が全部使えない時の最後の手にする ([DR-0027](DR-0027-own-directory-and-fallback-routes.md))。試すのは `bind` と `connect_any` 系だけ ([DR-0010](DR-0010-public-api.md))。
+他の手段が全部使えない時の最後の手にする ([DR-0027](DR-0027-own-directory-and-fallback-routes.md))。試すのは bind (fork-cwd、fork-cwd-sockdir) と、最終手段を使う `connect_ex` 系 (fork-cwd-direct) だけ ([DR-0010](DR-0010-public-api.md))。
 
 | 要求 | 子が `fchdir` する fd | 綴り |
 |---|---|---|
 | bind | D | `R/<ファイル名>` |
 | bind (D をどこにも作れない時) | ソケットのディレクトリ | `.sockat.XXXXXXXXXX/<ファイル名>` (R はソケットのディレクトリの中) |
-| `connect_any` 系 (connect の順の後) | ソケットのディレクトリ | ファイル名 |
+| 最終手段を使う `connect_ex` 系 (connect の順の後) | ソケットのディレクトリ | ファイル名 |
 
 1. 親がソケットを作り、ディレクトリの fd を持ち、sockaddr を組み立ててから fork する (ブロックしない connect では、ソケットを fork の前に `O_NONBLOCK` にする)
 2. 子は `fchdir(dirfd)` → 綴りで `bind` / `connect` → `_exit(結果)`
@@ -24,7 +24,7 @@ D を通す経路のスレッド cwd と /proc 版 ([DR-0027](DR-0027-own-direct
 - bind の後の listen は必ず親がする。子が listen すると、クライアントに見えるサーバの peer が死んだ子になる ([DR-0025](DR-0025-fork-bind-listen-by-parent.md))
 - 子の区間は async-signal-safe な呼び出し (`fchdir` / `bind` / `connect` / errno の読み出し / `_exit`) だけにする。allocation も lock も Rust の destructor も通さない
 - **子の status を他者に刈り取られた時** (`SIGCHLD` が `SIG_IGN`、他のスレッドの `waitpid(-1)`。`waitpid` が `ECHILD` で失敗する) は、ソケットの状態から結果を読む。bind は `getsockname` にパスが入っているか、connect は `getpeername` が通るか。この場合 errno は失われ、失敗は一般のエラー (`Other`) になる (試験で確認)
-- 綴りは標準の `sun_path` に入れる。Apple の OS の `connect_any` 系で、カーネルが広げた sockaddr ([DR-0005](DR-0005-widened-sockaddr-on-macos.md)) を断っていなければ、103 バイトを超えるファイル名にそれを使う。bind は使わない
+- 綴りは標準の `sun_path` に入れる。Apple の OS の `connect_ex` 系の fork-cwd-direct で、カーネルが広げた sockaddr ([DR-0005](DR-0005-widened-sockaddr-on-macos.md)) を断っていなければ、103 バイトを超えるファイル名にそれを使う。bind は使わない
 
 ### ディレクトリの開き方と要る権限
 

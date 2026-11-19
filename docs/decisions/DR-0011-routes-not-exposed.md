@@ -9,7 +9,7 @@
 
 ## Decision
 
-- 経路 (`Route`) は crate 内の値で、公開 API は捨てる。`connect_any` 系が返すのは経路の名前でなく、fork の経路を通ったか (= サーバに見える peer の pid が終了したプロセスのものになったか) だけ ([DR-0010](DR-0010-public-api.md))
+- 経路 (`Route`) は crate 内の値で、公開 API に出すのは `_ex` が返す経路の名前 (診断用の文字列) と失ったもの (`Loss`) だけ ([DR-0031](DR-0031-ex-functions.md))。経路を選ぶ・強制する口は作らない
 - 試験は crate 内の単体試験 (`src/tests.rs`) に置き、経路の順番 (`route::run_long`) に環境を差し替えた入力を渡すか、手段の関数 (`route::thread_cwd_op`、`route::fork_op`、`route::own::OwnDir` 等) を直接呼んで強制する
 - 環境を読む部分は値 (`route::Config`) にして試験から差し替える
   - D の置き場 (`own_dir_places`。置き場の無い・作れない場合を作る)
@@ -18,7 +18,7 @@
   - Apple の OS で広げた sockaddr を受け付けないカーネル (`wide`)
   - Linux の /proc の場所 (`proc_self_fd`。試験は何も無い場所や空のディレクトリを渡して /proc の無い環境の代わりにし、本物の /proc には触らない)
 - プロセス全体に効く設定 (cwd、umask、`SIGCHLD`) を変える試験は、試験のバイナリを子プロセスで起こして中で行う
-- feature も cfg(test) 専用の公開口も作らない。例外はハブの適合試験の CLI の口だけで、cfg フラグ `sockat_conformance` の後ろに隠す ([DR-0030](DR-0030-conformance-cli.md))
+- feature も cfg(test) 専用の公開口も作らない。ハブの適合試験の CLI も公開の `_ex` を使う ([DR-0030](DR-0030-conformance-cli.md))
 
 ## 理由
 

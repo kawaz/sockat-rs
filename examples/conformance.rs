@@ -2,42 +2,32 @@
 //! runs (the hub's `docs/design/conformance.md`, DR-0030). Not part of sockat.
 //!
 //! Reads one JSON object from stdin, `{ "op": "bind" | "connect", "path": ".." }`,
-//! makes one bind / connect with the route order of `sockat::bind` /
-//! `sockat::connect`, and writes one JSON object to stdout:
+//! makes one bind / connect by `sockat::bind_ex` / `sockat::connect_ex`
+//! without the last resort (`LastResort::Avoid`: the route order of
+//! `sockat::bind` / `sockat::connect`), and writes one JSON object to stdout:
 //! `{ "ok", "error", "route", "losses", "skipped" }`. A listener is closed
 //! (the socket file stays); a connected stream sends one byte `x` and is
 //! closed.
 //!
 //! Run it by `just --justfile <this repository>/justfile conformance` from any
-//! directory: it builds this with `RUSTFLAGS='--cfg sockat_conformance'` and
-//! the feature `any` into `target/conformance` (`just conformance-build`),
-//! then runs it in the caller's cwd and environment.
+//! directory: it builds this (`just conformance-build`), then runs it in the
+//! caller's cwd and environment.
 //!
 //! Exit status: 0 once the result is written (whether the call succeeded or
 //! not, and also when the byte could not be sent after a connect: whether it
 //! arrived is for the conformance script to see), 2 when stdin is not such an
 //! object (nothing is written to stdout).
 
-#[cfg(sockat_conformance)]
 fn main() -> std::process::ExitCode {
     cli::main()
 }
 
-#[cfg(not(sockat_conformance))]
-fn main() -> std::process::ExitCode {
-    eprintln!(
-        "conformance: build with RUSTFLAGS='--cfg sockat_conformance' (see `just conformance`)"
-    );
-    std::process::ExitCode::from(2)
-}
-
-#[cfg(sockat_conformance)]
 mod cli {
     use std::io::{self, Read, Write};
     use std::path::Path;
     use std::process::ExitCode;
 
-    use sockat::conformance;
+    use sockat::LastResort;
 
     /// What one call came to, in the order of the output's fields.
     struct Report {
@@ -58,7 +48,7 @@ mod cli {
         };
         let path = Path::new(&path);
         let report = match op {
-            Op::Bind => match conformance::bind(path) {
+            Op::Bind => match sockat::bind_ex(path, LastResort::Avoid) {
                 Ok(l) => {
                     drop(l.listener);
                     Report {
@@ -71,7 +61,7 @@ mod cli {
                 }
                 Err(e) => failed(e),
             },
-            Op::Connect => match conformance::connect(path) {
+            Op::Connect => match sockat::connect_ex(path, LastResort::Avoid) {
                 Ok(mut c) => {
                     if let Err(e) = c.stream.write_all(b"x") {
                         eprintln!("conformance: connected, but sending `x` failed: {e}");
@@ -92,7 +82,7 @@ mod cli {
         ExitCode::SUCCESS
     }
 
-    fn failed(e: sockat::AnyError) -> Report {
+    fn failed(e: sockat::ExError) -> Report {
         Report {
             ok: false,
             error: Some(error_name(&e.error)),

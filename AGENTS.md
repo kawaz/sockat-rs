@@ -6,7 +6,7 @@ sockat は、`sun_path` の上限を超えるパスでも Unix domain socket を
 
 ## 必読
 
-- [docs/decisions/DR-0027](docs/decisions/DR-0027-own-directory-and-fallback-routes.md) — 経路と試す順番の総論 (自分専用のディレクトリ D と乱数の symlink R を通す中心の経路、connect 系の予備の経路)。予備の経路ごとの安全性の考え方・却下した案・未確定の点は、そこからリンクした DR にある。経路に手を入れる前に、総論と触る経路の DR を読む
+- [docs/decisions/DR-0027](docs/decisions/DR-0027-own-directory-and-fallback-routes.md) — 経路と試す順番の総論 (bind の symlink-file と、自分専用のディレクトリ D と乱数の symlink R を通す経路、connect の順)。経路ごとの安全性の考え方・却下した案・未確定の点は、そこからリンクした DR にある。経路に手を入れる前に、総論と触る経路の DR を読む
 - [docs/decisions/INDEX.md](docs/decisions/INDEX.md) — 設計判断 (DR) の一覧
 - [docs/MANUAL-ja.md](docs/MANUAL-ja.md) — 利用者に約束している振る舞い (std と違う点、エラー)
 
@@ -20,7 +20,7 @@ sockat は、`sun_path` の上限を超えるパスでも Unix domain socket を
 | `src/sys.rs` | `unsafe` の境界。libc を直接呼ぶのはここだけ |
 | `src/tests.rs` | 経路を強制する単体試験 |
 | `tests/` | 公開 API の結合試験、tokio との連携試験 |
-| `examples/conformance.rs`、`src/conformance.rs` | ハブの適合試験から起こす CLI と、それが経路の情報を取る口 (cfg フラグ `sockat_conformance` の後ろ、公開しない。[DR-0030](docs/decisions/DR-0030-conformance-cli.md)) |
+| `examples/conformance.rs` | ハブの適合試験から起こす CLI (公開の `bind_ex` / `connect_ex` を最終手段無しで呼ぶ。[DR-0030](docs/decisions/DR-0030-conformance-cli.md)) |
 
 ## 守ること
 
@@ -28,7 +28,7 @@ sockat は、`sun_path` の上限を超えるパスでも Unix domain socket を
 - **`unsafe` は `src/sys.rs` にだけ書く。** `just lint-unsafe` が他のファイルの `unsafe` を落とす。`sys.rs` の関数は安全に呼べる形で公開し、各 `unsafe` に `SAFETY:` を添える
 - **std が受け付けるパス (OS ごとの `sun_path` − 1 バイト以内) には何も足さない。** std の関数をそのまま呼ぶ ([DR-0002](docs/decisions/DR-0002-std-handles-paths-it-accepts.md))
 - **経路の本当の失敗は次の経路でやり直さない。** 次へ進むのは経路自体が使えない時だけ ([DR-0012](docs/decisions/DR-0012-route-failure-handling.md))
-- **bind の綴りには必ず乱数の symlink R を挟む。** カーネルが覚える綴りが、R を消した後はどこで解決されても何にも当たらないように ([DR-0027](docs/decisions/DR-0027-own-directory-and-fallback-routes.md))
+- **bind の綴りには必ず乱数の名前の symlink を挟む** (R、または symlink-file の置き場の symlink)。カーネルが覚える綴りが、symlink を消した後はどこで解決されても無関係なファイルに当たらないように ([DR-0027](docs/decisions/DR-0027-own-directory-and-fallback-routes.md))
 - **fork した子の区間は async-signal-safe な呼び出しだけ。** allocation・lock・Rust の destructor を通さない。sockaddr は fork の前に親が組み立てる
 - **経路は公開 API に出さない。** 試験は crate 内で各経路の関数を呼ぶか、`route::Config` で環境を差し替えて経路を強制する ([DR-0011](docs/decisions/DR-0011-routes-not-exposed.md))
 - 公開 API・doc・エラーの文言は英語。DR と日本語の docs は日本語

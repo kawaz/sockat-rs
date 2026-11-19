@@ -65,7 +65,8 @@ async fn bind_ex_discards_after_the_listener_went_to_tokio() {
         .unwrap();
     let path = long_path(t.path(), 400);
 
-    let (listener, file) = sockat::bind_ex(&path).unwrap();
+    let sockat::ExListener { listener, file, .. } =
+        sockat::bind_ex(&path, sockat::LastResort::Avoid).unwrap();
     listener.set_nonblocking(true).unwrap();
     let listener = tokio::net::UnixListener::from_std(listener).unwrap();
     let client = sockat::connect_nonblocking(&path).unwrap();

@@ -9,6 +9,8 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
+use sockat::LastResort;
+
 /// `<base>/<dirs>/<name>` of exactly `total` bytes, directories created.
 fn nest(base: &Path, total: usize, name: &str) -> PathBuf {
     let fixed = base.as_os_str().len() + 1 + name.len();
@@ -92,8 +94,8 @@ fn bind_and_connect_work_at_any_length() {
     }
 }
 
-// The four connects (the two that may fork with the crate feature
-// `any`) in an ordinary environment (a writable /tmp, the socket under a
+// The four connects (and the `_ex` ones with the last resort allowed) in an
+// ordinary environment (a writable /tmp, the socket under a
 // temporary directory with a short file name): every length is reached
 // without forking on every platform (by the connect order of the platform:
 // proc-direct on Linux, at-direct on FreeBSD, widened up to 253 bytes on
@@ -122,38 +124,37 @@ fn in_an_ordinary_environment_no_connect_forks() {
         assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{total}");
         drop(listener.accept().unwrap());
 
-        #[cfg(feature = "any")]
-        {
-            let sockat::AnyConnection {
-                stream: mut c,
-                losses,
-                ..
-            } = sockat::connect_any(&p).unwrap();
-            assert_eq!(losses, [], "{total}");
-            ping(&listener, &mut c);
+        let sockat::ExStream {
+            stream: mut c,
+            losses,
+            ..
+        } = sockat::connect_ex(&p, LastResort::Allow).unwrap();
+        assert_eq!(losses, [], "{total}");
+        ping(&listener, &mut c);
 
-            let sockat::AnyConnection {
-                stream: mut c,
-                losses,
-                ..
-            } = sockat::connect_any_nonblocking(&p).unwrap();
-            assert_eq!(losses, [], "{total}");
-            let e = c.read(&mut buf).unwrap_err();
-            assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{total}");
-        }
+        let sockat::ExStream {
+            stream: mut c,
+            losses,
+            ..
+        } = sockat::connect_nonblocking_ex(&p, LastResort::Allow).unwrap();
+        assert_eq!(losses, [], "{total}");
+        let e = c.read(&mut buf).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{total}");
     }
 }
 
-// A long file name far from the cwd that no bind spelling holds: 100 bytes,
-// over the sun_path - 1 - 11 bytes that `R/<file name>` leaves (96 on Linux,
-// 92 on Apple and the BSDs), so `bind` is ENAMETOOLONG. A socket bound under a
-// short name and renamed to it is still reached by every connect: routes of
-// the connect order leave the file name out of the spelling (on Linux a
-// symlink in sockat's own directory, elsewhere a symlink under /tmp;
+// A long file name far from the cwd: 100 bytes, over the sun_path - 1 - 11
+// bytes that `R/<file name>` leaves (96 on Linux, 92 on Apple and the BSDs).
+// On Linux no bind spelling holds it, so `bind` is ENAMETOOLONG; on macOS the
+// bind goes through symlink-file, whose spelling has no file name in it, and
+// reaches it (hub DR-0016; other targets are not checked here). A socket
+// bound under a short name and renamed to it is reached by every connect:
+// routes of the connect order leave the file name out of the spelling (on
+// Linux a symlink in sockat's own directory, elsewhere a symlink under /tmp;
 // FreeBSD's at-direct takes the name, up to 103 bytes). In an ordinary
 // environment (a writable /tmp) none of them forks, and the plain `connect`
-// and `connect_nonblocking` work too (the two that may fork are checked with
-// the crate feature `any`).
+// and `connect_nonblocking` work too, as do the `_ex` ones with the last
+// resort allowed, which give up nothing.
 #[test]
 fn a_long_file_name_is_connected_to_without_forking() {
     const NAME_LEN: usize = 100;
@@ -162,11 +163,23 @@ fn a_long_file_name_is_connected_to_without_forking() {
         .tempdir_in("/tmp")
         .unwrap();
     let p = nest(t.path(), 600, &"n".repeat(NAME_LEN));
-    assert_eq!(
-        sockat::bind(&p).unwrap_err().raw_os_error(),
-        Some(libc::ENAMETOOLONG)
-    );
-    assert!(!is_socket(&p));
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        assert_eq!(
+            sockat::bind(&p).unwrap_err().raw_os_error(),
+            Some(libc::ENAMETOOLONG)
+        );
+        assert!(!is_socket(&p));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let bound = sockat::bind(&p).unwrap();
+        assert!(is_socket(&p));
+        let mut c = sockat::connect(&p).unwrap();
+        ping(&bound, &mut c);
+        drop(bound);
+        std::fs::remove_file(&p).unwrap();
+    }
     let short = p.with_file_name("s.sock");
     let listener = sockat::bind(&short).unwrap();
     std::fs::rename(&short, &p).unwrap();
@@ -177,18 +190,15 @@ fn a_long_file_name_is_connected_to_without_forking() {
     let e = c.read(&mut buf).unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
     drop(listener.accept().unwrap());
-    #[cfg(feature = "any")]
-    {
-        let sockat::AnyConnection {
-            stream: mut c,
-            losses,
-            ..
-        } = sockat::connect_any(&p).unwrap();
-        assert_eq!(losses, []);
-        ping(&listener, &mut c);
-        let any = sockat::connect_any_nonblocking(&p).unwrap();
-        assert_eq!(any.losses, []);
-    }
+    let sockat::ExStream {
+        stream: mut c,
+        losses,
+        ..
+    } = sockat::connect_ex(&p, LastResort::Allow).unwrap();
+    assert_eq!(losses, []);
+    ping(&listener, &mut c);
+    let ex = sockat::connect_nonblocking_ex(&p, LastResort::Allow).unwrap();
+    assert_eq!(ex.losses, []);
 }
 
 // Short paths are std's business: sockat hands them over unchanged, so the
@@ -364,11 +374,10 @@ fn long_path_errors_through_the_public_api() {
         sockat::bind(&p).unwrap_err().raw_os_error(),
         Some(libc::EADDRINUSE)
     );
+    // A file name no route through D holds: ENAMETOOLONG where a bind does
+    // not follow a symlink (Linux); macOS binds it through symlink-file.
     let long_name = t.path().join("n".repeat(254));
-    assert_eq!(
-        sockat::bind(&long_name).unwrap_err().raw_os_error(),
-        Some(libc::ENAMETOOLONG)
-    );
+    drop(bind_past_r(&long_name));
     let mut dir_slash = p.parent().unwrap().as_os_str().to_owned();
     dir_slash.push("/");
     assert_eq!(
@@ -377,7 +386,7 @@ fn long_path_errors_through_the_public_api() {
     );
 }
 
-// An any function that fails reports the route that made the call and failed,
+// An `_ex` function that fails reports the route that made the call and failed,
 // and none when it failed before any route was tried (SPEC "公開する操作"):
 //
 // * a long path whose directory is missing is ENOENT, and one with a file in
@@ -390,9 +399,8 @@ fn long_path_errors_through_the_public_api() {
 //   `standard`, and nothing was passed over before it.
 //
 // The errno is kept through the conversion into io::Error.
-#[cfg(feature = "any")]
 #[test]
-fn an_any_function_that_fails_before_the_routes_reports_no_route() {
+fn an_ex_function_that_fails_before_the_routes_reports_no_route() {
     let t = tempfile::Builder::new()
         .prefix("sockat-")
         .tempdir_in("/tmp")
@@ -403,11 +411,14 @@ fn an_any_function_that_fails_before_the_routes_reports_no_route() {
     std::fs::write(&file, b"").unwrap();
     let not_dir = file.join("s.sock");
     for (path, errno) in [(&missing, libc::ENOENT), (&not_dir, libc::ENOTDIR)] {
-        let errors = [
-            sockat::bind_any(path).unwrap_err(),
-            sockat::connect_any(path).unwrap_err(),
-            sockat::connect_any_nonblocking(path).unwrap_err(),
-        ];
+        let mut errors = Vec::new();
+        for last_resort in [LastResort::Avoid, LastResort::Allow] {
+            errors.extend([
+                sockat::bind_ex(path, last_resort).unwrap_err(),
+                sockat::connect_ex(path, last_resort).unwrap_err(),
+                sockat::connect_nonblocking_ex(path, last_resort).unwrap_err(),
+            ]);
+        }
         for e in errors {
             assert_eq!(e.error.raw_os_error(), Some(errno), "{e:?}");
             assert_eq!(e.route, None, "{e:?}");
@@ -421,7 +432,7 @@ fn an_any_function_that_fails_before_the_routes_reports_no_route() {
         short.as_os_str().len() <= std_max(),
         "the premise: {short:?} is short"
     );
-    let e = sockat::bind_any(&short).unwrap_err();
+    let e = sockat::bind_ex(&short, LastResort::Allow).unwrap_err();
     assert_eq!(e.error.raw_os_error(), Some(libc::ENOENT), "{e:?}");
     assert_eq!(e.route, Some("standard"), "{e:?}");
     assert!(e.skipped.is_empty(), "{e:?}");
@@ -461,13 +472,15 @@ fn the_address_of_a_long_path_bind_fits_sun_path() {
     }
 }
 
-// The longest file name a bind reaches is sun_path less the NUL less the 11
-// bytes of `R/` (std_max - 11: 96 on Linux, 92 on Apple and the BSDs), on
-// every platform: every bind spelling holds the file name behind a symlink
-// with a random 10-character name in the plain sockaddr, so that the spelling
-// the kernel keeps names nothing once sockat has removed the link. A name of
-// std_max - 11 bytes directly under a short directory binds and is reached;
-// one byte more is ENAMETOOLONG, and nothing is created.
+// The routes through D hold the file name behind a symlink with a random
+// 10-character name in the plain sockaddr (`R/<file name>`), so that the
+// spelling the kernel keeps names nothing once sockat has removed the link:
+// they reach a file name of sun_path less the NUL less the 11 bytes of `R/`
+// (std_max - 11: 96 on Linux, 92 on Apple and the BSDs). A name of
+// std_max - 11 bytes directly under a short directory binds and is reached.
+// One byte more is ENAMETOOLONG with nothing created where a bind does not
+// follow a symlink (Linux); on macOS the bind goes through symlink-file,
+// whose spelling holds no file name (hub DR-0016), and reaches it.
 #[test]
 fn a_bind_reaches_a_file_name_up_to_sun_path_less_the_nul_and_r() {
     let t = tempfile::Builder::new()
@@ -481,11 +494,36 @@ fn a_bind_reaches_a_file_name_up_to_sun_path_less_the_nul_and_r() {
     let mut client = sockat::connect(&at).unwrap();
     ping(&listener, &mut client);
     let over = t.path().join("o".repeat(longest + 1));
-    assert_eq!(
-        sockat::bind(&over).unwrap_err().raw_os_error(),
-        Some(libc::ENAMETOOLONG)
-    );
-    assert!(!over.exists());
+    match bind_past_r(&over) {
+        Some(listener) => {
+            assert!(is_socket(&over));
+            let mut client = sockat::connect(&over).unwrap();
+            ping(&listener, &mut client);
+        }
+        None => assert!(!over.exists()),
+    }
+}
+
+/// `sockat::bind` of a path whose file name no route through D holds (longer
+/// than `R/<file name>` leaves): ENAMETOOLONG where a bind does not follow a
+/// symlink (Linux; `None`), the listener through symlink-file where it does
+/// (macOS), either elsewhere (whether a bind follows is told at run time).
+fn bind_past_r(p: &Path) -> Option<UnixListener> {
+    let bound = sockat::bind(p);
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        assert_eq!(bound.unwrap_err().raw_os_error(), Some(libc::ENAMETOOLONG));
+        return None;
+    }
+    if cfg!(target_os = "macos") {
+        return Some(bound.unwrap());
+    }
+    match bound {
+        Ok(l) => Some(l),
+        Err(e) => {
+            assert_eq!(e.raw_os_error(), Some(libc::ENAMETOOLONG), "{e}");
+            None
+        }
+    }
 }
 
 // A long path needs no more permission on the socket's directory than std's
@@ -546,7 +584,8 @@ fn bind_ex_discards_its_socket_file_at_any_length() {
         .unwrap();
     for total in [40, std_max() + 1, 400] {
         let p = nest(t.path(), total, &format!("{total}.sock"));
-        let (listener, file) = sockat::bind_ex(&p).unwrap();
+        let sockat::ExListener { listener, file, .. } =
+            sockat::bind_ex(&p, sockat::LastResort::Avoid).unwrap();
         assert!(is_socket(&p), "{total}");
         let mut c = sockat::connect(&p).unwrap();
         ping(&listener, &mut c);
@@ -554,7 +593,8 @@ fn bind_ex_discards_its_socket_file_at_any_length() {
         file.discard().unwrap();
         assert!(std::fs::symlink_metadata(&p).is_err(), "{total}");
 
-        let (listener, file) = sockat::bind_ex(&p).unwrap();
+        let sockat::ExListener { listener, file, .. } =
+            sockat::bind_ex(&p, sockat::LastResort::Avoid).unwrap();
         drop((file, listener));
         assert!(is_socket(&p), "{total}: dropping the SocketFile removed it");
         std::fs::remove_file(&p).unwrap();
@@ -578,7 +618,8 @@ fn bind_ex_leaves_a_replaced_socket_file_alone() {
     std::fs::write(&theirs, b"theirs").unwrap();
     let mut kept = Vec::new();
     for what in ["a file", "another socket", "a symlink"] {
-        let (listener, file) = sockat::bind_ex(&p).unwrap();
+        let sockat::ExListener { listener, file, .. } =
+            sockat::bind_ex(&p, sockat::LastResort::Avoid).unwrap();
         drop(listener);
         std::fs::remove_file(&p).unwrap();
         match what {
@@ -592,7 +633,8 @@ fn bind_ex_leaves_a_replaced_socket_file_alone() {
     }
     assert_eq!(std::fs::read(&theirs).unwrap(), b"theirs");
 
-    let (listener, file) = sockat::bind_ex(&p).unwrap();
+    let sockat::ExListener { listener, file, .. } =
+        sockat::bind_ex(&p, sockat::LastResort::Avoid).unwrap();
     drop(listener);
     std::fs::remove_file(&p).unwrap();
     file.discard().unwrap();
@@ -614,7 +656,8 @@ fn bind_ex_discard_errs_only_when_it_cannot_tell() {
     let p = nest(t.path(), 400, "s.sock");
     let dir = p.parent().unwrap().to_path_buf();
 
-    let (listener, file) = sockat::bind_ex(&p).unwrap();
+    let sockat::ExListener { listener, file, .. } =
+        sockat::bind_ex(&p, sockat::LastResort::Avoid).unwrap();
     drop(listener);
     std::fs::remove_file(&p).unwrap();
     std::fs::remove_dir(&dir).unwrap();
@@ -625,7 +668,8 @@ fn bind_ex_discard_errs_only_when_it_cannot_tell() {
 
     use std::os::unix::fs::PermissionsExt;
     let mode = |m: u32| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(m)).unwrap();
-    let (listener, file) = sockat::bind_ex(&p).unwrap();
+    let sockat::ExListener { listener, file, .. } =
+        sockat::bind_ex(&p, sockat::LastResort::Avoid).unwrap();
     drop(listener);
     mode(0o600);
     // Root ignores the permission bits: then the path can still be looked up
@@ -661,7 +705,8 @@ fn bind_ex_remembers_the_real_path() {
     std::os::unix::fs::symlink(&one, &link).unwrap();
     let p = nest(&link, 400, "s.sock");
     let below = p.strip_prefix(&link).unwrap().to_path_buf();
-    let (listener, file) = sockat::bind_ex(&p).unwrap();
+    let sockat::ExListener { listener, file, .. } =
+        sockat::bind_ex(&p, sockat::LastResort::Avoid).unwrap();
     assert!(is_socket(&one.join(&below)));
     std::fs::create_dir_all(two.join(below.parent().unwrap())).unwrap();
     let theirs = sockat::bind(two.join(&below)).unwrap();
@@ -672,4 +717,65 @@ fn bind_ex_remembers_the_real_path() {
     assert!(!one.join(&below).exists());
     assert!(is_socket(&two.join(&below)));
     drop(theirs);
+}
+
+// The `_ex` functions without the last resort (`LastResort::Avoid`, the
+// default) take the routes of the plain functions in the same order and also
+// say how (hub DR-0015): what was given up, the route and the routes passed
+// over.
+//
+// * A short absolute path goes to std: route `standard`, nothing given up,
+//   nothing passed over; `discard()` removes the socket file.
+// * A long path: the bind gives up `respelled` (its address is not the path)
+//   and passes over `standard` first; a connect gives up nothing; the
+//   nonblocking one's stream does not wait.
+// * A failure carries the errno, the route that failed for real and the
+//   routes passed over, and converts back into the io::Error.
+#[test]
+fn the_ex_functions_take_the_plain_order_and_say_how() {
+    assert_eq!(LastResort::default(), LastResort::Avoid);
+    let t = tempfile::Builder::new()
+        .prefix("sockat-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let short = t.path().join("short.sock");
+    let b = sockat::bind_ex(&short, LastResort::Avoid).unwrap();
+    assert_eq!((b.route, b.losses.as_slice()), ("standard", &[][..]));
+    assert!(b.skipped.is_empty());
+    let c = sockat::connect_ex(&short, LastResort::Avoid).unwrap();
+    assert_eq!((c.route, c.losses.as_slice()), ("standard", &[][..]));
+    drop((c, b.listener));
+    b.file.discard().unwrap();
+    assert!(!short.exists());
+
+    let long = nest(t.path(), 400, "long.sock");
+    let b = sockat::bind_ex(&long, LastResort::Avoid).unwrap();
+    assert_eq!(b.losses, [sockat::Loss::Respelled]);
+    assert_ne!(b.route, "standard");
+    assert_eq!(b.skipped.first().map(|s| s.name), Some("standard"));
+    let sockat::ExStream {
+        stream: mut c,
+        losses,
+        skipped,
+        ..
+    } = sockat::connect_ex(&long, LastResort::Avoid).unwrap();
+    assert_eq!(losses, []);
+    assert_eq!(skipped.first().map(|s| s.name), Some("standard"));
+    ping(&b.listener, &mut c);
+    let mut c = sockat::connect_nonblocking_ex(&long, LastResort::Avoid)
+        .unwrap()
+        .stream;
+    let mut buf = [0u8; 1];
+    let e = c.read(&mut buf).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+    drop(b.listener);
+    b.file.discard().unwrap();
+    assert!(!long.exists());
+
+    let e = sockat::connect_ex(&long, LastResort::Avoid).unwrap_err();
+    assert_eq!(e.error.raw_os_error(), Some(libc::ENOENT), "{e:?}");
+    assert!(e.route.is_some(), "{e:?}");
+    assert_eq!(e.skipped.first().map(|s| s.name), Some("standard"));
+    assert_eq!(e.to_string(), e.error.to_string());
+    assert_eq!(std::io::Error::from(e).raw_os_error(), Some(libc::ENOENT));
 }
