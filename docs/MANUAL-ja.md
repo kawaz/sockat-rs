@@ -252,35 +252,26 @@ file.discard()?;
 | `sockat::connect_any(path)` | `connect` と同じ順の後、最後に [fork-direct](#fork-direct) | `Result<AnyConnection, AnyError>` (ブロックする) |
 | `sockat::connect_any_nonblocking(path)` | 同上 | `Result<AnyConnection, AnyError>` (非ブロッキング) |
 
-失うもの:
-
-- `bind_any` の symlink: カーネルが返すアドレスが `<置き場>/sockat.XXXXXXXXXX/<ファイル名>` になる。共有の置き場 (`/tmp` 等) では、symlink を消した後に他の利用者がその名前を作り直せるので、返ったアドレスで unlink すると相手の選んだディレクトリの同じ名前のファイルを消させうる。元のパスで消す
-- `connect_any` 系の fork-direct: サーバに見える peer の pid が、もう終了した子の pid になる ([下](#fork-direct-で-connect-した時の副作用)) 他、[fork の副作用](#fork-の経路の相手から見えない副作用)
+`bind_any` の symlink は `respelled` を失い、共有の置き場 (`/tmp` 等) では `recreatable-spelling` も失う。`connect_any` 系の fork-direct は `forked` を失う (サーバに見える peer の pid が、もう終了した子の pid になる。[下](#fork-direct-で-connect-した時の副作用))。それぞれの中身と避け方は [失うもの](#失うもの)。
 
 戻り値は公開フィールドの struct で、`#[non_exhaustive]` (後でフィールドが足されうるので、分解には `..` が要る):
 
 | フィールド | 中身 |
 |---|---|
 | `listener` / `stream` | std の `UnixListener` / `UnixStream` |
-| `losses` | 失ったものの並び (`Vec<Loss>`。何も失わなければ空)。分岐に使う |
+| `losses` | 失ったものの並び (`Vec<Loss>`。何も失わなければ空)。分岐に使う。`Loss` は `#[non_exhaustive]` の enum で、値は [失うもの](#失うもの) の表 |
 | `route` | 通った経路の名前 (`&'static str`。例: `"thread-cwd"`、`"symlink"`、`"fork-direct"`) |
 | `skipped` | 試して使えなかった経路の並び (`Vec<Skipped>`、試した順)。`Skipped` は `name` (経路の名前) と `reason` (使えなかった理由) を持つ |
 
-`Loss` (`#[non_exhaustive]` の enum。`as_str()` と `Display` は仕様の名前):
-
-| 値 | 名前 | 失うもの | 付く時 |
-|---|---|---|---|
-| `Respelled` | `respelled` | カーネルが返すアドレスが元のパスでない。綴りは他の利用者に見えうるので、cwd が他人も書ける場所だと作り直されうる。元のパスで消す | bind が standard 以外の経路を通った |
-| `Forked` | `forked` | [fork の副作用](#fork-の経路の相手から見えない副作用) (connect では peer の pid も) | fork・fork-sockdir・fork-direct を通った |
-| `RecreatableSpelling` | `recreatable-spelling` | カーネルが返す綴りが共有の置き場を通り、他の利用者が作り直せる | `bind_any` が共有の置き場の symlink を通った |
-| `CwdRelative` | `cwd-relative` | カーネルが覚えた綴りが cwd からの相対パス。cwd を変えた後にその綴りで消すと別の場所に当たる (std が元から持つ危険) | 相対パス (abstract の名前を除く) で bind が standard を通った |
-
-- 名前は約束で、変えずに足すだけ。知らない値は「何かを失った」とだけ読む。値の間に大小や包含は無い
-- connect で付くのは `Forked` だけ (connect の綴りは相手に残らない)
 - `route` と `skipped` は診断用で、中身を約束しない (経路は増えたり名前が変わったりする)
 - `route` より前に試した経路はすべて使えなかったもの。長いパスでは最初が `standard`
+- `skipped` に入るのは、その呼び出しで試す順の列 ([OS ごとに試す順番](#os-ごとに試す順番) の、その OS と状態の行) にある経路だけ。例えば `/proc` を使えない Linux では、proc・proc-sockdir・proc-direct・proc-held は入らない
 
-失敗した時は `AnyError` を返す。`error` (`io::Error`)、`route` (実際に bind / connect して失敗した経路の名前。どの経路も使えなかった `ENAMETOOLONG` や、経路の前に断った時は `None`)、`skipped` を持つ。`From<AnyError> for io::Error` で中の `io::Error` をそのまま返すので、`io::Result` を返す関数の中で `?` が使え、`raw_os_error()` で errno も取れる。`Display` は中の `io::Error` と同じ。
+失敗した時は `AnyError` を返す。`error` (`io::Error`)、`route`、`skipped` を持つ。
+
+- `route` は実際に bind / connect して失敗した経路の名前。短いパスで std が失敗した時は `"standard"`。どの経路も使えなかった `ENAMETOOLONG` と、経路の前に断った時 (NUL を含む、名前で終わらない、ソケットのディレクトリが無い・ディレクトリでない・実パスを引けない) は `None`
+- 経路の前に断った時は `skipped` も空。長さを判定するのはソケットのディレクトリを引いた後なので、`standard` もまだ試していない
+- `From<AnyError> for io::Error` で中の `io::Error` をそのまま返すので、`io::Result` を返す関数の中で `?` が使え、`raw_os_error()` で errno も取れる。`Display` は中の `io::Error` と同じ
 
 ```rust
 let sockat::AnyConnection { stream, losses, route, .. } = sockat::connect_any(path)?;
@@ -323,7 +314,7 @@ FreeBSD では at-direct がファイル名 103 バイトまで届くので、fo
 | proc-sockdir | `/proc/self/fd/<fd>/.sockat.XXXXXXXXXX/<ファイル名>` |
 | symlink (`bind_any`) | `<置き場>/sockat.XXXXXXXXXX/<ファイル名>` |
 
-R (と `.sockat.XXXXXXXXXX`、置き場の symlink) は bind の後に消えているので、返ってきた綴りでファイルを消す・`stat` する・`chmod` しても、何にも当たらない (fd の番号が使い回されても、どの cwd から解決しても)。ただし `bind_any` が共有の置き場の symlink で bind した時は、他の利用者がその名前を作り直せる。ソケット自体にも当たらないので、元のパスは自分で持っておき、それを使う (消すなら `bind_ex` も使える)。同じ綴りは `Debug` の表示や、フレームワークのログ・接続元の情報にも出る。
+R (と `.sockat.XXXXXXXXXX`、置き場の symlink) は bind の後に消えているので、返ってきた綴りでファイルを消す・`stat` する・`chmod` しても、普段は何にも当たらない (fd の番号が使い回されても)。ただし綴りは他の利用者に見えうるので、作り直されると当たりうる ([respelled](#respelled)、共有の置き場の symlink は [recreatable-spelling](#recreatable-spelling))。ソケット自体にも当たらないので、元のパスは自分で持っておき、それを使う (消すなら `bind_ex` も使える。[使ってはいけない書き方](#使ってはいけない書き方))。同じ綴りは `Debug` の表示や、フレームワークのログ・接続元の情報にも出る。
 
 OpenBSD では、103 バイト以内の短いパス (sockat は std にそのまま渡す) でも、std の `local_addr()` がパスの末尾 1 バイトを欠いて返す (CI で観測)。sockat ではなく std / OS の振る舞いで、std の `UnixListener::bind` を直接使っても同じになる。
 
@@ -358,6 +349,159 @@ sockat 自身は cwd を変えない。相対パスを作る時に、それが�
 ### 残るものがある
 
 呼び出しの途中でプロセスが死ぬと、`XDG_RUNTIME_DIR`・`TMPDIR`・`/tmp` に `sockat.XXXXXXXXXX` (D か symlink) が、ソケットのディレクトリに `.sockat.XXXXXXXXXX` (D か R) が残る。名前で sockat の残骸と分かる。
+
+## 失うもの
+
+経路を通ったことで、std と比べて何を失うか ([sockat の仕様の「失うもの」](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#失うもの))。any 系はこの名前を `losses` で返す。`bind` / `bind_ex` も、通った経路で同じものを失う (返さないだけ)。
+
+| 名前 | `Loss` | 失うもの | 付く時 |
+|---|---|---|---|
+| [respelled](#respelled) | `Respelled` | カーネルが返すアドレスが元のパスでない | bind が standard 以外の経路を通った |
+| [cwd-relative](#cwd-relative) | `CwdRelative` | カーネルが覚えた綴りが cwd からの相対パス | 相対パス (abstract の名前は除く) で bind が standard を通った |
+| [forked](#forked) | `Forked` | fork の副作用 | fork・fork-sockdir・fork-direct を通った |
+| [recreatable-spelling](#recreatable-spelling) | `RecreatableSpelling` | 綴りを他の利用者が作り直せる | `bind_any` が共有の置き場の symlink を通った |
+
+- `Loss` は `#[non_exhaustive]` の enum で、`as_str()` と `Display` は仕様の名前
+- 名前は約束で、変えずに足すだけ。知らない名前は「何かを失った」とだけ読む
+- 名前の間に大小や包含の関係は無い (`forked` と `recreatable-spelling` は互いを含まない)
+- connect の綴りは相手に残らないので、connect で付くのは `forked` だけ
+- 持ち主だけが書ける置き場の symlink は `respelled` だけ
+
+各節のコードは、crate doc に同じものがあり doctest で動かしている。
+
+### respelled
+
+- 起きること: bind した側の `local_addr()` (と、そこへ connect した側の `peer_addr()`) が元のパスでない綴りを返す ([カーネルが返すアドレスは元のパスではない](#カーネルが返すアドレスは元のパスではない))。listener を閉じてもソケットのファイルは消えない (std と同じ)
+- 注意すること: カーネルが返す綴りでファイルを消す・`stat` しない。綴りの中の乱数の名前 R は消してあるので普段は何にも当たらないが、綴りは他の利用者に見えうる (Linux の `/proc/net/unix`)。プロセスの cwd が他人も書ける場所 (`/tmp` 等) だと、相手が見て作り直した後にその綴りで消すと、相手の選んだディレクトリの同じ名前のファイルを消しうる
+- 避け方: 元のパスを持っておき、消す時はそれを使う。`bind_ex` の `SocketFile::discard()` を使う
+
+```rust
+use std::io;
+use std::path::Path;
+
+fn serve(path: &Path) -> io::Result<()> {
+    let (listener, file) = sockat::bind_ex(path)?;
+    // listener で受ける (tokio 等へ渡してもよい)
+    drop(listener);
+    file.discard() // bind したファイルがまだそこにある時だけ消す
+}
+
+fn serve_and_remove(path: &Path) -> io::Result<()> {
+    let listener = sockat::bind(path)?;
+    // listener で受ける
+    drop(listener);
+    std::fs::remove_file(path) // 元のパスで消す
+}
+```
+
+### cwd-relative
+
+- 起きること: 渡した相対パスが std にそのまま渡り (std が受け付ける長さの時)、カーネルが相対の綴りを覚える
+- 注意すること: cwd を変えた後に、その綴り (や渡した相対パス) で消す・`stat` すると別の場所に当たる。sockat が経路で失わせたものでなく std が元から持つ危険だが、知らせる
+- 避け方: bind の前にパスを絶対パスにする。消す時も絶対パスか `discard()` を使う
+
+```rust
+use std::io;
+use std::path::Path;
+
+fn serve(path: &Path) -> io::Result<()> {
+    let path = std::path::absolute(path)?; // bind の前に絶対パスにする
+    let (listener, file) = sockat::bind_ex(&path)?;
+    // listener で受ける
+    drop(listener);
+    file.discard()
+}
+```
+
+### forked
+
+- 起きること: fork した子が一瞬できる ([fork の経路の、相手から見えない副作用](#fork-の経路の相手から見えない副作用))。子は全 fd の複製を持ち、親に `SIGCHLD` が届き、`pthread_atfork` の handler が走る。`connect_any` 系ではサーバに見える peer の pid が子 ([fork-direct で connect した時の副作用](#fork-direct-で-connect-した時の副作用))
+- 注意すること: `SIGCHLD` の handler や `waitpid(-1)` を使うプログラムは、子を刈り取ったり、結果を取り違えたりしうる。fd を閉じて相手に EOF を伝えるつもりのプログラムは、子が終わるまで伝わらない。`connect_any` 系の相手のサーバは、peer の pid での認可を当てにできない
+- 避け方: 他のスレッドで `waitpid(-1)` を使わない (pid を指定して待つ)。`forked` を受け入れられない所では any 系を使わない
+
+```rust
+use std::io;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::process::{Command, ExitStatus};
+
+fn run_tool() -> io::Result<ExitStatus> {
+    let mut child = Command::new("true").spawn()?;
+    child.wait() // この子の pid を指定して待つ (waitpid(-1) を使わない)
+}
+
+fn dial(path: &Path) -> io::Result<UnixStream> {
+    sockat::connect(path) // connect_any でなく、fork しない connect
+}
+```
+
+### recreatable-spelling
+
+- 起きること: カーネルが返す綴りが共有の置き場 (`/tmp` 等) を通る (`<置き場>/sockat.XXXXXXXXXX/<ファイル名>`)
+- 注意すること: 名前は乱数なので事前には当てられないが、bind の後は他の利用者に見えうる (Linux の `/proc/net/unix`)。他の利用者がそれを作り直した後にその綴りで消すと、相手の選んだディレクトリの同じ名前のファイルを消しうる。名前の長さは防御でない (名前は bind の後に見える)
+- 避け方: カーネルが返す綴りで消さず、元のパスか `discard()` で消す。持ち主だけが書ける置き場 (`$XDG_RUNTIME_DIR` や、持ち主だけが書ける `$TMPDIR`) を用意すれば、そちらが先に使われてこの名前は付かない
+
+```rust
+use std::io;
+use std::path::Path;
+
+fn serve(path: &Path) -> io::Result<()> {
+    let any = sockat::bind_any(path)?; // feature `any`
+    // any.listener で受ける
+    drop(any.listener);
+    std::fs::remove_file(path) // local_addr() の綴りでなく、元のパスで消す
+}
+```
+
+## 使ってはいけない書き方
+
+sockat を使う時に、無関係なファイルを消したり、ファイルを消し損ねたりする書き方 ([sockat の仕様の「使ってはいけない書き方」](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#使ってはいけない書き方))。
+
+| 書き方 | Rust での形 | なぜいけないか | 代わりに |
+|---|---|---|---|
+| カーネルが返す綴りでソケットのファイルを消す・`stat` する | `std::fs::remove_file(listener.local_addr()?.as_pathname().unwrap())` | 長いパスでは元のパスでない ([respelled](#respelled))。cwd や共有の置き場しだいで、作り直された別のファイルに当たりうる ([cwd-relative](#cwd-relative)、[recreatable-spelling](#recreatable-spelling)) | 元のパスを持っておいて `std::fs::remove_file(path)`<br>`bind_ex` の `SocketFile::discard()` |
+| 相対パスで bind し、cwd を変えた後にその相対パスで消す | `sockat::bind("app.sock")` の後の<br>`std::env::set_current_dir(..)` と<br>`std::fs::remove_file("app.sock")` | 別の場所のファイルに当たる ([cwd-relative](#cwd-relative)) | bind の前に `std::path::absolute` で絶対パスにする<br>`discard()` |
+| listener を閉じればソケットのファイルが消えると当てにする | `drop(listener)` だけ | ソケットのファイルは消えない (std と同じ) | `discard()`<br>元のパスで消す |
+| `discard()` で listener も閉じると当てにする | `file.discard()` だけ | `discard()` はファイルを消すだけ ([DR-0028](./decisions/DR-0028-bind-ex-and-socket-file.md)) | listener は自分で閉じる (`drop(listener)`) |
+| any 系の `route`・`skipped`・`reason` の文字列で分岐する | `if any.route == "symlink"` | 診断用で、中身を約束しない (経路は増えたり変わったりする) | `losses` で分岐する (`any.losses.contains(&sockat::Loss::RecreatableSpelling)`) |
+| any 系の fork を使うプログラムで、他のスレッドが `waitpid(-1)` で子を刈る | `libc::waitpid(-1, ..)` | sockat の子を刈り取り、結果を取り違えうる ([forked](#forked)) | pid を指定して待つ (`std::process::Child::wait`)<br>`forked` を受け入れられない所では any 系を使わない |
+
+次のコードは、表の書き方を並べたもの (どれもしてはいけない)。
+
+```rust
+use std::io;
+use std::path::Path;
+
+fn wrong(path: &Path) -> io::Result<()> {
+    let listener = sockat::bind(path)?;
+    // カーネルが返す綴りで消す: 長いパスでは元のパスでなく、別のファイルに当たりうる
+    std::fs::remove_file(listener.local_addr()?.as_pathname().unwrap())?;
+    // listener を閉じても、ソケットのファイルは消えない
+    drop(listener);
+
+    let (listener, file) = sockat::bind_ex(path)?;
+    // discard() は listener を閉じない
+    file.discard()?;
+    let _still_open = listener;
+    Ok(())
+}
+
+fn wrong_relative() -> io::Result<()> {
+    let _listener = sockat::bind("app.sock")?;
+    std::env::set_current_dir("/")?;
+    // cwd を変えた後に相対パスで消す: 別の場所のファイルに当たる
+    std::fs::remove_file("app.sock")
+}
+
+fn wrong_any(path: &Path) -> io::Result<()> {
+    let any = sockat::bind_any(path)?; // feature `any`
+    // route の文字列で分岐する: 中身を約束しない (losses で分岐する)
+    if any.route == "symlink" {
+        eprintln!("bound through a symlink");
+    }
+    Ok(())
+}
+```
 
 ## エラー
 

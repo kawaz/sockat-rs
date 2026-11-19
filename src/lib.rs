@@ -229,6 +229,191 @@
 //! the removal, by someone who can write to the directory, cannot be caught:
 //! POSIX has no way to remove a file by its inode.
 //!
+//! # What is lost
+//!
+//! What taking a route loses compared to std, by the names of the
+//! [specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-is-lost).
+//! The `any` functions return them as `losses` (`Loss`); [`bind`] and
+//! [`bind_ex`] lose the same on the routes they take, without returning it.
+//! The [manual](https://github.com/kawaz/sockat-rs/blob/main/docs/MANUAL.md#what-is-lost)
+//! has what happens, what to watch out for and how to avoid each, with the
+//! code below.
+//!
+//! ## respelled
+//!
+//! A bind took a route other than standard: the address the kernel reports
+//! is not the path. Others may see that spelling and make it again, so do not
+//! remove or `stat` the file by it; keep the original path and use it, or
+//! use [`bind_ex`]'s [`SocketFile::discard`].
+//!
+//! ```
+//! use std::io;
+//! use std::path::Path;
+//!
+//! fn serve(path: &Path) -> io::Result<()> {
+//!     let (listener, file) = sockat::bind_ex(path)?;
+//!     // accept on listener (it may go to tokio etc.)
+//!     drop(listener);
+//!     file.discard() // removes the file only while it is still the one bound
+//! }
+//!
+//! fn serve_and_remove(path: &Path) -> io::Result<()> {
+//!     let listener = sockat::bind(path)?;
+//!     // accept on listener
+//!     drop(listener);
+//!     std::fs::remove_file(path) // remove by the original path
+//! }
+//! # let dir = tempfile::tempdir()?;
+//! # let deep = dir.path().join("d".repeat(100));
+//! # std::fs::create_dir(&deep)?;
+//! # serve(&deep.join("a.sock"))?;
+//! # serve_and_remove(&deep.join("b.sock"))?;
+//! # assert_eq!(std::fs::read_dir(&deep)?.count(), 0);
+//! # Ok::<(), io::Error>(())
+//! ```
+//!
+//! ## cwd-relative
+//!
+//! A bind of a relative path went to std as it is: the spelling the kernel
+//! keeps is relative to the cwd, and removing or `stat`ing by it (or by the
+//! relative path) after the cwd changes hits another place. A hazard std has
+//! on its own, reported all the same. Make the path absolute before the bind,
+//! and remove by the absolute path or `discard()`.
+//!
+//! ```
+//! use std::io;
+//! use std::path::Path;
+//!
+//! fn serve(path: &Path) -> io::Result<()> {
+//!     let path = std::path::absolute(path)?; // make it absolute before the bind
+//!     let (listener, file) = sockat::bind_ex(&path)?;
+//!     // accept on listener
+//!     drop(listener);
+//!     file.discard()
+//! }
+//! # let dir = tempfile::tempdir()?;
+//! # serve(&dir.path().join("s.sock"))?;
+//! # assert_eq!(std::fs::read_dir(dir.path())?.count(), 0);
+//! # Ok::<(), io::Error>(())
+//! ```
+//!
+//! ## forked
+//!
+//! A forked child made the call (fork, fork-sockdir, fork-direct), with the
+//! side effects of a fork (see [What differs from std for a long
+//! path](#what-differs-from-std-for-a-long-path)). A `SIGCHLD` handler or a
+//! `waitpid(-1)` may reap the child or mistake the result. Do not use
+//! `waitpid(-1)` in other threads (wait by pid), and where `forked` cannot be
+//! accepted, do not use the `any` functions.
+//!
+//! ```
+//! use std::io;
+//! use std::os::unix::net::UnixStream;
+//! use std::path::Path;
+//! use std::process::{Command, ExitStatus};
+//!
+//! fn run_tool() -> io::Result<ExitStatus> {
+//!     let mut child = Command::new("true").spawn()?;
+//!     child.wait() // waits for this child's pid (no waitpid(-1))
+//! }
+//!
+//! fn dial(path: &Path) -> io::Result<UnixStream> {
+//!     sockat::connect(path) // a connect that does not fork, not connect_any
+//! }
+//! # assert!(run_tool()?.success());
+//! # let dir = tempfile::tempdir()?;
+//! # let path = dir.path().join("d".repeat(100)).join("s.sock");
+//! # std::fs::create_dir(path.parent().unwrap())?;
+//! # let _listener = sockat::bind(&path)?;
+//! # dial(&path)?;
+//! # Ok::<(), io::Error>(())
+//! ```
+//!
+//! ## recreatable-spelling
+//!
+//! `bind_any` took the symlink in a shared place such as `/tmp`: the spelling
+//! the kernel reports goes through it, and another user can make it again
+//! once seen. Remove by the original path, not by that spelling. A place only
+//! the owner can write to (`$XDG_RUNTIME_DIR`, or a `$TMPDIR` only the owner
+//! can write to) is used first, and then this name is not given.
+//!
+//! ```
+//! # #[cfg(feature = "any")] {
+//! use std::io;
+//! use std::path::Path;
+//!
+//! fn serve(path: &Path) -> io::Result<()> {
+//!     let any = sockat::bind_any(path)?; // feature `any`
+//!     // accept on any.listener
+//!     drop(any.listener);
+//!     std::fs::remove_file(path) // by the original path, not local_addr()'s spelling
+//! }
+//! # let dir = tempfile::tempdir()?;
+//! # let deep = dir.path().join("d".repeat(100));
+//! # std::fs::create_dir(&deep)?;
+//! # serve(&deep.join("s.sock"))?;
+//! # assert_eq!(std::fs::read_dir(&deep)?.count(), 0);
+//! # }
+//! # Ok::<(), std::io::Error>(())
+//! ```
+//!
+//! # Patterns not to use
+//!
+//! Ways of using sockat that remove an unrelated file or fail to remove the
+//! file (the
+//! [specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#patterns-not-to-use)
+//! and the
+//! [manual](https://github.com/kawaz/sockat-rs/blob/main/docs/MANUAL.md#patterns-not-to-use)
+//! have why, and what to do instead):
+//!
+//! * removing or `stat`ing the socket file by the address the kernel reports
+//!   (`listener.local_addr()?.as_pathname()`): keep the original path, or use
+//!   [`SocketFile::discard`];
+//! * binding a relative path and removing by it after the cwd changes: make
+//!   the path absolute before the bind;
+//! * relying on closing the listener to remove the socket file, or on
+//!   `discard()` to close the listener;
+//! * branching on an `any` function's `route` or `skipped`: branch on
+//!   `losses`;
+//! * reaping children with `waitpid(-1)` on another thread of a program that
+//!   uses the `any` functions' fork: wait by pid.
+//!
+//! ```no_run
+//! use std::io;
+//! use std::path::Path;
+//!
+//! fn wrong(path: &Path) -> io::Result<()> {
+//!     let listener = sockat::bind(path)?;
+//!     // removing by the spelling the kernel reports: for a long path it is not the path, and may hit another file
+//!     std::fs::remove_file(listener.local_addr()?.as_pathname().unwrap())?;
+//!     // closing the listener does not remove the socket file
+//!     drop(listener);
+//!
+//!     let (listener, file) = sockat::bind_ex(path)?;
+//!     // discard() does not close the listener
+//!     file.discard()?;
+//!     let _still_open = listener;
+//!     Ok(())
+//! }
+//!
+//! fn wrong_relative() -> io::Result<()> {
+//!     let _listener = sockat::bind("app.sock")?;
+//!     std::env::set_current_dir("/")?;
+//!     // removing by the relative path after the cwd changed: hits a file in another place
+//!     std::fs::remove_file("app.sock")
+//! }
+//!
+//! # #[cfg(feature = "any")]
+//! fn wrong_any(path: &Path) -> io::Result<()> {
+//!     let any = sockat::bind_any(path)?; // feature `any`
+//!     // branching on the route's string: it promises nothing (branch on losses)
+//!     if any.route == "symlink" {
+//!         eprintln!("bound through a symlink");
+//!     }
+//!     Ok(())
+//! }
+//! ```
+//!
 //! # Errors
 //!
 //! The errors are those of `bind(2)`, `listen(2)` and `connect(2)` (and of
@@ -587,8 +772,10 @@ pub struct AnyListener {
     /// added, renamed or changed, so do not branch on it.
     pub route: &'static str,
     /// The routes tried before [`AnyListener::route`] and passed over, in the
-    /// order tried, each with why ([`Skipped`]). Empty for a path std took. For
-    /// diagnostics only, like [`AnyListener::route`].
+    /// order tried, each with why ([`Skipped`]): those of the order this call
+    /// tries on this platform in its state (no /proc route on a Linux without
+    /// /proc), `standard` first for a long path. Empty for a path std took.
+    /// For diagnostics only, like [`AnyListener::route`].
     pub skipped: Vec<Skipped>,
 }
 
@@ -657,12 +844,16 @@ pub struct AnyError {
     /// `ENAMETOOLONG` when no route could be used).
     pub error: io::Error,
     /// The name of the route that made the call and failed for real (an
-    /// existing file: `EADDRINUSE`, nobody listening: `ECONNREFUSED`, ...);
-    /// `None` when no route could be used, or the path was refused before
-    /// any was tried. For diagnostics only, as [`AnyListener::route`].
+    /// existing file: `EADDRINUSE`, nobody listening: `ECONNREFUSED`, ...;
+    /// `"standard"` when std failed on a path it took); `None` when no route
+    /// could be used, or the path was refused before any was tried (a NUL
+    /// byte, no file name, the socket's directory missing or not one). For
+    /// diagnostics only, as [`AnyListener::route`].
     pub route: Option<&'static str>,
     /// The routes tried and passed over, in the order tried, as
-    /// [`AnyListener::skipped`].
+    /// [`AnyListener::skipped`]; empty when the path was refused before any
+    /// route was tried (the length is judged only once the socket's directory
+    /// is looked up).
     pub skipped: Vec<Skipped>,
 }
 

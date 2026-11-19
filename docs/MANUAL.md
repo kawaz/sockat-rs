@@ -252,35 +252,26 @@ file.discard()?;
 | `sockat::connect_any(path)` | that of `connect`, then [fork-direct](#fork-direct) last | `Result<AnyConnection, AnyError>` (blocking) |
 | `sockat::connect_any_nonblocking(path)` | the same | `Result<AnyConnection, AnyError>` (nonblocking) |
 
-What is given up:
-
-- `bind_any`'s symlink: the address the kernel reports is `<place>/sockat.XXXXXXXXXX/<file name>`. In a shared place (`/tmp`, ...) another user can make that name again once the symlink is gone, so unlinking by the reported address could remove a file of that user's choosing in a directory of their choice. Remove the file by the original path
-- fork-direct of the `connect_any` ones: the peer pid the server sees is that of a child that has exited ([below](#side-effects-of-a-connect-through-fork-direct)), and [the side effects of a fork](#side-effects-of-the-fork-routes-that-no-peer-sees)
+`bind_any`'s symlink gives up `respelled`, and in a shared place (`/tmp`, ...) `recreatable-spelling` too. fork-direct of the `connect_any` ones gives up `forked` (the peer pid the server sees is that of a child that has exited; [below](#side-effects-of-a-connect-through-fork-direct)). What each means and how to avoid it is in [What is lost](#what-is-lost).
 
 The results are structs with public fields, `#[non_exhaustive]` (fields may be added, so a pattern needs `..`):
 
 | Field | Content |
 |---|---|
 | `listener` / `stream` | std's `UnixListener` / `UnixStream` |
-| `losses` | what was given up (`Vec<Loss>`; empty when nothing was). Branch on this |
+| `losses` | what was given up (`Vec<Loss>`; empty when nothing was). Branch on this. `Loss` is a `#[non_exhaustive]` enum, its values in the table of [What is lost](#what-is-lost) |
 | `route` | the name of the route taken (`&'static str`, such as `"thread-cwd"`, `"symlink"`, `"fork-direct"`) |
 | `skipped` | the routes tried and passed over, in the order tried (`Vec<Skipped>`). A `Skipped` has `name` (the route's name) and `reason` (why it could not be used) |
 
-`Loss` (a `#[non_exhaustive]` enum; `as_str()` and `Display` give the specification's names):
-
-| Value | Name | What is given up | When |
-|---|---|---|---|
-| `Respelled` | `respelled` | the address the kernel reports is not the path. Others can see the spelling, so where the cwd is writable by others it can be made again; remove the file by the original path | a bind took a route other than standard |
-| `Forked` | `forked` | [the side effects of a fork](#side-effects-of-the-fork-routes-that-no-peer-sees) (for a connect, the peer pid too) | fork, fork-sockdir or fork-direct was taken |
-| `RecreatableSpelling` | `recreatable-spelling` | the spelling the kernel reports goes through a shared place, where others can make it again | `bind_any` took the symlink in a shared place |
-| `CwdRelative` | `cwd-relative` | the spelling the kernel keeps is relative to the cwd; removing by it after the cwd changes reaches another place (a risk std has on its own) | a bind of a relative path (not an abstract name) took standard |
-
-- The names are promised and only added to. Read one you do not know as "something was given up". They have no order and none includes another
-- A connect gives up `Forked` alone (its spelling is kept nowhere)
 - `route` and `skipped` are for diagnostics and promise nothing about their content (routes may be added or renamed)
 - Every route tried before `route` was passed over. For a long path the first is `standard`
+- `skipped` holds only routes of the order the call tries (the row of [Order per OS](#order-per-os) for that OS and state). On a Linux without `/proc`, for example, proc, proc-sockdir, proc-direct and proc-held are not in it
 
-A failure returns an `AnyError`, with `error` (the `io::Error`), `route` (the route that actually bound / connected and failed; `None` when no route could be used, `ENAMETOOLONG`, or the path was refused before any) and `skipped`. `From<AnyError> for io::Error` gives the inner `io::Error` as it is, so `?` works in a function returning `io::Result` and `raw_os_error()` still gives the errno. Its `Display` is the inner `io::Error`'s.
+A failure returns an `AnyError`, with `error` (the `io::Error`), `route` and `skipped`.
+
+- `route` is the name of the route that actually bound / connected and failed; `"standard"` when std failed on a short path. `None` when no route could be used (`ENAMETOOLONG`) and when the path was refused before any route (a NUL byte, no file name, the socket's directory missing, not a directory, or its real path not resolvable)
+- When the path was refused before any route, `skipped` is empty too: the length is judged only after the socket's directory is looked up, so not even `standard` has been tried
+- `From<AnyError> for io::Error` gives the inner `io::Error` as it is, so `?` works in a function returning `io::Result` and `raw_os_error()` still gives the errno. Its `Display` is the inner `io::Error`'s
 
 ```rust
 let sockat::AnyConnection { stream, losses, route, .. } = sockat::connect_any(path)?;
@@ -323,7 +314,7 @@ On FreeBSD at-direct reaches file names of up to 103 bytes, so fork-direct is ne
 | proc-sockdir | `/proc/self/fd/<fd>/.sockat.XXXXXXXXXX/<file name>` |
 | symlink (`bind_any`) | `<place>/sockat.XXXXXXXXXX/<file name>` |
 
-R (and `.sockat.XXXXXXXXXX`, the place's symlink) is gone once the bind has returned, so removing, `stat`ing or `chmod`ing by the reported address hits nothing (however the fd number is reused, from whatever cwd it is resolved). After a bind by `bind_any` through a symlink in a shared place, though, another user can make that name again. It does not reach the socket either: keep the path you passed and use that (or `bind_ex` to remove the file). The same spelling shows in `Debug` output and in what frameworks log or hand out as the peer address.
+R (and `.sockat.XXXXXXXXXX`, the place's symlink) is gone once the bind has returned, so removing, `stat`ing or `chmod`ing by the reported address normally hits nothing (however the fd number is reused). Others can see the spelling, though, and once they make it again it can hit something ([respelled](#respelled); for the symlink in a shared place [recreatable-spelling](#recreatable-spelling)). It does not reach the socket either: keep the path you passed and use that (or `bind_ex` to remove the file; [Patterns not to use](#patterns-not-to-use)). The same spelling shows in `Debug` output and in what frameworks log or hand out as the peer address.
 
 On OpenBSD, std's `local_addr()` drops the last byte of the path even for a short path of up to 103 bytes (which sockat hands to std unchanged), as observed in CI. This is std's / the OS's behaviour, not sockat's: std's `UnixListener::bind` alone does the same.
 
@@ -358,6 +349,159 @@ sockat itself never changes the cwd. The relative spelling is checked to name th
 ### Things can be left behind
 
 If the process dies in the middle of a call, `sockat.XXXXXXXXXX` (D or a symlink) stays in `XDG_RUNTIME_DIR`, `TMPDIR` or `/tmp`, and `.sockat.XXXXXXXXXX` (D or R) in the socket's directory. The names mark them as sockat's.
+
+## What is lost
+
+What taking a route loses compared to std ([the sockat specification's "What is lost"](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-is-lost)). The any functions return these names as `losses`. `bind` / `bind_ex` lose the same on the routes they take (they just do not return it).
+
+| Name | `Loss` | What is lost | When |
+|---|---|---|---|
+| [respelled](#respelled) | `Respelled` | the address the kernel reports is not the original path | a bind took a route other than standard |
+| [cwd-relative](#cwd-relative) | `CwdRelative` | the spelling the kernel keeps is relative to the cwd | a bind took standard with a relative path (not an abstract name) |
+| [forked](#forked) | `Forked` | the side effects of forking | fork, fork-sockdir or fork-direct was taken |
+| [recreatable-spelling](#recreatable-spelling) | `RecreatableSpelling` | the spelling can be made again by other users | `bind_any` took the symlink in a shared place |
+
+- `Loss` is a `#[non_exhaustive]` enum; `as_str()` and `Display` give the specification's names
+- The names are a promise: never changed, only added to. Read a name you do not know only as "something was lost"
+- The names have no order or inclusion among them (`forked` and `recreatable-spelling` do not include each other)
+- A connect's spelling is left nowhere on the peer, so the only name a connect gets is `forked`
+- The symlink in a place only the owner can write to gets `respelled` only
+
+The code in each section is also in the crate documentation, where it runs as a doctest.
+
+### respelled
+
+- What happens: the bound side's `local_addr()` (and the connecting side's `peer_addr()`) reports a spelling that is not the original path ([The address the kernel reports is not the path](#the-address-the-kernel-reports-is-not-the-path)). Closing the listener does not remove the socket file (as with std)
+- Watch out for: do not remove or `stat` the file by the spelling the kernel reports. The random name R in it has been removed, so normally it hits nothing, but the spelling may be visible to other users (Linux's `/proc/net/unix`). If the process's cwd is a place others can write to (`/tmp`, ...), after another user sees and makes it again, removing by that spelling may remove a same-named file in a directory that user chose
+- How to avoid: keep the original path and use it when removing. Use `bind_ex`'s `SocketFile::discard()`
+
+```rust
+use std::io;
+use std::path::Path;
+
+fn serve(path: &Path) -> io::Result<()> {
+    let (listener, file) = sockat::bind_ex(path)?;
+    // accept on listener (it may go to tokio etc.)
+    drop(listener);
+    file.discard() // removes the file only while it is still the one bound
+}
+
+fn serve_and_remove(path: &Path) -> io::Result<()> {
+    let listener = sockat::bind(path)?;
+    // accept on listener
+    drop(listener);
+    std::fs::remove_file(path) // remove by the original path
+}
+```
+
+### cwd-relative
+
+- What happens: the given relative path goes to std unchanged (when std takes its length), and the kernel keeps a relative spelling
+- Watch out for: removing or `stat`ing by that spelling (or by the given relative path) after the cwd changes hits another place. A hazard std already has rather than one a route introduced, but it is reported
+- How to avoid: make the path absolute before the bind. Remove by the absolute path or `discard()` as well
+
+```rust
+use std::io;
+use std::path::Path;
+
+fn serve(path: &Path) -> io::Result<()> {
+    let path = std::path::absolute(path)?; // make it absolute before the bind
+    let (listener, file) = sockat::bind_ex(&path)?;
+    // accept on listener
+    drop(listener);
+    file.discard()
+}
+```
+
+### forked
+
+- What happens: a child is forked for a moment ([Side effects of the fork routes that no peer sees](#side-effects-of-the-fork-routes-that-no-peer-sees)). The child holds copies of every fd, the parent gets `SIGCHLD`, and `pthread_atfork` handlers run. After the `connect_any` ones the peer pid the server sees is that of the child ([Side effects of a connect through fork-direct](#side-effects-of-a-connect-through-fork-direct))
+- Watch out for: a program that uses a `SIGCHLD` handler or `waitpid(-1)` may reap the child or mistake the result. A program that closes an fd to tell the peer EOF gets it across only after the child exits. The server on the other end of a `connect_any` one cannot count on authorizing by the peer's pid
+- How to avoid: do not use `waitpid(-1)` in other threads (wait by pid). Where `forked` cannot be accepted, do not use the any functions
+
+```rust
+use std::io;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::process::{Command, ExitStatus};
+
+fn run_tool() -> io::Result<ExitStatus> {
+    let mut child = Command::new("true").spawn()?;
+    child.wait() // waits for this child's pid (no waitpid(-1))
+}
+
+fn dial(path: &Path) -> io::Result<UnixStream> {
+    sockat::connect(path) // a connect that does not fork, not connect_any
+}
+```
+
+### recreatable-spelling
+
+- What happens: the spelling the kernel reports goes through a shared place (`/tmp`, ...) (`<place>/sockat.XXXXXXXXXX/<file name>`)
+- Watch out for: the name is random, so it cannot be guessed in advance, but after the bind other users may see it (Linux's `/proc/net/unix`). If another user makes it again and it is then removed by that spelling, a same-named file in a directory the other user chose may be removed. The name's length is not the defense (the name is visible after the bind)
+- How to avoid: do not remove by the spelling the kernel reports; remove by the original path or `discard()`. If you provide a place only the owner can write to (`$XDG_RUNTIME_DIR`, or a `$TMPDIR` only the owner can write to), it is used first and this name is not given
+
+```rust
+use std::io;
+use std::path::Path;
+
+fn serve(path: &Path) -> io::Result<()> {
+    let any = sockat::bind_any(path)?; // feature `any`
+    // accept on any.listener
+    drop(any.listener);
+    std::fs::remove_file(path) // by the original path, not local_addr()'s spelling
+}
+```
+
+## Patterns not to use
+
+Ways of using sockat that remove an unrelated file or fail to remove the file ([the sockat specification's "Patterns not to use"](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#patterns-not-to-use)).
+
+| Pattern | In Rust | Why not | Instead |
+|---|---|---|---|
+| removing or `stat`ing the socket file by the spelling the kernel reports | `std::fs::remove_file(listener.local_addr()?.as_pathname().unwrap())` | for a long path it is not the original path ([respelled](#respelled)). Depending on the cwd or a shared place, it may hit another file someone made again ([cwd-relative](#cwd-relative), [recreatable-spelling](#recreatable-spelling)) | keep the original path and `std::fs::remove_file(path)`<br>`bind_ex`'s `SocketFile::discard()` |
+| binding with a relative path and removing by that relative path after the cwd changes | `sockat::bind("app.sock")` followed by<br>`std::env::set_current_dir(..)` and<br>`std::fs::remove_file("app.sock")` | hits a file in another place ([cwd-relative](#cwd-relative)) | make the path absolute with `std::path::absolute` before the bind<br>`discard()` |
+| relying on closing the listener to remove the socket file | `drop(listener)` alone | the socket file is not removed (as with std) | `discard()`<br>remove by the original path |
+| relying on `discard()` to close the listener too | `file.discard()` alone | `discard()` only removes the file ([DR-0028](./decisions/DR-0028-bind-ex-and-socket-file.md), Japanese) | close the listener yourself (`drop(listener)`) |
+| branching on the strings of the any functions' `route` / `skipped` / `reason` | `if any.route == "symlink"` | they are for diagnostics and promise nothing (routes are added and changed) | branch on `losses` (`any.losses.contains(&sockat::Loss::RecreatableSpelling)`) |
+| in a program that uses the any functions' fork, another thread reaping children with `waitpid(-1)` | `libc::waitpid(-1, ..)` | it may reap sockat's child and mistake the result ([forked](#forked)) | wait by pid (`std::process::Child::wait`)<br>where `forked` cannot be accepted, do not use the any functions |
+
+The code below lines up the patterns of the table (none of it is to be done).
+
+```rust
+use std::io;
+use std::path::Path;
+
+fn wrong(path: &Path) -> io::Result<()> {
+    let listener = sockat::bind(path)?;
+    // removing by the spelling the kernel reports: for a long path it is not the path, and may hit another file
+    std::fs::remove_file(listener.local_addr()?.as_pathname().unwrap())?;
+    // closing the listener does not remove the socket file
+    drop(listener);
+
+    let (listener, file) = sockat::bind_ex(path)?;
+    // discard() does not close the listener
+    file.discard()?;
+    let _still_open = listener;
+    Ok(())
+}
+
+fn wrong_relative() -> io::Result<()> {
+    let _listener = sockat::bind("app.sock")?;
+    std::env::set_current_dir("/")?;
+    // removing by the relative path after the cwd changed: hits a file in another place
+    std::fs::remove_file("app.sock")
+}
+
+fn wrong_any(path: &Path) -> io::Result<()> {
+    let any = sockat::bind_any(path)?; // feature `any`
+    // branching on the route's string: it promises nothing (branch on losses)
+    if any.route == "symlink" {
+        eprintln!("bound through a symlink");
+    }
+    Ok(())
+}
+```
 
 ## Errors
 
