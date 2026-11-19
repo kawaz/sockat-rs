@@ -301,6 +301,7 @@ On FreeBSD at-direct reaches file names of up to 103 bytes, so fork-cwd-direct i
 ### SocketFile
 
 - `bind_ex` takes the socket file's real path and `(st_dev, st_ino)` right after the bind, inside the route, before it returns the listener (on the routes through D and the form without D while R is still there, by the spelling the bind took; on symlink-file and symlink-dir by the real path of the socket's directory and the file name). When that cannot be done, the listener is closed and the error returned; the socket file stays
+- For a relative path, the process's cwd `(st_dev, st_ino)` is compared before the bind and the realpath and after both; when they differ, it is handled as when the file cannot be looked up (the error is `Other`). Another thread changing the cwd in between would put the bound file and the remembered one under different cwds, and `discard()` could remove an unrelated file of the same name. A change and change back is not seen
 - `SocketFile::discard()` removes what is at that real path only when its `(st_dev, st_ino)` is the same. Anything else (another socket bound at the path since, a file, a symlink) is left alone, and with nothing there (a directory along the path removed or replaced by something that is not a directory included) nothing is done. Both are `Ok(())`. When what is there cannot be looked up for another reason (`EACCES`, say) or the removal fails, that is an error (not knowing whether the file was removed is never `Ok(())`)
 - `discard()` does not close the listener. The listener is std's `UnixListener` and may go to tokio etc.; whoever holds it closes it, and `discard()` comes after that
 - Dropping a `SocketFile` does nothing
@@ -536,7 +537,7 @@ fn wrong_ex(path: &Path) -> io::Result<()> {
 | No route fits ([Where reaching stops](#where-reaching-stops)); for `connect` / `connect_nonblocking` and the `connect_ex` ones with `LastResort::Avoid` also when only fork-cwd-direct would reach the path | `ENAMETOOLONG` |
 | A path too long for std that does not end with a file name (`dir/`, `dir/.`, `..`, ...) | `InvalidInput` |
 | A path containing a NUL (at any length; on Linux / Android a path starting with a NUL goes to std as is) | `InvalidInput` |
-| The cwd changed during relative | `Other` |
+| The cwd changed during relative, or during `bind_ex` of a relative path | `Other` |
 | The forked child did not exit normally, or its exit status was reaped elsewhere (`SIGCHLD` set to `SIG_IGN`, a `waitpid(-1)` on another thread) and the socket was not bound / connected | `Other` |
 
 Errors are `std::io::Error`s (for the `_ex` functions an `ExError`, which also carries the routes tried and converts back by `?`); for OS errors `raw_os_error()` gives the errno.

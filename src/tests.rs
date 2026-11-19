@@ -2249,6 +2249,192 @@ fn child_bind_ex_relative() {
     }
 }
 
+// A relative path is resolved against the cwd twice in bind_ex: by the bind
+// and by the realpath of what is kept. Another thread changing the cwd in
+// between makes them name files in different directories, and discard() would
+// then remove a file of the same name the bind never made. So bind_ex compares
+// the cwd's (st_dev, st_ino) before the realpath and after the bind and, when
+// they differ, treats it as a file that cannot be looked up (SPEC "_ex"): the
+// listener is closed, nothing is removed, and the error names the route that
+// bound. The cwd is changed by the test hook at the point between the two
+// look-ups, to a directory with the same relative directories in it:
+// * short path: std binds first, so the bind is under the first cwd and the
+//   realpath under the second, where an unrelated file of the same name is;
+// * long path through D, through R beside the socket and (bind_ex's last
+//   resort) symlink-dir: the bind goes to the socket's directory's real path
+//   taken before the change, so it is under the first cwd; the unrelated file
+//   is under the second;
+// * long path through symlink-file (macOS, where a bind follows it): the
+//   symlink points to the path made absolute against the second cwd, where
+//   the bind is, and the real path kept is under the first, where the
+//   unrelated file is.
+// In each case the call fails, the socket file stays where the bind put it,
+// and the unrelated file stays. The default bind keeps nothing, so it is not
+// checked: the same change leaves its short relative bind as std's. Runs in a
+// child process whose cwd is changed.
+#[test]
+fn bind_ex_of_a_relative_path_fails_when_the_cwd_changes_in_between() {
+    let first = tmp();
+    let second = tmp();
+    run_child(
+        "tests::child_cwd_changes_in_between",
+        first.path(),
+        &[("SOCKAT_CHILD_OTHER_CWD", second.path().as_os_str())],
+    );
+}
+
+/// Change the cwd to `SOCKAT_CHILD_OTHER_CWD`, as another thread could in the
+/// middle of a call ([`Config::between_cwd_lookups`]).
+fn to_the_other_cwd() {
+    std::env::set_current_dir(env_path("SOCKAT_CHILD_OTHER_CWD")).unwrap();
+}
+
+#[test]
+fn child_cwd_changes_in_between() {
+    if !in_child() {
+        return;
+    }
+    let first = std::env::current_dir().unwrap();
+    let second = env_path("SOCKAT_CHILD_OTHER_CWD");
+    let place = tmp();
+    let link_place = tmp();
+    let hooked = |c: Config| Config {
+        between_cwd_lookups: to_the_other_cwd,
+        ..c
+    };
+    // A relative path longer than DIRECT_MAX, with its directories under both
+    // cwds.
+    let long = |name: &str| {
+        let p = nest(Path::new("long"), 200, name);
+        std::fs::create_dir_all(second.join(p.parent().unwrap())).unwrap();
+        p
+    };
+    struct Case {
+        what: &'static str,
+        req: Request,
+        rel: PathBuf,
+        cfg: Config,
+        /// The route expected to bind, when only one can.
+        route: Option<&'static str>,
+        /// Whether the bind is under the second cwd (else the first).
+        bound_in_second: bool,
+    }
+    let case = |what, req, rel, cfg, route, bound_in_second| Case {
+        what,
+        req,
+        rel,
+        cfg: hooked(cfg),
+        route,
+        bound_in_second,
+    };
+    #[allow(unused_mut)]
+    let mut cases = vec![
+        case(
+            "short",
+            BIND,
+            PathBuf::from("short.sock"),
+            config(&[], &[]),
+            Some("standard"),
+            false,
+        ),
+        case(
+            "long through D",
+            BIND,
+            long("d.sock"),
+            config(&[at(place.path())], &[]),
+            None,
+            false,
+        ),
+        case(
+            "long without D",
+            BIND,
+            long("r.sock"),
+            config(&[], &[]),
+            None,
+            false,
+        ),
+        case(
+            "long through symlink-dir",
+            BIND_LAST,
+            long("l.sock"),
+            bind_nowhere(&[link_place.path()]),
+            Some("symlink-dir"),
+            false,
+        ),
+    ];
+    #[cfg(target_os = "macos")]
+    cases.push(case(
+        "long through symlink-file",
+        BIND,
+        long("f.sock"),
+        with_symlink_file_bind(config(&[at(place.path())], &[link_place.path()])),
+        Some("symlink-file"),
+        true,
+    ));
+    let mut failures = Vec::new();
+    for Case {
+        what,
+        req,
+        rel,
+        cfg: c,
+        route: expected,
+        bound_in_second,
+    } in cases
+    {
+        std::env::set_current_dir(&first).unwrap();
+        let (bound_in, unrelated_in) = match bound_in_second {
+            true => (&second, &first),
+            false => (&first, &second),
+        };
+        std::fs::write(unrelated_in.join(&rel), "unrelated").unwrap();
+        let result = route::run_with(req, &rel, true, Some(&c));
+        std::env::set_current_dir(&first).unwrap();
+        match result {
+            Ok(r) => {
+                // What bind_ex would hand out, discarded as its user would.
+                let b = r.bound.unwrap();
+                drop(r.fd);
+                let kept = b.path.clone();
+                let discarded = crate::SocketFile {
+                    path: b.path,
+                    id: b.id,
+                }
+                .discard();
+                failures.push(format!(
+                    "{what}: bound by {} and kept {kept:?} (discard: {discarded:?})",
+                    r.route.name()
+                ));
+            }
+            Err(f) => {
+                if f.route.is_none() || (expected.is_some() && f.route != expected) {
+                    failures.push(format!("{what}: route {:?}, not {expected:?}", f.route));
+                }
+                if !f.error.to_string().contains("current directory changed") {
+                    failures.push(format!("{what}: {:?}", f.error));
+                }
+            }
+        }
+        if !is_socket(&bound_in.join(&rel)) {
+            failures.push(format!("{what}: no socket file left under {bound_in:?}"));
+        }
+        if std::fs::read(unrelated_in.join(&rel)).ok().as_deref() != Some(&b"unrelated"[..]) {
+            failures.push(format!(
+                "{what}: the unrelated file under {unrelated_in:?} was removed"
+            ));
+        }
+    }
+    assert_empty(place.path());
+    assert_empty(link_place.path());
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    let c = hooked(config(&[], &[]));
+    let (_l, r) = route::run_with(BIND, Path::new("default.sock"), false, Some(&c))
+        .map(|r| (r.fd, r.route))
+        .unwrap();
+    std::env::set_current_dir(&first).unwrap();
+    assert_eq!(r, Route::Standard);
+    assert!(is_socket(&first.join("default.sock")));
+}
+
 // ----- the names of the routes and the routes passed over -----
 
 // The routes carry the names of the SPEC ("経路の名前"), one name for each

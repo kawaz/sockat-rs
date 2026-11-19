@@ -102,6 +102,7 @@ impl SocketFile { pub fn discard(self) -> io::Result<()>; }
   - D を通す経路と D 無しの形: R が残っている間に、bind と同じ綴り `R/<ファイル名>` で D (またはソケットのディレクトリ) の fd から `fstatat(AT_SYMLINK_NOFOLLOW)`。パスは R の先 (ソケットのディレクトリの realpath) とファイル名
   - symlink-file と symlink-dir: ソケットのディレクトリの realpath とファイル名を `lstat`
 - 覚えられなければ listener を閉じ、ファイルは消さずにエラーを返す (通った経路の名前を `route` に付ける)
+- 相対パスでは、bind と realpath を引くことの前と両方の後でプロセスの cwd の `(st_dev, st_ino)` を比べ (`route::run_with`)、違えば (取れなければ) 覚えられない時と同じに扱う。エラーは `io::ErrorKind::Other`。既定の `bind` は覚えない (`route::run` は `Bound` を取らない) ので比べない (ハブ SPEC の `_ex`)
 - `discard()` は realpath を `lstat` し、`(st_dev, st_ino)` が同じ時だけ `unlink` する。違う物があれば触らず、何も無ければ (`ENOENT` / `ENOTDIR`) 何もしない。どちらも `Ok(())`。確かめられない時とそれ以外の `unlink` の失敗はエラー
 - `discard()` は listener を閉じない。`SocketFile` を drop しても何もしない
 

@@ -301,6 +301,7 @@ FreeBSD では at-direct がファイル名 103 バイトまで届くので、fo
 ### SocketFile
 
 - `bind_ex` は bind が通った直後、経路の中で listener を返す前に、ソケットのファイルの realpath と `(st_dev, st_ino)` を覚える (D を通す経路と D 無しの形では R が残っている間に、bind と同じ綴りで引く。symlink-file と symlink-dir ではソケットのディレクトリの realpath とファイル名で引く)。覚えられなければ listener を閉じ、ファイルは消さずにエラーを返す
+- 相対パスでは、bind と realpath を引くことの前と両方の後でプロセスの cwd の `(st_dev, st_ino)` を比べ、違えば覚えられない時と同じに扱う (エラーは `Other`)。他のスレッドが間に cwd を変えると bind した所と覚える所が別の cwd の下になり、`discard()` が同じ名前の無関係なファイルを消しうるため。変えて戻した場合は見えない
 - `SocketFile::discard()` は、その realpath にある物の `(st_dev, st_ino)` が同じ時だけ消す。別の物 (後から同じパスに bind された別のソケット、ファイル、symlink) は消さず、何も無ければ (途中のディレクトリが消された・ディレクトリでない物に置き換わった時も) 何もしない。どちらも `Ok(())`。それ以外の理由で確かめられない時 (`EACCES` 等) と消そうとして失敗した時はエラー (消せたか分からないのを `Ok(())` にしない)
 - `discard()` は listener を閉じない。listener は std の `UnixListener` で、tokio 等へ渡せる。閉じるのは listener を持っている側で、閉じてから `discard()` する
 - `SocketFile` を drop しても何もしない
@@ -536,7 +537,7 @@ fn wrong_ex(path: &Path) -> io::Result<()> {
 | どの経路にも収まらない ([どこから届かなくなるか](#どこから届かなくなるか))。`connect` / `connect_nonblocking` と `LastResort::Avoid` の `connect_ex` 系では、fork-cwd-direct でしか届かない時も | `ENAMETOOLONG` |
 | std にそのまま渡せない長さのパスで、名前で終わらない (`dir/`、`dir/.`、`..` 等) | `InvalidInput` |
 | NUL を含むパス (長さによらない。Linux / Android で先頭が NUL のパスは std にそのまま渡す) | `InvalidInput` |
-| relative の途中で cwd が変わった | `Other` |
+| relative の途中、または相対パスの `bind_ex` の途中で cwd が変わった | `Other` |
 | fork した子が正常に終了しなかった。または子の終了状態を他で刈り取られ (`SIGCHLD` を `SIG_IGN` にしている、他のスレッドの `waitpid(-1)`)、ソケットが bind / connect されていなかった | `Other` |
 
 エラーは `std::io::Error` (`_ex` は、それと試した経路を持つ `ExError`。`?` で `io::Error` に戻る) で、OS のエラーは `raw_os_error()` で errno を取れる。

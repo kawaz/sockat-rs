@@ -880,8 +880,11 @@ fn ex_error(f: route::Failed) -> ExError {
 /// bound rather than `ENAMETOOLONG`), and those of looking the socket file up
 /// right after the bind; then the listener is closed and the socket file stays
 /// (as after [`bind`]), so that no [`SocketFile`] is handed out that could not
-/// remove it. As an [`ExError`] with the routes tried (it converts into the
-/// [`io::Error`] by `?`).
+/// remove it. The same for a relative `path` when the cwd's `(st_dev,
+/// st_ino)` differs before the bind and the realpath and after both (another
+/// thread changed it, so the file looked up need not be the one bound), as an
+/// `Other` error. As an [`ExError`] with the routes tried (it converts into
+/// the [`io::Error`] by `?`).
 pub fn bind_ex<P: AsRef<Path>>(path: P, last_resort: LastResort) -> Result<ExListener, ExError> {
     let path = path.as_ref();
     let options = BindOptions {

@@ -422,8 +422,11 @@ impl Call {
 /// ([`path::refuse_nul`]). The exception is a path starting with a NUL on Linux
 /// and Android, a name in the abstract namespace rather than a file, which is
 /// not sockat's business at any length: it goes as is ([`path::is_abstract`]).
+///
+/// Nothing of a bound file is taken (no [`Bound`]): the default bind keeps
+/// nothing to remove later, so it has nothing that could fail to be taken.
 pub(crate) fn run(req: Request, path: &Path) -> io::Result<(OwnedFd, Route)> {
-    run_reporting(req, path)
+    run_with(req, path, false, None)
         .map(|r| (r.fd, r.route))
         .map_err(|f| f.error)
 }
@@ -437,10 +440,11 @@ pub(crate) fn run(req: Request, path: &Path) -> io::Result<(OwnedFd, Route)> {
 /// R is still there, by the same spelling the bind took (`R/<name>` relative
 /// to D's fd, the symlink R followed, the socket file not) and the real path R
 /// points to; on symlink-file and symlink-dir, by the real path of the socket's
-/// directory and the file name. When that cannot be taken, the listener is
-/// closed and the error returned with the route's name; the socket file stays.
+/// directory and the file name. When that cannot be taken, or for a relative
+/// path the cwd changed meanwhile ([`run_with`]), the listener is closed and
+/// the error returned with the route's name; the socket file stays.
 pub(crate) fn run_reporting(req: Request, path: &Path) -> Result<Reached, Failed> {
-    run_with(req, path, req.is_bind())
+    run_with(req, path, req.is_bind(), None)
 }
 
 /// The socket file a bind made: its real path and `(st_dev, st_ino)`, taken
@@ -451,8 +455,60 @@ pub(crate) struct Bound {
     pub(crate) id: (u64, u64),
 }
 
-/// [`run`], and with `remember` the [`Bound`] of a bind.
-fn run_with(req: Request, path: &Path, remember: bool) -> Result<Reached, Failed> {
+/// [`run`], and with `remember` the [`Bound`] of a bind. `cfg` is what the
+/// routes read from the environment: `None` to read it once a long path needs
+/// it (a short one goes as is, before anything else is looked at); the tests
+/// pass their own.
+///
+/// With `remember`, a relative path is resolved against the cwd both by the
+/// bind and by the realpath of the [`Bound`], at different moments. Another
+/// thread changing the cwd in between makes the two name files in different
+/// directories, and the [`Bound`] could be an unrelated file of the same name
+/// that `discard()` would remove. So the cwd's `(st_dev, st_ino)` is taken
+/// before both and again after both; when they differ (or cannot be taken)
+/// the [`Bound`] is treated as one that cannot be taken: the listener is
+/// closed and the error returned with the route's name, the socket file
+/// staying (hub SPEC `_ex`). A change undone before the second look is not
+/// seen.
+pub(crate) fn run_with(
+    req: Request,
+    path: &Path,
+    remember: bool,
+    cfg: Option<&Config>,
+) -> Result<Reached, Failed> {
+    if !remember || path.is_absolute() || path::is_abstract(path) {
+        return run_unchecked(req, path, remember, cfg);
+    }
+    let before = dir_id(Path::new("."));
+    let reached = run_unchecked(req, path, remember, cfg)?;
+    if before.is_some() && dir_id(Path::new(".")) == before {
+        return Ok(reached);
+    }
+    drop(reached.fd);
+    Err(Failed {
+        error: io::Error::other(
+            "the current directory changed while binding a path relative to it; \
+             the listener was closed and the socket file left in place",
+        ),
+        route: Some(reached.route.name()),
+        skipped: reached.skipped,
+    })
+}
+
+/// `(st_dev, st_ino)` of the directory `dir`, following a symlink.
+fn dir_id(dir: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(dir).ok()?;
+    Some((m.dev(), m.ino()))
+}
+
+/// [`run_with`] without the check of the cwd.
+fn run_unchecked(
+    req: Request,
+    path: &Path,
+    remember: bool,
+    cfg: Option<&Config>,
+) -> Result<Reached, Failed> {
     let direct = |req, path: &Path| {
         let failed = |error| Failed {
             error,
@@ -460,6 +516,9 @@ fn run_with(req: Request, path: &Path, remember: bool) -> Result<Reached, Failed
             skipped: Vec::new(),
         };
         let fd = plain_op(req, path).map_err(failed)?;
+        if let Some(cfg) = cfg {
+            (cfg.between_cwd_lookups)();
+        }
         let bound = match remember {
             true => Some(bound_at(path).map_err(failed)?),
             false => None,
@@ -478,7 +537,10 @@ fn run_with(req: Request, path: &Path, remember: bool) -> Result<Reached, Failed
     if path::len(path) <= DIRECT_MAX {
         return direct(req, path);
     }
-    run_long_with(req, path, &Config::from_env(), remember)
+    match cfg {
+        Some(cfg) => run_long_with(req, path, cfg, remember),
+        None => run_long_with(req, path, &Config::from_env(), remember),
+    }
 }
 
 /// The [`Bound`] of the socket file at `path`, bound just now by std:
@@ -541,6 +603,12 @@ pub(crate) struct Config {
     /// place to stand in for a D that a umask made impossible to open where
     /// the kernel would open it anyway (`O_PATH` on Linux).
     pub(crate) open_own_dir: own::OpenAt,
+    /// Called once where a relative path has been resolved against the cwd
+    /// and is yet to be again: for a short path after std's bind and before
+    /// the realpath of the bound file, for a long path after the realpath of
+    /// the socket's directory and before the routes. Does nothing outside the
+    /// tests, which change the cwd there, as another thread could.
+    pub(crate) between_cwd_lookups: fn(),
 }
 
 /// A place where D may be made.
@@ -617,6 +685,7 @@ impl Config {
             thread_cwd: true,
             open_socket_dir: open_dir,
             open_own_dir: own::open_own_dir,
+            between_cwd_lookups: || {},
         }
     }
 }
@@ -746,6 +815,7 @@ pub(crate) fn run_long_with(
         return Err(before(io::Error::from_raw_os_error(libc::ENOTDIR)));
     }
     let real_dir = std::fs::canonicalize(dir).map_err(before)?;
+    (cfg.between_cwd_lookups)();
     let mut t = Target {
         req,
         path,
@@ -2121,7 +2191,6 @@ pub(crate) mod apple {
 #[cfg(not(target_os = "freebsd"))]
 pub(crate) mod posix {
     use super::*;
-    use std::os::unix::fs::MetadataExt;
 
     #[cfg(target_vendor = "apple")]
     use crate::sys::WIDE_PATH_MAX;
@@ -2151,11 +2220,6 @@ pub(crate) mod posix {
         pub(crate) path: PathBuf,
         /// `(st_dev, st_ino)` of the cwd when the spelling was made.
         cwd: (u64, u64),
-    }
-
-    fn dir_id(dir: &Path) -> Option<(u64, u64)> {
-        let m = std::fs::metadata(dir).ok()?;
-        Some((m.dev(), m.ino()))
     }
 
     /// The spellings of the cwd that the path may start with: what
