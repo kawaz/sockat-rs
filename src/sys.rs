@@ -937,6 +937,18 @@ pub(crate) fn ignore_sigchld() {
     }
 }
 
+/// A duplicate of `fd` numbered `min` or more, close-on-exec
+/// (`fcntl(F_DUPFD_CLOEXEC)`). Test-only: gives a directory fd more digits
+/// than the route order estimated for it (Linux).
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) fn dup_at_least(fd: BorrowedFd<'_>, min: libc::c_int) -> io::Result<OwnedFd> {
+    // SAFETY: fcntl F_DUPFD_CLOEXEC on a borrowed fd; on success the returned
+    // fd is a new one that nothing else owns.
+    let new = cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, min) })?;
+    // SAFETY: `new` is a freshly duplicated fd owned by no one else.
+    Ok(unsafe { OwnedFd::from_raw_fd(new) })
+}
+
 /// Whether `fd` is `O_NONBLOCK`. Test-only (the connect option tests run on
 /// Linux and Apple).
 #[cfg(all(

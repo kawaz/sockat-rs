@@ -34,14 +34,14 @@ A path that std accepts (up to `sun_path` − 1 bytes) is handed to std unchange
 | Linux / Android / illumos | up to 107 bytes |
 | macOS / iOS / FreeBSD / NetBSD / OpenBSD | up to 103 bytes |
 
-A longer path is reached first by **the routes through D**. sockat makes a directory D of its own (`sockat.XXXXXXXXXX`, mode 0700) and holds it by an fd, makes in it a symlink R with a random name (pointing to the socket's directory), binds / connects with `R/<file name>` relative to D's fd, and removes R and D. The spelling the kernel keeps is `R/<file name>`; R is gone by then, so wherever it is resolved later, it hits nothing. The routes' names are those of the [sockat specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md) ("route names").
+A longer path is bound through **the routes through D**. sockat makes a directory D of its own (`sockat.XXXXXXXXXX`, mode 0700) and holds it by an fd, makes in it a symlink R with a random name (pointing to the socket's directory), binds with `R/<file name>` relative to D's fd, and removes R and D. The spelling the kernel keeps is `R/<file name>`; R is gone by then, so wherever it is resolved later, it hits nothing. The routes' names are those of the [sockat specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md) ("route names").
 
-| OS | Routes through D (in this order) |
+| OS | bind (in this order) |
 |---|---|
-| Linux / Android | thread-cwd → proc → fork (bind only) |
-| macOS / iOS and the other Apple OSes | thread-cwd → fork (bind only) |
+| Linux / Android | thread-cwd → proc → fork |
+| macOS / iOS and the other Apple OSes | thread-cwd → fork |
 | FreeBSD | at |
-| NetBSD / OpenBSD / illumos / other Unix | fork (bind only) |
+| NetBSD / OpenBSD / illumos / other Unix | fork |
 | Windows | not supported (compile error) |
 
 - **thread-cwd**: move the cwd of a throwaway thread, and of it alone, into D (Linux: `unshare(CLONE_FS)` and `fchdir`; Apple OSes: `pthread_fchdir_np`). It has no side effects, so every function tries it. Not used on Linux under a seccomp filter
@@ -50,26 +50,26 @@ A longer path is reached first by **the routes through D**. sockat makes a direc
 - **fork**: fork a child that `fchdir`s into D and binds. The caller listens afterwards, so it has no side effect visible to peers
 - D goes in `TMPDIR`, `/tmp` or the socket's directory (`.sockat.XXXXXXXXXX`), the first where it can be made. A place needs to be neither safe nor short (D is held by its fd). Where D can be made nowhere, a bind makes R in the socket's directory and tries the same order (thread-cwd-sockdir → proc-sockdir → fork-sockdir; at-sockdir on FreeBSD)
 
-When the routes through D cannot be used, the connects alone try **the fallback routes**. The kernel keeps no spelling of a connect, so these carry no random part.
+A connect tries the routes that need neither writing (making D, R or a symlink) nor a thread first, and the routes through D (thread-cwd, proc, at, and proc-held, through a symlink in D) and the symlink in a place after them. When an earlier route reaches the socket, neither D nor a symlink is made. The kernel keeps no spelling of a connect, so apart from the routes through D these carry no random part. D is made at most once in a call and shared by the routes that use it.
 
-| OS | Fallback routes (in this order) |
+| OS | connect (in this order) |
 |---|---|
-| Linux / Android (`/proc` usable) | proc-direct → proc-held → symlink |
-| Linux / Android (no `/proc`) | relative → symlink |
-| macOS / iOS and the other Apple OSes | relative → widened → symlink |
-| FreeBSD | at-direct |
+| Linux / Android (`/proc` usable) | proc-direct → thread-cwd → proc → proc-held → symlink |
+| Linux / Android (no `/proc`) | relative → thread-cwd → symlink |
+| macOS / iOS and the other Apple OSes | relative → widened → thread-cwd → symlink |
+| FreeBSD | at-direct → at |
 | NetBSD / OpenBSD / illumos / other Unix | relative → symlink |
 
 - **proc-direct**: pass `/proc/self/fd/<directory fd>/<file name>`
-- **proc-held**: make a symlink to the socket file in D and pass `/proc/self/fd/<D's fd>/s`
 - **relative**: when std accepts the path relative to the cwd, pass that. Only the path string is rewritten; the cwd is never changed
 - **widened**: pass a sockaddr carrying up to 253 bytes, which the macOS kernel accepts (the address of a socket bound through it is cut short and breaks its readers, so a bind never uses it)
-- **symlink**: create a short symlink to the socket file under `TMPDIR` or `/tmp`, in a place where no other user can replace it, go through it, and remove it at once
 - **at-direct**: pass the socket's directory's fd and the file name to `connectat`
+- **proc-held**: make a symlink to the socket file in D and pass `/proc/self/fd/<D's fd>/s`
+- **symlink**: create a short symlink to the socket file under `TMPDIR` or `/tmp`, in a place where no other user can replace it, go through it, and remove it at once
 
 The `connect_any` variants fork last when none of these reaches the path (fork-direct). None of the routes changes the cwd of the calling process or thread, so they can be used from multi-threaded programs.
 
-`connect` / `connect_nonblocking` never fork. Where only the fork route would reach the path, they return `ENAMETOOLONG`, as a plain connect to a path too long for `sun_path` does. That happens only when the routes through D cannot be used for a connect (NetBSD / OpenBSD / illumos, Linux under a seccomp filter without `/proc`, an Apple OS without `pthread_fchdir_np`) and no fallback route reaches the path either. With a usable `/tmp`, `connect` reaches the path whatever the directory depth and the file name length. The length limits of each route, and where reaching stops, are in [docs/MANUAL.md](./docs/MANUAL.md#how-a-long-path-is-reached).
+`connect` / `connect_nonblocking` never fork. Where only the fork route would reach the path, they return `ENAMETOOLONG`, as a plain connect to a path too long for `sun_path` does. That happens only when the routes through D cannot be used for a connect (NetBSD / OpenBSD / illumos, Linux under a seccomp filter without `/proc`, an Apple OS without `pthread_fchdir_np`) and no route without D reaches the path either. With a usable `/tmp`, `connect` reaches the path whatever the directory depth and the file name length. The length limits of each route, and where reaching stops, are in [docs/MANUAL.md](./docs/MANUAL.md#how-a-long-path-is-reached).
 
 ## The exception: the any functions
 

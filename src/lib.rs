@@ -38,18 +38,20 @@
 //!
 //! # How a long path is reached
 //!
-//! A path longer than std accepts goes first through a directory of sockat's
+//! A path longer than std accepts is bound through a directory of sockat's
 //! own, D (**the routes through D**), and only when that cannot be used,
-//! for a bind through the socket's directory itself (**the form without
-//! D**), for a connect through **the fallback routes**. The routes carry the
-//! names of the [specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md):
+//! through the socket's directory itself (**the form without D**). A connect
+//! tries **the connect routes** that need neither writing (making D, R or a
+//! symlink) nor a thread first, then the routes through D and the symlink.
+//! The routes carry the names of the
+//! [specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md):
 //!
 //! | Platform | [`bind`] | [`connect`], [`connect_nonblocking`] |
 //! |---|---|---|
-//! | Linux, Android | thread-cwd, proc, fork | thread-cwd, proc, then proc-direct, proc-held, symlink |
-//! | Linux, Android without `/proc` | thread-cwd, fork | thread-cwd, then relative, symlink |
-//! | macOS, iOS (Apple) | thread-cwd, fork | thread-cwd, then relative, widened, symlink |
-//! | FreeBSD | at | at, then at-direct |
+//! | Linux, Android | thread-cwd, proc, fork | proc-direct, thread-cwd, proc, proc-held, symlink |
+//! | Linux, Android without `/proc` | thread-cwd, fork | relative, thread-cwd, symlink |
+//! | macOS, iOS (Apple) | thread-cwd, fork | relative, widened, thread-cwd, symlink |
+//! | FreeBSD | at | at-direct, at |
 //! | NetBSD, OpenBSD, illumos, other Unix | fork | relative, symlink |
 //!
 //! `bind_any` tries what [`bind`] does, then a symlink in a place;
@@ -80,7 +82,9 @@
 //!   calling process as the server, as with any other route
 //!
 //! D and R are removed when the call returns, so the spelling the kernel keeps
-//! for a bound socket names nothing afterwards, wherever it is resolved. D goes
+//! for a bound socket names nothing afterwards, wherever it is resolved. D is
+//! made at most once in a call and shared by every route that uses it; a
+//! connect makes it only when no route before those reached the socket. D goes
 //! in `TMPDIR` (or `/tmp` when it is unset), then `/tmp`, then the socket's
 //! directory (named `.sockat.XXXXXXXXXX` there). None of them needs to be
 //! safe or short: D is held by its fd. A D that cannot be opened right after
@@ -96,14 +100,13 @@
 //! bytes (Linux, illumos) or 92 (Apple, the BSDs); 88 / 84 without D (about
 //! 72 by proc-sockdir).
 //!
-//! **The fallback routes** (connects only). A connected socket is not bound,
-//! so its spelling is kept nowhere and needs no random part:
+//! **The connect routes** (connects only). A connected socket is not bound,
+//! so its spelling is kept nowhere and needs no random part. The first four
+//! need neither writing nor a thread and come first in a connect's order:
 //!
-//! * **proc-direct** (Linux): `/proc/self/fd/<dirfd>/<file name>`, for a file
-//!   name of up to about 90 bytes
-//! * **proc-held** (Linux with `/proc`): D made as above, a symlink `s` in it
-//!   to the socket file, and the connect by `/proc/self/fd/<D's fd>/s`,
-//!   whatever the directory depth and the file name length
+//! * **proc-direct** (Linux with `/proc`):
+//!   `/proc/self/fd/<dirfd>/<file name>`, for a file name of up to about 90
+//!   bytes
 //! * **relative**: the path spelled relative to the working directory, when
 //!   std accepts that. Only the path string is rewritten; the cwd is never
 //!   changed
@@ -111,14 +114,18 @@
 //!   which XNU accepts: the path itself, or failing that the relative
 //!   spelling. A bind never uses it: the address of a socket bound so does not
 //!   fit `sun_path` and breaks its readers (CPython, Go's `net.FileConn`)
+//! * **at-direct** (FreeBSD): `connectat(2)` on the socket's directory fd with
+//!   the file name (up to 103 bytes)
+//! * **proc-held** (Linux with `/proc`): a symlink `s` to the socket file in
+//!   D (the one a route before it made, or made as above), and the connect by
+//!   `/proc/self/fd/<D's fd>/s`, whatever the directory depth and the file
+//!   name length
 //! * **symlink**: a short symlink to the socket file under `TMPDIR` or failing
 //!   that `/tmp`, removed right after the call, made only in a place where no
 //!   other user can replace it (a sticky directory owned by root or the calling
 //!   user, as `/tmp` is, or a directory of the calling user's that group and
 //!   others cannot write to). Through `/tmp`, a connect is reached whatever the
 //!   directory depth and the file name length
-//! * **at-direct** (FreeBSD): `connectat(2)` on the socket's directory fd with
-//!   the file name (up to 103 bytes)
 //!
 //! None of these changes the working directory of the calling process or of
 //! the calling thread, and all of them can be used from multi-threaded
@@ -138,9 +145,9 @@
 //! too long for `sun_path` does. That happens only when the routes through D
 //! cannot be used for a connect (no thread cwd and no `/proc`: NetBSD,
 //! OpenBSD, illumos, Linux under a seccomp filter without `/proc`, an Apple
-//! OS without `pthread_fchdir_np`) and none of the fallback routes reaches the
-//! path (no safe place for the symlink, and the path fits neither a relative
-//! spelling nor, on Apple, the widened sockaddr). [`bind`] fails with
+//! OS without `pthread_fchdir_np`) and none of the other connect routes
+//! reaches the path (no safe place for the symlink, and the path fits neither
+//! a relative spelling nor, on Apple, the widened sockaddr). [`bind`] fails with
 //! `ENAMETOOLONG` where no route through D or beside the socket can be used.
 //!
 //! `bind_any`, `connect_any` and `connect_any_nonblocking`, behind the crate
@@ -953,7 +960,7 @@ fn bind_reporting(path: &Path, options: BindOptions) -> Result<AnyListener, AnyE
 /// `ENAMETOOLONG` in an environment you have to support: it reaches a long
 /// path in any ordinary environment. This is for the rare one where only the
 /// fork route does (sockat's own directory cannot be used for a connect, and
-/// none of the fallback routes reaches the path; see the
+/// none of the other connect routes reaches the path; see the
 /// [crate documentation](crate)), when the connection is wanted at the cost of
 /// the fork's side effects. The order tried is that of [`connect`], with the
 /// fork route last.

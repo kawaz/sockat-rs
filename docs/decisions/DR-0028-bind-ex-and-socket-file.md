@@ -26,7 +26,7 @@ impl SocketFile {
 - `bind_ex` は `bind` と同じ経路で bind し、ソケットのファイルの realpath と `(st_dev, st_ino)` を覚えた `SocketFile` を listener と組で返す
 - 覚えるのは bind が通った直後、経路の中で listener を返す前 (`route::bind_remembering`)
   - std に渡す長さのパス: std の bind が返った直後に `realpath(3)` と `lstat(2)`
-  - 中心の経路: D と R が残っている間に、bind と同じ綴り `R/<ファイル名>` で D の fd から `fstatat(AT_SYMLINK_NOFOLLOW)` (R は辿り、ソケットのファイル自体は辿らない)。パスは R の先 (ソケットのディレクトリの realpath) とファイル名。スレッド cwd はスレッドが終わった直後、fork は子の終了を受けた後
+  - D を通す経路: D と R が残っている間に、bind と同じ綴り `R/<ファイル名>` で D の fd から `fstatat(AT_SYMLINK_NOFOLLOW)` (R は辿り、ソケットのファイル自体は辿らない)。パスは R の先 (ソケットのディレクトリの realpath) とファイル名。スレッド cwd はスレッドが終わった直後、fork は子の終了を受けた後
 - 覚えられなければ listener を閉じ、ファイルは消さずにエラーを返す
 - `discard()` は realpath を `lstat` し、`(st_dev, st_ino)` が同じ時だけ `unlink` する。違う物 (別のソケット、ファイル、symlink) があれば触らず、何も無ければ (`lstat` が `ENOENT` / `ENOTDIR`) 何もしない。どちらも `Ok(())`。確かめられない時 (`lstat` がそれ以外で失敗、`EACCES` 等) と `unlink` の失敗はエラー (試験 `bind_ex_discard_errs_only_when_it_cannot_tell`)
 - `discard()` は listener を閉じない。閉じるのは listener を持っている利用者 (tokio、サーバのフレームワーク等)

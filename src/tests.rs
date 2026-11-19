@@ -10,9 +10,10 @@
 //!   was handed to the kernel. A route that "works" but creates the socket
 //!   elsewhere is the failure these tests exist to catch.
 //! * Which route is taken is forced through the route order's inputs
-//!   ([`Config`]: the places for sockat's own directory D, the places for the
-//!   fallback symlink, where /proc is, whether the thread-cwd means and the
-//!   widened sockaddr may be used), never through the process environment.
+//!   ([`Config`]: the places for sockat's own directory D, the places for a
+//!   connect's symlink, where /proc is, whether the thread-cwd means and the
+//!   widened sockaddr may be used, how the socket's directory and D are
+//!   opened), never through the process environment.
 //! * Temporary directories have random names and are removed when the test
 //!   ends (`tempfile::TempDir`).
 //! * Tests that need a particular working directory or a process-wide setting
@@ -160,7 +161,7 @@ fn at(p: &Path) -> Place {
 
 /// The route order's inputs as the public API reads them, except that D may
 /// be made in `places` (in that order; the socket's directory only when it is
-/// among them as [`Place::SocketDir`]) and the fallback's symlink may go in
+/// among them as [`Place::SocketDir`]) and a connect's symlink may go in
 /// `links` (not on FreeBSD, which has no such route). The widened sockaddr is
 /// on (Apple), /proc is looked for where it is (Linux), the thread-cwd means
 /// is on (Linux, Apple).
@@ -178,8 +179,8 @@ fn config(places: &[Place], links: &[&Path]) -> Config {
 
 /// `c` with the thread-cwd means turned off, standing in for a system where it
 /// cannot be used (a seccomp filter in effect, as under docker's default
-/// profile; `unshare` refused; no `pthread_fchdir_np`), so that the central
-/// route goes on to its next means. On the targets without it, `c` as it is.
+/// profile; `unshare` refused; no `pthread_fchdir_np`), so that the order
+/// goes on to its next route. On the targets without it, `c` as it is.
 fn no_thread_cwd(c: Config) -> Config {
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     return Config {
@@ -190,8 +191,7 @@ fn no_thread_cwd(c: Config) -> Config {
     return c;
 }
 
-/// `c` with every means of the central route that comes before the fork
-/// turned off: the thread-cwd means ([`no_thread_cwd`]) and, on Linux, /proc
+/// `c` with every means through D that comes before the fork turned off: the thread-cwd means ([`no_thread_cwd`]) and, on Linux, /proc
 /// (looked for where nothing is), so that a bind, with D or without it, goes
 /// on to the fork route. FreeBSD's bindat cannot turn out unusable and stays.
 fn fork_means_only(c: Config) -> Config {
@@ -202,6 +202,25 @@ fn fork_means_only(c: Config) -> Config {
     };
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     return no_thread_cwd(c);
+}
+
+/// `c` with the connect routes that need neither writing nor a thread
+/// unusable, so that a connect goes on to the routes through D (SPEC "connect
+/// の順"): the socket's directory cannot be opened ([`refuse_socket_dir`]: no
+/// proc-direct, at-direct or fork-direct) and the widened sockaddr is off
+/// (Apple). relative is left to the path: one hundreds of bytes long under
+/// `/tmp` is too far from the cwd for it.
+fn no_direct(c: Config) -> Config {
+    #[allow(unused_mut)]
+    let mut c = Config {
+        open_socket_dir: refuse_socket_dir,
+        ..c
+    };
+    #[cfg(target_vendor = "apple")]
+    {
+        c.wide = false;
+    }
+    c
 }
 
 /// Why the thread-cwd means cannot be used in this environment, or `None`
@@ -281,11 +300,12 @@ fn thread_here() -> bool {
     return false;
 }
 
-/// Whether `r` is the route the central route takes for `req` with the
-/// default means of the platform and a short file name: the thread-cwd means
-/// where it is usable (`thread`); else on Linux the /proc version, on FreeBSD
-/// bindat / connectat, and elsewhere a forked child in D for a bind (a
-/// connect has no central means left there, [`connects_through_d`]).
+/// Whether `r` is the route through D that `req` takes with the default means
+/// of the platform and a short file name (a connect with the routes before
+/// D off, [`no_direct`]): the thread-cwd means where it is usable (`thread`);
+/// else on Linux the /proc version, on FreeBSD bindat / connectat, and
+/// elsewhere a forked child in D for a bind (a connect has no route through D
+/// left there, [`connects_through_d`]).
 fn route_through_d(req: Request, thread: bool, r: Route) -> bool {
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     if thread {
@@ -330,10 +350,10 @@ fn sockdir_route(thread: bool, r: Route) -> bool {
     };
 }
 
-/// Whether the platform has a central means for a connect (one that does not
-/// fork) here: the thread-cwd means (`thread`), on Linux also the /proc
-/// version, on FreeBSD connectat. NetBSD, OpenBSD, illumos and the other Unix
-/// targets have none, and their connects take the fallback routes.
+/// Whether the platform has a connect route through D here: thread-cwd
+/// (`thread`), on Linux also proc, on FreeBSD at. NetBSD, OpenBSD, illumos
+/// and the other Unix targets have none, and their connects take only the
+/// routes that need no D (relative, symlink).
 fn connects_through_d(thread: bool) -> bool {
     if cfg!(target_os = "freebsd") {
         return true;
@@ -655,8 +675,8 @@ fn a_missing_directory_is_enoent_even_when_the_name_fits_no_sockaddr() {
 // * bind: every bind spelling holds the file name in the plain sockaddr
 //   (`R/<name>`, or `.sockat.XXXXXXXXXX/<name>` without D), so no bind
 //   reaches it: ENAMETOOLONG, and nothing is created.
-// * connect: the fallback routes reach a socket file without the file name in
-//   the spelling (on Linux with /proc the symlink in D, `/proc/self/fd/<n>/s`;
+// * connect: the routes that keep the file name out of the spelling reach the
+//   socket file (on Linux with /proc the symlink in D, `/proc/self/fd/<n>/s`;
 //   elsewhere the symlink to the file under /tmp), so the name's length does
 //   not matter, and the plain `connect` reaches it without forking (every
 //   target but FreeBSD, where connectat takes the name as bindat does). A
@@ -724,10 +744,10 @@ fn long_paths_without_a_file_name_or_with_nul_are_invalid_input() {
 // linux::a_leading_nul_goes_to_std_at_any_length).
 //
 // "Nothing is created" covers the routes too: a long path is refused before
-// one is tried. The central route in particular would otherwise make D in a
-// place before the call through it failed, and the fallback a symlink. So the
-// calls run in a child whose TMPDIR is a short directory (the first place for
-// D and the symlink), and that place, the socket's directory (the last place
+// one is tried. The routes through D in particular would otherwise make D in a
+// place before the call through it failed, and the symlink route a symlink. So
+// the calls run in a child whose TMPDIR is a short directory (the first place
+// for D and the symlink), and that place, the socket's directory (the last place
 // for D) and the directory above it must keep their modification times (each
 // would change if an entry were created in it and removed again).
 //
@@ -845,9 +865,9 @@ fn child_nul_paths() {
 }
 
 // The four public connects, as they map onto the connect options: on a long
-// path that the central route reaches (200 bytes, short file name: the
-// thread-cwd means, or on Linux under a seccomp filter the /proc version), each
-// connects from this process (the server sees its pid), the two that may fork
+// path (200 bytes, short file name: the first route of the connect order
+// reaches it, proc-direct on Linux, widened on Apple), each connects from this
+// process (the server sees its pid), the two that may fork
 // report that they did not, and each returns a stream that is O_NONBLOCK
 // exactly for the two nonblocking ones. Which of them may fork is checked route
 // by route (check_fork_and_peer) and through the public API in
@@ -930,7 +950,7 @@ fn fork_binds_and_connects_through_the_shared_socket() {
 // the server accepts and before anything is sent), after the accept, and after
 // data went both ways. The client is an ordinary connect of this process (it
 // does not fork), so the pid it sees is the server's alone. Three binds: the
-// route forced (fork_op); the central route with its other means unusable
+// route forced (fork_op); the bind through D with its other means unusable
 // (the thread-cwd means off, and a file name of 85 bytes, too long behind
 // /proc/self/fd/<n>/R/ on Linux), forking in D; and with D made nowhere and
 // the means before the fork off (thread cwd, /proc), forking with R beside the
@@ -1099,12 +1119,13 @@ fn concurrent_routes_never_change_the_cwd() {
 }
 
 // ---------------------------------------------------------------------------
-// the central route (every platform)
+// the routes through D (every platform)
 // ---------------------------------------------------------------------------
 
-// The central route as the platform takes it, with one place for D: a bind
-// and the four connects of a 600-byte path (a short file name) go through D,
-// and afterwards:
+// The routes through D as the platform takes them, with one place for D: a
+// bind and the four connects of a 600-byte path (a short file name; for the
+// connects the routes that need neither writing nor a thread off,
+// [`no_direct`]) go through D, and afterwards:
 //
 // * the socket is at the path given and data flows both ways;
 // * the place was used (its mtime changed: D was made in it) and is empty
@@ -1117,8 +1138,8 @@ fn concurrent_routes_never_change_the_cwd() {
 // The means: the thread-cwd one where this system allows it (Linux without a
 // seccomp filter, Apple), otherwise on Linux the /proc version, on FreeBSD
 // bindat / connectat, on the other targets a forked child in D for the bind
-// (their connects have no central means and take the fallback routes, here
-// the symlink under a place for it, which leave the place for D untouched).
+// (their connects have no route through D and take the symlink under a place
+// for it, which leaves the place for D untouched).
 #[test]
 fn the_routes_through_d_go_through_r_and_leave_nothing_behind() {
     let thread = thread_here();
@@ -1127,6 +1148,7 @@ fn the_routes_through_d_go_through_r_and_leave_nothing_behind() {
     let place = tmp();
     let links = tmp();
     let c = config(&[at(place.path())], &[links.path()]);
+    let connect_c = no_direct(c.clone());
     let p = nest(t.path(), 600, "s.sock");
 
     mark_untouched(place.path());
@@ -1149,7 +1171,7 @@ fn the_routes_through_d_go_through_r_and_leave_nothing_behind() {
 
     for req in CONNECTS {
         mark_untouched(place.path());
-        let (cl, r) = route::run_long(req, &p, &c).unwrap();
+        let (cl, r) = route::run_long(req, &p, &connect_c).unwrap();
         if connects_through_d(thread) {
             assert!(route_through_d(req, thread, r), "{req:?} {r:?}");
             assert_touched(place.path());
@@ -1169,7 +1191,7 @@ fn the_routes_through_d_go_through_r_and_leave_nothing_behind() {
 // own for the call instead of moving the caller's (and moving it back with
 // pthread_fchdir_np(-1) would drop the caller's own setting). Checked from a
 // test thread that sets its own cwd to a directory X, binds and connects
-// through the central route, then reads its cwd: still X; and the process's
+// through D by thread-cwd, then reads its cwd: still X; and the process's
 // cwd, read on this thread, unchanged. Where the thread-cwd means is not used
 // (a seccomp filter), the caller cannot set a thread cwd of its own on Linux
 // either, and there is nothing to check.
@@ -1203,7 +1225,7 @@ fn the_callers_own_thread_cwd_is_left_as_it_is() {
         let c = config(&[at(&place_path)], &[]);
         let (l, r) = route::run_long(BIND, &p, &c).unwrap();
         assert_eq!(r, Route::ThreadCwd);
-        let (cl, r) = route::run_long(CONNECT, &p, &c).unwrap();
+        let (cl, r) = route::run_long(CONNECT, &p, &no_direct(c)).unwrap();
         assert_eq!(r, Route::ThreadCwd);
         ping(l, cl);
         let after = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
@@ -1216,8 +1238,8 @@ fn the_callers_own_thread_cwd_is_left_as_it_is() {
     assert_eq!(std::env::current_dir().unwrap(), cwd);
 }
 
-// The spelling the kernel keeps for a socket bound through the central route
-// names nothing once the call has returned, wherever it is resolved later.
+// The spelling the kernel keeps for a socket bound through D or beside the
+// socket names nothing once the call has returned, wherever it is resolved later.
 // Libraries above sockat unlink or stat the bound address (Python's asyncio
 // cleaning up, Go's UnixListener.Close, a user's remove_file(local_addr)), so
 // the spelling must not land on an unrelated file:
@@ -1443,16 +1465,16 @@ fn the_bound_file_is_taken_right_after_the_bind_on_every_route() {
     assert_empty(place.path());
 }
 
-// The central route never opens the socket's directory: R in D points to its
-// real path, which the kernel resolves with search permission alone, as for a
-// plain bind / connect by path. So a socket's directory without read
+// The routes through D never open the socket's directory: R in D points to
+// its real path, which the kernel resolves with search permission alone, as
+// for a plain bind / connect by path. So a socket's directory without read
 // permission (mode 0300: write + search) is reached through D on every target,
 // also where a directory is opened O_RDONLY (the BSDs other than Apple,
 // illumos), which would fail there. The bind goes through D and the connects
-// as the platform takes them (through D, or the fallback symlink, which needs
-// no fd of the directory either). Only the routes that need the directory's
-// fd (the /proc and connectat routes, a fork in it) open it, and where that
-// fails they cannot be used. Root bypasses permission checks, so as root the
+// as the platform takes them (proc-direct, which opens the directory O_PATH;
+// through D; or the symlink, which needs no fd of the directory either). Only
+// the routes that need the directory's fd (proc-direct, at-direct, a fork in
+// it) open it, and where that fails they cannot be used. Root bypasses permission checks, so as root the
 // test cannot tell anything and says so.
 #[test]
 fn a_directory_without_read_permission_is_reached_through_d() {
@@ -1515,28 +1537,34 @@ fn socket_dir_opens() -> usize {
     SOCKET_DIR_OPENS.with(|n| n.replace(0))
 }
 
-// The socket's directory is opened only by the routes that need its fd (the
-// /proc and connectat fallbacks, a fork in it, D or R made in it), so a
-// directory that cannot be opened costs only those (SPEC). With its open
-// refused and one place for D, the central route still binds and connects
-// through D made there, by the platform's default means and, with the
-// thread-cwd means off, by the next one: on Linux the /proc version, which
-// checks /proc without the socket's directory; elsewhere a fork in D for a
-// bind, and for a connect bindat / connectat (FreeBSD) or a fallback that
-// does not fork. None of this even asks for the socket's directory: D in a
-// place other than it needs no fd of it.
+// The socket's directory is opened only by the routes that need its fd
+// (proc-direct, at-direct, a fork in it, D or R made in it), so a directory
+// that cannot be opened costs only those (SPEC). With its open refused (and
+// the widened sockaddr off on Apple, [`no_direct`]) and one place for D, the
+// bind and the connects still go through D made there, by the platform's
+// default means and, with the thread-cwd means off, by the next one: on Linux
+// the /proc version, which checks /proc without the socket's directory;
+// elsewhere a fork in D for a bind, and for a connect at (FreeBSD) or the
+// symlink, which does not fork. The bind does not even ask for the socket's
+// directory (D in a place other than it needs no fd of it); a connect asks
+// once, for the route before D that needs it (proc-direct on Linux, at-direct
+// on FreeBSD), and nowhere else.
 #[test]
 fn a_socket_directory_that_cannot_be_opened_costs_only_the_routes_that_need_its_fd() {
     let t = tmp();
     let place = tmp();
     let links = tmp();
+    let asked_by_a_connect = usize::from(cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd"
+    )));
     socket_dir_opens();
     for (i, thread) in [thread_here(), false].into_iter().enumerate() {
-        let mut c = config(&[at(place.path())], &[links.path()]);
+        let mut c = no_direct(config(&[at(place.path())], &[links.path()]));
         if !thread {
             c = no_thread_cwd(c);
         }
-        c.open_socket_dir = refuse_socket_dir;
         let p = nest(&t.path().join(i.to_string()), 400, "s.sock");
         let (l, r) = route::run_long(BIND, &p, &c).unwrap();
         assert!(
@@ -1544,6 +1572,7 @@ fn a_socket_directory_that_cannot_be_opened_costs_only_the_routes_that_need_its_
             "thread {thread}: bind {r:?}"
         );
         assert!(is_socket(&p));
+        assert_eq!(socket_dir_opens(), 0, "thread {thread}: bind");
         let listener = UnixListener::from(l);
         for req in CONNECTS {
             let (cl, r) = route::run_long(req, &p, &c).unwrap();
@@ -1555,9 +1584,13 @@ fn a_socket_directory_that_cannot_be_opened_costs_only_the_routes_that_need_its_
             } else {
                 assert!(!r.forked(), "thread {thread}: {req:?} {r:?}");
             }
+            assert_eq!(
+                socket_dir_opens(),
+                asked_by_a_connect,
+                "thread {thread}: {req:?}"
+            );
             ping_kept(&listener, cl);
         }
-        assert_eq!(socket_dir_opens(), 0, "thread {thread}");
         assert_empty(place.path());
         assert_empty(links.path());
     }
@@ -1567,7 +1600,7 @@ fn a_socket_directory_that_cannot_be_opened_costs_only_the_routes_that_need_its_
 // in it, and the first where it can is used (DR-0027): a place that does not
 // exist, a place that is a file, then two directories. The first directory is
 // used (its mtime changes; empty afterwards) and the second untouched. A bind
-// goes through D wherever this platform's central route takes it.
+// goes through D by this platform's means.
 #[test]
 fn d_goes_in_the_first_place_where_it_can_be_made() {
     let t = tmp();
@@ -1642,14 +1675,23 @@ fn d_needs_no_safe_place() {
 // plain listings. Made directly (OwnDir::create), the name is checked; through
 // the route order with no other place usable, a connect makes D in the
 // socket's directory (its mtime changes, and a connect makes nothing else
-// there) and leaves nothing named `.sockat.` (where the platform has a central
-// means for a connect).
+// there) and leaves nothing named `.sockat.`. The routes before D are passed
+// over by the path: 600 bytes (too long for relative and widened) and on
+// Linux a file name of 93 bytes (too long for proc-direct, short enough for
+// `R/<name>` of thread-cwd and for proc-held). This is checked where the
+// connect has a route through D after them (Linux, Apple); FreeBSD's
+// at-direct takes every file name its at takes.
 #[test]
 fn d_in_the_socket_directory_is_hidden_and_removed() {
     use std::os::fd::AsFd;
     let t = tmp();
     let place = tmp();
-    let p = nest(t.path(), 600, "s.sock");
+    let name = if cfg!(any(target_os = "linux", target_os = "android")) {
+        "n".repeat(93)
+    } else {
+        "s.sock".to_string()
+    };
+    let p = nest(t.path(), 600, &name);
     let dir = p.parent().unwrap();
     let dir_fd = route::open_dir(dir).unwrap();
     let target = std::fs::canonicalize(dir).unwrap();
@@ -1657,15 +1699,9 @@ fn d_in_the_socket_directory_is_hidden_and_removed() {
         (Place::SocketDir, own::HIDDEN_PREFIX),
         (at(place.path()), own::PREFIX),
     ] {
-        let d = own::OwnDir::create(
-            &where_,
-            Some(dir_fd.as_fd()),
-            None,
-            own::open_own_dir,
-            &target,
-            own::LinkName::Random,
-        )
-        .unwrap();
+        let d =
+            own::OwnDir::create(&where_, Some(dir_fd.as_fd()), None, own::open_own_dir).unwrap();
+        d.with_r(&target).unwrap();
         assert!(is_drawn(&d.name, prefix), "{where_:?}: {:?}", d.name);
         drop(d);
     }
@@ -1675,7 +1711,8 @@ fn d_in_the_socket_directory_is_hidden_and_removed() {
     let c = config(&[at(Path::new("/nonexistent")), Place::SocketDir], &[]);
     let (l, _) = route::run_long(BIND, &p, &c).unwrap();
     assert_none_named(dir, own::HIDDEN_PREFIX);
-    if connects_through_d(thread_here()) {
+    let linux = cfg!(any(target_os = "linux", target_os = "android"));
+    if linux || cfg!(target_vendor = "apple") && thread_here() {
         mark_untouched(dir);
         let (cl, r) = route::run_long(CONNECT, &p, &c).unwrap();
         assert!(!r.forked(), "{r:?}");
@@ -1701,8 +1738,9 @@ fn bind_forks_beside(r: Route) -> bool {
 // socket's directory, `.sockat.XXXXXXXXXX` to the directory itself, so the
 // spelling the kernel keeps is `.sockat.XXXXXXXXXX/<name>`, and R is removed
 // afterwards. The socket is at the path given and reached; the client sees
-// this process as the server (the listen is the parent's). A connect goes on
-// to the fallback routes (here a symlink under a place for it), not forking.
+// this process as the server (the listen is the parent's). A connect reaches
+// the socket by the routes that need no D (with /proc off on Linux, the
+// symlink under a place for it), not forking.
 // The spelling costs 19 bytes: a file name of DIRECT_MAX - 19 binds, one byte
 // more is ENAMETOOLONG with nothing made (even where R/<name> would fit in D).
 // (FreeBSD binds by bindat instead, with the same spelling.)
@@ -1742,8 +1780,8 @@ fn with_d_made_nowhere_a_bind_forks_with_r_beside_the_socket() {
     assert_untouched(t.path());
 }
 
-// With D made nowhere, a bind tries the means of the central route in the same
-// order as with D, beside the socket: R (`.sockat.XXXXXXXXXX`, to the socket's
+// With D made nowhere, a bind tries the means through D in the same order as
+// with D, beside the socket: R (`.sockat.XXXXXXXXXX`, to the socket's
 // directory) made in the socket's directory and the call made with
 // `.sockat.XXXXXXXXXX/<name>` relative to its fd (kawaz 2026-11-19, D12-Q1).
 // By default that is the platform's first means (the thread-cwd means where it
@@ -1756,7 +1794,7 @@ fn with_d_made_nowhere_a_bind_forks_with_r_beside_the_socket() {
 // cannot be opened (its open refused, standing in for a directory without
 // read permission where it is opened O_RDONLY), R cannot be made beside it:
 // the bind is ENAMETOOLONG and nothing is made there. (The connects reach the
-// socket by the fallback routes, here a symlink under a place for it.)
+// socket by the routes that need no D.)
 #[test]
 fn with_d_made_nowhere_a_bind_takes_the_sockdir_routes() {
     let t = tmp();
@@ -2050,8 +2088,9 @@ fn only_what_passes_the_checks_is_removed_for_a_d_not_opened() {
 //   place for bind_any's symlink): ENAMETOOLONG, no route, every route
 //   passed over, the symlink last;
 // * a route fails for real (bind_any through the symlink onto an existing
-//   file: EADDRINUSE; a connect through D to a missing socket: ENOENT): that
-//   route's name, and the ones before it passed over;
+//   file: EADDRINUSE; a connect to a missing socket by the first route of the
+//   platform's connect order that can be used: ENOENT): that route's name,
+//   and the ones before it passed over;
 // * the directory is missing: ENOENT before any route, and nothing passed
 //   over (the length is judged only once the directory is looked up, so not
 //   even `standard` has been tried).
@@ -2095,12 +2134,15 @@ fn a_failure_reports_the_routes_tried_and_keeps_the_errno() {
     let name = f.route.unwrap_or_else(|| panic!("{f:?}"));
     assert!(
         [
+            "proc-direct",
+            "relative",
+            "widened",
+            "at-direct",
             "thread-cwd",
             "proc",
             "at",
-            "relative",
+            "proc-held",
             "symlink",
-            "proc-held"
         ]
         .contains(&name),
         "{name}"
@@ -2250,10 +2292,11 @@ fn standard_is_passed_over_only_for_a_long_path() {
 // passed over, in the order tried, each with a reason (SPEC "公開する操作",
 // what the any functions return). With the thread-cwd means off (so the run does
 // not depend on it) and the inputs chosen per platform, the names come in the
-// SPEC's order: through D (thread-cwd, proc, fork), then beside the socket
-// (the `-sockdir` ones) when D can be made nowhere, then bind_any's symlink;
-// for a connect the fallback routes, then fork-direct. Only the names are
-// pinned; a reason just has to be there.
+// SPEC's order: for a bind through D (thread-cwd, proc, fork), then beside
+// the socket (the `-sockdir` ones) when D can be made nowhere, then
+// bind_any's symlink; for a connect the order of the OS (SPEC "connect の
+// 順": the routes that need neither writing nor a thread first), then
+// fork-direct. Only the names are pinned; a reason just has to be there.
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 #[test]
 fn the_routes_passed_over_are_reported_in_the_order_tried() {
@@ -2362,9 +2405,9 @@ fn the_routes_passed_over_are_reported_in_the_order_tried() {
             &bare,
             "fork-direct",
             if linux {
-                vec!["standard", "thread-cwd", "relative", "symlink"]
+                vec!["standard", "relative", "thread-cwd", "symlink"]
             } else {
-                vec!["standard", "thread-cwd", "relative", "widened", "symlink"]
+                vec!["standard", "relative", "widened", "thread-cwd", "symlink"]
             },
         ),
     ];
@@ -2375,7 +2418,7 @@ fn the_routes_passed_over_are_reported_in_the_order_tried() {
             nest(&t.path().join("4"), 400, &"n".repeat(95)),
             &with_d,
             "proc-held",
-            vec!["standard", "thread-cwd", "proc", "proc-direct"],
+            vec!["standard", "proc-direct", "thread-cwd", "proc"],
         ));
     } else {
         cases.push((
@@ -2384,7 +2427,7 @@ fn the_routes_passed_over_are_reported_in_the_order_tried() {
             nest(&t.path().join("4"), 600, "s.sock"),
             &with_d,
             "symlink",
-            vec!["standard", "thread-cwd", "relative", "widened"],
+            vec!["standard", "relative", "widened", "thread-cwd"],
         ));
     }
     for (what, req, p, c, route, skipped) in cases {
@@ -2417,19 +2460,20 @@ fn the_routes_passed_over_are_reported_in_the_order_tried() {
 }
 
 // skipped holds only the routes of the order this call tries on this platform
-// in its state (SPEC "公開する操作": the order of "試す順番" with the one row of
-// "予備の経路 (connect 系)" that the OS and the state, /proc usable or not,
-// pick), every one of them that could not be used; a route of no such order is
-// not reported. With the thread-cwd means off, /proc looked for where nothing
-// is on Linux (a Linux without /proc), D made nowhere and no place for the
-// fallback's symlink:
+// in its state (SPEC "公開する操作": the order of "試す順番", for a connect with
+// the one row of "connect の順" that the OS and the state, /proc usable or
+// not, pick), every one of them that could not be used; a route of no such
+// order is not reported. With the thread-cwd means off, /proc looked for where
+// nothing is on Linux (a Linux without /proc), D made nowhere and no place for
+// a connect's symlink:
 //
 // * a bind passes over standard, thread-cwd and fork through D, then
 //   thread-cwd-sockdir, and is made by fork-sockdir. proc and proc-sockdir
 //   are for a Linux with /proc only (SPEC "経路の名前"), so they are not there;
-// * connect_any passes over standard, thread-cwd and the fallback row of a
-//   Linux without /proc (relative, symlink; no proc-direct or proc-held) or of
-//   Apple (relative, widened, symlink), and is made by fork-direct;
+// * connect_any passes over standard and the row of a Linux without /proc
+//   (relative, thread-cwd, symlink; no proc-direct, proc or proc-held) or of
+//   Apple (relative, widened, thread-cwd, symlink), and is made by
+//   fork-direct;
 // * a connect that may not fork passes over the same routes and fails with
 //   ENAMETOOLONG and no route: fork-direct is not in its order (the last row of
 //   its column in "試す順番" is ENAMETOOLONG), so it is not reported either.
@@ -2460,14 +2504,14 @@ fn only_the_routes_of_the_order_tried_are_reported() {
     let p = nest(&t.path().join("connect"), 600, "s.sock");
     let (l, _) = route::run_long(BIND, &p, &config(&[at(place.path())], &[])).unwrap();
     let listener = UnixListener::from(l);
-    let fallback: &[&str] = if linux {
-        &["standard", "thread-cwd", "relative", "symlink"]
+    let order: &[&str] = if linux {
+        &["standard", "relative", "thread-cwd", "symlink"]
     } else {
-        &["standard", "thread-cwd", "relative", "widened", "symlink"]
+        &["standard", "relative", "widened", "thread-cwd", "symlink"]
     };
     let reached = route::run_long_with(CONNECT_ANY, &p, &bare, false).unwrap();
     assert_eq!(reached.route.name(), "fork-direct", "{:?}", reached.skipped);
-    assert_eq!(names(&reached.skipped), fallback);
+    assert_eq!(names(&reached.skipped), order);
     ping_kept(&listener, reached.fd);
 
     let f = route::run_long_with(CONNECT, &p, &bare, false)
@@ -2475,13 +2519,12 @@ fn only_the_routes_of_the_order_tried_are_reported() {
         .unwrap();
     assert_eq!(errno(&f.error), Some(libc::ENAMETOOLONG), "{f:?}");
     assert_eq!(f.route, None);
-    assert_eq!(names(&f.skipped), fallback);
+    assert_eq!(names(&f.skipped), order);
     assert_empty(place.path());
 }
 
 // The -sockdir routes are tried only when D was to be made and could be made
-// nowhere (hub SPEC 445c1670): when no means of the central route can be used
-// at all (here a file name too long for `R/<name>`), D is not made, so no
+// nowhere (hub SPEC 445c1670): when no means through D can be used at all (here a file name too long for `R/<name>`), D is not made, so no
 // -sockdir route is tried or reported, and the bind is ENAMETOOLONG with only
 // the routes through D passed over. With no place for D at all, D being made
 // nowhere must not be taken for a reason to try the -sockdir routes. The
@@ -2503,13 +2546,13 @@ fn no_sockdir_route_is_tried_when_d_is_not_made() {
     assert_untouched(t.path());
 }
 
-// The central route's spelling is `R/<name>`, 11 bytes more than the file
-// name, in the plain sockaddr: a file name of DIRECT_MAX - 11 bytes (96 on
+// The spelling through D is `R/<name>`, 11 bytes more than the file name, in
+// the plain sockaddr: a file name of DIRECT_MAX - 11 bytes (96 on
 // Linux and illumos, 92 on Apple and the BSDs) binds through D and is reached;
 // one byte more fits no bind spelling and is ENAMETOOLONG for the bind, with
 // nothing made in the place (the length is checked before D is made). A
-// connect to such a name still gets there on the fallback routes (a socket
-// bound under a short name and renamed).
+// connect to such a name still gets there by a route that keeps the file name
+// out of the spelling (a socket bound under a short name and renamed).
 #[test]
 fn the_routes_through_d_take_a_file_name_up_to_sun_path_less_r() {
     let t = tmp();
@@ -2536,15 +2579,20 @@ fn the_routes_through_d_take_a_file_name_up_to_sun_path_less_r() {
     ping(l, cl);
 }
 
-// A bind / connect that a means of the central route made is the result: its
-// error is returned, no later means is tried (the fork route, for a bind) and
-// no later place, and a connect does not go on to the fallback routes. With two
-// places for D and a place for the fallback symlink: an existing file is
+// A bind / connect that a means through D made is the result: its error is
+// returned, no later means is tried (the fork route, for a bind) and no later
+// place, and a connect does not go on to the routes after it (the symlink).
+// With two places for D and a place for a connect's symlink, and for the
+// connects the routes before D off ([`no_direct`]): an existing file is
 // EADDRINUSE, a missing socket ENOENT and a socket nobody listens on
 // ECONNREFUSED; the second place for D and the place for the symlink stay
-// untouched, the first is empty again. (Where the platform has no central means
-// for a connect, its connects are the fallback's business and only the bind is
-// checked here.)
+// untouched, the first is empty again. (Where the platform has no connect
+// route through D, only the bind is checked here.)
+//
+// The same holds for a route before D: a connect whose first route (Linux
+// proc-direct, FreeBSD at-direct, Apple widened for a path of at most 253
+// bytes) fails for real returns that failure, and D is not made for the
+// routes after it: both places for D stay untouched.
 #[test]
 fn a_failure_through_d_is_not_retried() {
     let t = tmp();
@@ -2558,31 +2606,339 @@ fn a_failure_through_d_is_not_retried() {
     mark_untouched(links.path());
     let e = route::run_long(BIND, &p, &c).unwrap_err();
     assert_eq!(errno(&e), Some(libc::EADDRINUSE), "{e}");
+    let stale = p.with_file_name("stale.sock");
+    stale_socket(&stale);
     if connects_through_d(thread_here()) {
+        let through_d = no_direct(c.clone());
         for req in CONNECTS {
-            let e = route::run_long(req, &p.with_file_name("x.sock"), &c).unwrap_err();
+            let e = route::run_long(req, &p.with_file_name("x.sock"), &through_d).unwrap_err();
             assert_eq!(errno(&e), Some(libc::ENOENT), "{req:?}: {e}");
         }
-        let stale = p.with_file_name("stale.sock");
-        stale_socket(&stale);
         for req in CONNECTS {
-            let e = route::run_long(req, &stale, &c).unwrap_err();
+            let e = route::run_long(req, &stale, &through_d).unwrap_err();
             assert_eq!(errno(&e), Some(libc::ECONNREFUSED), "{req:?}: {e}");
         }
     }
     assert_untouched(second.path());
     assert_untouched(links.path());
     assert_empty(first.path());
+
+    if cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd"
+    )) {
+        let near = nest(&t.path().join("near"), 200, "s.sock");
+        let near_stale = near.with_file_name("stale.sock");
+        stale_socket(&near_stale);
+        mark_untouched(first.path());
+        for req in CONNECTS {
+            let f = route::run_long_with(req, &near.with_file_name("x.sock"), &c, false)
+                .err()
+                .unwrap();
+            assert_eq!(errno(&f.error), Some(libc::ENOENT), "{req:?}: {f:?}");
+            assert!(
+                ["proc-direct", "at-direct", "widened"].contains(&f.route.unwrap_or_default()),
+                "{req:?}: {f:?}"
+            );
+            let f = route::run_long_with(req, &near_stale, &c, false)
+                .err()
+                .unwrap();
+            assert_eq!(errno(&f.error), Some(libc::ECONNREFUSED), "{req:?}: {f:?}");
+        }
+        assert_untouched(first.path());
+        assert_untouched(second.path());
+        assert_untouched(links.path());
+    }
+}
+
+// ----- the connect order (SPEC "connect の順") -----
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd"
+))]
+thread_local! {
+    /// How often a stand-in for opening D ([`Config::open_own_dir`]) was
+    /// called on this thread: once for each D made in a place.
+    static OWN_DIR_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How often D was made since the last call, by the counting stand-ins on this
+/// thread ([`refuse_own_dir_counted`], the Linux `open_own_dir_high`). The
+/// route order makes D on the calling thread, and each test runs on a thread of
+/// its own, so the count is this test's.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd"
+))]
+fn own_dir_opens() -> usize {
+    OWN_DIR_OPENS.with(|n| n.replace(0))
+}
+
+/// [`refuse_own_dir`], counted ([`own_dir_opens`]): D is made in the place,
+/// cannot be opened, is removed again, and the place is passed over.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd"
+))]
+fn refuse_own_dir_counted(base: std::os::fd::BorrowedFd<'_>, name: &OsStr) -> io::Result<OwnedFd> {
+    OWN_DIR_OPENS.with(|n| n.set(n.get() + 1));
+    refuse_own_dir(base, name)
+}
+
+// A connect tries the routes that need neither writing nor a thread first
+// (SPEC "connect の順", kawaz 裁定): when one of them reaches the socket, D is
+// not made and no symlink either. With the thread-cwd means on and a place
+// for D and one for the symlink, each connect reaches the socket by the
+// platform's first route, and both places keep their mtime (nothing created
+// in them or removed from them):
+//
+// * Linux with /proc: proc-direct (`/proc/self/fd/<the socket's directory's
+//   fd>/<name>`);
+// * Linux without /proc, NetBSD, OpenBSD, illumos: relative, for a path whose
+//   spelling relative to the cwd fits;
+// * Apple: relative the same way, and widened for a path of up to 253 bytes
+//   that relative does not reach;
+// * FreeBSD: at-direct (connectat with the file name on the socket's
+//   directory's fd).
+#[test]
+fn a_connect_by_a_route_that_needs_no_writing_makes_nothing() {
+    #[allow(unused_variables)]
+    let t = tmp();
+    let bind_place = tmp();
+    let place = tmp();
+    let links = tmp();
+    #[cfg(not(target_os = "freebsd"))]
+    let below = tmp_below_cwd();
+    #[cfg(not(target_os = "freebsd"))]
+    let near = {
+        let cwd = std::env::current_dir().unwrap();
+        let rel_base = below.path().strip_prefix(&cwd).unwrap().to_path_buf();
+        cwd.join(nest(&rel_base, DIRECT_MAX, "rel.sock"))
+    };
+    let c = config(&[at(place.path())], &[links.path()]);
+    #[allow(unused_mut)]
+    let mut cases: Vec<(PathBuf, Config, Route)> = Vec::new();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        assert!(Path::new("/proc/self/fd").exists(), "the premise: /proc");
+        cases.push((
+            nest(t.path(), 400, "proc.sock"),
+            c.clone(),
+            Route::ProcDirect,
+        ));
+        let no_proc = Config {
+            proc_self_fd: PathBuf::from("/nonexistent/proc/self/fd"),
+            ..c.clone()
+        };
+        cases.push((near, no_proc, Route::Relative));
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        cases.push((near, c.clone(), Route::Relative));
+        cases.push((nest(t.path(), 200, "wide.sock"), c.clone(), Route::Widened));
+    }
+    #[cfg(target_os = "freebsd")]
+    cases.push((nest(t.path(), 400, "at.sock"), c.clone(), Route::AtDirect));
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd"
+    )))]
+    cases.push((near, c.clone(), Route::Relative));
+    for (p, c, want) in cases {
+        let (l, _) = route::run_long(BIND, &p, &config(&[at(bind_place.path())], &[])).unwrap();
+        let listener = UnixListener::from(l);
+        mark_untouched(place.path());
+        mark_untouched(links.path());
+        for req in CONNECTS {
+            let (cl, r) = route::run_long(req, &p, &c).unwrap();
+            assert_eq!(r, want, "{req:?}");
+            ping_kept(&listener, cl);
+        }
+        assert_untouched(place.path());
+        assert_untouched(links.path());
+    }
+}
+
+// D is made at most once in a call (SPEC "D と R"): where it could be made
+// nowhere, every route through D of the connect order is passed over for
+// that (D is not tried again for the next one), and the connect goes on to
+// the next route that needs no D. With the routes that need neither writing
+// nor a thread unusable (the socket's directory cannot be opened, the widened
+// sockaddr is off, the path too far from the cwd for relative), one place for
+// D where D is made but cannot be opened (so it is removed and the place
+// passed over) and a place for the symlink:
+//
+// * Linux with /proc: proc-direct, thread-cwd, proc and proc-held are passed
+//   over, and the symlink reaches the socket;
+// * Apple: relative, widened and thread-cwd, then the symlink;
+// * FreeBSD: at-direct and at, then ENAMETOOLONG (FreeBSD has no symlink
+//   route).
+//
+// D is made once (the place is touched and empty again), and every route
+// through D after the one that tried has "no place for D" as its reason.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd"
+))]
+#[test]
+fn with_d_made_nowhere_every_route_through_d_is_passed_over_and_d_tried_once() {
+    let t = tmp();
+    let bind_place = tmp();
+    let place = tmp();
+    let links = tmp();
+    #[allow(unused_mut)]
+    let mut c = Config {
+        open_socket_dir: refuse_socket_dir,
+        open_own_dir: refuse_own_dir_counted,
+        ..config(&[at(place.path())], &[links.path()])
+    };
+    #[cfg(target_vendor = "apple")]
+    {
+        c.wide = false;
+    }
+    let p = nest(t.path(), 400, "s.sock");
+    let (l, _) = route::run_long(BIND, &p, &config(&[at(bind_place.path())], &[])).unwrap();
+    let listener = UnixListener::from(l);
+    mark_untouched(place.path());
+    own_dir_opens();
+    let result = route::run_long_with(CONNECT, &p, &c, false);
+    let skipped = match &result {
+        Ok(r) => &r.skipped,
+        Err(f) => &f.skipped,
+    };
+    let names: Vec<&str> = skipped.iter().map(|s| s.name).collect();
+    let (want, through_d): (&[&str], &[&str]) =
+        if cfg!(any(target_os = "linux", target_os = "android")) {
+            (
+                &["standard", "proc-direct", "thread-cwd", "proc", "proc-held"],
+                &["thread-cwd", "proc", "proc-held"],
+            )
+        } else if cfg!(target_vendor = "apple") {
+            (
+                &["standard", "relative", "widened", "thread-cwd"],
+                &["thread-cwd"],
+            )
+        } else {
+            (&["standard", "at-direct", "at"], &["at"])
+        };
+    assert_eq!(names, want, "{skipped:?}");
+    assert_eq!(own_dir_opens(), 1, "{skipped:?}");
+    assert_touched(place.path());
+    assert_empty(place.path());
+    let first_try = skipped
+        .iter()
+        .position(|s| through_d.contains(&s.name) && s.reason == route::names::NO_PLACE)
+        .unwrap_or_else(|| panic!("no route through D found no place: {skipped:?}"));
+    for s in &skipped[first_try..] {
+        assert_eq!(s.reason, route::names::NO_PLACE, "{skipped:?}");
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        let r = result.unwrap();
+        assert_eq!(r.route.name(), "symlink");
+        ping_kept(&listener, r.fd);
+        assert_empty(links.path());
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        let _ = &listener;
+        let f = result.err().unwrap();
+        assert_eq!(errno(&f.error), Some(libc::ENAMETOOLONG), "{f:?}");
+    }
+}
+
+// The connect order's routes that need D now and later — on Linux with /proc
+// the proc route, whose spelling holds R, and proc-held after it, whose
+// spelling is `s` in D — share one D made once in the call (SPEC "D と R"):
+// D is not removed and made again between them. In a child process (so the
+// fds the route order opens get small numbers), D is opened by a stand-in
+// that counts and gives D's fd a number of 4 digits; the file name, 79 bytes,
+// lets `/proc/self/fd/<fd>/R/<name>` fit with the number the route order
+// estimates before making D (at most 2 digits here) but not with D's own, so
+// the proc route makes D and passes it over as too long once it sees D's fd,
+// and proc-held reaches the socket through `s` in that same D. The
+// thread-cwd means is off and the socket's directory cannot be opened (no
+// proc-direct), so the order is proc-direct, thread-cwd, proc passed over,
+// then proc-held; D was made once, and the place is empty again.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn d_is_made_once_for_the_routes_through_it() {
+    let t = tmp();
+    let place = tmp();
+    let p = nest(t.path(), 400, &"m".repeat(79));
+    let (l, _) = route::run_long(BIND, &p, &config(&[at(place.path())], &[])).unwrap();
+    let listener = UnixListener::from(l);
+    run_child(
+        "tests::d_made_once_child",
+        Path::new("/"),
+        &[
+            ("SOCKAT_CHILD_PATH", p.as_os_str()),
+            ("SOCKAT_CHILD_PLACE", place.path().as_os_str()),
+        ],
+    );
+    let (_s, _) = listener.accept().unwrap();
+    assert_empty(place.path());
+}
+
+/// Open D as the route order does, with its fd moved to a number of 4 digits,
+/// counting the calls ([`own_dir_opens`]).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn open_own_dir_high(base: std::os::fd::BorrowedFd<'_>, name: &OsStr) -> io::Result<OwnedFd> {
+    use std::os::fd::AsFd;
+    OWN_DIR_OPENS.with(|n| n.set(n.get() + 1));
+    let fd = own::open_own_dir(base, name)?;
+    sys::dup_at_least(fd.as_fd(), 1000)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn d_made_once_child() {
+    if !in_child() {
+        return;
+    }
+    let p = env_path("SOCKAT_CHILD_PATH");
+    let place = env_path("SOCKAT_CHILD_PLACE");
+    let c = Config {
+        open_socket_dir: refuse_socket_dir,
+        open_own_dir: open_own_dir_high,
+        ..no_thread_cwd(config(&[at(&place)], &[]))
+    };
+    own_dir_opens();
+    let reached = route::run_long_with(CONNECT, &p, &c, false).unwrap();
+    assert_eq!(reached.route, Route::ProcHeld, "{:?}", reached.skipped);
+    assert_eq!(own_dir_opens(), 1, "{:?}", reached.skipped);
+    let names: Vec<&str> = reached.skipped.iter().map(|s| s.name).collect();
+    assert_eq!(
+        names,
+        ["standard", "proc-direct", "thread-cwd", "proc"],
+        "{:?}",
+        reached.skipped
+    );
+    assert_eq!(reached.skipped[3].reason, route::names::TOO_LONG);
+    assert_empty(&place);
 }
 
 // The `TMPDIR` the public order reads is the first place for D, and it may be
 // relative (it is opened once, against the cwd of the moment, and held by its
 // fd; no spelling names it) or far too deep for any sockaddr (D is never in a
 // spelling). Two children of this binary run with such a TMPDIR and the public
-// order (Config::from_env): the bind and a connect go through D made in TMPDIR
-// (its mtime changes, it is empty afterwards) where the platform's central
-// route takes them. A relative TMPDIR is left out of the places for the
-// fallback symlink, a deep one is passed over there (the spelling would not
+// order (Config::from_env): the bind goes through D made in TMPDIR (its mtime
+// changes, it is empty afterwards), and a connect reaches the socket by the
+// platform's connect order. A relative TMPDIR is left out of the places for a
+// connect's symlink, a deep one is passed over there (the spelling would not
 // fit); that is checked with the symlink route.
 #[test]
 fn tmpdir_may_be_relative_or_deep_for_d() {
@@ -2629,7 +2985,7 @@ fn child_bind_and_connect_from_env() {
 // The places the public order reads: D goes in `${TMPDIR:-/tmp}` (an empty
 // TMPDIR is unset; a relative one is used as it is), then /tmp unless that is
 // the same spelling (written with or without a trailing slash), then the
-// socket's directory. The fallback symlink goes in TMPDIR only when it is
+// socket's directory. A connect's symlink goes in TMPDIR only when it is
 // absolute, then /tmp, once when TMPDIR is /tmp. The symlink of bind_any goes
 // in XDG_RUNTIME_DIR, TMPDIR (each only when absolute; empty is unset) and
 // /tmp, each spelling once (SPEC "symlink の置き場と名前"). Outside the tests
@@ -2750,8 +3106,8 @@ fn a_directory_replaced_before_it_is_held_is_not_used() {
     let d = made();
     let mode_of = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode_of(&d), 0o700);
-    let mut held = hold(&d).unwrap();
-    held.link(&target, own::LinkName::Random).unwrap();
+    let held = hold(&d).unwrap();
+    held.with_r(&target).unwrap();
     let links: Vec<_> = std::fs::read_dir(&d)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -2868,16 +3224,14 @@ fn d_renamed_away_is_still_used_and_its_replacement_is_not_removed() {
         Some(socket_dir.as_fd()),
         hold_proc(),
         own::open_own_dir,
-        &target,
-        own::LinkName::Random,
     )
     .unwrap();
+    let anchor = d.with_r(&target).unwrap();
     let named = place.join(&d.name);
     let moved = place.join("moved");
     std::fs::rename(&named, &moved).unwrap();
     std::fs::create_dir(&named).unwrap();
 
-    let anchor = d.anchor();
     let addr = SockAddr::standard(Path::new(anchor.link).join("s.sock").as_os_str()).unwrap();
     let sock = sys::socket(false).unwrap();
     sys::op_in_dir_forked(sys::Op::Bind, sock.as_fd(), anchor.fd, &addr).unwrap();
@@ -3088,13 +3442,15 @@ fn a_taken_name_is_skipped_and_the_tries_are_bounded() {
 mod freebsd {
     use super::*;
 
-    // FreeBSD's central means is bindat / connectat with `R/<name>` on D's fd:
-    // a bind and every connect go through it (none forks). A file name too long
-    // for `R/<name>` (93 to 103 bytes) is still connected to by connectat on
-    // the socket's directory with the bare name (the fallback route), which
-    // leaves the place for D untouched; its bind is ENAMETOOLONG. With D made
-    // nowhere, a bind forks with R beside the socket (FreeBSD's only fork) and
-    // a connect takes connectat.
+    // FreeBSD's bind goes through D by bindat with `R/<name>` on D's fd. A
+    // connect takes at-direct first (connectat with the bare name on the
+    // socket's directory's fd), which leaves the place for D untouched, and
+    // at (connectat with `R/<name>` on D's fd) only when at-direct cannot be
+    // used, here the socket's directory not opened ([`no_direct`]); none
+    // forks. A file name too long for `R/<name>` (93 to 103 bytes) is still
+    // connected to by at-direct; its bind is ENAMETOOLONG. With D made
+    // nowhere, a bind takes at-sockdir (bindat with R beside the socket) and a
+    // connect at-direct.
     #[test]
     fn at_and_at_direct_take_bindat_and_connectat() {
         let t = tmp();
@@ -3104,8 +3460,15 @@ mod freebsd {
         let (l, r) = route::run_long(BIND, &p, &c).unwrap();
         assert_eq!(r, Route::At);
         let listener = UnixListener::from(l);
+        mark_untouched(place.path());
         for req in CONNECTS {
             let (cl, r) = route::run_long(req, &p, &c).unwrap();
+            assert_eq!(r, Route::AtDirect, "{req:?}");
+            ping_kept(&listener, cl);
+        }
+        assert_untouched(place.path());
+        for req in CONNECTS {
+            let (cl, r) = route::run_long(req, &p, &no_direct(c.clone())).unwrap();
             assert_eq!(r, Route::At, "{req:?}");
             ping_kept(&listener, cl);
         }
@@ -3125,7 +3488,7 @@ mod freebsd {
         let nowhere = config(&[], &[]);
         let q = p.with_file_name("q.sock");
         let (l, r) = route::run_long(BIND, &q, &nowhere).unwrap();
-        assert!(r.forked(), "{r:?}");
+        assert_eq!(r, Route::AtSockdir);
         let (cl, r) = route::run_long(CONNECT, &q, &nowhere).unwrap();
         assert_eq!(r, Route::AtDirect);
         ping(l, cl);
@@ -3195,15 +3558,15 @@ mod linux {
         }
     }
 
-    // The /proc means of the central route and the fallback routes that need
-    // /proc, by file name length, with the thread-cwd means off (as under a
-    // seccomp filter) and one place for D:
+    // The routes that need /proc, by file name length, with the thread-cwd
+    // means off (as under a seccomp filter) and one place for D:
     //
-    // * a short name: `/proc/self/fd/<D's fd>/R/<name>` fits, so the bind and
-    //   every connect take the /proc version (none forks);
-    // * 85 bytes: that no longer fits (14 + digits + 1 + 11 + 85 > 107), so
-    //   the bind forks in D (`R/<name>` fits), and a connect takes the
-    //   fallback /proc route, `/proc/self/fd/<dir fd>/<name>`;
+    // * a short name: `/proc/self/fd/<D's fd>/R/<name>` fits, so the bind
+    //   takes proc; a connect takes proc-direct,
+    //   `/proc/self/fd/<dir fd>/<name>`, which comes first in its order;
+    // * 85 bytes: proc no longer fits (14 + digits + 1 + 11 + 85 > 107), so
+    //   the bind forks in D (`R/<name>` fits); proc-direct still fits for a
+    //   connect;
     // * 95 bytes: neither /proc spelling fits, so a connect takes the symlink
     //   in D, `/proc/self/fd/<D's fd>/s` (about 20 bytes whatever the name);
     //   the bind still forks in D.
@@ -3215,7 +3578,10 @@ mod linux {
         let t = tmp();
         let place = tmp();
         let c = no_thread_cwd(config(&[at(place.path())], &[]));
-        let central: fn(Request, Route) -> bool = |_, r| r == Route::Proc;
+        let short: fn(Request, Route) -> bool = |req, r| match req {
+            Request::Bind(_) => r == Route::Proc,
+            Request::Connect(_) => r == Route::ProcDirect,
+        };
         let fd_route: fn(Request, Route) -> bool = |req, r| match req {
             Request::Bind(_) => r.forked(),
             Request::Connect(_) => r == Route::ProcDirect,
@@ -3225,7 +3591,7 @@ mod linux {
             Request::Connect(_) => r == Route::ProcHeld,
         };
         for (name, want) in [
-            ("s.sock".to_string(), central),
+            ("s.sock".to_string(), short),
             ("e".repeat(85), fd_route),
             ("n".repeat(95), file_link),
         ] {
@@ -3245,13 +3611,13 @@ mod linux {
 
     // The same lengths with the socket's directory's open refused (it is
     // opened O_PATH here, which a permission does not stop, so a stand-in
-    // refuses it): only the fallback /proc route, which needs that fd, is lost.
-    // Whether /proc can be used is checked without the socket's directory, so
-    // a short name still takes the /proc version of the central route, and the
-    // symlink in D (`/proc/self/fd/<D's fd>/s`) still serves every connect of
-    // 85 and 95 bytes; the bind forks in D as before. Only those connects ask
-    // for the socket's directory, once each (the fallback /proc route); D is
-    // made and removed in the place every time.
+    // refuses it): only proc-direct, which needs that fd, is lost. Whether
+    // /proc can be used is checked without the socket's directory, so a
+    // connect of a short name goes on to proc, and the symlink in D
+    // (`/proc/self/fd/<D's fd>/s`) still serves every connect of 85 and 95
+    // bytes; the bind takes proc or forks in D as before. Only the connects
+    // ask for the socket's directory, once each (proc-direct); D is made and
+    // removed in the place every time.
     #[test]
     fn proc_and_proc_held_need_no_socket_directory_fd() {
         let t = tmp();
@@ -3262,7 +3628,7 @@ mod linux {
         let proc: fn(Route) -> bool = |r| r == Route::Proc;
         let fork: fn(Route) -> bool = |r| r.forked();
         for (name, bind, connect, opens) in [
-            ("s.sock".to_string(), proc, Route::Proc, 0),
+            ("s.sock".to_string(), proc, Route::Proc, 1),
             ("e".repeat(85), fork, Route::ProcHeld, 1),
             ("n".repeat(95), fork, Route::ProcHeld, 1),
         ] {
@@ -3368,7 +3734,8 @@ mod linux {
     // Without /proc (no /proc directory, or an empty one with nothing
     // mounted) and without the thread-cwd means, D is opened O_RDONLY and its
     // mode set by fchmod (an O_PATH fd takes no fchmod), and the bind forks in
-    // D. A connect takes the fallback routes of a Linux without /proc:
+    // D. A connect takes the routes of a Linux without /proc (thread-cwd
+    // being off):
     //
     // * a path whose spelling relative to the cwd is at most DIRECT_MAX bytes
     //   takes the relative route;
@@ -3483,10 +3850,10 @@ mod linux {
     /// | way | path, inputs | bind | connects |
     /// |---|---|---|---|
     /// | Direct | DIRECT_MAX bytes | Direct | Direct |
-    /// | ThreadCwd | 600 bytes (if usable here) | ThreadCwd | ThreadCwd |
-    /// | ProcThroughLink | 600, thread cwd off | ProcThroughLink | ProcThroughLink |
-    /// | ProcFd | name of 85, thread cwd off | fork in D | ProcFd |
-    /// | ProcFileLink | name of 95, thread cwd off | fork in D | ProcFileLink |
+    /// | ThreadCwd | 600 bytes (if usable here), [`no_direct`] | ThreadCwd | ThreadCwd |
+    /// | ProcThroughLink | 600, thread cwd off, [`no_direct`] | Proc | Proc |
+    /// | ProcFd | name of 85, thread cwd off | fork in D | ProcDirect |
+    /// | ProcFileLink | name of 95, thread cwd off | fork in D | ProcHeld |
     /// | Relative | below the cwd, no /proc, thread cwd off | fork in D | Relative |
     /// | Symlink | 600, no /proc, thread cwd off, a link place | fork in D | Symlink |
     /// | Fork | 600, no /proc, thread cwd off, no link place | fork in D | fork (connect_any) |
@@ -3509,7 +3876,7 @@ mod linux {
             (
                 "ProcThroughLink",
                 nest(t, 600, "proc.sock"),
-                off.clone(),
+                no_direct(off.clone()),
                 std::sync::Arc::new(|_, r| r == Route::Proc),
             ),
             (
@@ -3550,7 +3917,7 @@ mod linux {
             cases.push((
                 "ThreadCwd",
                 nest(t, 600, "thread.sock"),
-                base,
+                no_direct(base),
                 std::sync::Arc::new(|_, r| r == Route::ThreadCwd),
             ));
         }
@@ -3621,7 +3988,7 @@ const FULL_BACKLOG: i32 = libc::ECONNREFUSED;
 type Way = std::sync::Arc<dyn Fn(Request) -> io::Result<(OwnedFd, Route)> + Send + Sync>;
 
 /// Whether a route is the one a [`Way`] must take for a request (a bind and a
-/// connect can differ: the fallback routes are for connects only).
+/// connect can differ: some routes are for connects only).
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 type Want = std::sync::Arc<dyn Fn(Request, Route) -> bool + Send + Sync>;
 
@@ -3776,9 +4143,9 @@ fn check_fork_and_peer(way: &Way, want: &Want, forks: bool, what: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// The POSIX fallback routes of a connect: the relative spelling and the
-// symlink in a safe place (every target but FreeBSD), and the thread-cwd
-// means forced (Linux, Apple)
+// The POSIX routes of a connect: the relative spelling and the symlink in a
+// safe place (every target but FreeBSD), and the thread-cwd means forced
+// (Linux, Apple)
 // ---------------------------------------------------------------------------
 
 #[cfg(not(target_os = "freebsd"))]
@@ -3789,11 +4156,11 @@ mod posix {
     use std::ffi::OsString;
     use std::path::Component;
 
-    /// The route order's inputs with no place for D (so a connect goes
-    /// straight to the fallback routes and a bind forks beside the socket),
-    /// `links` as the places for the symlink, and on Linux /proc made to look
-    /// absent, so the POSIX fallback order runs there too. On Apple the
-    /// widened sockaddr is on.
+    /// The route order's inputs with no place for D (so a connect passes over
+    /// the routes through D and a bind goes beside the socket), `links` as
+    /// the places for the symlink, and on Linux /proc made to look absent, so
+    /// the order of a Linux without /proc (relative, thread-cwd, symlink)
+    /// runs there. On Apple the widened sockaddr is on.
     fn cfg(links: &[&Path]) -> Config {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         return Config {
@@ -3809,9 +4176,9 @@ mod posix {
     }
 
     // A path over DIRECT_MAX bytes whose spelling relative to the cwd is at
-    // most DIRECT_MAX bytes: a connect that gets to the fallback routes takes
-    // the relative route first (through std, the plain sockaddr), before
-    // anything else is considered (on Apple, the widened form). The bind
+    // most DIRECT_MAX bytes: a connect takes the relative route first
+    // (through std, the plain sockaddr), before anything else is considered
+    // (on Apple, the widened form). The bind
     // (beside the socket here, no place for D) put the socket at the given
     // absolute path.
     #[test]
@@ -4340,25 +4707,27 @@ mod posix {
         assert_eq!(std::env::current_dir().unwrap(), cwd);
     }
 
-    // Where the thread-cwd means sits: first in the central route, for every
-    // request (no side effect a server or another thread can see), and when
-    // it cannot be used the central route goes on to its next means. A
-    // 600-byte path far from the cwd, one place for D, on Linux /proc made to
-    // look absent:
+    // Where the thread-cwd means sits: first of a bind's means, and in a
+    // connect's order right after the routes that need neither writing nor a
+    // thread (relative, and widened on Apple), for every request (no side
+    // effect a server or another thread can see); when it cannot be used the
+    // order goes on to the next route. A 600-byte path far from the cwd (so
+    // relative and widened cannot reach it), one place for D, on Linux /proc
+    // made to look absent:
     //
     // * the means on: the bind and the four connects take it (where this
     //   system allows it; under a seccomp filter the order must go on just
     //   the same);
-    // * the means off: the bind forks in D, and the connects go to the
-    //   fallback routes (here the symlink under a short place; `connect` would
-    //   be ENAMETOOLONG without it).
+    // * the means off: the bind forks in D, and the connects go on to the
+    //   symlink under a short place (`connect` would be ENAMETOOLONG without
+    //   it).
     //
     // A bind / connect it made is the result: a missing socket is ENOENT and
     // a socket nobody listens on ECONNREFUSED for the connects that may not
     // fork too (not the ENAMETOOLONG that going on would end in for them).
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     #[test]
-    fn thread_cwd_comes_first_and_its_failures_are_final() {
+    fn thread_cwd_comes_before_fork_and_symlink_and_its_failures_are_final() {
         let usable = thread_cwd_usable();
         let t = tmp();
         let place = tmp();
@@ -4413,7 +4782,7 @@ mod posix {
     //
     // These run in a child process so the cwd (and $PWD) can be chosen. This
     // process binds the socket (through D), the child connects through the
-    // fallback order (no place for D, without /proc on Linux), prints the
+    // order with no place for D (without /proc on Linux), prints the
     // route and the spelling, and this process checks which listener got the
     // connection.
 
@@ -4451,7 +4820,7 @@ mod posix {
         println!("sockat-child: {route:?} {rel}");
     }
 
-    /// A listener at `p` (bound through the central route) that does not
+    /// A listener at `p` (bound through D) that does not
     /// block on accept, so "nothing came" is a WouldBlock.
     fn listen_at(p: &Path) -> UnixListener {
         let place = tmp();
@@ -4677,8 +5046,8 @@ mod apple {
     use std::os::unix::ffi::OsStrExt;
 
     /// The route order's inputs with no place for D and the thread-cwd means
-    /// off (a connect goes straight to the fallback routes; a bind forks
-    /// beside the socket), `links` as the places for the symlink and the
+    /// off (a connect has no route through D left; a bind forks beside the
+    /// socket), `links` as the places for the symlink and the
     /// widened sockaddr on or off (`wide: false` stands in for a kernel that
     /// refuses it).
     fn cfg(links: &[&Path], wide: bool) -> Config {
@@ -4790,7 +5159,7 @@ mod apple {
     // spellings a connect widens: the path itself (200 bytes under /tmp), the
     // relative spelling (240 bytes below the cwd), and the file name of the
     // fork route (100 bytes, over `R/<name>`'s 92 but in the widened form).
-    // The first two bind through D (the default central route), and the
+    // The first two bind through D (thread-cwd, the default), and the
     // address the socket ends up with fits a sockaddr_un (getsockname reports
     // at most its length, and std shows the whole spelling); a connect to the
     // same path with no place for D widens where it can. A file name over 92
@@ -4835,8 +5204,7 @@ mod apple {
         assert_empty(place.path());
     }
 
-    // The widened route of a connect that gets to the fallback routes: over
-    // DIRECT_MAX bytes, no relative spelling of at most DIRECT_MAX, and at most
+    // The widened route of a connect: over DIRECT_MAX bytes, no relative spelling of at most DIRECT_MAX, and at most
     // 253 bytes, the path itself goes in the widened form. Under /tmp the
     // relative spelling from the package root climbs all the way up, so it is
     // long.
@@ -4901,15 +5269,16 @@ mod apple {
     // plain bind / connect by path: pthread_fchdir_np and fchdir take such an
     // fd, and R in D resolves to the directory with search permission alone. A
     // directory of mode 0300 (write + search, no read) cannot be opened
-    // O_RDONLY, yet the central route (thread cwd, and the fork in D with the
-    // means off) binds and connects in it, and the last fork of connect_any
-    // connects. Without O_SEARCH the long path would fail where a short one
+    // O_RDONLY, yet the bind through D (thread cwd, and the fork in D with the
+    // means off) binds in it, connect_any connects (thread cwd, or its last
+    // fork with the means off and no place for the symlink), and so does the
+    // last fork with no place for D. Without O_SEARCH the long path would fail where a short one
     // in the same directory works.
     #[test]
     fn the_routes_do_not_need_read_permission_on_the_directory() {
         let place = tmp();
-        let central = config(&[at(place.path())], &[]);
-        for (c, thread) in [(central.clone(), true), (no_thread_cwd(central), false)] {
+        let with_d = config(&[at(place.path())], &[]);
+        for (c, thread) in [(with_d.clone(), true), (no_thread_cwd(with_d), false)] {
             let t = tmp();
             let p = nest(t.path(), 400, "s.sock");
             let dir = p.parent().unwrap().to_path_buf();

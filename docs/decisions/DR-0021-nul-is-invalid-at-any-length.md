@@ -8,7 +8,7 @@
 - std にそのまま渡せる長さのパスは std に渡す ([DR-0002](DR-0002-std-handles-paths-it-accepts.md))
 - カーネルはソケットのパスを最初の NUL までしか読まない。NUL を含むパスを通すと、利用者の指定と別の場所 (NUL の手前まで) にソケットができうる
 - Rust の std (`library/std/src/os/unix/net/addr.rs` の `sockaddr_un`) は、`bytes.contains(&0)` のパスを長さの判定より前に `InvalidInput` ("paths must not contain interior null bytes") で断る。先頭の NUL も断る。Linux の abstract namespace は `Path` でなく `SocketAddr::from_abstract_name` と `bind_addr` / `connect_addr` で扱う
-- 長いパスは経路に回るので、NUL の判定を経路に任せると経路が先に動く。例えば中心の経路は、置き場に D と R を作ってから、それを通した bind / connect で `InvalidInput` になる (試験 `a_nul_is_invalid_input_at_any_length_and_nothing_is_made` は置き場とソケットのディレクトリの mtime が変わらないことを確かめる)
+- 長いパスは経路に回るので、NUL の判定を経路に任せると経路が先に動く。例えば D を通す経路は、置き場に D と R を作ってから、それを通した bind / connect で `InvalidInput` になる (試験 `a_nul_is_invalid_input_at_any_length_and_nothing_is_made` は置き場とソケットのディレクトリの mtime が変わらないことを確かめる)
 
 ## Decision
 

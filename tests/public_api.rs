@@ -95,9 +95,10 @@ fn bind_and_connect_work_at_any_length() {
 // The four connects (the two that may fork with the crate feature
 // `any`) in an ordinary environment (a writable /tmp, the socket under a
 // temporary directory with a short file name): every length is reached
-// without forking on every platform (through sockat's own directory in /tmp,
-// or on the targets without a central means for a connect the symlink under
-// /tmp, both whatever the directory depth), so the two connects that may fork
+// without forking on every platform (by the connect order of the platform:
+// proc-direct on Linux, at-direct on FreeBSD, widened up to 253 bytes on
+// Apple, then through sockat's own directory in /tmp or the symlink under
+// /tmp, whatever the directory depth), so the two connects that may fork
 // report that they gave up nothing (no fork; a connect's spelling is kept
 // nowhere), and the two that may not connect as well. The
 // nonblocking ones hand back a stream that does not wait: a read with nothing
@@ -146,10 +147,10 @@ fn in_an_ordinary_environment_no_connect_forks() {
 // A long file name far from the cwd that no bind spelling holds: 100 bytes,
 // over the sun_path - 1 - 11 bytes that `R/<file name>` leaves (96 on Linux,
 // 92 on Apple and the BSDs), so `bind` is ENAMETOOLONG. A socket bound under a
-// short name and renamed to it is still reached by every connect: the
-// fallback routes of a connect leave the file name out of the spelling (on
-// Linux a symlink in sockat's own directory, elsewhere a symlink under /tmp;
-// FreeBSD's connectat takes the name, up to 103 bytes). In an ordinary
+// short name and renamed to it is still reached by every connect: routes of
+// the connect order leave the file name out of the spelling (on Linux a
+// symlink in sockat's own directory, elsewhere a symlink under /tmp;
+// FreeBSD's at-direct takes the name, up to 103 bytes). In an ordinary
 // environment (a writable /tmp) none of them forks, and the plain `connect`
 // and `connect_nonblocking` work too (the two that may fork are checked with
 // the crate feature `any`).

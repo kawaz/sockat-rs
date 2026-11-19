@@ -25,7 +25,7 @@
 
 ## 理由
 
-- 経路が OS で違うので、各 OS で全部の試験を回す。スレッド cwd も bindat も無い Unix (NetBSD・OpenBSD・illumos) は、D の中で fork する bind と、macOS と共有する connect の予備の経路 (相対パス、symlink) を、それぞれのカーネルで確かめる
+- 経路が OS で違うので、各 OS で全部の試験を回す。スレッド cwd も bindat も無い Unix (NetBSD・OpenBSD・illumos) は、D の中で fork する bind と、macOS と共有する connect の経路 (相対パス、symlink) を、それぞれのカーネルで確かめる
 - cross check は、fork だけの経路 (dirfd の primitive が無い) と BSD の sockaddr の形を compile で確かめる
 - CI と手元で同じ入口 (`just ci`) を使い、検査をそろえる
 - nextest の slow-timeout で、ハングした試験 1 本を job 全体の timeout でなくその試験の失敗として出す

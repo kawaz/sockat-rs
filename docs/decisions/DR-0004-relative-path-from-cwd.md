@@ -1,4 +1,4 @@
-# DR-0004: connect 系の予備に cwd からの相対パスを std に渡す経路と、その作り方
+# DR-0004: connect 系に cwd からの相対パスを std に渡す経路と、その作り方
 
 - Status: Accepted
 - Date: 2026-11-18
@@ -9,7 +9,7 @@
 
 ## Decision
 
-connect 系の予備の経路 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) の 1 つにする (`/proc` の無い Linux / Android、Apple の OS、NetBSD / OpenBSD / illumos 等)。bind には使わない (カーネルが覚える綴りが後で cwd 次第で別の場所に当たる)。元のパスが絶対パスで、相対パスが std にそのまま渡せる長さ ([DR-0002](DR-0002-std-handles-paths-it-accepts.md)) なら、それを std に渡す。パスを文字列で書き直すだけで、cwd は変えない。
+connect の順 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) の最初の経路にする (`/proc` の無い Linux / Android、Apple の OS、NetBSD / OpenBSD / illumos 等)。bind には使わない (カーネルが覚える綴りが後で cwd 次第で別の場所に当たる)。元のパスが絶対パスで、相対パスが std にそのまま渡せる長さ ([DR-0002](DR-0002-std-handles-paths-it-accepts.md)) なら、それを std に渡す。パスを文字列で書き直すだけで、cwd は変えない。
 
 相対パスは 2 つの作り方を、この順に試す。
 
@@ -45,5 +45,5 @@ connect 系の予備の経路 ([DR-0027](DR-0027-own-directory-and-fallback-rout
 
 - 相対パスの作り方: kawaz 指示 2026-11-18
 - 相対パスの経路を macOS 以外にも使う: kawaz 裁定 2026-11-18
-- connect 系の予備の経路だけに使う: kawaz 裁定 (ハブ DR-0012、2026-11-19)
+- connect 系の経路だけに使う: kawaz 裁定 (ハブ DR-0012、2026-11-19)。connect の順の最初に置く: kawaz 裁定 (ハブ SPEC 12dc1577)
 - 上に無い細部: 出所の記録なし

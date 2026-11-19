@@ -5,7 +5,7 @@
 
 ## Context
 
-中心の経路のスレッド cwd と /proc 版 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) が使えない環境 (seccomp の filter が掛かった Linux、`pthread_fchdir_np` の無い libSystem、それらの無い NetBSD・OpenBSD・illumos 等) が残る。cwd はプロセスの全スレッドで共有されるので、呼び出し元のプロセスで `chdir` はできない。hyoui (DR-0041 決定 5) は、ディレクトリの fd に `fchdir` した子を fork してファイル名だけで bind / connect する。
+D を通す経路のスレッド cwd と /proc 版 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) が使えない環境 (seccomp の filter が掛かった Linux、`pthread_fchdir_np` の無い libSystem、それらの無い NetBSD・OpenBSD・illumos 等) が残る。cwd はプロセスの全スレッドで共有されるので、呼び出し元のプロセスで `chdir` はできない。hyoui (DR-0041 決定 5) は、ディレクトリの fd に `fchdir` した子を fork してファイル名だけで bind / connect する。
 
 ## Decision
 
@@ -15,7 +15,7 @@
 |---|---|---|
 | bind | D | `R/<ファイル名>` |
 | bind (D をどこにも作れない時) | ソケットのディレクトリ | `.sockat.XXXXXXXXXX/<ファイル名>` (R はソケットのディレクトリの中) |
-| `connect_any` 系 (予備の経路の後) | ソケットのディレクトリ | ファイル名 |
+| `connect_any` 系 (connect の順の後) | ソケットのディレクトリ | ファイル名 |
 
 1. 親がソケットを作り、ディレクトリの fd を持ち、sockaddr を組み立ててから fork する (ブロックしない connect では、ソケットを fork の前に `O_NONBLOCK` にする)
 2. 子は `fchdir(dirfd)` → 綴りで `bind` / `connect` → `_exit(結果)`
@@ -34,7 +34,7 @@
 | Linux | `O_PATH` | 検索権限で足りる |
 | その他の Unix | `O_RDONLY` | 読み取り権限も要る。開けなければこの経路は使えない |
 
-- D は中心の経路が開いた fd ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) をそのまま使う
+- D は D を通す経路が開いた fd ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) をそのまま使う
 - Apple の OS で `O_SEARCH` をディレクトリに受け付けない古いカーネルは `EISDIR` / `EINVAL` を返すとみなし、その時は `O_RDONLY` で開き直す (この分岐は手元のカーネルでは通らないので、試験では `O_SEARCH` で開いた結果を値として差し替えて通す)
 
 ### 副作用 (doc に書く)

@@ -57,20 +57,21 @@ std が受け付ける長さ (標準に渡す長さ) までのパスは std に�
 | Linux / Android / illumos | 107 バイトまで |
 | macOS / iOS 等 Apple の OS / FreeBSD / NetBSD / OpenBSD | 103 バイトまで |
 
-それを超えるパスは、まず自分専用のディレクトリ D を通す経路で、それが使えない時は bind は [D 無しの形](#d-無しの形)、connect 系は [予備の経路](#予備の経路-connect-系) で届く。最初に使えた経路で bind / connect する。どの経路も呼び出し元のプロセスの cwd も呼び出し元のスレッドの cwd も変えないので、マルチスレッドのプログラムから使える。経路の名前は [sockat の仕様](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md) の「経路の名前」と同じ。
+それを超えるパスは、bind は自分専用のディレクトリ D を通す経路で、それが使えない時は [D 無しの形](#d-無しの形) で届く。connect は、書き込み (D・R・symlink を作る) もスレッドも要らない [connect の経路](#connect-の経路) を先に試し、D を通す経路と symlink をその後に試す。最初に使えた経路で bind / connect する。どの経路も呼び出し元のプロセスの cwd も呼び出し元のスレッドの cwd も変えないので、マルチスレッドのプログラムから使える。経路の名前は [sockat の仕様](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md) の「経路の名前」と同じ。
 
 ### OS ごとに試す順番
 
 | OS | `bind` | `connect` / `connect_nonblocking` |
 |---|---|---|
-| Linux / Android | [thread-cwd](#thread-cwd) → [proc](#proc) → [fork](#fork) | thread-cwd → proc → [proc-direct](#proc-direct) → [proc-held](#proc-held) → [symlink](#symlink) |
-| Linux / Android (`/proc` 無し) | thread-cwd → fork | thread-cwd → [relative](#relative) → symlink |
-| macOS / iOS 等 Apple の OS | thread-cwd → fork | thread-cwd → relative → [widened](#widened) → symlink |
-| FreeBSD | [at](#at) | at → [at-direct](#at-direct) |
+| Linux / Android | [thread-cwd](#thread-cwd) → [proc](#proc) → [fork](#fork) | [proc-direct](#proc-direct) → thread-cwd → proc → [proc-held](#proc-held) → [symlink](#symlink) |
+| Linux / Android (`/proc` 無し) | thread-cwd → fork | [relative](#relative) → thread-cwd → symlink |
+| macOS / iOS 等 Apple の OS | thread-cwd → fork | relative → [widened](#widened) → thread-cwd → symlink |
+| FreeBSD | [at](#at) | [at-direct](#at-direct) → at |
 | NetBSD / OpenBSD / illumos / その他の Unix | fork | relative → symlink |
 | Windows | 対象外 (Unix 以外では compile エラー) | |
 
 - 長いパスの前に [standard](#standard) が試され、長さで使えない
+- connect は、書き込みもスレッドも要らない経路 (proc-direct・relative・widened・at-direct) を先に、D を作る経路 (thread-cwd・proc・proc-held・at) とスレッドを立てる経路 (thread-cwd)、symlink を作る経路をその後に試す。前の経路で届けば D も symlink も作らない
 - `bind` は D をどこにも作れない時、同じ順を [D 無しの形](#d-無しの形) (`-sockdir`) で試す
 - `bind_any` は `bind` と同じ順に試し、最後に [symlink](#symlink) で bind する。`connect_any` 系は `connect` と同じ順に試し、最後に [fork-direct](#fork-direct) で connect する ([例外: any 系](#例外-any-系))
 - 最初にソケットのディレクトリを `stat` で引く。無ければ `ENOENT` (ファイル名の長さによらない)
@@ -82,7 +83,7 @@ std にそのまま渡す。パスが std にそのまま渡す長さ以下の�
 
 ### D を通す経路
 
-自分専用のディレクトリ D を作って fd で掴み、その中に乱数の名前の symlink R (ソケットのディレクトリの realpath を指す) を作り、D の fd を基準に `R/<ファイル名>` で bind / connect する。終わったら R と D を消す。[thread-cwd](#thread-cwd)・[at](#at)・[proc](#proc)・[fork](#fork) がこの形。
+自分専用のディレクトリ D を作って fd で掴み、その中に乱数の名前の symlink R (ソケットのディレクトリの realpath を指す) を作り、D の fd を基準に `R/<ファイル名>` で bind / connect する。終わったら R と D を消す。[thread-cwd](#thread-cwd)・[at](#at)・[proc](#proc)・[fork](#fork) がこの形。connect の [proc-held](#proc-held) も、R の代わりにソケットのファイルを指す `s` を置いて同じ D を使う。
 
 1. D の置き場に、mode 0700 のディレクトリ `sockat.XXXXXXXXXX` (英数 10 文字の乱数) を作る
 2. それを名前を辿らずに (`O_NOFOLLOW`) 開き、ディレクトリで、持ち主が自分で、group と other に権限が無いことを確かめる。違えば (作ってから開くまでに他人が差し替えた) 使わず、消さない。通ったら 0700 にそろえる (umask が持ち主のビットを削っていても使えるように)
@@ -90,8 +91,9 @@ std にそのまま渡す。パスが std にそのまま渡す長さ以下の�
 4. 使える最初の経路で `R/<ファイル名>` を bind / connect する
 5. 成功でも失敗でも、R を消し、D はその名前がまだ開いた物を指す時だけ消す
 
+- D は 1 回の呼び出しで 1 度だけ作り、D を使う経路で共有する (thread-cwd が断られた後の proc、proc の綴りに収まらなかった後の proc-held は、同じ D を使う)。どこにも作れなければ、後の D を使う経路はどれも飛ばし、作り直さない
 - **D の置き場**は `TMPDIR` (未設定なら `/tmp`。相対パスでもよい)、`/tmp`、ソケットのディレクトリ (名前は `.sockat.XXXXXXXXXX`) の順。最初に D を作れた所を使う。置き場は安全 (sticky 等) でなくても深くてもよい (D は fd で掴み、綴りに置き場が出ない)
-- 置き場を開けない、D を作れない、確かめた結果が違う、0700 にそろえられない、R を作れない時は、次の置き場に進む
+- 置き場を開けない、D を作れない、確かめた結果が違う、0700 にそろえられない、R (proc-held が最初に D を求めた時は `s`) を作れない時は、次の置き場に進む
 - 作った直後の D を開けない時 (umask が持ち主のビットを削り、Apple の OS は検索、Linux と Apple の OS 以外は読み取りの権限が無い) は、名前で引いて 2 の条件を満たせば消し、次の置き場に進む。名前で確かめてから消すまでに差し替えられても、空のディレクトリしか消えない
 - 綴りは `R/<ファイル名>` で、R の 11 バイトの分、ファイル名は sockaddr に入る長さより短くなる (Linux / illumos 96 バイト、Apple の OS / BSD 92 バイトまで。proc はおよそ 79 バイトまで)
 - D は Linux では `O_PATH`、Apple の OS では `O_SEARCH`、他の OS では `O_RDONLY` で開く。0700 にそろえるのは、`/proc` を使える Linux は `/proc/self/fd/<fd>` の `chmod`、`/proc` の無い Linux は名前で `O_RDONLY` で開き直して同じ物か照合してから `fchmod`、他は `fchmod`
@@ -126,23 +128,23 @@ D をどこにも作れない時の bind が使う。ソケットのディレク
 
 - 綴りは 19 バイト + ファイル名 (ファイル名は Linux / illumos 88、Apple の OS / BSD 84 バイトまで。proc-sockdir はおよそ 72 バイトまで)
 - ソケットのディレクトリを開けない、R も作れない時は `ENAMETOOLONG` (`bind_any` はこの後に [symlink](#symlink) を試す)
-- connect 系は D 無しの形を使わず、予備の経路に進む
+- connect は D 無しの形を使わず、[OS ごとに試す順番](#os-ごとに試す順番) の次の経路に進む
 
-### 予備の経路 (connect 系)
+### connect の経路
 
-D を通す経路が使えない時 (使える経路が無い、D をどこにも作れない、ファイル名が `R/` を足すと収まらない) に、connect 系だけが試す。connect した側のソケットは bind されず綴りが残らないので、綴りに乱数の部品を挟まない。
+connect だけが使う経路。connect した側のソケットは bind されず綴りが残らないので、綴りに乱数の部品を挟まない。proc-direct・relative・widened・at-direct は書き込みもスレッドも要らないので、connect の順の先頭に置く。
 
 #### proc-direct
 
-Linux / Android。ソケットのディレクトリを `O_PATH` で開き、`/proc/self/fd/<fd>/<ファイル名>` を std に渡す。綴り全体が 107 バイトまでなので、ファイル名はおよそ 90 バイトまで (fd 番号の桁数で変わる)。ソケットのディレクトリを開けなければ次の経路に進む。
+`/proc` を使える Linux / Android。connect の順の最初。ソケットのディレクトリを `O_PATH` で開き、`/proc/self/fd/<fd>/<ファイル名>` を std に渡す。綴り全体が 107 バイトまでなので、ファイル名はおよそ 90 バイトまで (fd 番号の桁数で変わる)。ソケットのディレクトリを開けない、`/proc/self/fd/<fd>` を引けない時は次の経路に進む。
 
 #### proc-held
 
-`/proc` を使える Linux / Android。D を作って確かめ、その中にソケットのファイルを指す symlink `s` を作り、`/proc/self/fd/<D の fd>/s` で connect する。綴りはおよそ 20 バイトで、ファイル名の長さにもディレクトリの深さにもよらない。D の置き場は D を通す経路と同じ (安全でなくてもよい)。ソケットのディレクトリは開かない。
+`/proc` を使える Linux / Android。[proc](#proc) の次。D (前の経路が作っていればその D、無ければ作って確かめる) の中にソケットのファイルを指す symlink `s` を作り、`/proc/self/fd/<D の fd>/s` で connect する。綴りはおよそ 20 バイトで、ファイル名の長さにもディレクトリの深さにもよらない。D の置き場は D を通す経路と同じ (安全でなくてもよい)。ソケットのディレクトリは開かない。
 
 #### relative
 
-cwd からの相対パスが sockaddr に入る長さ以内なら、それを std に渡す。元のパスが絶対パスの時だけ使う。パスを文字列で書き直すだけで、cwd は変えない (`chdir` しない)。
+`/proc` の無い Linux / Android、Apple の OS、NetBSD / OpenBSD / illumos / その他の Unix の connect の順の最初。cwd からの相対パスが sockaddr に入る長さ以内なら、それを std に渡す。元のパスが絶対パスの時だけ使う。パスを文字列で書き直すだけで、cwd は変えない (`chdir` しない)。
 
 - パスが cwd (`getcwd`、または cwd と同じディレクトリを指す `$PWD`) の下にあれば、前を削る。それで sockaddr に入る長さにならない時 (cwd の下に無い時も含む) は、両方を実パスに揃えて `..` で上る綴りも作る。短い方を使う
 - 相対パスのディレクトリが元のディレクトリと `(st_dev, st_ino)` で一致しない時と、cwd が既に変わっている時は、この経路は使えないとして次に進む
@@ -150,13 +152,13 @@ cwd からの相対パスが sockaddr に入る長さ以内なら、それを st
 
 #### widened
 
-Apple の OS。XNU は `sun_path` が 104 バイトを超えるアドレスも、パスが 253 バイトまでなら受け付ける。元のパスが 253 バイト以内ならそれを、無理なら相対パスが 253 バイト以内ならそれを渡す。カーネルが受け付けない (`EINVAL` / `ENAMETOOLONG`) 時は次に進む。
+Apple の OS。relative の次。XNU は `sun_path` が 104 バイトを超えるアドレスも、パスが 253 バイトまでなら受け付ける。元のパスが 253 バイト以内ならそれを、無理なら相対パスが 253 バイト以内ならそれを渡す。カーネルが受け付けない (`EINVAL` / `ENAMETOOLONG`) 時は次に進み、[fork-direct](#fork-direct) も広げた sockaddr を使わない。
 
 `bind` は使わない。広げた形で bind したソケットのアドレスは `sockaddr_un` に入らず、`getsockname` が途中で切れたパスを返して、読む側 (CPython の asyncio の後始末、Go の `net.FileConn` 等) を壊すからである。
 
 #### symlink
 
-置き場に `sockat.XXXXXXXXXX` の symlink を作り、それを通して bind / connect して、すぐ消す。connect は予備の経路として、bind は `bind_any` だけが最後に試す。
+置き場に `sockat.XXXXXXXXXX` の symlink を作り、それを通して bind / connect して、すぐ消す。connect は connect の順の最後 (FreeBSD 以外) に、bind は `bind_any` だけが最後に試す。
 
 | | connect | `bind_any` |
 |---|---|---|
@@ -173,7 +175,7 @@ Apple の OS。XNU は `sun_path` が 104 バイトを超えるアドレスも�
 
 #### at-direct
 
-FreeBSD。ソケットのディレクトリを開き、`connectat(2)` でファイル名を渡す。ファイル名は 103 バイトまで。
+FreeBSD。connect の順の最初。ソケットのディレクトリを開き、`connectat(2)` でファイル名を渡す。ファイル名は 103 バイトまで。ソケットのディレクトリを開けない時は [at](#at) に進む。
 
 #### fork-direct
 
@@ -204,14 +206,14 @@ std にそのまま渡せない長さのパスが `ENAMETOOLONG` になる時 (�
 | OS | `bind` | `connect` / `connect_nonblocking` | `connect_any` 系 |
 |---|---|---|---|
 | Linux / Android (`/proc` あり) | ファイル名が 96 バイトを超える | 届く (proc-held) | 届く |
-| Linux / Android (`/proc` 無し) | ファイル名が 96 バイトを超える | thread-cwd が使えず (ファイル名が 96 バイトを超えるかスレッド cwd が使えない)、relative が 107 バイトを超え、symlink も使えない | ファイル名が 107 バイトを超え、symlink も使えない |
+| Linux / Android (`/proc` 無し) | ファイル名が 96 バイトを超える | relative が 107 バイトを超え、thread-cwd が使えず (ファイル名が 96 バイトを超えるかスレッド cwd が使えない)、symlink も使えない | ファイル名が 107 バイトを超え、symlink も使えない |
 | FreeBSD | ファイル名が 92 バイトを超える | ファイル名が 103 バイトを超える | ファイル名が 103 バイトを超える |
-| macOS / iOS 等 Apple の OS | ファイル名が 92 バイトを超える | thread-cwd が使えず (ファイル名が 92 バイトを超えるかスレッド cwd が使えない)、元のパスも相対パスも 253 バイトを超え、symlink も使えない | ファイル名が 253 バイトを超え、symlink も使えない |
+| macOS / iOS 等 Apple の OS | ファイル名が 92 バイトを超える | 元のパスも相対パスも 253 バイトを超え、thread-cwd が使えず (ファイル名が 92 バイトを超えるかスレッド cwd が使えない)、symlink も使えない | ファイル名が 253 バイトを超え、symlink も使えない |
 | NetBSD / OpenBSD / その他の BSD | ファイル名が 92 バイトを超える | relative が 103 バイトを超え、symlink も使えない | ファイル名が 103 バイトを超え、symlink も使えない |
 | illumos | ファイル名が 96 バイトを超える | relative が 107 バイトを超え、symlink も使えない | ファイル名が 107 バイトを超え、symlink も使えない |
 
 - Linux でスレッド cwd が使えない時 (seccomp の filter 等)、bind はファイル名およそ 79 バイトまで proc、その先 96 バイトまでは fork
-- D をどこにも作れない時、bind は D 無しの形でファイル名 88 バイト (Apple の OS / BSD は 84) まで届く (ソケットのディレクトリを開けて R を作れる時)。connect 系は予備の経路の分だけ届く (proc-held は使えない)
+- D をどこにも作れない時、bind は D 無しの形でファイル名 88 バイト (Apple の OS / BSD は 84) まで届く (ソケットのディレクトリを開けて R を作れる時)。connect 系は connect の順のうち D を使わない経路 (proc-direct・relative・widened・symlink・at-direct) の分だけ届く (proc-held も使えない)
 - `bind_any` の symlink の綴りは D を通す経路の綴りより長いので、`bind` より長いファイル名には届かない。届くのは、D も D 無しの形も使えない時
 - `bind_any` で symlink の綴りが 103 / 107 バイトに収まる置き場が無い時も `ENAMETOOLONG`
 - Apple の OS の connect 系の 253 バイトは、カーネルが広げた sockaddr を受け付ける時。断った時は 103 バイト
@@ -282,10 +284,10 @@ if losses.contains(&sockat::Loss::Forked) {
 
 `bind_any` の symlink が要るのは、D をどこにも作れず、ソケットのディレクトリも開けない (R を作れない) 時。綴りが D を通す経路より長いので、ファイル名が長すぎて `bind` が届かない時には役に立たない。
 
-`connect_any` 系の fork-direct が要るのは、D を通す経路を connect に使えず、予備の経路も届かない時だけ:
+`connect_any` 系の fork-direct が要るのは、connect の順のどの経路も届かない時だけ:
 
 - D を通す経路を connect に使えない: NetBSD / OpenBSD / illumos 等 (スレッド cwd が無い)、seccomp の filter が掛かり `/proc` の無い Linux、`pthread_fchdir_np` の無い Apple の OS
-- 予備の経路も届かない: 安全で symlink を作れる置き場が無く、相対パスにも (Apple の OS は広げた sockaddr にも) 収まらない
+- D を通さない経路も届かない: 安全で symlink を作れる置き場が無く、相対パスにも (Apple の OS は広げた sockaddr にも) 収まらない
 
 FreeBSD では at-direct がファイル名 103 バイトまで届くので、fork-direct まで来ることは無い。`connect_any_nonblocking` は fork の前にソケットを非ブロッキングにするので、子の connect も待たない。
 
@@ -320,7 +322,7 @@ OpenBSD では、103 バイト以内の短いパス (sockat は std にそのま
 
 ### bind できるファイル名は connect より短い
 
-bind の綴りには R の 11 バイトが入るので、bind できるファイル名は Linux / illumos で 96 バイト、Apple の OS / BSD で 92 バイトまで。connect は予備の経路で、ふつうはファイル名の長さによらず届く。
+bind の綴りには R の 11 バイトが入るので、bind できるファイル名は Linux / illumos で 96 バイト、Apple の OS / BSD で 92 バイトまで。connect は R を挟まない経路 (proc-held、symlink 等) で、ふつうはファイル名の長さによらず届く。
 
 ### 名前で終わらないパスは InvalidInput
 

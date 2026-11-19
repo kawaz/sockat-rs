@@ -57,20 +57,21 @@ A path of up to the length std accepts goes to std unchanged ([standard](#standa
 | Linux / Android / illumos | 107 bytes |
 | macOS / iOS and other Apple OSes / FreeBSD / NetBSD / OpenBSD | 103 bytes |
 
-A longer path is reached first by the routes through D, a directory of sockat's own, and when those cannot be used, for a bind by [the form without D](#the-form-without-d), for the connects by [the fallback routes](#the-fallback-routes-connects). The first route that can be used makes the call. None of the routes changes the working directory of the calling process or of the calling thread, so they can be used from multi-threaded programs. The routes' names are those of the [sockat specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md) ("route names").
+A longer path is bound through D, a directory of sockat's own, and when that cannot be used, by [the form without D](#the-form-without-d). A connect tries [the connect routes](#the-connect-routes) that need neither writing (making D, R or a symlink) nor a thread first, and the routes through D and the symlink after them. The first route that can be used makes the call. None of the routes changes the working directory of the calling process or of the calling thread, so they can be used from multi-threaded programs. The routes' names are those of the [sockat specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md) ("route names").
 
 ### Order per OS
 
 | OS | `bind` | `connect` / `connect_nonblocking` |
 |---|---|---|
-| Linux / Android | [thread-cwd](#thread-cwd) → [proc](#proc) → [fork](#fork) | thread-cwd → proc → [proc-direct](#proc-direct) → [proc-held](#proc-held) → [symlink](#symlink) |
-| Linux / Android (no `/proc`) | thread-cwd → fork | thread-cwd → [relative](#relative) → symlink |
-| macOS / iOS and other Apple OSes | thread-cwd → fork | thread-cwd → relative → [widened](#widened) → symlink |
-| FreeBSD | [at](#at) | at → [at-direct](#at-direct) |
+| Linux / Android | [thread-cwd](#thread-cwd) → [proc](#proc) → [fork](#fork) | [proc-direct](#proc-direct) → thread-cwd → proc → [proc-held](#proc-held) → [symlink](#symlink) |
+| Linux / Android (no `/proc`) | thread-cwd → fork | [relative](#relative) → thread-cwd → symlink |
+| macOS / iOS and other Apple OSes | thread-cwd → fork | relative → [widened](#widened) → thread-cwd → symlink |
+| FreeBSD | [at](#at) | [at-direct](#at-direct) → at |
 | NetBSD / OpenBSD / illumos / other Unix | fork | relative → symlink |
 | Windows | not supported (compile error outside Unix) | |
 
 - [standard](#standard) is tried before these and cannot be used for the length
+- A connect tries the routes that need neither writing nor a thread (proc-direct, relative, widened, at-direct) first, and after them the routes that make D (thread-cwd, proc, proc-held, at), the one that starts a thread (thread-cwd) and the one that makes a symlink. When an earlier route reaches the socket, neither D nor a symlink is made
 - A bind for which D can be made nowhere tries the same order in [the form without D](#the-form-without-d) (the `-sockdir` routes)
 - `bind_any` tries the order of `bind`, then binds through [symlink](#symlink) last. `connect_any` and `connect_any_nonblocking` try the order of `connect`, then connect through [fork-direct](#fork-direct) last ([The exception: the any functions](#the-exception-the-any-functions))
 - The socket's directory is looked up (`stat`) first. If it is missing, the error is `ENOENT` (whatever the file name length)
@@ -82,7 +83,7 @@ The path goes to std as it is. Used only for a path of up to the length std acce
 
 ### The routes through D
 
-sockat makes a directory D of its own, holds it by an fd, makes in it a symlink R with a random name to the real path of the socket's directory, and binds / connects with `R/<file name>` relative to D's fd. R and D are removed afterwards. [thread-cwd](#thread-cwd), [at](#at), [proc](#proc) and [fork](#fork) take this form.
+sockat makes a directory D of its own, holds it by an fd, makes in it a symlink R with a random name to the real path of the socket's directory, and binds / connects with `R/<file name>` relative to D's fd. R and D are removed afterwards. [thread-cwd](#thread-cwd), [at](#at), [proc](#proc) and [fork](#fork) take this form. The connect route [proc-held](#proc-held) uses the same D, with `s`, a symlink to the socket file, in place of R.
 
 1. In a place for D, a directory `sockat.XXXXXXXXXX` (10 random letters and digits) of mode 0700 is made
 2. It is opened without following its name (`O_NOFOLLOW`) and checked: a directory, owned by the caller, no permission for group and others. Anything else (someone replaced it between the two steps) is neither used nor removed. Once checked, its mode is set to 0700 (so a umask that took the owner's bits does not get in the way)
@@ -90,8 +91,9 @@ sockat makes a directory D of its own, holds it by an fd, makes in it a symlink 
 4. `R/<file name>` is bound / connected by the first route that can be used
 5. Success or failure, R is removed, and D is removed only while its name still names the directory held
 
+- D is made at most once in a call and shared by the routes that use it (proc after thread-cwd was refused, proc-held after proc's spelling did not fit, use the same D). When it can be made nowhere, every later route that uses D is passed over, and D is not tried again
 - **The places for D** are `TMPDIR` (`/tmp` when unset; a relative one is fine), `/tmp`, then the socket's directory (named `.sockat.XXXXXXXXXX` there), the first where D can be made. A place needs to be neither safe (sticky, ...) nor short: D is held by its fd and no spelling names the place
-- When a place cannot be opened, D cannot be created, the check fails, D cannot be set to 0700 or R cannot be created, the next place is tried
+- When a place cannot be opened, D cannot be created, the check fails, D cannot be set to 0700 or R (`s` when proc-held asks for D first) cannot be created, the next place is tried
 - When D just made cannot be opened (a umask took the owner's bits: search on Apple OSes, read on targets other than Linux and Apple OSes), it is looked up by its name and removed if it passes the checks of 2, and the next place is tried. Should it be replaced between that look-up and the removal, only an empty directory can be removed
 - The spelling is `R/<file name>`, so the file name has R's 11 bytes less than the sockaddr length (up to 96 bytes on Linux / illumos, 92 on Apple OSes / the BSDs; about 79 for proc)
 - D is opened `O_PATH` on Linux, `O_SEARCH` on Apple OSes, `O_RDONLY` elsewhere. It is set to 0700 by `chmod` of `/proc/self/fd/<fd>` on Linux with `/proc`, by `fchmod` of D opened again by name `O_RDONLY` and checked to be the same directory on Linux without `/proc`, by `fchmod` elsewhere
@@ -126,23 +128,23 @@ Used by a bind when D can be made nowhere. R (`.sockat.XXXXXXXXXX`) is made in t
 
 - The spelling is 19 bytes plus the file name (file names of up to 88 bytes on Linux / illumos, 84 on Apple OSes / the BSDs; about 72 for proc-sockdir)
 - When the socket's directory cannot be opened or R cannot be made either, it is `ENAMETOOLONG` (`bind_any` then tries [symlink](#symlink))
-- The connects do not use this form; they go on to the fallback routes
+- The connects do not use this form; they go on to the next route of the [order per OS](#order-per-os)
 
-### The fallback routes (connects)
+### The connect routes
 
-Tried by the connects only, when the routes through D cannot be used (no route usable, D made nowhere, the file name too long once `R/` is added). A connected socket is not bound and its spelling is kept nowhere, so these spellings carry no random part.
+Routes of the connects only. A connected socket is not bound and its spelling is kept nowhere, so these spellings carry no random part. proc-direct, relative, widened and at-direct need neither writing nor a thread, so they come first in the connect order.
 
 #### proc-direct
 
-Linux / Android. The socket's directory is opened `O_PATH` and `/proc/self/fd/<fd>/<file name>` is handed to std. The whole spelling must be at most 107 bytes, so the file name about 90 bytes at most (it depends on the number of digits of the fd). When the socket's directory cannot be opened, the next route is tried.
+Linux / Android with `/proc`. First in the connect order. The socket's directory is opened `O_PATH` and `/proc/self/fd/<fd>/<file name>` is handed to std. The whole spelling must be at most 107 bytes, so the file name about 90 bytes at most (it depends on the number of digits of the fd). When the socket's directory cannot be opened or `/proc/self/fd/<fd>` cannot be looked up, the next route is tried.
 
 #### proc-held
 
-Linux / Android with `/proc`. D is made and checked, a symlink `s` to the socket file is made in it, and the connect goes through `/proc/self/fd/<D's fd>/s`. The spelling is about 20 bytes whatever the file name length and the directory depth. The places for D are those of the routes through D (none needs to be safe). The socket's directory is not opened.
+Linux / Android with `/proc`. After [proc](#proc). In D (the one an earlier route made, or one made and checked now), a symlink `s` to the socket file is made, and the connect goes through `/proc/self/fd/<D's fd>/s`. The spelling is about 20 bytes whatever the file name length and the directory depth. The places for D are those of the routes through D (none needs to be safe). The socket's directory is not opened.
 
 #### relative
 
-When the path spelled relative to the cwd fits the sockaddr length, that goes to std. Only for an absolute path. Only the path string is rewritten; the cwd is never changed (no `chdir`).
+First in the connect order of Linux / Android without `/proc`, Apple OSes, NetBSD / OpenBSD / illumos / other Unix. When the path spelled relative to the cwd fits the sockaddr length, that goes to std. Only for an absolute path. Only the path string is rewritten; the cwd is never changed (no `chdir`).
 
 - When the path is below the cwd (`getcwd`, or a `$PWD` that names the cwd), that prefix is cut off. When that does not fit (the path not being below the cwd included), a spelling climbing with `..` between the two resolved to real paths is made too. The shorter is used
 - When the relative spelling's directory does not match the original by `(st_dev, st_ino)`, or the cwd has already changed, the route counts as unusable and the next is tried
@@ -150,13 +152,13 @@ When the path spelled relative to the cwd fits the sockaddr length, that goes to
 
 #### widened
 
-Apple OSes. XNU takes an address whose path is longer than `sun_path`'s 104 bytes, up to 253 bytes. The path itself is handed over when it is at most 253 bytes, failing that the relative spelling when that is. When the kernel refuses it (`EINVAL` / `ENAMETOOLONG`) the next route is tried.
+Apple OSes. After relative. XNU takes an address whose path is longer than `sun_path`'s 104 bytes, up to 253 bytes. The path itself is handed over when it is at most 253 bytes, failing that the relative spelling when that is. When the kernel refuses it (`EINVAL` / `ENAMETOOLONG`) the next route is tried, and [fork-direct](#fork-direct) does not use the widened sockaddr either.
 
 A `bind` never uses it: the address of a socket bound so does not fit `sockaddr_un`, `getsockname` returns a truncated path, and its readers break (CPython's asyncio clean-up, Go's `net.FileConn`, ...).
 
 #### symlink
 
-A symlink `sockat.XXXXXXXXXX` is made in a place, the bind / connect goes through it, and it is removed at once. A connect tries it as a fallback route; a bind only in `bind_any`, last.
+A symlink `sockat.XXXXXXXXXX` is made in a place, the bind / connect goes through it, and it is removed at once. A connect tries it last in the connect order (not on FreeBSD); a bind only in `bind_any`, last.
 
 | | connect | `bind_any` |
 |---|---|---|
@@ -173,7 +175,7 @@ A symlink `sockat.XXXXXXXXXX` is made in a place, the bind / connect goes throug
 
 #### at-direct
 
-FreeBSD. The socket's directory is opened and `connectat(2)` takes the file name, of up to 103 bytes.
+FreeBSD. First in the connect order. The socket's directory is opened and `connectat(2)` takes the file name, of up to 103 bytes. When the socket's directory cannot be opened, [at](#at) is tried.
 
 #### fork-direct
 
@@ -204,14 +206,14 @@ When a path too long for std is `ENAMETOOLONG` (assuming the directory exists an
 | OS | `bind` | `connect` / `connect_nonblocking` | `connect_any` ones |
 |---|---|---|---|
 | Linux / Android (`/proc`) | file name over 96 bytes | always reached (proc-held) | always reached |
-| Linux / Android (no `/proc`) | file name over 96 bytes | thread-cwd unusable (file name over 96 bytes, or the thread cwd unusable), relative over 107 bytes, and no symlink | file name over 107 bytes, and no symlink |
+| Linux / Android (no `/proc`) | file name over 96 bytes | relative over 107 bytes, thread-cwd unusable (file name over 96 bytes, or the thread cwd unusable), and no symlink | file name over 107 bytes, and no symlink |
 | FreeBSD | file name over 92 bytes | file name over 103 bytes | file name over 103 bytes |
-| macOS / iOS and other Apple OSes | file name over 92 bytes | thread-cwd unusable (file name over 92 bytes, or the thread cwd unusable), the path and the relative path over 253 bytes, and no symlink | file name over 253 bytes, and no symlink |
+| macOS / iOS and other Apple OSes | file name over 92 bytes | the path and the relative path over 253 bytes, thread-cwd unusable (file name over 92 bytes, or the thread cwd unusable), and no symlink | file name over 253 bytes, and no symlink |
 | NetBSD / OpenBSD / other BSDs | file name over 92 bytes | relative over 103 bytes, and no symlink | file name over 103 bytes, and no symlink |
 | illumos | file name over 96 bytes | relative over 107 bytes, and no symlink | file name over 107 bytes, and no symlink |
 
 - On Linux without the thread cwd (a seccomp filter, ...), a bind takes proc for a file name of up to about 79 bytes and fork up to 96
-- When D can be made nowhere, a bind reaches a file name of up to 88 bytes (84 on Apple OSes / the BSDs) by the form without D (when the socket's directory can be opened and R made in it). The connects reach what the fallback routes reach (without proc-held)
+- When D can be made nowhere, a bind reaches a file name of up to 88 bytes (84 on Apple OSes / the BSDs) by the form without D (when the socket's directory can be opened and R made in it). The connects reach what the routes of the connect order that do not use D reach (proc-direct, relative, widened, symlink, at-direct; without proc-held either)
 - `bind_any`'s symlink spelling is longer than those through D, so it does not reach a longer file name than `bind`. It reaches the path when neither D nor the form without D can be used
 - `bind_any` is `ENAMETOOLONG` as well when no place makes its symlink spelling fit 103 / 107 bytes
 - The 253 bytes of the connects on Apple OSes hold while the kernel takes the widened sockaddr; after it refuses, 103
@@ -282,10 +284,10 @@ if losses.contains(&sockat::Loss::Forked) {
 
 `bind_any`'s symlink is needed only when D can be made nowhere and the socket's directory cannot be opened either (no R). Its spelling is longer than that of the routes through D, so it does not help when the file name is too long for `bind`.
 
-fork-direct of the `connect_any` ones is needed only when the routes through D cannot be used for a connect and no fallback route reaches the path either:
+fork-direct of the `connect_any` ones is needed only when no route of the connect order reaches the path:
 
 - the routes through D unusable for a connect: NetBSD / OpenBSD / illumos and the like (no thread cwd), Linux under a seccomp filter without `/proc`, an Apple OS without `pthread_fchdir_np`
-- no fallback route: no safe place where a symlink can be made, and the path fits neither a relative spelling nor (on Apple OSes) the widened sockaddr
+- no route without D either: no safe place where a symlink can be made, and the path fits neither a relative spelling nor (on Apple OSes) the widened sockaddr
 
 On FreeBSD at-direct reaches file names of up to 103 bytes, so fork-direct is never reached there. `connect_any_nonblocking` makes the socket nonblocking before the fork, so the child's connect does not wait either.
 
@@ -320,7 +322,7 @@ On OpenBSD, std's `local_addr()` drops the last byte of the path even for a shor
 
 ### A bind reaches a shorter file name than a connect
 
-A bind spelling carries R's 11 bytes, so a bind reaches file names of up to 96 bytes on Linux / illumos and 92 on Apple OSes / the BSDs. A connect normally reaches any file name length through the fallback routes.
+A bind spelling carries R's 11 bytes, so a bind reaches file names of up to 96 bytes on Linux / illumos and 92 on Apple OSes / the BSDs. A connect normally reaches any file name length through the routes without R (proc-held, symlink, ...).
 
 ### A path that does not end with a file name is InvalidInput
 

@@ -1,4 +1,4 @@
-# DR-0006: connect 系の予備に、安全な置き場の短い symlink を経由する経路
+# DR-0006: connect 系に、安全な置き場の短い symlink を経由する経路
 
 - Status: Accepted
 - Date: 2026-11-18
@@ -9,7 +9,7 @@
 
 ## Decision
 
-connect 系の予備の経路 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) の最後に置く (FreeBSD 以外)。bind には使わない (カーネルが覚える綴りが置き場を通り、後でその名前を他人が作り直せる)。
+connect の順 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) の最後に置く (FreeBSD 以外)。bind には使わない (カーネルが覚える綴りが置き場を通り、後でその名前を他人が作り直せる)。
 
 ### 置き場
 
@@ -64,5 +64,5 @@ connect 系の予備の経路 ([DR-0027](DR-0027-own-directory-and-fallback-rout
 - 置き場を使う前に安全か確かめる: kawaz 裁定 2026-11-18
 - 置き場がディレクトリであることも確かめる: ハブの SPEC (sockat-py の指摘、2026-11-18)
 - 名前 (`sockat.` の接頭辞): 統括の裁定 2026-11-18。kawaz は接頭辞を支持
-- connect 系の予備の経路だけに使い、bind に使わない: kawaz 裁定 (ハブ DR-0012、2026-11-19)
+- connect 系の経路だけに使い (`bind_any` の最後を除く)、bind に使わない: kawaz 裁定 (ハブ DR-0012、2026-11-19)
 - 上に無い細部: 出所の記録なし
