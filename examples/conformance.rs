@@ -14,9 +14,9 @@
 //! then runs it in the caller's cwd and environment.
 //!
 //! Exit status: 0 once the result is written (whether the call succeeded or
-//! not), 1 when the byte could not be sent after a connect (the result is
-//! still written), 2 when stdin is not such an object (nothing is written to
-//! stdout).
+//! not, and also when the byte could not be sent after a connect: whether it
+//! arrived is for the conformance script to see), 2 when stdin is not such an
+//! object (nothing is written to stdout).
 
 #[cfg(sockat_conformance)]
 fn main() -> std::process::ExitCode {
@@ -57,7 +57,6 @@ mod cli {
             }
         };
         let path = Path::new(&path);
-        let mut status = ExitCode::SUCCESS;
         let report = match op {
             Op::Bind => match conformance::bind(path) {
                 Ok(l) => {
@@ -76,7 +75,6 @@ mod cli {
                 Ok(mut c) => {
                     if let Err(e) = c.stream.write_all(b"x") {
                         eprintln!("conformance: connected, but sending `x` failed: {e}");
-                        status = ExitCode::FAILURE;
                     }
                     drop(c.stream);
                     Report {
@@ -91,7 +89,7 @@ mod cli {
             },
         };
         println!("{}", to_json(&report));
-        status
+        ExitCode::SUCCESS
     }
 
     fn failed(e: sockat::AnyError) -> Report {

@@ -2479,6 +2479,30 @@ fn only_the_routes_of_the_order_tried_are_reported() {
     assert_empty(place.path());
 }
 
+// The -sockdir routes are tried only when D was to be made and could be made
+// nowhere (hub SPEC 445c1670): when no means of the central route can be used
+// at all (here a file name too long for `R/<name>`), D is not made, so no
+// -sockdir route is tried or reported, and the bind is ENAMETOOLONG with only
+// the routes through D passed over. With no place for D at all, D being made
+// nowhere must not be taken for a reason to try the -sockdir routes. The
+// socket's directory is left untouched.
+#[test]
+fn no_sockdir_route_is_tried_when_d_is_not_made() {
+    let t = tmp();
+    let p = t.path().join("n".repeat(250));
+    mark_untouched(t.path());
+    // No place for D either, so that only the check on the means keeps the
+    // -sockdir routes from being tried.
+    let f = route::run_long_with(BIND, &p, &config(&[], &[]), false)
+        .err()
+        .unwrap();
+    assert_eq!(errno(&f.error), Some(libc::ENAMETOOLONG), "{f:?}");
+    let names: Vec<_> = f.skipped.iter().map(|s| s.name).collect();
+    assert!(names.iter().all(|n| !n.ends_with("-sockdir")), "{names:?}");
+    assert!(names.contains(&"standard"), "{names:?}");
+    assert_untouched(t.path());
+}
+
 // The central route's spelling is `R/<name>`, 11 bytes more than the file
 // name, in the plain sockaddr: a file name of DIRECT_MAX - 11 bytes (96 on
 // Linux and illumos, 92 on Apple and the BSDs) binds through D and is reached;

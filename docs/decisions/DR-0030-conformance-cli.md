@@ -26,7 +26,7 @@
 - 入力の JSON は dev-dependency の `serde_json` で読む。出力は項目を conformance.md の順に並べて組み立て、文字列は `serde_json` でエスケープする
 - `error`: errno のあるエラーは POSIX の errno の表で引いた名前 (同じ値の名前が 2 つある時は表の先の方。`EAGAIN`、`EOPNOTSUPP`、表に無い errno は `errno-<番号>`)。errno の無いエラーは `InvalidInput` なら `invalid-argument`、他は `general`
 - bind が通ったら listener を閉じる (ソケットのファイルは消さない)。connect が通ったら `x` を 1 バイト送って閉じる
-- 終了コード: 結果を出したら 0 (bind / connect の成否によらない)。connect の後に `x` を送れなかった時は結果を出して 1。標準入力を読めない時は標準出力に何も出さず 2
+- 終了コード: 結果を出したら 0 (bind / connect の成否によらず、connect の後に `x` を送れなかった時も。届いたかはハブのスクリプトが見る)。標準入力を読めない時は標準出力に何も出さず 2 (ハブ conformance.md 445c1670)
 
 ### 起こし方
 
