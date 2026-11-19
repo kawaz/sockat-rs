@@ -589,8 +589,8 @@ fn bind_ex_discards_its_socket_file_at_any_length() {
         assert!(is_socket(&p), "{total}");
         let mut c = sockat::connect(&p).unwrap();
         ping(&listener, &mut c);
-        drop((c, listener));
         file.discard().unwrap();
+        drop((c, listener));
         assert!(std::fs::symlink_metadata(&p).is_err(), "{total}");
 
         let sockat::ExListener { listener, file, .. } =
@@ -716,8 +716,8 @@ fn bind_ex_remembers_the_real_path() {
     let theirs = sockat::bind(two.join(&below)).unwrap();
     std::fs::remove_file(&link).unwrap();
     std::os::unix::fs::symlink(&two, &link).unwrap();
-    drop(listener);
     file.discard().unwrap();
+    drop(listener);
     assert!(!one.join(&below).exists());
     assert!(is_socket(&two.join(&below)));
     drop(theirs);
@@ -730,8 +730,10 @@ fn bind_ex_remembers_the_real_path() {
 //
 // * A short absolute path goes to std: route `standard`, nothing given up,
 //   nothing passed over; `discard()` removes the socket file.
-// * A long path: the bind gives up `respelled` (its address is not the path)
-//   and passes over `standard` first; a connect gives up nothing; the
+// * A long path: the bind gives up `respelled` (its address is not the path),
+//   and `forked` too where its route is the fork-cwd one (the targets with
+//   neither the thread-cwd nor the symlink-file route, such as OpenBSD and
+//   illumos), and passes over `standard` first; a connect gives up nothing; the
 //   nonblocking one's stream does not wait.
 // * A failure carries the errno, the route that failed for real and the
 //   routes passed over, and converts back into the io::Error.
@@ -748,13 +750,17 @@ fn the_ex_functions_take_the_plain_order_and_say_how() {
     assert!(b.skipped.is_empty());
     let c = sockat::connect_ex(&short, LastResort::Avoid).unwrap();
     assert_eq!((c.route, c.losses.as_slice()), ("standard", &[][..]));
-    drop((c, b.listener));
     b.file.discard().unwrap();
+    drop((c, b.listener));
     assert!(!short.exists());
 
     let long = nest(t.path(), 400, "long.sock");
     let b = sockat::bind_ex(&long, LastResort::Avoid).unwrap();
-    assert_eq!(b.losses, [sockat::Loss::Respelled]);
+    if b.route.starts_with("fork-cwd") {
+        assert_eq!(b.losses, [sockat::Loss::Respelled, sockat::Loss::Forked]);
+    } else {
+        assert_eq!(b.losses, [sockat::Loss::Respelled], "{}", b.route);
+    }
     assert_ne!(b.route, "standard");
     assert_eq!(b.skipped.first().map(|s| s.name), Some("standard"));
     let sockat::ExStream {
@@ -772,8 +778,8 @@ fn the_ex_functions_take_the_plain_order_and_say_how() {
     let mut buf = [0u8; 1];
     let e = c.read(&mut buf).unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
-    drop(b.listener);
     b.file.discard().unwrap();
+    drop(b.listener);
     assert!(!long.exists());
 
     let e = sockat::connect_ex(&long, LastResort::Avoid).unwrap_err();

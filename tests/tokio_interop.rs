@@ -54,8 +54,9 @@ async fn std_sockets_from_sockat_are_adopted_by_tokio() {
 
 // bind_ex's listener goes to tokio like bind's (it is std's own type, moved
 // into tokio::net::UnixListener::from_std), and the SocketFile stays behind:
-// once tokio's listener has served a connection and is dropped, discard()
-// removes the socket file. This is why discard() does not close the listener
+// once tokio's listener has served a connection, discard() removes the
+// socket file, before tokio's listener is dropped (discard() is called before
+// the listener is closed). This is why discard() does not close the listener
 // itself: it no longer has it.
 #[tokio::test]
 async fn bind_ex_discards_after_the_listener_went_to_tokio() {
@@ -77,8 +78,8 @@ async fn bind_ex_discards_after_the_listener_went_to_tokio() {
     server.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"ping");
 
-    drop(listener);
     assert!(path.exists());
     file.discard().unwrap();
+    drop(listener);
     assert!(std::fs::symlink_metadata(&path).is_err());
 }
