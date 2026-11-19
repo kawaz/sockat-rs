@@ -22,11 +22,12 @@ list:
 
 # ---------- lint / test ----------
 
-# cargo fmt --check + clippy (-D warnings、全 feature と feature 無し) + unsafe 封じ込め
+# cargo fmt --check + clippy (-D warnings、全 feature と feature 無しと cfg sockat_conformance) + unsafe 封じ込め
 check: lint-unsafe
     cargo fmt --check
     cargo clippy --all-targets --all-features -- -D warnings
     cargo clippy --all-targets -- -D warnings
+    RUSTFLAGS='--cfg sockat_conformance' cargo clippy --all-targets --all-features --target-dir '{{conformance_target}}' -- -D warnings
 
 # cargo fmt (書き換える)
 fmt:
@@ -71,6 +72,20 @@ test *ARGS: check
 test-linux *ARGS:
     docker run --rm -v "$PWD":/work -w /work -e CARGO_TARGET_DIR=/work/target-linux/docker \
       -v sockat-cargo-registry:/usr/local/cargo/registry rust:1 cargo test --all-features "$@"
+
+# ---------- 適合試験 (ハブの conformance) ----------
+
+# 適合試験の CLI の target。RUSTFLAGS が通常の build と違うので分ける
+conformance_target := env("CARGO_TARGET_DIR", justfile_directory() / "target") / "conformance"
+
+# 適合試験の CLI を build する (RUSTFLAGS で cfg sockat_conformance を立てる)
+conformance-build:
+    RUSTFLAGS='--cfg sockat_conformance' cargo build -q --features any --example conformance --target-dir '{{conformance_target}}'
+
+# 適合試験の CLI を起こす。標準入力の JSON 1 つで 1 回 bind / connect し、結果の JSON を標準出力に出す。cwd と環境は呼んだ所のまま (DR-0030)
+[no-cd]
+conformance: conformance-build
+    @'{{conformance_target}}/debug/examples/conformance'
 
 # check + test (CI entry point)
 ci: check test

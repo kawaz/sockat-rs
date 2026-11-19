@@ -18,7 +18,7 @@
   - Apple の OS で広げた sockaddr を受け付けないカーネル (`wide`)
   - Linux の /proc の場所 (`proc_self_fd`。試験は何も無い場所や空のディレクトリを渡して /proc の無い環境の代わりにし、本物の /proc には触らない)
 - プロセス全体に効く設定 (cwd、umask、`SIGCHLD`) を変える試験は、試験のバイナリを子プロセスで起こして中で行う
-- feature も cfg(test) 専用の公開口も作らない
+- feature も cfg(test) 専用の公開口も作らない。例外はハブの適合試験の CLI の口だけで、cfg フラグ `sockat_conformance` の後ろに隠す ([DR-0030](DR-0030-conformance-cli.md))
 
 ## 理由
 

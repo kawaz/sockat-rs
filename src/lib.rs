@@ -492,6 +492,10 @@ mod path;
 mod route;
 mod sys;
 
+#[cfg(all(sockat_conformance, feature = "any"))]
+#[doc(hidden)]
+pub mod conformance;
+
 #[cfg(test)]
 mod tests;
 
@@ -925,9 +929,13 @@ fn any_error(f: route::Failed) -> AnyError {
 /// converts into the [`io::Error`] by `?`).
 #[cfg(feature = "any")]
 pub fn bind_any<P: AsRef<Path>>(path: P) -> Result<AnyListener, AnyError> {
-    let path = path.as_ref();
-    let r = route::run_reporting(Request::Bind(BindOptions { symlink: true }), path)
-        .map_err(any_error)?;
+    bind_reporting(path.as_ref(), BindOptions { symlink: true })
+}
+
+/// A bind as `options` say, with what was given up and how ([`AnyListener`]).
+#[cfg(feature = "any")]
+fn bind_reporting(path: &Path, options: BindOptions) -> Result<AnyListener, AnyError> {
+    let r = route::run_reporting(Request::Bind(options), path).map_err(any_error)?;
     Ok(AnyListener {
         listener: UnixListener::from(r.fd),
         losses: losses(true, r.route, path),
@@ -1006,6 +1014,13 @@ fn connect_any_with(path: &Path, nonblocking: bool) -> Result<AnyConnection, Any
         nonblocking,
         fork: true,
     };
+    connect_reporting(path, options)
+}
+
+/// A connect as `options` say, with what was given up and how
+/// ([`AnyConnection`]).
+#[cfg(feature = "any")]
+fn connect_reporting(path: &Path, options: ConnectOptions) -> Result<AnyConnection, AnyError> {
     let r = route::run_reporting(Request::Connect(options), path).map_err(any_error)?;
     Ok(AnyConnection {
         stream: UnixStream::from(r.fd),

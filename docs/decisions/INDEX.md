@@ -35,5 +35,6 @@ Status は各 DR ファイルの `Status:` 行が正本。
 | [DR-0027](DR-0027-own-directory-and-fallback-routes.md) | ✅ 実装済 | 長いパスは自分専用のディレクトリ D を fd で掴み、その中の乱数の symlink R を通して `R/<ファイル名>` で bind / connect する (thread-cwd → proc → fork、FreeBSD は at)。D をどこにも作れない bind は `-sockdir` の経路。connect 系は予備に proc-direct・proc-held・relative・widened・symlink・at-direct。開けない D は名前で確かめて消す |
 | [DR-0028](DR-0028-bind-ex-and-socket-file.md) | ✅ 実装済 | 後始末つきの bind `bind_ex` は listener と `SocketFile` を返し、`discard()` は bind 直後に覚えた `(st_dev, st_ino)` が同じ時だけ消す。listener を閉じるのは利用者 |
 | [DR-0029](DR-0029-any-functions.md) | ✅ 実装済 | any 系 (bind_any、connect_any 系) は feature `any` の後ろの「何かを失ってでも届かせる」opt-in。bind_any は最後に置き場の symlink (持ち主だけが書ける置き場 → 共有の置き場)。戻り値は `#[non_exhaustive]` の struct で、std の型と `losses`・`route`・`skipped`、失敗は `AnyError` (errno を保つ) |
+| [DR-0030](DR-0030-conformance-cli.md) | ✅ 実装済 | 適合試験の CLI は `examples/conformance.rs`。経路の情報は cfg フラグ `sockat_conformance` (feature でない) の後ろの `#[doc(hidden)]` のモジュールから取る。`just conformance` で起こす |
 
 退避した DR は [archive/INDEX.md](archive/INDEX.md)。

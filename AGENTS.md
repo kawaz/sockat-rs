@@ -20,6 +20,7 @@ sockat は、`sun_path` の上限を超えるパスでも Unix domain socket を
 | `src/sys.rs` | `unsafe` の境界。libc を直接呼ぶのはここだけ |
 | `src/tests.rs` | 経路を強制する単体試験 |
 | `tests/` | 公開 API の結合試験、tokio との連携試験 |
+| `examples/conformance.rs`、`src/conformance.rs` | ハブの適合試験から起こす CLI と、それが経路の情報を取る口 (cfg フラグ `sockat_conformance` の後ろ、公開しない。[DR-0030](docs/decisions/DR-0030-conformance-cli.md)) |
 
 ## 守ること
 
@@ -39,6 +40,7 @@ sockat は、`sun_path` の上限を超えるパスでも Unix domain socket を
 - cwd やシグナルの扱いのようにプロセス全体に効く設定が要る試験は、試験バイナリを子プロセスで起こして中で行う (`run_child`)。試験は並行して走るので、同じプロセスで変えない
 - fork の経路の子はプロセスの全 fd の複製を一瞬持つ。並行する試験の fork が、閉じたはずの listener を生かすことがある。「誰も listen していないソケット」が要る試験は、別プロセスで作る (`stale_socket`)
 - 各試験の直前に「何を確かめ、なぜそうなるべきか」をコメントで書く。DR の番号だけで済ませない
+- ハブの適合試験は `just --justfile <このリポ>/justfile conformance` を起こす (入出力はハブの `docs/design/conformance.md`、[DR-0030](docs/decisions/DR-0030-conformance-cli.md))。先に `just conformance-build` を 1 回
 
 ## VCS と push
 
