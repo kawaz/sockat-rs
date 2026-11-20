@@ -70,8 +70,13 @@ std が受け付ける長さ (`sun_path` − 1 バイト) までのパスは std
 - B の置き場は、realpath した実パスで確かめ・綴る (macOS の `/tmp` の B は `/private/tmp/sockat-<uid>`)
 - B は、ルートから置き場までのディレクトリが全部「持ち主が root か自分で、group も other も書けないか、sticky」で、B 自身が「実ディレクトリで、持ち主が自分で、group も other も書けない」時だけ使う。既定の名前の B が外れたら `sockat-<uid>.<乱数 10 文字>` を作る。置き場に書けなければ次の置き場へ
 - `$XDG_RUNTIME_DIR`・`$TMPDIR` が空か相対パスなら、その置き場は使わない
+- 「自分」と名前の `<uid>` は実効 uid
 - 1 つのプロセスが使う置き場 1〜3 の B は 1 つ (`usable_cross_uid` の時だけ、もう 1 つ使いうる)。ソケットのディレクトリの B はディレクトリごと
-- 綴りが収まらないと先に分かる時は、B を作らない
+- 一度持った B は、プロセスの間それを使う。作れなかった置き場は、次の呼び出しで試し直す
+- 持っている B・D が消されていたら (fd の `st_nlink` が 0、または名前で引いた物が fd と違う)、次の呼び出しで作り直す
+- 綴りが収まらないと先に分かる時は、B を作らない。次の置き場にも移らず、B を通る経路を飛ばす (プロセスの B はパスの長さでは変わらない)
+- D を作れなければ、その呼び出しでは D を使う経路を飛ばす。別の B は探さない
+- ソケットのディレクトリの B は procB の綴りでだけ使う
 - [`Options::base`](#options) を渡すと、B はその場所になる
 
 B は `/proc/<pid>/fd/<B の fd>` (procB。`/proc` を使える時) か、B の実パスで綴る。procB の綴りは同じ uid・同じ PID 名前空間のプロセスだけが辿れ、プロセスが終われば辿れない。
@@ -189,7 +194,7 @@ Linux の bind は、ファイル名がおよそ 96 バイトを超えるか、s
 
 | 項目 | 中身 |
 |---|---|
-| `usable_cross_uid: bool` | bind の綴りを別の uid も辿れる物にする。途中と B 自身が other に x を持つ置き場の B だけを使い、procB を使わない。満たせなければ thread-cwd / at (`Dangling`) に進む。connect 系は見ない |
+| `usable_cross_uid: bool` | bind の綴りを別の uid も辿れる物にする。途中と B 自身が other に x を持つ置き場の B だけを使い、procB を使わない。満たせなければ thread-cwd / at (`Dangling`) に進む。B が他の uid に辿らせるかは、プロセスがその B を持った時に判定して覚え、後で見直さない (`Options::base` の B も)。connect 系は見ない |
 | `base: Option<PathBuf>` | B そのものの場所 (例 `/tmp/my-app-1000/sockat`)。無ければ作り (mode 0711)、確かめに外れたら `ENOENT` / `ENOTDIR` / `EPERM` で、自動の置き場に落とさない。相対パスと、名前で終わらないパスは、パスの長さによらず `InvalidInput`。base の場所が symlink なら `EPERM`。確かめは長いパスで経路を試す前に行い、B を作るのは B を使う経路に来た時だけ。bind 系も connect 系も使う |
 
 ```rust
@@ -243,7 +248,8 @@ let bound = sockat::bind_ex(path, options)?;
 - どちらも 2 回目以降は何もしない。Drop では何もしない
 - `remove` は listener を閉じない。閉じるのは利用者
 - 約束は listener を開いている間の置き換えまで。閉じた後に消して作り直された物は、番号をすぐ使い回すファイルシステム (ext4、BSD の UFS / FFS) で見分けられない。`remove` は listener を閉じる前に呼ぶ
-- 相対パスの `bind_ex` は、パスを引く前と、bind と覚えるための realpath の後で cwd の `(st_dev, st_ino)` を比べ、違えば listener を閉じて `Other` のエラーを返す (ソケットのファイルは残る)
+- `bind_ex` がソケットのファイルを覚えられない時は、listener を閉じ、E を片付け、ソケットのファイルは消さずにエラーを返す (確かめられないファイルを消すと、置き換わった物を消しうる)
+- 相対パスの `bind_ex` は、パスを引く前と、bind と覚えるための realpath の後で cwd の `(st_dev, st_ino)` を比べ、違えば覚えられない時と同じに `Other` のエラーを返す
 - 確かめてから消すまでの間に、ソケットのディレクトリに書ける者がファイルをすり替えるのは防げない (inode を指定して消す手段が POSIX に無い)
 
 ```rust
@@ -387,13 +393,14 @@ fn serve(path: &Path) -> io::Result<()> {
 | `Options::base` の場所がディレクトリでも symlink でもない | `ENOTDIR` |
 | `Options::base` の場所が symlink (実ディレクトリでない) | `EPERM` |
 | `Options::base` の持ち主・権限の確かめに外れた (`usable_cross_uid` の bind で、途中と base 自身が other に x を持たないことを含む) | `EPERM` |
-| `Options::base` が相対パスか、名前で終わらない (パスの長さによらない) | `InvalidInput` |
+| `Options::base` が相対パスか、名前で終わらない (パスの長さによらず、abstract の名前の判定より前) | `InvalidInput` |
+| `Options::base` の確かめに通った後、B を作れない | 作れなかったエラー |
 | std にそのまま渡せない長さのパスで、名前で終わらない (`dir/`、`dir/.`、`..` 等) | `InvalidInput` |
 | NUL を含むパス (長さによらない) | `InvalidInput` |
 | relative の途中、または相対パスの `bind_ex` の途中で cwd が変わった | `Other` |
 
 - ディレクトリを先に引くので、`ENOENT` と `ENOTDIR` は長さの判定より前に決まり、経路は試されない (`ExError` の `route` は `None`、`skipped` は空)
-- `Options::base` の確かめは経路の前に行い、外れたら `route` は `None`、`skipped` は空
+- `Options::base` の確かめは経路の前に行い、外れたら `route` は `None`、`skipped` は空。確かめに通った後に B を作れなかった時は、`route` は `None`、`skipped` はそれまでに飛ばした経路
 - `_ex` は、実際に bind / connect して失敗した経路を `ExError::route` に入れる
 - macOS では backlog が満杯の時も `ECONNREFUSED` を返すので、`ECONNREFUSED` だけでは「誰も listen していないソケットファイル」と判定できない (std の connect でも同じ)
 

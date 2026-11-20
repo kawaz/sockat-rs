@@ -70,8 +70,13 @@ A longer path is handed to the kernel by a short spelling that names the same pl
 - The base for B is checked and spelled by its real path after realpath (B in macOS's `/tmp` is `/private/tmp/sockat-<uid>`)
 - B is used only when every directory from the root to the base is "owned by root or the caller, and either writable by neither group nor others, or sticky", and B itself is "a real directory, owned by the caller, writable by neither group nor others". When B with the default name fails this, `sockat-<uid>.<10 random characters>` is made. When the place is not writable, the next place is tried
 - A `$XDG_RUNTIME_DIR` or `$TMPDIR` that is empty or relative is not used as a base
+- "The caller" and the `<uid>` in the names are the effective uid
 - A process uses one B in bases 1 to 3 (one more only with `usable_cross_uid`). A B in the socket's directory is one per directory
-- When it is known beforehand that the spelling will not fit, no B is made
+- A B once held is used for the rest of the process. A base where B could not be made is tried again by the next call
+- When a B or D held has been removed (its fd's `st_nlink` is 0, or what its name names is not the fd's), the next call makes it again
+- When it is known beforehand that the spelling will not fit, no B is made. The next base is not tried either; the routes through B are passed over (the process's B does not change with the length of a path)
+- When D cannot be made, the routes that use D are passed over in that call. No other B is looked for
+- A B in the socket's directory is used only through the procB spelling
 - With [`Options::base`](#options), B is at that place
 
 B is spelled `/proc/<pid>/fd/<B's fd>` (procB, when `/proc` can be used) or by B's real path. A procB spelling can be followed only by processes of the same uid in the same PID namespace, and not after the process ends.
@@ -189,7 +194,7 @@ The `_ex` functions and resolve take `sockat::Options`. `Options::default()` is 
 
 | Field | Content |
 |---|---|
-| `usable_cross_uid: bool` | make a bind's spelling one another uid can follow too. Only a B in a base where every directory on the way and B itself give others x is used, and procB is not. When that cannot be met, the bind goes on to thread-cwd / at (`Dangling`). The connects do not look at it |
+| `usable_cross_uid: bool` | make a bind's spelling one another uid can follow too. Only a B in a base where every directory on the way and B itself give others x is used, and procB is not. When that cannot be met, the bind goes on to thread-cwd / at (`Dangling`). Whether a B lets another uid follow it is judged when the process takes that B, and kept (also for the B of `Options::base`). The connects do not look at it |
 | `base: Option<PathBuf>` | where B itself is (for example `/tmp/my-app-1000/sockat`). Made when missing (mode 0711). When the checks fail, `ENOENT` / `ENOTDIR` / `EPERM`, never falling back to the automatic bases. A relative path and a path that does not end with a name are `InvalidInput`, whatever the length of the socket path. A symlink at the base is `EPERM`. The check is made for a long path before any route is tried, and B is made only when a route that uses B is reached. Used by both the binds and the connects |
 
 ```rust
@@ -243,7 +248,8 @@ The names in `route`, `base` and `skipped`, and `reason`, are for diagnostics an
 - Both do nothing from the second call on. Dropping does nothing
 - `remove` does not close the listener. Closing it is up to the user
 - The promise covers replacements while the listener is open. Once it is closed, a file removed and made again cannot be told apart on file systems that reuse inode numbers at once (ext4, the BSDs' UFS / FFS). Call `remove` before closing the listener
-- For a relative path, `bind_ex` compares the cwd's `(st_dev, st_ino)` before looking the path up and after the bind and the realpath taken to remember the file; when they differ, it closes the listener and returns an `Other` error (the socket file stays)
+- When `bind_ex` cannot remember the socket file, it closes the listener, cleans up E, and returns an error without removing the socket file (removing a file it could not check might remove what replaced it)
+- For a relative path, `bind_ex` compares the cwd's `(st_dev, st_ino)` before looking the path up and after the bind and the realpath taken to remember the file; when they differ, it returns an `Other` error as when the file cannot be remembered
 - Someone who can write to the socket's directory and swaps the file between the check and the removal is not stopped (POSIX has no way to remove a file by its inode)
 
 ```rust
@@ -387,13 +393,14 @@ fn serve(path: &Path) -> io::Result<()> {
 | `Options::base` is neither a directory nor a symlink | `ENOTDIR` |
 | `Options::base` is a symlink (not a real directory) | `EPERM` |
 | `Options::base` fails the owner / permission checks (including, for a bind with `usable_cross_uid`, a directory on the way or the base itself not giving others x) | `EPERM` |
-| `Options::base` is relative or does not end with a name (whatever the length of the path) | `InvalidInput` |
+| `Options::base` is relative or does not end with a name (whatever the length of the path, and before a name in the abstract namespace is looked at) | `InvalidInput` |
+| `Options::base` passes its check, but B cannot be made | the error of making it |
 | A path too long for std that does not end with a name (`dir/`, `dir/.`, `..`, ...) | `InvalidInput` |
 | A path containing a NUL (at any length) | `InvalidInput` |
 | The cwd changed during relative, or during `bind_ex` of a relative path | `Other` |
 
 - The directory is looked up first, so `ENOENT` and `ENOTDIR` are settled before the length is judged, and no route is tried (`ExError`'s `route` is `None`, `skipped` empty)
-- `Options::base` is checked before the routes; when it fails, `route` is `None` and `skipped` empty
+- `Options::base` is checked before the routes; when it fails, `route` is `None` and `skipped` empty. When B cannot be made after the check passed, `route` is `None` and `skipped` holds the routes passed over until then
 - The `_ex` functions put the route that actually bound / connected and failed in `ExError::route`
 - On macOS a full backlog also returns `ECONNREFUSED`, so `ECONNREFUSED` alone does not tell a socket file nobody listens on (the same with std's connect)
 
