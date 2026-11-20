@@ -7,21 +7,23 @@
 //! * [`SockAddr`] — a `sockaddr_un` built by hand. On Apple targets it can also
 //!   hold the "widened" form whose `sun_path` runs past the 104 bytes of
 //!   `struct sockaddr_un`, up to `SOCK_MAXADDRLEN` (255) bytes in total.
-//! * [`socket`] / [`bind`] / [`connect`] / [`listen`] — a stream socket set up the
-//!   same way std sets up the sockets behind `UnixListener` / `UnixStream`
-//!   (optionally `O_NONBLOCK`, which std cannot connect with).
+//! * [`socket`] / [`bind`] / [`connect`] / [`listen`] — a stream or datagram
+//!   socket set up the same way std sets up the sockets behind `UnixListener`
+//!   / `UnixStream` / `UnixDatagram` (optionally `O_NONBLOCK`, which std
+//!   cannot connect with).
 //! * `op_in_dir_on_thread` — bind / connect relative to a directory fd on a
 //!   thread of its own whose working directory alone is moved there (Linux:
 //!   `unshare(CLONE_FS)` and `fchdir`; Apple: `pthread_fchdir_np`).
-//! * [`op_in_dir_forked`] — bind / connect relative to a directory fd in a forked
-//!   child that `fchdir`s; returns the child's pid.
 //! * `op_at` — `bindat(2)` / `connectat(2)` (FreeBSD).
-//! * [`mkdir_at`] / [`open_dir_at`] / [`id_at`] / [`symlink_at`] / [`unlink_at`]
-//!   — the `*at(2)` calls that make, hold and clean up sockat's own directory
-//!   and the symlinks in it, through directory fds rather than names.
+//! * [`mkdir_at`] / [`open_dir_at`] / [`id_at`] / [`stat_at`] / [`chmod_at`] /
+//!   [`symlink_at`] / [`unlink_at`] — the `*at(2)` calls that make, check and
+//!   clean up the directories B and D and the symlinks E, through directory
+//!   fds rather than names.
+//! * [`lock`] — `flock(2)` on D, which keeps it alive while the process
+//!   holds it.
 //! * `random_bytes` — the random part of the names sockat creates.
-//! * `effective_uid` — the owner sockat's own directory and a safe place for
-//!   the temporary symlink must have.
+//! * `effective_uid` / [`process_id`] — the owner B and D must have, and the
+//!   pid in a `/proc/<pid>/fd/<fd>` spelling.
 
 use std::ffi::{CString, OsStr};
 use std::io;
@@ -69,9 +71,6 @@ pub(crate) const WIDE_PATH_MAX: usize = libc::SOCK_MAXADDRLEN as usize - SUN_PAT
 const ADDR_STORAGE: usize = 256;
 
 /// A Unix domain socket address built for `bind(2)` / `connect(2)`.
-///
-/// It is plain bytes so the forked child of [`op_in_dir_forked`] can pass it to
-/// the kernel without touching the allocator.
 #[repr(C, align(8))]
 pub(crate) struct SockAddr {
     storage: [u8; ADDR_STORAGE],
@@ -168,20 +167,34 @@ fn cvt(rc: libc::c_int) -> io::Result<libc::c_int> {
     }
 }
 
-/// A new `AF_UNIX` / `SOCK_STREAM` socket, set up like the ones std creates:
+/// The type of a socket: `SOCK_STREAM` or `SOCK_DGRAM`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SockType {
+    /// `SOCK_STREAM` (std's `UnixListener` / `UnixStream`).
+    Stream,
+    /// `SOCK_DGRAM` (std's `UnixDatagram`).
+    Datagram,
+}
+
+impl SockType {
+    fn raw(self) -> libc::c_int {
+        match self {
+            SockType::Stream => libc::SOCK_STREAM,
+            SockType::Datagram => libc::SOCK_DGRAM,
+        }
+    }
+}
+
+/// A new `AF_UNIX` socket of `ty`, set up like the ones std creates:
 /// close-on-exec everywhere, and `SO_NOSIGPIPE` where std sets it (see
 /// [`no_sigpipe`]). `nonblocking` makes it `O_NONBLOCK` as well.
-pub(crate) fn socket(nonblocking: bool) -> io::Result<OwnedFd> {
+pub(crate) fn socket(ty: SockType, nonblocking: bool) -> io::Result<OwnedFd> {
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
     {
         let nonblock = if nonblocking { libc::SOCK_NONBLOCK } else { 0 };
         // SAFETY: plain syscall; the returned fd is owned by the OwnedFd below.
         let fd = cvt(unsafe {
-            libc::socket(
-                libc::AF_UNIX,
-                libc::SOCK_STREAM | libc::SOCK_CLOEXEC | nonblock,
-                0,
-            )
+            libc::socket(libc::AF_UNIX, ty.raw() | libc::SOCK_CLOEXEC | nonblock, 0)
         })?;
         // SAFETY: `fd` is a fresh fd nobody else owns.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
@@ -191,7 +204,7 @@ pub(crate) fn socket(nonblocking: bool) -> io::Result<OwnedFd> {
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
     {
         // SAFETY: plain syscall; the returned fd is owned by the OwnedFd below.
-        let fd = cvt(unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) })?;
+        let fd = cvt(unsafe { libc::socket(libc::AF_UNIX, ty.raw(), 0) })?;
         // SAFETY: `fd` is a fresh fd nobody else owns.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         // SAFETY: fcntl on an fd we own.
@@ -282,122 +295,6 @@ pub(crate) fn op(op: Op, sock: BorrowedFd<'_>, addr: &SockAddr) -> io::Result<()
     match op {
         Op::Bind => bind(sock, addr),
         Op::Connect => connect(sock, addr),
-    }
-}
-
-/// Whether `sock` is bound to a pathname (`getsockname(2)` returns a non-empty
-/// `sun_path`).
-fn is_bound(sock: BorrowedFd<'_>) -> io::Result<bool> {
-    let mut storage = [0u8; ADDR_STORAGE];
-    let mut len = ADDR_STORAGE as libc::socklen_t;
-    // SAFETY: the kernel writes at most `len` bytes into `storage`.
-    cvt(unsafe { libc::getsockname(sock.as_raw_fd(), storage.as_mut_ptr().cast(), &mut len) })?;
-    Ok(len as usize > SUN_PATH_OFFSET && storage[SUN_PATH_OFFSET] != 0)
-}
-
-/// Whether `sock` is connected (`getpeername(2)` succeeds).
-fn is_connected(sock: BorrowedFd<'_>) -> io::Result<bool> {
-    let mut storage = [0u8; ADDR_STORAGE];
-    let mut len = ADDR_STORAGE as libc::socklen_t;
-    // SAFETY: the kernel writes at most `len` bytes into `storage`.
-    let rc = unsafe { libc::getpeername(sock.as_raw_fd(), storage.as_mut_ptr().cast(), &mut len) };
-    if rc == 0 {
-        return Ok(true);
-    }
-    let err = io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::ENOTCONN) {
-        Ok(false)
-    } else {
-        Err(err)
-    }
-}
-
-/// Bind or connect `sock` to `addr` resolved relative to the directory `dir`,
-/// by forking a child that `fchdir`s into `dir` and does the call there.
-///
-/// After `fork(2)` the parent's and the child's `sock` refer to the same open
-/// file description, so the child's `bind(2)` / `connect(2)` takes effect on
-/// the parent's socket; nothing has to be passed back but the result. Only the
-/// child changes its working directory, so no thread of the caller ever sees a
-/// different cwd.
-///
-/// The child runs nothing but `fchdir(2)`, `bind(2)` / `connect(2)`, a read of
-/// `errno`, and `_exit(2)`: all async-signal-safe, no allocation, no locks, no
-/// Rust destructors. `addr` is built by the parent before the fork. This keeps
-/// the call within what POSIX allows after `fork(2)` in a multi-threaded
-/// process. The child reports `0` for success or the `errno` (clamped to
-/// 1..=255) as its exit status.
-///
-/// The parent waits for that pid only (it never reaps other children). If the
-/// status cannot be collected because something else reaped the child first
-/// (`SIGCHLD` set to `SIG_IGN`, or a `waitpid(-1)` elsewhere in the process;
-/// `waitpid` then fails with `ECHILD`), the outcome is read off the socket
-/// itself: bound / connected means success.
-///
-/// On success it returns the child's pid: the process that made the call, and
-/// so the one a server's peer-credential query names for a connect (Linux's
-/// `SO_PEERCRED` for good, macOS's `LOCAL_PEERPID` until this process sends).
-/// The child has exited by then (or was reaped elsewhere); the pid is a record
-/// of who connected, not a process to signal.
-pub(crate) fn op_in_dir_forked(
-    op: Op,
-    sock: BorrowedFd<'_>,
-    dir: BorrowedFd<'_>,
-    addr: &SockAddr,
-) -> io::Result<libc::pid_t> {
-    let sock_raw = sock.as_raw_fd();
-    let dir_raw = dir.as_raw_fd();
-    let addr_ptr = addr.as_ptr();
-    let addr_len = addr.len;
-    // SAFETY: fork(2) itself can always be called. The child below only makes
-    // async-signal-safe calls and `_exit`s, so it never touches a lock or the
-    // allocator state the parent's other threads held at the moment of the fork.
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if pid == 0 {
-        // Child.
-        // SAFETY: fchdir / bind / connect / _exit are async-signal-safe; the fd
-        // numbers and the address bytes were prepared by the parent before the
-        // fork and are only read here. `last_os_error` only reads errno (no
-        // allocation: the Os variant of io::Error is a plain integer).
-        unsafe {
-            if libc::fchdir(dir_raw) != 0 {
-                libc::_exit(errno_status());
-            }
-            let rc = match op {
-                Op::Bind => libc::bind(sock_raw, addr_ptr, addr_len),
-                Op::Connect => libc::connect(sock_raw, addr_ptr, addr_len),
-            };
-            if rc != 0 {
-                libc::_exit(errno_status());
-            }
-            libc::_exit(0);
-        }
-    }
-    let mut status: libc::c_int = 0;
-    loop {
-        // SAFETY: waits for the child we forked; `status` is a local.
-        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if r == pid {
-            break;
-        }
-        let err = io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(libc::EINTR) => continue,
-            Some(libc::ECHILD) => return outcome_from_socket(op, sock).map(|()| pid),
-            _ => return Err(err),
-        }
-    }
-    if !libc::WIFEXITED(status) {
-        return Err(io::Error::other(
-            "the child process that binds / connects the socket did not exit normally",
-        ));
-    }
-    match libc::WEXITSTATUS(status) {
-        0 => Ok(pid),
-        code => Err(io::Error::from_raw_os_error(code)),
     }
 }
 
@@ -610,29 +507,6 @@ pub(crate) fn unshare_fs() -> io::Result<()> {
     cvt(unsafe { libc::unshare(libc::CLONE_FS) }).map(drop)
 }
 
-fn errno_status() -> libc::c_int {
-    io::Error::last_os_error()
-        .raw_os_error()
-        .unwrap_or(255)
-        .clamp(1, 255)
-}
-
-fn outcome_from_socket(op: Op, sock: BorrowedFd<'_>) -> io::Result<()> {
-    let done = match op {
-        Op::Bind => is_bound(sock)?,
-        Op::Connect => is_connected(sock)?,
-    };
-    if done {
-        Ok(())
-    } else {
-        Err(io::Error::other(
-            "the child process that binds / connects the socket was reaped elsewhere \
-             (SIGCHLD ignored, or waitpid(-1) in another thread) and the socket is not \
-             bound / connected",
-        ))
-    }
-}
-
 /// `bindat(2)` / `connectat(2)` with `addr` resolved relative to `dir`
 /// (FreeBSD 10+).
 #[cfg(target_os = "freebsd")]
@@ -732,6 +606,8 @@ pub(crate) fn id_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<(u64, u64)>
 pub(crate) struct StatAt {
     /// Whether it is a directory (`S_ISDIR`).
     pub(crate) is_dir: bool,
+    /// Whether it is a symlink (`S_ISLNK`).
+    pub(crate) is_symlink: bool,
     /// The permission bits and the set-id / sticky bits (`st_mode & 0o7777`).
     pub(crate) mode: u32,
     /// The owner (`st_uid`).
@@ -761,8 +637,11 @@ pub(crate) fn stat_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<StatAt> {
     let dir_type = libc::S_IFDIR as u32;
     #[allow(clippy::unnecessary_cast)]
     let type_mask = libc::S_IFMT as u32;
+    #[allow(clippy::unnecessary_cast)]
+    let link_type = libc::S_IFLNK as u32;
     Ok(StatAt {
         is_dir: mode & type_mask == dir_type,
+        is_symlink: mode & type_mask == link_type,
         mode: mode & 0o7777,
         uid: st.st_uid,
     })
@@ -793,10 +672,64 @@ pub(crate) fn unlink_at(dir: BorrowedFd<'_>, name: &OsStr, remove_dir: bool) -> 
     cvt(unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), flags) }).map(drop)
 }
 
+/// `fchmodat(2)` without flags: set the mode of `name` inside the directory
+/// `dir` to `mode` (a symlink at `name` is followed: the callers use it only
+/// on an entry they made a moment ago in a directory nobody else can change
+/// entries of, after checking it by an fd opened `O_NOFOLLOW`).
+///
+/// Design rationale: by name rather than `fchmod(2)` on the fd, because on
+/// Linux the fd is `O_PATH` (which `fchmod` refuses with `EBADF`), and an
+/// `O_RDONLY` fd needs the owner's read bit, which a umask may have taken.
+pub(crate) fn chmod_at(dir: BorrowedFd<'_>, name: &OsStr, mode: u32) -> io::Result<()> {
+    let name = c_name(name)?;
+    // SAFETY: `name` is NUL-terminated and lives for the call; `dir` is a
+    // borrowed, live fd.
+    cvt(unsafe { libc::fchmodat(dir.as_raw_fd(), name.as_ptr(), mode as libc::mode_t, 0) })
+        .map(drop)
+}
+
+/// How [`lock`] locks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lock {
+    /// `LOCK_SH | LOCK_NB`: the lock a live process holds on its D.
+    Shared,
+    /// `LOCK_EX | LOCK_NB`: taken by `sweep()` only when no process holds D.
+    Exclusive,
+}
+
+/// `flock(2)` on `fd` without waiting: `Ok(true)` when the lock was taken,
+/// `Ok(false)` when another open file description holds a conflicting one
+/// (`EWOULDBLOCK`). The lock lasts as long as the open file description.
+pub(crate) fn lock(fd: BorrowedFd<'_>, how: Lock) -> io::Result<bool> {
+    let op = match how {
+        Lock::Shared => libc::LOCK_SH,
+        Lock::Exclusive => libc::LOCK_EX,
+    } | libc::LOCK_NB;
+    loop {
+        // SAFETY: plain syscall on a borrowed, live fd.
+        if unsafe { libc::flock(fd.as_raw_fd(), op) } == 0 {
+            return Ok(true);
+        }
+        let e = io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EWOULDBLOCK) => return Ok(false),
+            _ => return Err(e),
+        }
+    }
+}
+
 /// The effective uid of this process (`geteuid(2)`, which cannot fail).
 pub(crate) fn effective_uid() -> libc::uid_t {
     // SAFETY: plain syscall without arguments; it always succeeds.
     unsafe { libc::geteuid() }
+}
+
+/// The pid of this process (`getpid(2)`, which cannot fail), read at each
+/// call (a forked child has its own).
+pub(crate) fn process_id() -> libc::pid_t {
+    // SAFETY: plain syscall without arguments; it always succeeds.
+    unsafe { libc::getpid() }
 }
 
 /// Fill `buf` with random bytes from the system's secure generator:
@@ -866,25 +799,6 @@ pub(crate) fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
     std::fs::File::open("/dev/urandom")?.read_exact(buf)
 }
 
-/// `LOCAL_PEERPID` of a connected socket (Apple). Test-only: used to record
-/// which process the server sees as the peer.
-#[cfg(all(test, target_vendor = "apple"))]
-pub(crate) fn local_peer_pid(sock: BorrowedFd<'_>) -> io::Result<libc::pid_t> {
-    let mut pid: libc::pid_t = 0;
-    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    // SAFETY: getsockopt writes at most `len` bytes into `pid`.
-    cvt(unsafe {
-        libc::getsockopt(
-            sock.as_raw_fd(),
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERPID,
-            (&raw mut pid).cast(),
-            &mut len,
-        )
-    })?;
-    Ok(pid)
-}
-
 /// The length `getsockname(2)` reports for `sock`'s address, asked with room
 /// for the widest address any target here builds ([`ADDR_STORAGE`] bytes).
 /// Test-only: checks whether a bound address fits a `sockaddr_un` (Apple).
@@ -897,25 +811,6 @@ pub(crate) fn local_address_len(sock: BorrowedFd<'_>) -> io::Result<usize> {
     Ok(len as usize)
 }
 
-/// `SO_PEERCRED` pid of a connected socket (Linux). Test-only.
-#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
-pub(crate) fn peer_cred_pid(sock: BorrowedFd<'_>) -> io::Result<libc::pid_t> {
-    // SAFETY: `ucred` is plain old data; zeroed is a valid value.
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: getsockopt writes at most `len` bytes into `cred`.
-    cvt(unsafe {
-        libc::getsockopt(
-            sock.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&raw mut cred).cast(),
-            &mut len,
-        )
-    })?;
-    Ok(cred.pid)
-}
-
 /// Set the file mode creation mask of the process (`umask(2)`, which cannot
 /// fail). Test-only, and only for a child process of the test binary: the mask
 /// is process-wide.
@@ -925,29 +820,6 @@ pub(crate) fn set_umask(mask: u32) {
     unsafe {
         libc::umask(mask as libc::mode_t);
     }
-}
-
-/// Set `SIGCHLD` to `SIG_IGN`, which makes the kernel reap children on its own
-/// (`waitpid` then fails with `ECHILD`). Test-only, and only for a child
-/// process of the test binary: the disposition is process-wide.
-#[cfg(test)]
-pub(crate) fn ignore_sigchld() {
-    // SAFETY: installs SIG_IGN, no handler code runs.
-    unsafe {
-        libc::signal(libc::SIGCHLD, libc::SIG_IGN);
-    }
-}
-
-/// A duplicate of `fd` numbered `min` or more, close-on-exec
-/// (`fcntl(F_DUPFD_CLOEXEC)`). Test-only: gives a directory fd more digits
-/// than the route order estimated for it (Linux).
-#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
-pub(crate) fn dup_at_least(fd: BorrowedFd<'_>, min: libc::c_int) -> io::Result<OwnedFd> {
-    // SAFETY: fcntl F_DUPFD_CLOEXEC on a borrowed fd; on success the returned
-    // fd is a new one that nothing else owns.
-    let new = cvt(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, min) })?;
-    // SAFETY: `new` is a freshly duplicated fd owned by no one else.
-    Ok(unsafe { OwnedFd::from_raw_fd(new) })
 }
 
 /// Whether `fd` is `O_NONBLOCK`. Test-only (the connect option tests run on

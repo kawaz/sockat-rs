@@ -1,15 +1,15 @@
 //! The conformance CLI that the hub's language-independent conformance test
-//! runs (the hub's `docs/design/conformance.md`, DR-0030). Not part of sockat.
+//! runs (the hub's `docs/design/conformance.md`). Not part of sockat.
 //!
 //! Reads one JSON object from stdin,
-//! `{ "op": "bind" | "connect", "path": "..", "last_resort": true | false }`
-//! (`last_resort` may be left out, meaning false), makes one bind / connect by
-//! `sockat::bind_ex` / `sockat::connect_ex` with `LastResort::Allow` when
-//! `last_resort` is true and `LastResort::Avoid` (the route order of
-//! `sockat::bind` / `sockat::connect`) otherwise, and writes one JSON object to stdout:
-//! `{ "ok", "error", "route", "losses", "skipped" }`. A listener is closed
-//! (the socket file stays); a connected stream sends one byte `x` and is
-//! closed.
+//! `{ "op": "bind" | "connect", "path": "..", "usable_cross_uid": bool, "base": ".." | null }`
+//! (`usable_cross_uid` and `base` may be left out: false and none), makes one
+//! bind / connect by `sockat::bind_ex` / `sockat::connect_ex` with those
+//! `Options`, and writes one JSON object to stdout:
+//! `{ "ok", "error", "route", "base", "spelling", "skipped" }`. Neither
+//! `remove()` nor `cleanup()` is called (the script looks at what is left). A
+//! bound listener is not closed before the process ends; a connected stream
+//! sends one byte `x` and is closed.
 //!
 //! Run it by `just --justfile <this repository>/justfile conformance` from any
 //! directory: it builds this (`just conformance-build`), then runs it in the
@@ -26,22 +26,19 @@ fn main() -> std::process::ExitCode {
 
 mod cli {
     use std::io::{self, Read, Write};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::ExitCode;
 
-    use sockat::LastResort;
+    use serde_json::{Value, json};
+    use sockat::{Options, Spelling, Until};
 
-    /// What one call came to, in the order of the output's fields.
-    struct Report {
-        ok: bool,
-        error: Option<String>,
-        route: Option<&'static str>,
-        losses: Vec<&'static str>,
-        skipped: Vec<&'static str>,
+    enum Op {
+        Bind,
+        Connect,
     }
 
     pub(crate) fn main() -> ExitCode {
-        let (op, path, last_resort) = match read_input() {
+        let (op, path, options) = match read_input() {
             Ok(input) => input,
             Err(message) => {
                 eprintln!("conformance: {message}");
@@ -49,81 +46,122 @@ mod cli {
             }
         };
         let path = Path::new(&path);
-        let report = match op {
-            Op::Bind => match sockat::bind_ex(path, last_resort) {
-                Ok(l) => {
-                    drop(l.listener);
-                    Report {
-                        ok: true,
-                        error: None,
-                        route: Some(l.route),
-                        losses: l.losses.iter().map(|l| l.as_str()).collect(),
-                        skipped: l.skipped.iter().map(|s| s.name).collect(),
-                    }
+        let out = match op {
+            Op::Bind => match sockat::bind_ex(path, options) {
+                Ok(b) => {
+                    let out = json!({
+                        "ok": true,
+                        "error": null,
+                        "route": b.route,
+                        "base": b.base,
+                        "spelling": spelling(b.spelling),
+                        "skipped": names(&b.skipped),
+                    });
+                    // The listener stays open until the process ends (the
+                    // hub's conformance.md), and nothing is removed.
+                    std::mem::forget(b);
+                    out
                 }
                 Err(e) => failed(e),
             },
-            Op::Connect => match sockat::connect_ex(path, last_resort) {
+            Op::Connect => match sockat::connect_ex(path, options) {
                 Ok(mut c) => {
-                    if let Err(e) = c.stream.write_all(b"x") {
+                    if let Err(e) = c.socket.write_all(b"x") {
                         eprintln!("conformance: connected, but sending `x` failed: {e}");
                     }
-                    drop(c.stream);
-                    Report {
-                        ok: true,
-                        error: None,
-                        route: Some(c.route),
-                        losses: c.losses.iter().map(|l| l.as_str()).collect(),
-                        skipped: c.skipped.iter().map(|s| s.name).collect(),
-                    }
+                    json!({
+                        "ok": true,
+                        "error": null,
+                        "route": c.route,
+                        "base": null,
+                        "spelling": null,
+                        "skipped": names(&c.skipped),
+                    })
                 }
                 Err(e) => failed(e),
             },
         };
-        println!("{}", to_json(&report));
+        println!("{out}");
         ExitCode::SUCCESS
     }
 
-    fn failed(e: sockat::ExError) -> Report {
-        Report {
-            ok: false,
-            error: Some(error_name(&e.error)),
-            route: e.route,
-            losses: Vec::new(),
-            skipped: e.skipped.iter().map(|s| s.name).collect(),
+    fn failed(e: sockat::ExError) -> Value {
+        json!({
+            "ok": false,
+            "error": error_name(&e.error),
+            "route": e.route,
+            "base": null,
+            "spelling": null,
+            "skipped": names(&e.skipped),
+        })
+    }
+
+    fn names(skipped: &[sockat::Skipped]) -> Vec<&'static str> {
+        skipped.iter().map(|s| s.name).collect()
+    }
+
+    /// The SPEC's `Spelling` as JSON: `kind` and, for `Linked`, its
+    /// attributes under their Rust names.
+    fn spelling(s: Spelling) -> Value {
+        match s {
+            Spelling::Original => json!({ "kind": "Original" }),
+            Spelling::CwdRelative => json!({ "kind": "CwdRelative" }),
+            Spelling::Linked {
+                removable,
+                until,
+                usable_cross_uid,
+                usable_with_private_tmp,
+            } => json!({
+                "kind": "Linked",
+                "removable": removable,
+                "until": match until {
+                    Until::Process => "Process",
+                    Until::Cleanup => "Cleanup",
+                },
+                "usable_cross_uid": usable_cross_uid,
+                "usable_with_private_tmp": usable_with_private_tmp,
+            }),
+            Spelling::Dangling => json!({ "kind": "Dangling" }),
+            _ => json!({ "kind": "Unknown" }),
         }
     }
 
-    enum Op {
-        Bind,
-        Connect,
-    }
-
-    /// `op`, `path` and `last_resort` (false when left out) of the JSON
-    /// object on stdin.
-    fn read_input() -> Result<(Op, String, LastResort), String> {
+    /// `op`, `path` and the `Options` (`usable_cross_uid`, `base`) of the
+    /// JSON object on stdin.
+    fn read_input() -> Result<(Op, String, Options), String> {
         let mut text = String::new();
         io::stdin()
             .read_to_string(&mut text)
             .map_err(|e| format!("reading stdin: {e}"))?;
-        let v: serde_json::Value =
+        let v: Value =
             serde_json::from_str(&text).map_err(|e| format!("stdin is not JSON: {e}"))?;
-        let op = match v.get("op").and_then(|o| o.as_str()) {
+        let op = match v.get("op").and_then(Value::as_str) {
             Some("bind") => Op::Bind,
             Some("connect") => Op::Connect,
             _ => return Err("`op` must be \"bind\" or \"connect\"".into()),
         };
         let path = v
             .get("path")
-            .and_then(|p| p.as_str())
+            .and_then(Value::as_str)
             .ok_or("`path` must be a string")?;
-        let last_resort = match v.get("last_resort") {
-            None => LastResort::Avoid,
-            Some(serde_json::Value::Bool(false)) => LastResort::Avoid,
-            Some(serde_json::Value::Bool(true)) => LastResort::Allow,
-            Some(_) => return Err("`last_resort` must be true or false".into()),
+        let usable_cross_uid = match v.get("usable_cross_uid") {
+            None => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err("`usable_cross_uid` must be true or false".into()),
         };
-        Ok((op, path.to_owned(), last_resort))
+        let base = match v.get("base") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(PathBuf::from(s)),
+            Some(_) => return Err("`base` must be a string or null".into()),
+        };
+        Ok((
+            op,
+            path.to_owned(),
+            Options {
+                usable_cross_uid,
+                base,
+            },
+        ))
     }
 
     /// The errno's name for an OS error, `invalid-argument` for sockat's
@@ -210,25 +248,4 @@ mod cli {
         (libc::EDQUOT, "EDQUOT"),
         (libc::ESTALE, "ESTALE"),
     ];
-
-    /// The output object, its fields in the order of the hub's
-    /// `conformance.md`.
-    fn to_json(r: &Report) -> String {
-        let s = |v: &str| serde_json::Value::from(v).to_string();
-        let opt = |v: Option<&str>| v.map_or_else(|| "null".to_owned(), s);
-        let list = |v: &[&str]| {
-            format!(
-                "[{}]",
-                v.iter().map(|x| s(x)).collect::<Vec<_>>().join(", ")
-            )
-        };
-        format!(
-            "{{ \"ok\": {}, \"error\": {}, \"route\": {}, \"losses\": {}, \"skipped\": {} }}",
-            r.ok,
-            opt(r.error.as_deref()),
-            opt(r.route),
-            list(&r.losses),
-            list(&r.skipped),
-        )
-    }
 }

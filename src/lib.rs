@@ -3,28 +3,22 @@
 //!
 //! `struct sockaddr_un` keeps the socket path in a fixed array: 104 bytes on
 //! macOS and the BSDs, 108 on Linux and illumos, the terminating NUL included.
-//! std's [`UnixListener::bind`] and [`UnixStream::connect`] refuse anything
-//! longer, although the file system has no such limit. Deep temporary
-//! directories (macOS's `$TMPDIR` alone is about 50 bytes; test harnesses and
-//! sandboxes nest further) run into it easily. The limit is on the argument
-//! passed to `bind(2)` / `connect(2)`, so sockat hands the kernel a short
-//! spelling that names the same place.
+//! std's [`UnixListener::bind`], [`UnixStream::connect`] and
+//! [`UnixDatagram::bind`](std::os::unix::net::UnixDatagram::bind) refuse anything longer, although the file system has
+//! no such limit. Deep temporary directories (macOS's `$TMPDIR` alone is about
+//! 50 bytes; test harnesses and sandboxes nest further) run into it easily.
+//! The limit is on the argument of `bind(2)` / `connect(2)`, so sockat hands
+//! the kernel a short spelling that names the same place.
 //!
 //! Use [`bind`] and [`connect`] where you would use std's, and
-//! [`connect_nonblocking`] in async code. They take a path of any length and
-//! return std's own types. [`bind_ex`], [`connect_ex`] and
-//! [`connect_nonblocking_ex`] do the same and also say how the path was
-//! reached and what was given up for it, and [`bind_ex`] returns a
-//! [`SocketFile`] that removes the socket file later. A path that std accepts is handed to std
-//! unchanged, so it behaves exactly as with std:
+//! [`connect_nonblocking`] in async code; [`datagram`] has the same for
+//! `SOCK_DGRAM`. They take a path of any length and return std's own types. A
+//! path std accepts goes to std unchanged, so it behaves exactly as with std:
 //!
 //! | Platform | `sun_path` (NUL included) | Handed to std |
 //! |---|---|---|
 //! | Linux, Android, illumos | 108 | up to 107 bytes |
 //! | macOS, iOS, FreeBSD, NetBSD, OpenBSD | 104 | up to 103 bytes |
-//!
-//! For a longer path the socket file is still created at (or looked up at) the
-//! path given.
 //!
 //! ```no_run
 //! use std::io::{Read, Write};
@@ -39,442 +33,106 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 //!
+//! The behaviour is the language-independent
+//! [specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md);
+//! the details, with examples, are in the
+//! [manual](https://github.com/kawaz/sockat-rs/blob/main/docs/MANUAL.md).
+//!
 //! # How a long path is reached
 //!
-//! A path longer than std accepts is bound through a symlink to the socket
-//! file where a bind follows one (**symlink-file**; macOS, NetBSD), else through
-//! a directory of sockat's own, D (**the routes through D**), and only when
-//! that cannot be used, through the socket's directory itself (**the form
-//! without D**). A connect tries **the connect routes** that need neither
-//! writing (making D, R or a symlink) nor a thread first, then the routes
-//! through D and symlink-file. The routes carry the names of the
-//! [specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md):
+//! A bind's spelling is kept by the kernel for the life of the socket and
+//! reported by `getsockname` / `getpeername`; libraries remove the socket file
+//! by it and a datagram peer replies to it. So a long path is bound by a short
+//! spelling that keeps naming the same place: through a symlink E in a
+//! directory D of this process, in a directory B of this user.
 //!
-//! | Platform | [`bind`] | [`connect`], [`connect_nonblocking`] |
+//! * **B** is `/tmp/sockat-<uid>` (else `$XDG_RUNTIME_DIR/sockat`, else
+//!   `$TMPDIR/sockat-<uid>`, else `.sockat.<random>` in the socket's
+//!   directory), mode 0711, checked to be this user's and to be reached only
+//!   through directories no other user can change. It is reused across
+//!   processes and never removed by sockat. [`Options::base`] puts it where
+//!   the application says.
+//! * **D** is a directory with a random name in B, one per process and B, on
+//!   which the process holds a shared `flock(2)` for its life.
+//! * **E** is a symlink in D: to the socket's directory (**link-dir**,
+//!   spelling `B/D/E/<file name>`) or to the socket file (**link-file**,
+//!   `B/D/E`, where a bind follows a symlink: macOS, NetBSD).
+//!
+//! B is spelled `/proc/<pid>/fd/<B's fd>` where `/proc` can be used, else by
+//! its real path. When no such spelling fits, a bind goes through
+//! **thread-cwd** (Linux, Apple: a thread of its own moves its own working
+//! directory into D) or **at** (FreeBSD: `bindat(2)`) with a random E that is
+//! removed right away (the spelling then names nothing).
+//!
+//! A connect's spelling is kept nowhere, so a connect leaves nothing: it
+//! tries the routes that need neither writing nor a thread first
+//! (**proc-direct** `/proc/self/fd/<dirfd>/<file name>` on Linux,
+//! **relative** to the cwd, **widened** sockaddr up to 253 bytes on Apple,
+//! **at-direct** `connectat(2)` on FreeBSD), then **thread-cwd-direct**
+//! (Linux, Apple), then **link-file** through an E made directly in B and
+//! removed right after the connect.
+//!
+//! | Platform | bind | connect |
 //! |---|---|---|
-//! | Linux, Android | thread-cwd, proc, fork-cwd | proc-direct, thread-cwd, proc, proc-held, symlink-file |
-//! | Linux, Android without `/proc` | thread-cwd, fork-cwd | relative, thread-cwd, symlink-file |
-//! | macOS, iOS (Apple) | symlink-file, thread-cwd, fork-cwd | relative, widened, thread-cwd, symlink-file |
-//! | FreeBSD | at | at-direct, at |
-//! | NetBSD, other Unix | symlink-file, fork-cwd | relative, symlink-file |
-//! | OpenBSD, illumos | fork-cwd | relative, symlink-file |
+//! | Linux, Android | link-dir, thread-cwd | proc-direct (relative without `/proc`), thread-cwd-direct, link-file |
+//! | macOS, iOS (Apple) | link-dir, link-file, thread-cwd | relative, widened, thread-cwd-direct, link-file |
+//! | FreeBSD | link-dir, at | at-direct, link-file |
+//! | NetBSD | link-dir, link-file | relative, link-file |
+//! | OpenBSD, illumos | link-dir | relative, link-file |
 //!
-//! [`bind_ex`], [`connect_ex`] and [`connect_nonblocking_ex`] try the same,
-//! and with [`LastResort::Allow`] a last resort after it: symlink-dir for
-//! [`bind_ex`], fork-cwd-direct for the connects. The first route that can be
-//! used makes the call; a real failure there (`ENOENT`, `EADDRINUSE`,
-//! `ECONNREFUSED`, ...) is the result, not a reason to try the next.
+//! The first route that can be used makes the call; a real failure there
+//! (`ENOENT`, `EADDRINUSE`, `ECONNREFUSED`, ...) is the result, not a reason
+//! to try the next. No route forks, and none changes the working directory of
+//! the process or of the calling thread.
 //!
-//! **symlink-file** (a bind, not Linux, FreeBSD, OpenBSD or illumos; a
-//! connect, not FreeBSD): a short
-//! symlink `sockat.XXXXXXXXXX` to the socket file under `TMPDIR` or failing
-//! that `/tmp`, removed right after the call, made only in a place where no
-//! other user can replace it (a sticky directory owned by root or the calling
-//! user, as `/tmp` is, or a directory of the calling user's that group and
-//! others cannot write to). The spelling holds no file name, so it reaches any
-//! file name length. A bind through it reaches the path only where the kernel
-//! follows the symlink (macOS, NetBSD; Linux, FreeBSD, OpenBSD and illumos do
-//! not, and the route is not tried there; the other targets are told at run
-//! time): when such a bind fails with
-//! something at the path, that is the failure (`EADDRINUSE`, ...); with
-//! nothing there, the kernel is taken not to have followed the symlink, and the
-//! next route is tried.
+//! # What a bind leaves, and what can be cleaned up
 //!
-//! **The routes through D.** sockat makes a directory D of mode 0700 (named
-//! `sockat.XXXXXXXXXX`, 10 random letters and digits) and holds it by an fd,
-//! checked to be the directory it made (owned by the calling user, no
-//! permission for group and others). In D it makes a symlink R with a random
-//! name to the real path of the socket's directory, and makes the call with
-//! `R/<file name>` relative to D's fd, by the first of these routes that can
-//! be used:
+//! [`bind`] keeps its E until the process ends; dead processes' D (and their
+//! E) are removed by the system's cleanup of temporary directories, or by
+//! [`sweep`]. [`bind_ex`] returns a [`SocketFile`]: [`SocketFile::remove`]
+//! removes the socket file (only while it is still the one bound) and the E,
+//! [`SocketFile::cleanup`] the E alone. [`resolve_for_bind`] and
+//! [`resolve_for_connect`] return a spelling to hand to std yourself, with
+//! the same clean-up. A connect never leaves anything.
 //!
-//! * **thread-cwd** (Linux, Apple): a thread started for the call alone moves
-//!   its own working directory, and no other thread's, into D
-//!   (`unshare(CLONE_FS)` then `fchdir` on Linux, `pthread_fchdir_np` on
-//!   Apple). Not used on Linux under a seccomp filter (docker's default
-//!   installs one; a filter may kill the process for `unshare`, so it is not
-//!   called then) or where `pthread_fchdir_np` is missing
-//! * **proc** (Linux): `/proc/self/fd/<D's fd>/R/<file name>`, for a file
-//!   name of up to about 79 bytes
-//! * **at** (FreeBSD): `bindat(2)` / `connectat(2)` on D's fd
-//! * **fork-cwd** ([`bind`] only): a forked child that `fchdir`s into D binds
-//!   and exits; the listen is made by the calling process, so a client sees
-//!   the calling process as the server, as with any other route
-//!
-//! D and R are removed when the call returns, so the spelling the kernel keeps
-//! for a bound socket names nothing afterwards, wherever it is resolved. D is
-//! made at most once in a call and shared by every route that uses it; a
-//! connect makes it only when no route before those reached the socket. D goes
-//! in `TMPDIR` (or `/tmp` when it is unset), then `/tmp`, then the socket's
-//! directory (named `.sockat.XXXXXXXXXX` there). None of them needs to be
-//! safe or short: D is held by its fd. A D that cannot be opened right after
-//! it is made (a umask took the owner's bits) is removed again by its name,
-//! and the next place is tried.
-//!
-//! **The form without D.** When D can be made in no place, a bind makes R
-//! (`.sockat.XXXXXXXXXX`) beside the socket instead and tries the same routes
-//! (thread-cwd-sockdir or at-sockdir, proc-sockdir, fork-cwd-sockdir) with
-//! `.sockat.XXXXXXXXXX/<file name>` relative to the socket's directory.
-//!
-//! `R/<file name>` takes 11 bytes, so the routes through D reach a file name
-//! of up to 96 bytes (Linux, illumos) or 92 (Apple, the BSDs); 88 / 84 without
-//! D (about 72 by proc-sockdir). On macOS a bind reaches any file name length
-//! through symlink-file.
-//!
-//! **The connect routes** (connects only). A connected socket is not bound,
-//! so its spelling is kept nowhere and needs no random part. The first four
-//! need neither writing nor a thread and come first in a connect's order:
-//!
-//! * **proc-direct** (Linux with `/proc`):
-//!   `/proc/self/fd/<dirfd>/<file name>`, for a file name of up to about 90
-//!   bytes
-//! * **relative**: the path spelled relative to the working directory, when
-//!   std accepts that. Only the path string is rewritten; the cwd is never
-//!   changed
-//! * **widened** (Apple): a `sockaddr_un` carrying up to 253 bytes of path,
-//!   which XNU accepts: the path itself, or failing that the relative
-//!   spelling. A bind never uses it: the address of a socket bound so does not
-//!   fit `sun_path` and breaks its readers (CPython, Go's `net.FileConn`)
-//! * **at-direct** (FreeBSD): `connectat(2)` on the socket's directory fd with
-//!   the file name (up to 103 bytes)
-//! * **proc-held** (Linux with `/proc`): a symlink `s` to the socket file in
-//!   D (the one a route before it made, or made as above), and the connect by
-//!   `/proc/self/fd/<D's fd>/s`, whatever the directory depth and the file
-//!   name length
-//! * **symlink-file**, as above, last. Through `/tmp`, a connect is reached
-//!   whatever the directory depth and the file name length
-//!
-//! None of these changes the working directory of the calling process or of
-//! the calling thread, and all of them can be used from multi-threaded
-//! programs. Windows is not supported (the crate is Unix-only). The details,
-//! and where each function stops reaching a path, are in the
-//! [manual](https://github.com/kawaz/sockat-rs/blob/main/docs/MANUAL.md); the
-//! design and the reasons in
-//! [DR-0027](https://github.com/kawaz/sockat-rs/blob/main/docs/decisions/DR-0027-own-directory-and-fallback-routes.md)
-//! (in Japanese).
-//!
-//! # The last resort: `LastResort::Allow`
-//!
-//! [`connect`] and [`connect_nonblocking`] never fork: a connect is not
-//! expected to, and after a connect through a fork the peer pid the server
-//! sees is that of a process that has already exited. Where only that would
-//! reach the path, they fail with `ENAMETOOLONG`, as any connect to a path
-//! too long for `sun_path` does. That happens only when the routes through D
-//! cannot be used for a connect (no thread cwd and no `/proc`: NetBSD,
-//! OpenBSD, illumos, Linux under a seccomp filter without `/proc`, an Apple
-//! OS without `pthread_fchdir_np`) and none of the other connect routes
-//! reaches the path (no safe place for the symlink, and the path fits neither
-//! a relative spelling nor, on Apple, the widened sockaddr). [`bind`] fails with
-//! `ENAMETOOLONG` where no route can be used.
-//!
-//! For that rare environment, when the path is wanted at the cost of
-//! something, [`bind_ex`], [`connect_ex`] and [`connect_nonblocking_ex`] take
-//! [`LastResort::Allow`]: [`bind_ex`] binds last through a symlink to the
-//! socket's directory in a place (symlink-dir; in a shared place such as
-//! `/tmp`, another user can make the reported address again), the connects
-//! connect last from a forked child (fork-cwd-direct). What was given up is in
-//! `losses` ([`Loss`]), with the name of the route taken and the routes passed
-//! over ([`ExListener`], [`ExStream`]), and a failure is an [`ExError`] that
-//! converts back into the `io::Error`. [`LastResort::Avoid`] tries only what
-//! the plain function tries. [`bind`] (and [`bind_ex`] either way) forks as
-//! fork-cwd when nothing before it can be used; the child only binds and the
-//! listen is done by the calling process, so the listener is this process's
-//! like any other, and nothing a client can see differs.
-//!
-//! # What differs from std for a long path
-//!
-//! * **The address the kernel reports is not the path.** `local_addr()` of the
-//!   listener and of accepted streams, and `peer_addr()` of a connected client,
-//!   report the spelling handed to the kernel when the listener was bound
-//!   (whichever route the client took): `R/<file name>`,
-//!   `/proc/self/fd/<n>/R/<file name>` or `.sockat.XXXXXXXXXX/<file name>`,
-//!   `<place>/sockat.XXXXXXXXXX` after symlink-file
-//!   (`<place>/sockat.XXXXXXXXXX/<file name>` after symlink-dir). R
-//!   is gone by then, so removing, `stat`ing or `chmod`ing by the reported
-//!   address finds nothing rather than another file; it never names the
-//!   socket either. Keep the path you passed and use that (for example to
-//!   remove the socket file with [`std::fs::remove_file`], which has no length
-//!   limit, or with [`bind_ex`]). The same address shows in `Debug` output and
-//!   in what frameworks log or hand out as the peer address.
-//! * **A bind reaches a shorter file name than a connect** where it does not
-//!   go through symlink-file: 96 bytes on Linux and illumos, 92 on Apple and
-//!   the BSDs (`R/` takes 11 of `sun_path`), where a connect reaches any. On
-//!   macOS a bind reaches any too.
-//! * **A path that does not end with a file name is `InvalidInput`.** A path
-//!   longer than std accepts ending in `/`, `/.` or `/..` (or being `..`)
-//!   cannot be split into a directory and a file name and is refused before
-//!   anything is created; a shorter one goes to std and gets the kernel's error.
-//! * **The peer pid the server sees can be that of an exited process**
-//!   ([`connect_ex`] and [`connect_nonblocking_ex`] with
-//!   [`LastResort::Allow`], when they take fork-cwd-direct): the forked child
-//!   that made the connect and exited. The socket itself belongs to the caller and works as usual. The uid and gid the
-//!   server sees are the caller's. On macOS (`LOCAL_PEERPID`) the server sees
-//!   the caller's pid once the caller sends on the socket; on Linux
-//!   (`SO_PEERCRED`) it stays the exited child's. The number of an exited pid
-//!   may be reused by another process later. Nothing can be looked up from
-//!   that pid (the process, its parent): the process is gone.
-//! * **The fork routes have side effects no peer sees** ([`bind`],
-//!   [`bind_ex`], and the connects' last resort). As with any `fork(2)`, the
-//!   child has copies of all file descriptors until it exits a moment later, so a socket or pipe
-//!   another thread closes during that moment stays open until then (a peer
-//!   sees the EOF slightly later; a listener closed meanwhile can still accept
-//!   a connection into its backlog). The calling process also gets a
-//!   `SIGCHLD`, the `pthread_atfork` handlers run, monitoring tools see a
-//!   short-lived child, and a `waitpid(-1)` on another thread may reap the
-//!   child (sockat then reads the outcome off the socket).
-//! * **Permissions.** On macOS the socket's directory and D are opened
-//!   `O_SEARCH` and on Linux `O_PATH`, so a long path needs no more permission
-//!   than a plain bind / connect; on other Unix targets they are opened
-//!   `O_RDONLY` and need read permission as well.
-//! * **The directory is resolved slightly earlier than the call.** R points to
-//!   the real path of the socket's directory, taken when R is made, and the
-//!   proc-direct, relative, at-direct and fork-cwd-direct routes of a connect look
-//!   the directory up first. If a directory along the path is renamed or a symlink
-//!   along it is repointed in between, the socket goes to (or is looked up in)
-//!   the directory as it was when looked up, not as it is at the moment of the
-//!   call.
-//! * **relative is exposed to another thread's `chdir`.** sockat
-//!   itself never changes the cwd. The path is spelled relative to the cwd only
-//!   after checking that the spelling names the same directory, and the cwd is
-//!   checked again afterwards; if another thread changed it in between, the
-//!   result is discarded and an error is returned. Programs that change the
-//!   cwd while other threads connect are racing every relative path in the
-//!   process anyway; sockat does not make that safe, it only detects the
-//!   visible case.
-//! * **Something can be left behind** if the process dies in the middle of a
-//!   call: D (`sockat.XXXXXXXXXX`) or a temporary symlink under
-//!   `XDG_RUNTIME_DIR`, `TMPDIR` or `/tmp`, and D or R (`.sockat.XXXXXXXXXX`)
-//!   in the socket's directory.
-//!
-//! # Removing the socket file
-//!
-//! As with std, the socket file stays when the listener is closed. [`bind_ex`]
-//! binds as [`bind`] does and also returns a [`SocketFile`], which removes the
-//! socket file later ([`SocketFile::discard`]), only while it is still the one
-//! the bind made. Closing the listener stays with whoever has it (tokio, a
-//! server framework, ...). A replacement of the file between the check and
-//! the removal, by someone who can write to the directory, cannot be caught:
-//! POSIX has no way to remove a file by its inode.
-//!
-//! # What is lost
-//!
-//! What taking a route loses compared to std, by the names of the
-//! [specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-is-lost).
-//! The `_ex` functions return them as `losses` ([`Loss`]); [`bind`],
-//! [`connect`] and [`connect_nonblocking`] lose the same on the routes they
-//! take, without returning it.
-//! The [manual](https://github.com/kawaz/sockat-rs/blob/main/docs/MANUAL.md#what-is-lost)
-//! has what happens, what to watch out for and how to avoid each, with the
-//! code below.
-//!
-//! ## respelled
-//!
-//! A bind took a route other than standard: the address the kernel reports
-//! is not the path. Others may see that spelling and make it again, so do not
-//! remove or `stat` the file by it; keep the original path and use it, or
-//! use [`bind_ex`]'s [`SocketFile::discard`].
-//!
-//! ```
-//! use std::io;
-//! use std::path::Path;
-//!
-//! fn serve(path: &Path) -> io::Result<()> {
-//!     let bound = sockat::bind_ex(path, sockat::LastResort::Avoid)?;
-//!     // accept on bound.listener (it may go to tokio etc.)
-//!     let removed = bound.file.discard(); // removes the file only while it is still the one bound
-//!     drop(bound.listener);
-//!     removed
-//! }
-//!
-//! fn serve_and_remove(path: &Path) -> io::Result<()> {
-//!     let listener = sockat::bind(path)?;
-//!     // accept on listener
-//!     drop(listener);
-//!     std::fs::remove_file(path) // remove by the original path
-//! }
-//! # let dir = tempfile::tempdir()?;
-//! # let deep = dir.path().join("d".repeat(100));
-//! # std::fs::create_dir(&deep)?;
-//! # serve(&deep.join("a.sock"))?;
-//! # serve_and_remove(&deep.join("b.sock"))?;
-//! # assert_eq!(std::fs::read_dir(&deep)?.count(), 0);
-//! # Ok::<(), io::Error>(())
-//! ```
-//!
-//! ## cwd-relative
-//!
-//! A bind of a relative path went to std as it is: the spelling the kernel
-//! keeps is relative to the cwd, and removing or `stat`ing by it (or by the
-//! relative path) after the cwd changes hits another place. A hazard std has
-//! on its own, reported all the same. Make the path absolute before the bind,
-//! and remove by the absolute path or `discard()`.
-//!
-//! ```
-//! use std::io;
-//! use std::path::Path;
-//!
-//! fn serve(path: &Path) -> io::Result<()> {
-//!     let path = std::path::absolute(path)?; // make it absolute before the bind
-//!     let bound = sockat::bind_ex(&path, sockat::LastResort::Avoid)?;
-//!     // accept on bound.listener
-//!     let removed = bound.file.discard();
-//!     drop(bound.listener);
-//!     removed
-//! }
-//! # let dir = tempfile::tempdir()?;
-//! # serve(&dir.path().join("s.sock"))?;
-//! # assert_eq!(std::fs::read_dir(dir.path())?.count(), 0);
-//! # Ok::<(), io::Error>(())
-//! ```
-//!
-//! ## forked
-//!
-//! A forked child made the call (fork-cwd, fork-cwd-sockdir, fork-cwd-direct),
-//! with the side effects of a fork (see [What differs from std for a long
-//! path](#what-differs-from-std-for-a-long-path)). A `SIGCHLD` handler or a
-//! `waitpid(-1)` may reap the child or mistake the result. Do not use
-//! `waitpid(-1)` in other threads (wait by pid). A connect forks only as the
-//! last resort: do not pass [`LastResort::Allow`] where `forked` cannot be
-//! accepted. A bind's fork-cwd is one of its routes, so a bind cannot avoid it
-//! where it is the route that reaches the path.
-//!
-//! ```
-//! use std::io;
-//! use std::os::unix::net::UnixStream;
-//! use std::path::Path;
-//! use std::process::{Command, ExitStatus};
-//!
-//! fn run_tool() -> io::Result<ExitStatus> {
-//!     let mut child = Command::new("true").spawn()?;
-//!     child.wait() // waits for this child's pid (no waitpid(-1))
-//! }
-//!
-//! fn dial(path: &Path) -> io::Result<UnixStream> {
-//!     sockat::connect(path) // a connect that does not fork (no last resort)
-//! }
-//! # assert!(run_tool()?.success());
-//! # let dir = tempfile::tempdir()?;
-//! # let path = dir.path().join("d".repeat(100)).join("s.sock");
-//! # std::fs::create_dir(path.parent().unwrap())?;
-//! # let _listener = sockat::bind(&path)?;
-//! # dial(&path)?;
-//! # Ok::<(), io::Error>(())
-//! ```
-//!
-//! ## recreatable-spelling
-//!
-//! [`bind_ex`]'s last resort took symlink-dir in a shared place such as
-//! `/tmp`: the spelling the kernel reports goes through it, and another user
-//! can make it again once seen. Remove by [`SocketFile::discard`] or the
-//! original path, not by that spelling. A place only the owner can write to
-//! (`$XDG_RUNTIME_DIR`, or a `$TMPDIR` only the owner can write to) is used
-//! first, and then this name is not given.
-//!
-//! ```
-//! use std::io;
-//! use std::path::Path;
-//!
-//! fn serve(path: &Path) -> io::Result<()> {
-//!     let bound = sockat::bind_ex(path, sockat::LastResort::Allow)?;
-//!     // accept on bound.listener
-//!     let removed = bound.file.discard(); // not by local_addr()'s spelling
-//!     drop(bound.listener);
-//!     removed
-//! }
-//! # let dir = tempfile::tempdir()?;
-//! # let deep = dir.path().join("d".repeat(100));
-//! # std::fs::create_dir(&deep)?;
-//! # serve(&deep.join("s.sock"))?;
-//! # assert_eq!(std::fs::read_dir(&deep)?.count(), 0);
-//! # Ok::<(), std::io::Error>(())
-//! ```
+//! What a bind's spelling is good for is in [`Spelling`]: whether removing by
+//! it removes the socket file, until when it can be followed, and whether
+//! another uid can follow it.
 //!
 //! # Patterns not to use
 //!
-//! Ways of using sockat that remove an unrelated file or fail to remove the
-//! file (the
-//! [specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#patterns-not-to-use)
-//! and the
-//! [manual](https://github.com/kawaz/sockat-rs/blob/main/docs/MANUAL.md#patterns-not-to-use)
-//! have why, and what to do instead):
-//!
 //! * removing or `stat`ing the socket file by the address the kernel reports
-//!   (`listener.local_addr()?.as_pathname()`): keep the original path, or use
-//!   [`SocketFile::discard`];
-//! * binding a relative path and removing by it after the cwd changes: make
-//!   the path absolute before the bind;
+//!   without looking at [`Spelling`]: a link-file spelling removes E, not the
+//!   file, and a `Dangling` one names nothing. Keep the path, or use
+//!   [`SocketFile::remove`];
+//! * using a spelling after its clean-up or after the process ended;
+//! * binding a relative path and removing by it after the cwd changes;
 //! * relying on closing the listener to remove the socket file, or on
-//!   `discard()` to close the listener;
-//! * branching on an `_ex` function's `route` or `skipped`: branch on
-//!   `losses`;
-//! * reaping children with `waitpid(-1)` on another thread of a program whose
-//!   calls may fork: wait by pid.
-//!
-//! ```no_run
-//! use std::io;
-//! use std::path::Path;
-//!
-//! fn wrong(path: &Path) -> io::Result<()> {
-//!     let listener = sockat::bind(path)?;
-//!     // removing by the spelling the kernel reports: for a long path it is not the path, and may hit another file
-//!     std::fs::remove_file(listener.local_addr()?.as_pathname().unwrap())?;
-//!     // closing the listener does not remove the socket file
-//!     drop(listener);
-//!
-//!     let bound = sockat::bind_ex(path, sockat::LastResort::Avoid)?;
-//!     // discard() does not close the listener
-//!     bound.file.discard()?;
-//!     let _still_open = bound.listener;
-//!     Ok(())
-//! }
-//!
-//! fn wrong_relative() -> io::Result<()> {
-//!     let _listener = sockat::bind("app.sock")?;
-//!     std::env::set_current_dir("/")?;
-//!     // removing by the relative path after the cwd changed: hits a file in another place
-//!     std::fs::remove_file("app.sock")
-//! }
-//!
-//! fn wrong_ex(path: &Path) -> io::Result<()> {
-//!     let bound = sockat::bind_ex(path, sockat::LastResort::Allow)?;
-//!     // branching on the route's string: it promises nothing (branch on losses)
-//!     if bound.route == "symlink-dir" {
-//!         eprintln!("bound through a symlink");
-//!     }
-//!     Ok(())
-//! }
-//! ```
+//!   [`SocketFile::remove`] to close the listener;
+//! * calling [`SocketFile::remove`] after the listener is closed (a file made
+//!   again at the path may then not be told apart);
+//! * branching on `route`, `base` or `skipped`: they are diagnostics; branch
+//!   on [`Spelling`].
 //!
 //! # Errors
 //!
-//! The errors are those of `bind(2)`, `listen(2)` and `connect(2)` (and of
-//! opening the directory) as [`std::io::Error`]s, for example `ENOENT` for a
-//! missing directory or socket, `EADDRINUSE` for an existing file,
-//! `ECONNREFUSED` for a socket nobody listens on, `EAGAIN` for a full backlog
-//! on a nonblocking connect (Linux; macOS answers `ECONNREFUSED` to any
-//! connect on a full backlog, so there `ECONNREFUSED` alone does not mean
-//! nobody listens). When no route can reach the path (for [`bind`], a file
-//! name too long for `R/<file name>` where symlink-file cannot be used; for
-//! [`connect`] and [`connect_nonblocking`], also when only a forked child
-//! would), the error is `ENAMETOOLONG`. The `_ex` functions return the same
-//! errors as an [`ExError`], which also carries the routes tried and converts
-//! into the `io::Error` by `?`. A path longer than std accepts that does not end with a
-//! file name is an `InvalidInput` error. So is a path of any length that
-//! contains a NUL byte, refused before anything is created: the kernel would
-//! read the path only up to the NUL. On Linux and Android a path starting with
-//! a NUL names a socket in the abstract namespace rather than a file; it is
-//! handed to std as is, which refuses it as well (std takes abstract names
-//! through `SocketAddr::from_abstract_name` and `UnixListener::bind_addr` /
-//! `UnixStream::connect_addr`).
-//!
-//! A path longer than `PATH_MAX` (1024 on macOS, 4096 on Linux) is
-//! `ENAMETOOLONG`: the directory is opened by the full path, and that limit is
-//! outside what sockat is for.
+//! The errors of `bind(2)`, `listen(2)` and `connect(2)` as
+//! [`std::io::Error`]s: `ENOENT` for a missing directory or socket,
+//! `ENOTDIR`, `EADDRINUSE`, `ECONNREFUSED`, `EAGAIN` for a full backlog on a
+//! nonblocking connect (Linux; macOS answers `ECONNREFUSED`). `ENAMETOOLONG`
+//! when no route reaches the path. `InvalidInput` for a path longer than std
+//! accepts that does not end with a file name, and for a path of any length
+//! with a NUL byte (on Linux a leading NUL, the abstract namespace, goes to
+//! std as it is). [`Options::base`] that fails its checks is `ENOENT`,
+//! `ENOTDIR` or `EPERM`, never another place. The `_ex` functions return an
+//! [`ExError`], which converts into the `io::Error` by `?`.
 //!
 //! # Async runtimes
 //!
-//! The results are std types, so any runtime that adopts std sockets can take
-//! them. With tokio:
+//! The results are std types, so any runtime that adopts std sockets takes
+//! them. [`connect_nonblocking`] does not wait (a Unix-domain connect
+//! completes or fails within the call, and its clean-up is an `unlink`) and
+//! returns the stream nonblocking:
 //!
 //! ```no_run
 //! # async fn demo(path: std::path::PathBuf) -> std::io::Result<()> {
@@ -487,25 +145,25 @@
 //! # Ok(())
 //! # }
 //! ```
-//!
-//! [`connect_nonblocking`] does not wait for the peer (a Unix-domain connect
-//! completes or fails within the call) and returns the stream still
-//! nonblocking, so it can be called on the runtime's worker threads directly.
-//! [`bind`] does not wait for a peer either. [`bind_ex`]'s listener goes to the
-//! runtime the same way; its [`SocketFile`] stays with the caller.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
 #[cfg(not(unix))]
-compile_error!("sockat supports Unix targets only (Windows is out of scope, see DR-0009)");
+compile_error!("sockat supports Unix targets only (Windows is out of scope)");
 
 use std::io;
+use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use route::{BindOptions, ConnectOptions, Request, Route};
+use route::{Connect, Request, Use};
+use sys::SockType;
 
+mod base;
+pub mod datagram;
 mod path;
 mod route;
 mod sys;
@@ -515,300 +173,165 @@ mod tests;
 
 pub use route::Skipped;
 
-/// Create a socket bound to `path` and listening on it, like
-/// [`UnixListener::bind`] but for a path of any length.
+/// What the `_ex` functions and resolve take besides the path.
 ///
-/// A path that std accepts goes to [`UnixListener::bind`] unchanged. A longer
-/// path is reached by the routes the platform has, fork-cwd last (see the
-/// [crate documentation](crate)): the forked child only binds, and the listen
-/// is done by this process, so the listener is this process's like any other.
-/// The socket file is created at `path` either way, and is not removed when
-/// the listener is dropped (as with std; [`bind_ex`] returns a
-/// [`SocketFile`] that removes it).
-///
-/// # Errors
-///
-/// The errors of `bind(2)` / `listen(2)`, for example `EADDRINUSE` when `path`
-/// exists and `ENOENT` when its directory does not; `ENAMETOOLONG` when no
-/// route reaches the path (a file name too long for `R/<file name>` where no
-/// symlink-file bind can be used); `InvalidInput` for a path longer than std
-/// accepts that does not end with a file name, or for a path that contains a
-/// NUL byte.
-pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
-    let options = BindOptions { last_resort: false };
-    route::run(Request::Bind(options), path.as_ref()).map(|(fd, _)| UnixListener::from(fd))
-}
-
-/// Connect to the socket at `path`, like [`UnixStream::connect`] but for a path
-/// of any length, without forking. Use it wherever std's would be used.
-///
-/// A path that std accepts goes to [`UnixStream::connect`] unchanged. A longer
-/// path is reached by the connect order of the platform (see the
-/// [crate documentation](crate)), so in an ordinary environment it is reached
-/// whatever the directory depth and the file name length, and the connection
-/// is always made by this process. Only in a rare environment where nothing but
-/// a forked child would reach the path is the error `ENAMETOOLONG`, as for any
-/// connect to a path too long for `sun_path` ([`connect_ex`] with
-/// [`LastResort::Allow`] is for that case).
-///
-/// The stream blocks, like std's. In async code use [`connect_nonblocking`].
-///
-/// # Errors
-///
-/// The errors of `connect(2)`, for example `ENOENT` when nothing is at `path`
-/// and `ECONNREFUSED` when nobody listens on it (on macOS also when its backlog
-/// is full); `ENAMETOOLONG` when no route of the connect order reaches the
-/// path; `InvalidInput` for a path longer than std accepts that does not end
-/// with a file name, or for a path that contains a NUL byte.
-pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
-    connect_with(path.as_ref(), false)
-}
-
-/// [`connect`] on a nonblocking socket: the connect does not wait, and the
-/// stream it returns is still nonblocking (ready for
-/// `tokio::net::UnixStream::from_std` as it is).
-///
-/// A Unix-domain connect completes or fails within the call, so there is
-/// nothing to wait for afterwards. When the listener's backlog is full the
-/// connect fails at once: `EAGAIN` on Linux (where a blocking connect waits for
-/// room), `ECONNREFUSED` on macOS (as a blocking connect does).
-///
-/// # Errors
-///
-/// Those of [`connect`], and `EAGAIN` for a full backlog on Linux.
-pub fn connect_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
-    connect_with(path.as_ref(), true)
-}
-
-/// The two plain connects: block or not, never the last resort.
-fn connect_with(path: &Path, nonblocking: bool) -> io::Result<UnixStream> {
-    let options = ConnectOptions {
-        nonblocking,
-        last_resort: false,
-    };
-    route::run(Request::Connect(options), path).map(|(fd, _)| UnixStream::from(fd))
-}
-
-/// Whether an `_ex` function may take its last resort: the route that reaches
-/// the path at the cost of something, tried once every other route is
-/// unusable.
-///
-/// | function | last resort | what it gives up |
-/// |---|---|---|
-/// | [`bind_ex`] | symlink-dir: a symlink in a place to the socket's directory | [`Loss::Respelled`], and in a shared place such as `/tmp` [`Loss::RecreatableSpelling`] |
-/// | [`connect_ex`], [`connect_nonblocking_ex`] | fork-cwd-direct: a forked child connects | [`Loss::Forked`] (the peer pid the server sees is an exited child's) |
-///
-/// [`LastResort::Avoid`] (the [`Default`]) tries what the plain function
-/// tries, in the same order. Passing [`LastResort::Allow`] is the choice to
-/// accept what the last resort gives up; [`ExListener::losses`] /
-/// [`ExStream::losses`] say what was given up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum LastResort {
-    /// Do not take the last resort: where only it would reach the path, the
-    /// call fails with `ENAMETOOLONG`, as the plain function does.
-    #[default]
-    Avoid,
-    /// Take the last resort when no other route reaches the path.
-    Allow,
-}
-
-impl LastResort {
-    fn allowed(self) -> bool {
-        self == LastResort::Allow
-    }
-}
-
-/// Something given up, compared with std, to reach the path (the SPEC's
-/// "失うもの"). An `_ex` function returns those of the route it took, as a
-/// list ([`ExListener::losses`], [`ExStream::losses`]); none of them implies
-/// another, and they have no order.
-///
-/// The names are promised and only ever added to (the enum is
-/// `#[non_exhaustive]`): read one you do not know as "something was given
-/// up". [`Loss::as_str`] and `Display` give the SPEC's name.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Loss {
-    /// `respelled`: the address the kernel reports for the bound socket is
-    /// not the path (see the [crate documentation](crate)). It names nothing
-    /// once the call has returned, but it can be seen by other users (Linux's
-    /// `/proc/net/unix`), and where the process's cwd is writable by others
-    /// they can make it again; remove the socket file by the path you passed
-    /// or [`SocketFile::discard`], not by the reported address. Only a bind
-    /// gives this up.
-    Respelled,
-    /// `forked`: a forked child made the call, with the side effects of a
-    /// fork (see the [crate documentation](crate)). After a connect, the peer
-    /// pid the server sees is the exited child's.
-    Forked,
-    /// `recreatable-spelling`: the address the kernel reports goes through a
-    /// shared place such as `/tmp` ([`bind_ex`]'s last resort, symlink-dir),
-    /// where another user can make it again once sockat removed it: whatever
-    /// later removes the socket file by that address could remove a file of
-    /// that user's choosing. Remove it by the path you passed or
-    /// [`SocketFile::discard`].
-    RecreatableSpelling,
-    /// `cwd-relative`: a relative path went to std as it is, so the address
-    /// the kernel keeps for the bound socket is relative to the cwd: after the
-    /// cwd changes, removing or looking up the socket by it reaches another
-    /// place. std has this risk on its own; it is reported all the same. Not
-    /// for a name in Linux's abstract namespace.
-    CwdRelative,
-}
-
-impl Loss {
-    /// The SPEC's name: `"respelled"`, `"forked"`, `"recreatable-spelling"`
-    /// or `"cwd-relative"`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Loss::Respelled => "respelled",
-            Loss::Forked => "forked",
-            Loss::RecreatableSpelling => "recreatable-spelling",
-            Loss::CwdRelative => "cwd-relative",
-        }
-    }
-}
-
-impl std::fmt::Display for Loss {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// What the route `route` gave up for a bind (`bind`) or a connect to `path`
-/// (SPEC "経路の名前", the column "失うもの").
-fn losses(bind: bool, route: Route, path: &Path) -> Vec<Loss> {
-    match (bind, route) {
-        (true, Route::Standard) if !path.is_absolute() && !path::is_abstract(path) => {
-            vec![Loss::CwdRelative]
-        }
-        (_, Route::Standard) => Vec::new(),
-        (true, Route::SymlinkDir { shared: true }) => {
-            vec![Loss::Respelled, Loss::RecreatableSpelling]
-        }
-        (true, r) if r.forked() => vec![Loss::Respelled, Loss::Forked],
-        (true, _) => vec![Loss::Respelled],
-        (false, r) if r.forked() => vec![Loss::Forked],
-        (false, _) => Vec::new(),
-    }
-}
-
-/// What [`bind_ex`] returns: the listener, the [`SocketFile`] that removes
-/// the socket file later, what was given up to bind it, and how it was bound.
-///
-/// The fields are public so the value can be taken apart as it comes. Later
-/// versions may add fields (the struct is `#[non_exhaustive]`), so a pattern
-/// needs `..`:
+/// [`Options::default`] is what [`bind`] and [`connect`] do.
 ///
 /// ```no_run
-/// use sockat::{ExListener, LastResort, Loss};
-///
-/// let path = "/a/very/long/directory/.../server.sock";
-/// let ExListener { listener, file, losses, .. } = sockat::bind_ex(path, LastResort::Avoid)?;
-/// if losses.contains(&Loss::Respelled) {
-///     // the address the kernel reports is not `path`: remove by `file`
-/// }
-/// // ... serve on `listener` ...
-/// file.discard()?; // before the listener is closed
-/// drop(listener);
-/// # Ok::<(), std::io::Error>(())
-/// ```
-#[non_exhaustive]
-#[derive(Debug)]
-pub struct ExListener {
-    /// The listening socket, std's own type, as [`bind`] returns it.
-    pub listener: UnixListener,
-    /// Removes the socket file later, only while it is still the one this
-    /// bind made ([`SocketFile::discard`]); call it before the listener is
-    /// closed. Closing the listener stays with whoever has it.
-    pub file: SocketFile,
-    /// What was given up to bind it ([`Loss`]), empty when nothing was.
-    /// Branch on this.
-    pub losses: Vec<Loss>,
-    /// The name of the route that bound it (the SPEC's "経路の名前", such as
-    /// `"thread-cwd"` or `"symlink-file"`). For diagnostics only: routes may be
-    /// added, renamed or changed, so do not branch on it.
-    pub route: &'static str,
-    /// The routes tried before [`ExListener::route`] and passed over, in the
-    /// order tried, each with why ([`Skipped`]): those of the order this call
-    /// tries on this platform in its state (no /proc route on a Linux without
-    /// /proc; the last resort only when asked for), `standard` first for a
-    /// long path. Empty for a path std took. For diagnostics only, like
-    /// [`ExListener::route`].
-    pub skipped: Vec<Skipped>,
-}
-
-/// What [`connect_ex`] and [`connect_nonblocking_ex`] return: the stream,
-/// what was given up to connect it, and how it was connected.
-///
-/// The fields are public so the value can be taken apart as it comes. Later
-/// versions may add fields (the struct is `#[non_exhaustive]`), so a pattern
-/// needs `..`:
-///
-/// ```no_run
-/// use sockat::{ExStream, LastResort, Loss};
-///
-/// let path = "/a/very/long/directory/.../server.sock";
-/// let ExStream { stream, losses, .. } = sockat::connect_ex(path, LastResort::Allow)?;
-/// if losses.contains(&Loss::Forked) {
-///     eprintln!("connected to {path} through a forked child");
-/// }
-/// # drop(stream);
+/// let options = sockat::Options {
+///     base: Some("/tmp/my-app-1000/sockat".into()),
+///     ..Default::default()
+/// };
+/// let bound = sockat::bind_ex("/a/very/long/directory/.../server.sock", options)?;
 /// # Ok::<(), sockat::ExError>(())
 /// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Ask a bind for a spelling another uid can follow as well: B only where
+    /// every directory on the way to it and B itself let others search (`/tmp`
+    /// does; `$XDG_RUNTIME_DIR` and macOS's `$TMPDIR` are 0700), and never the
+    /// `/proc/<pid>/fd/...` spelling. When that cannot be had, the bind goes
+    /// through thread-cwd / at (a `Dangling` spelling) rather than give a
+    /// spelling another uid cannot follow; [`Spelling`] tells. The connects
+    /// do not look at it (their spelling is kept nowhere).
+    pub usable_cross_uid: bool,
+    /// Where B is (B itself, for example `/tmp/my-app-1000/sockat`), instead
+    /// of the automatic places: an application's own directory, which it
+    /// cleans up itself ([`sweep_base`]). Made when missing, checked (the
+    /// directories on the way no other user can change, B this user's and not
+    /// writable by group and others), and an error (`ENOENT`, `ENOTDIR`,
+    /// `EPERM`) rather than another place when the check fails. The check is
+    /// made before any route is tried, for a long path only; B is made only
+    /// when a route that uses it is reached. Used for the binds and the
+    /// connects.
+    pub base: Option<PathBuf>,
+}
+
+/// What a bind's spelling (the address the kernel keeps and reports by
+/// `getsockname` / `getpeername`) is good for.
+///
+/// `#[non_exhaustive]`: read a kind you do not know as "do not rely on the
+/// spelling".
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Spelling {
+    /// The absolute path itself (std took it).
+    Original,
+    /// The relative path itself (std took it): after the cwd changes it names
+    /// another place. A hazard std has on its own, reported all the same.
+    CwdRelative,
+    /// Through B, D and E, naming the same place as the path while it can be
+    /// followed.
+    Linked {
+        /// Whether unlinking the spelling removes the socket file: `true`
+        /// through a symlink to the directory (link-dir), `false` through a
+        /// symlink to the file (link-file: the unlink removes E). Remove a
+        /// link-file socket by [`SocketFile::remove`] or the path.
+        removable: bool,
+        /// Until when the spelling can be followed.
+        until: Until,
+        /// Whether a process of another uid can follow it.
+        usable_cross_uid: bool,
+        /// Whether a peer can follow it even when this process or the peer
+        /// has a `/tmp` of its own (systemd's `PrivateTmp`): `false` when B is
+        /// under `/tmp` or `/var/tmp`. A peer in another mount namespace as a
+        /// whole (a container) is not covered.
+        usable_with_private_tmp: bool,
+    },
+    /// Through an E removed right after the bind (thread-cwd, at): it names
+    /// nothing. Removing by it removes nothing.
+    Dangling,
+}
+
+/// Until when a [`Spelling::Linked`] spelling can be followed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Until {
+    /// While this process lives (`/proc/<pid>/fd/<B's fd>/...`): only
+    /// processes of the same uid in the same PID namespace (and root) follow
+    /// it.
+    Process,
+    /// Until E is cleaned up ([`SocketFile::cleanup`], [`ForBind::cleanup`]),
+    /// or for [`bind`], until D is removed after the process ends (B's real
+    /// path).
+    Cleanup,
+}
+
+/// What [`bind_ex`] and [`datagram::bind_ex`] return.
+///
+/// The fields are public so the value can be taken apart as it comes (a
+/// pattern needs `..`: later versions may add fields):
+///
+/// ```no_run
+/// let path = "/a/very/long/directory/.../server.sock";
+/// let sockat::Bound { socket, file, .. } = sockat::bind_ex(path, Default::default())?;
+/// // ... serve on `socket` (it may go to tokio etc.) ...
+/// file.remove()?; // before the listener is closed
+/// drop(socket);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[non_exhaustive]
 #[derive(Debug)]
-pub struct ExStream {
-    /// The connected stream, std's own type. It belongs to this process and
-    /// works as usual whichever route made the connection.
-    pub stream: UnixStream,
-    /// What was given up to connect it ([`Loss`]): [`Loss::Forked`] when the
-    /// last resort, a forked child that has exited since, made the
-    /// connection, after which the peer pid the server sees is that child's
-    /// (see [`connect_ex`]); empty when this process made it (a connect's
-    /// spelling is kept nowhere). Branch on this.
-    pub losses: Vec<Loss>,
-    /// The name of the route that connected it, as [`ExListener::route`].
+pub struct Bound<S> {
+    /// The socket, std's own type, as [`bind`] / [`datagram::bind`] return it.
+    pub socket: S,
+    /// Removes the socket file and cleans up E later; call it before the
+    /// socket is closed. Closing the socket stays with whoever has it.
+    pub file: SocketFile,
+    /// What the spelling the kernel keeps is good for. Branch on this.
+    pub spelling: Spelling,
+    /// The route that bound it (such as `"link-dir"`). Diagnostics only:
+    /// routes may be added, renamed or changed.
     pub route: &'static str,
-    /// The routes passed over before it, as [`ExListener::skipped`].
+    /// The B the spelling goes through (`proc`, `tmp`, `runtime`, `tmpdir`,
+    /// `sockdir`, `given`), `None` when it goes through none. Diagnostics only.
+    pub base: Option<&'static str>,
+    /// The routes tried and passed over before [`Bound::route`], in the order
+    /// tried, each with why; `standard` first for a long path. Diagnostics
+    /// only.
     pub skipped: Vec<Skipped>,
 }
 
-/// Why an `_ex` function did not reach the path: the [`io::Error`], and the
-/// routes tried, for diagnostics.
+/// What [`connect_ex`] and [`connect_nonblocking_ex`] return.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct Connected<S> {
+    /// The connected socket, std's own type.
+    pub socket: S,
+    /// The route that connected it. Diagnostics only.
+    pub route: &'static str,
+    /// The routes passed over before it. Diagnostics only.
+    pub skipped: Vec<Skipped>,
+}
+
+/// What [`datagram::connect_ex`] returns: how the caller's socket was
+/// connected.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    /// The route that connected it. Diagnostics only.
+    pub route: &'static str,
+    /// The routes passed over before it. Diagnostics only.
+    pub skipped: Vec<Skipped>,
+}
+
+/// Why an `_ex` function or a resolve did not reach the path: the
+/// [`io::Error`], and the routes tried, for diagnostics.
 ///
 /// It converts into the [`io::Error`] as it is (`From`), so `?` in a function
 /// returning [`io::Result`] works and [`io::Error::raw_os_error`] still gives
-/// the errno; the `error` field gives it without the conversion. `Display`
-/// and `source` are those of the [`io::Error`].
-///
-/// The fields are public; later versions may add fields (the struct is
-/// `#[non_exhaustive]`).
-///
-/// ```no_run
-/// let path = "/a/very/long/directory/.../server.sock";
-/// match sockat::connect_ex(path, sockat::LastResort::Avoid) {
-///     Ok(c) => drop(c.stream),
-///     Err(e) => eprintln!("{e} (errno {:?}) after {:?}", e.error.raw_os_error(), e.skipped),
-/// }
-/// ```
+/// the errno. `Display` and `source` are those of the [`io::Error`].
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct ExError {
-    /// The error, as the plain function returns it (for example `ENOENT`, or
-    /// `ENAMETOOLONG` when no route could be used).
+    /// The error, as the plain function returns it.
     pub error: io::Error,
-    /// The name of the route that made the call and failed for real (an
-    /// existing file: `EADDRINUSE`, nobody listening: `ECONNREFUSED`, ...;
-    /// `"standard"` when std failed on a path it took); `None` when no route
-    /// could be used, or the path was refused before any was tried (a NUL
-    /// byte, no file name, the socket's directory missing or not one). For
-    /// diagnostics only, as [`ExListener::route`].
+    /// The route that made the call and failed for real (`EADDRINUSE`,
+    /// `ECONNREFUSED`, ...); `None` when no route could be used
+    /// (`ENAMETOOLONG`), the path was refused before any was tried, or
+    /// [`Options::base`] failed. Diagnostics only.
     pub route: Option<&'static str>,
-    /// The routes tried and passed over, in the order tried, as
-    /// [`ExListener::skipped`]; empty when the path was refused before any
-    /// route was tried (the length is judged only once the socket's directory
-    /// is looked up).
+    /// The routes tried and passed over, in the order tried; empty when the
+    /// path was refused before any route was tried. Diagnostics only.
     pub skipped: Vec<Skipped>,
 }
 
@@ -830,202 +353,64 @@ impl From<ExError> for io::Error {
     }
 }
 
-/// The [`ExError`] of a call that did not reach the path.
-fn ex_error(f: route::Failed) -> ExError {
-    ExError {
-        error: f.error,
-        route: f.route,
-        skipped: f.skipped,
+impl From<route::Failed> for ExError {
+    fn from(f: route::Failed) -> Self {
+        ExError {
+            error: f.error,
+            route: f.route,
+            skipped: f.skipped,
+        }
     }
 }
 
-/// [`bind`], with a [`SocketFile`] that removes the socket file later, what
-/// was given up and how the path was bound ([`ExListener`]); with
-/// [`LastResort::Allow`], also the last resort, symlink-dir, when no route of
-/// [`bind`] can be used.
+/// The socket file a bind made (its real path and `(st_dev, st_ino)`, taken
+/// right after the bind), and the E its spelling goes through.
 ///
-/// With [`LastResort::Avoid`] the routes and their order are [`bind`]'s. With
-/// [`LastResort::Allow`], where [`bind`] would be `ENAMETOOLONG` (sockat's own
-/// directory can be made in no place, and the socket's directory cannot be
-/// opened or R made in it), this makes a symlink `sockat.XXXXXXXXXX` (10
-/// random letters and digits) to the real path of the socket's directory in a
-/// place, binds by `<place>/sockat.XXXXXXXXXX/<file name>`, and removes the
-/// symlink. The places are `XDG_RUNTIME_DIR` and `TMPDIR` (each when set to an
-/// absolute path) and `/tmp`: first those only this user can write to (owned
-/// by this user, without write permission for group and others), then the
-/// shared ones (sticky and owned by root or this user, as `/tmp` is). A place
-/// that is neither, or too long for the spelling, is passed over. Through a
-/// shared place another user can make the reported address again once the
-/// symlink is gone ([`Loss::RecreatableSpelling`]); remove the socket file by
-/// [`SocketFile::discard`] or the path you passed.
-///
-/// The listener is std's own type, free to go wherever [`bind`]'s would (into
-/// `tokio::net::UnixListener::from_std`, another thread, a server
-/// framework); closing it stays with its owner. The [`SocketFile`] only
-/// removes the file, typically once the listener is closed. The socket file's
-/// real path and its `(st_dev, st_ino)` are taken right after the bind, before
-/// this returns: for a path handed to std, as soon as std's bind returns; for
-/// a long path, inside the route (through D while sockat's own directory and
-/// the symlink in it are still there, by the same spelling the bind took).
-/// Someone who can write to the socket's directory and replaces the file in
-/// the moment between the bind and that look-up is not caught: POSIX has no
-/// way to name a file by its inode.
-///
-/// ```no_run
-/// let path = "/a/very/long/directory/.../server.sock";
-/// let bound = sockat::bind_ex(path, sockat::LastResort::Avoid)?;
-/// // ... serve on `bound.listener` ...
-/// bound.file.discard()?;
-/// drop(bound.listener);
-/// # Ok::<(), std::io::Error>(())
-/// ```
-///
-/// # Errors
-///
-/// Those of [`bind`] (with [`LastResort::Allow`], a path symlink-dir reaches is
-/// bound rather than `ENAMETOOLONG`), and those of looking the socket file up
-/// right after the bind; then the listener is closed and the socket file stays
-/// (as after [`bind`]), so that no [`SocketFile`] is handed out that could not
-/// remove it. The same for a relative `path` when the cwd's `(st_dev,
-/// st_ino)` differs before the bind and the realpath and after both (another
-/// thread changed it, so the file looked up need not be the one bound), as an
-/// `Other` error. As an [`ExError`] with the routes tried (it converts into
-/// the [`io::Error`] by `?`).
-pub fn bind_ex<P: AsRef<Path>>(path: P, last_resort: LastResort) -> Result<ExListener, ExError> {
-    let path = path.as_ref();
-    let options = BindOptions {
-        last_resort: last_resort.allowed(),
-    };
-    let r = route::run_reporting(Request::Bind(options), path).map_err(ex_error)?;
-    let route = r.route;
-    let Some(bound) = r.bound else {
-        return Err(ExError {
-            error: io::Error::other("the socket file was not looked up"),
-            route: Some(route.name()),
-            skipped: r.skipped,
-        });
-    };
-    Ok(ExListener {
-        listener: UnixListener::from(r.fd),
-        file: SocketFile {
-            path: bound.path,
-            id: bound.id,
-        },
-        losses: losses(true, route, path),
-        route: route.name(),
-        skipped: r.skipped,
-    })
-}
-
-/// [`connect`], with what was given up and how it connected
-/// ([`ExStream`]); with [`LastResort::Allow`], also the last resort,
-/// fork-cwd-direct, when no route of [`connect`] reaches the path.
-///
-/// With [`LastResort::Avoid`] the routes and their order are [`connect`]'s.
-/// [`LastResort::Allow`] is for the rare environment where only a forked
-/// child reaches the path (sockat's own directory cannot be used for a
-/// connect, and none of the other connect routes reaches the path; see the
-/// [crate documentation](crate)), when the connection is wanted at the cost of
-/// the fork's side effects. The forked child `fchdir`s into the socket's
-/// directory, connects by the file name and exits at once.
-/// [`ExStream::losses`] holds [`Loss::Forked`] when it was taken; on every
-/// other route the connection was made by this process, and nothing is given
-/// up.
-///
-/// After the fork, the peer pid the server sees is that of the child, a
-/// process that has already exited. The stream itself belongs to this process
-/// and works as usual. The uid and gid the server sees are this process's. On
-/// macOS (`LOCAL_PEERPID`) the server sees this process's pid once it sends on
-/// the stream; on Linux (`SO_PEERCRED`) it stays the exited child's. Nothing
-/// can be looked up from that pid (the process, its parent): the process is
-/// gone, and the number may be reused by another process later. So the pid
-/// itself is of no use to this process or to the server, and is not returned.
-///
-/// # Errors
-///
-/// Those of [`connect`] (with [`LastResort::Allow`], a path only the fork
-/// reaches is connected rather than `ENAMETOOLONG`), as an [`ExError`] with the
-/// routes tried (it converts into the [`io::Error`] by `?`).
-pub fn connect_ex<P: AsRef<Path>>(path: P, last_resort: LastResort) -> Result<ExStream, ExError> {
-    connect_ex_with(path.as_ref(), false, last_resort)
-}
-
-/// [`connect_ex`] on a nonblocking socket, as [`connect_nonblocking`] is to
-/// [`connect`]. With [`LastResort::Allow`] the socket is made nonblocking
-/// before the fork, so the child's connect does not wait either.
-///
-/// # Errors
-///
-/// Those of [`connect_ex`], and `EAGAIN` for a full backlog on Linux.
-pub fn connect_nonblocking_ex<P: AsRef<Path>>(
-    path: P,
-    last_resort: LastResort,
-) -> Result<ExStream, ExError> {
-    connect_ex_with(path.as_ref(), true, last_resort)
-}
-
-/// The two `_ex` connects: block or not.
-fn connect_ex_with(
-    path: &Path,
-    nonblocking: bool,
-    last_resort: LastResort,
-) -> Result<ExStream, ExError> {
-    let options = ConnectOptions {
-        nonblocking,
-        last_resort: last_resort.allowed(),
-    };
-    let r = route::run_reporting(Request::Connect(options), path).map_err(ex_error)?;
-    Ok(ExStream {
-        stream: UnixStream::from(r.fd),
-        losses: losses(false, r.route, path),
-        route: r.route.name(),
-        skipped: r.skipped,
-    })
-}
-
-/// The socket file a [`bind_ex`] made: its real path and `(st_dev, st_ino)`.
-///
-/// Dropping it does nothing: the file is removed only by [`SocketFile::discard`].
+/// Dropping it does nothing: the file is removed only by
+/// [`SocketFile::remove`], E only by it or [`SocketFile::cleanup`].
 #[derive(Debug)]
 pub struct SocketFile {
-    /// The real path of the socket file, taken right after the bind.
     path: PathBuf,
-    /// `(st_dev, st_ino)` of the socket file at that path then.
     id: (u64, u64),
+    link: Option<Arc<base::Link>>,
+    removed: AtomicBool,
 }
 
 impl SocketFile {
-    /// Remove the socket file, if what is at its real path now is still the
-    /// file the bind made (the same `(st_dev, st_ino)`, looked up without
-    /// following a symlink).
+    fn new(r: route::Remembered, link: Option<Arc<base::Link>>) -> Self {
+        Self {
+            path: r.path,
+            id: r.id,
+            link,
+            removed: AtomicBool::new(false),
+        }
+    }
+
+    /// Remove the socket file, the first time only, if what is at its real
+    /// path now is still the file the bind made (the same `(st_dev,
+    /// st_ino)`, looked up without following a symlink), and clean up E
+    /// ([`SocketFile::cleanup`]). Later calls do nothing.
     ///
-    /// Anything else there (another socket bound at the path since, a file
-    /// or a symlink put in its place) is left alone, and so is nothing at all
-    /// (the path or a directory along it gone, or a directory along it
-    /// replaced by something that is not one): all are `Ok(())`, the file of
-    /// the bind being gone either way. When what is at the path cannot be
-    /// looked up for another reason (`EACCES`, say), whether the file is
-    /// still there is unknown, and that is an error rather than `Ok(())`. The
-    /// listener is not touched; call this before closing it.
-    ///
-    /// The promise is that what replaced the file while the listener was open
-    /// is not removed. Once the listener is closed, a file removed and made
-    /// again at the path may be given the same inode number (ext4, the BSDs'
-    /// UFS / FFS), cannot be told apart, and may be removed, as removing by the
-    /// path would.
-    ///
-    /// The look-up and the removal are two steps: a file put at the path in
-    /// the moment between them, by someone who can write to the directory, is
-    /// removed instead. POSIX has no way to remove a file by its inode, so
-    /// this cannot be closed.
+    /// Anything else there (another socket bound since, a file put in its
+    /// place) is left alone, and so is nothing at all: both are `Ok(())`. The
+    /// socket is not closed; call this before closing it. The promise covers
+    /// what replaced the file while the socket was open: once it is closed, a
+    /// file removed and made again at the path may get the same inode number
+    /// (ext4, the BSDs' UFS / FFS) and be removed, as removing by the path
+    /// would. A file put at the path between the look-up and the removal, by
+    /// someone who can write to the directory, is removed instead (POSIX has
+    /// no way to remove a file by its inode).
     ///
     /// # Errors
     ///
-    /// Those of `lstat(2)` (other than `ENOENT` and `ENOTDIR`, which mean
-    /// the file is not there) and `unlink(2)` on the path.
-    pub fn discard(self) -> io::Result<()> {
+    /// Those of `lstat(2)` (other than `ENOENT` and `ENOTDIR`) and `unlink(2)`
+    /// on the path, and of removing E; a call after an error tries again.
+    pub fn remove(&self) -> io::Result<()> {
+        if self.removed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let gone = |e: &io::Error| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR));
-        match file_id(&self.path) {
+        let removed = match file_id(&self.path) {
             Ok(id) if id == self.id => match std::fs::remove_file(&self.path) {
                 Err(e) if gone(&e) => Ok(()),
                 removed => removed,
@@ -1033,6 +418,27 @@ impl SocketFile {
             Ok(_) => Ok(()),
             Err(e) if gone(&e) => Ok(()),
             Err(e) => Err(e),
+        };
+        // E is cleaned up even when the file could not be removed; the
+        // file's error is the one returned (hub SPEC "remove").
+        let cleaned = self.cleanup();
+        removed?;
+        cleaned?;
+        self.removed.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Remove the E the spelling goes through, the first time only (later
+    /// calls do nothing). The spelling names nothing afterwards; the socket
+    /// file and the socket stay. Nothing to do for a spelling through no E.
+    ///
+    /// # Errors
+    ///
+    /// Those of `unlink(2)` on E (other than `ENOENT`).
+    pub fn cleanup(&self) -> io::Result<()> {
+        match &self.link {
+            Some(link) => link.cleanup(),
+            None => Ok(()),
         }
     }
 }
@@ -1042,4 +448,368 @@ fn file_id(path: &Path) -> io::Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::symlink_metadata(path)?;
     Ok((m.dev(), m.ino()))
+}
+
+/// The new socket of a call that makes one.
+fn new_socket(socket: Option<OwnedFd>) -> io::Result<OwnedFd> {
+    socket.ok_or_else(|| io::Error::other("no socket was made"))
+}
+
+/// Bind a socket of `ty` to `path` and, with `remember`, take the socket file.
+pub(crate) fn bind_with(
+    ty: SockType,
+    path: &Path,
+    options: &Options,
+    remember: bool,
+) -> Result<(OwnedFd, Option<SocketFile>, route::Reached), ExError> {
+    let mut r = route::run(Request::Bind(ty), path, options, remember, None)?;
+    let socket = new_socket(r.socket.take()).map_err(|error| ExError {
+        error,
+        route: Some(r.route),
+        skipped: r.skipped.clone(),
+    })?;
+    let file = r.file.take().map(|f| SocketFile::new(f, r.link.clone()));
+    if remember && file.is_none() {
+        return Err(ExError {
+            error: io::Error::other("the socket file was not looked up"),
+            route: Some(r.route),
+            skipped: r.skipped,
+        });
+    }
+    Ok((socket, file, r))
+}
+
+/// The [`Bound`] of a bind made with `remember`.
+pub(crate) fn bound<S: From<OwnedFd>>(
+    (socket, file, r): (OwnedFd, Option<SocketFile>, route::Reached),
+) -> Result<Bound<S>, ExError> {
+    let Some(file) = file else {
+        return Err(ExError {
+            error: io::Error::other("the socket file was not looked up"),
+            route: Some(r.route),
+            skipped: r.skipped,
+        });
+    };
+    Ok(Bound {
+        socket: S::from(socket),
+        file,
+        spelling: r.spelling.unwrap_or(Spelling::Original),
+        route: r.route,
+        base: r.base,
+        skipped: r.skipped,
+    })
+}
+
+/// Create a socket bound to `path` and listening on it, like
+/// [`UnixListener::bind`] but for a path of any length.
+///
+/// A path that std accepts goes to [`UnixListener::bind`] unchanged. A longer
+/// path is bound by the routes of the platform (see the [crate
+/// documentation](crate)); the socket file is created at `path` either way,
+/// and is not removed when the listener is dropped (as with std). Its E stays
+/// until the process ends ([`bind_ex`] returns a [`SocketFile`] that removes
+/// the file and E).
+///
+/// # Errors
+///
+/// The errors of `bind(2)` / `listen(2)`, for example `EADDRINUSE` when `path`
+/// exists and `ENOENT` when its directory does not; `ENAMETOOLONG` when no
+/// route reaches the path; `InvalidInput` for a path longer than std accepts
+/// that does not end with a file name, or for a path that contains a NUL
+/// byte.
+pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
+    let (socket, _, _) = bind_with(SockType::Stream, path.as_ref(), &Options::default(), false)?;
+    Ok(UnixListener::from(socket))
+}
+
+/// Connect to the socket at `path`, like [`UnixStream::connect`] but for a
+/// path of any length. Nothing is left behind.
+///
+/// The stream blocks, like std's. In async code use [`connect_nonblocking`].
+///
+/// # Errors
+///
+/// The errors of `connect(2)`, for example `ENOENT` when nothing is at `path`
+/// and `ECONNREFUSED` when nobody listens on it (on macOS also when its
+/// backlog is full); `ENAMETOOLONG` when no route reaches the path;
+/// `InvalidInput` as for [`bind`].
+pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
+    connect_with(path.as_ref(), false, &Options::default())
+        .map(|c| c.socket)
+        .map_err(io::Error::from)
+}
+
+/// [`connect`] on a nonblocking socket: the connect does not wait, and the
+/// stream it returns is still nonblocking (ready for
+/// `tokio::net::UnixStream::from_std` as it is).
+///
+/// A Unix-domain connect completes or fails within the call, and sockat's
+/// clean-up after it is an `unlink`, so nothing waits. When the listener's
+/// backlog is full the connect fails at once: `EAGAIN` on Linux (where a
+/// blocking connect waits for room), `ECONNREFUSED` on macOS.
+///
+/// # Errors
+///
+/// Those of [`connect`], and `EAGAIN` for a full backlog on Linux.
+pub fn connect_nonblocking<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
+    connect_with(path.as_ref(), true, &Options::default())
+        .map(|c| c.socket)
+        .map_err(io::Error::from)
+}
+
+fn connect_with(
+    path: &Path,
+    nonblocking: bool,
+    options: &Options,
+) -> Result<Connected<UnixStream>, ExError> {
+    let req = Request::Connect(Connect::Stream { nonblocking });
+    let r = route::run(req, path, options, false, None)?;
+    let socket = new_socket(r.socket).map_err(|error| ExError {
+        error,
+        route: Some(r.route),
+        skipped: r.skipped.clone(),
+    })?;
+    Ok(Connected {
+        socket: UnixStream::from(socket),
+        route: r.route,
+        skipped: r.skipped,
+    })
+}
+
+/// [`bind`], with the [`SocketFile`] that removes the socket file and cleans
+/// up E later, what the spelling is good for, and how it was bound
+/// ([`Bound`]). `options` chooses B ([`Options`]).
+///
+/// The socket file's real path and `(st_dev, st_ino)` are taken right after
+/// the bind, before this returns. For a relative `path`, the cwd's `(st_dev,
+/// st_ino)` must be the same before the bind and after that look-up (another
+/// thread changing it would make the file looked up another one); otherwise
+/// the listener is closed and an error returned (the socket file stays, and
+/// so does nothing else). A listener short of a [`SocketFile`] that could
+/// remove the file is never handed out. Unlike std's and [`bind`]'s, nothing
+/// is removed when the listener is closed even for a short path: remove by
+/// [`SocketFile::remove`].
+///
+/// ```no_run
+/// let path = "/a/very/long/directory/.../server.sock";
+/// let bound = sockat::bind_ex(path, Default::default())?;
+/// if let sockat::Spelling::Linked { removable: false, .. } = bound.spelling {
+///     // removing by `bound.socket.local_addr()` would remove E, not the file
+/// }
+/// // ... serve on `bound.socket` ...
+/// bound.file.remove()?;
+/// drop(bound.socket);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// # Errors
+///
+/// Those of [`bind`], those of [`Options::base`], and those of looking the
+/// socket file up right after the bind, as an [`ExError`] with the routes
+/// tried.
+pub fn bind_ex<P: AsRef<Path>>(path: P, options: Options) -> Result<Bound<UnixListener>, ExError> {
+    bound(bind_with(SockType::Stream, path.as_ref(), &options, true)?)
+}
+
+/// [`connect`], with how it connected ([`Connected`]). `options` chooses B
+/// for the link-file route ([`Options::base`]); `usable_cross_uid` is not
+/// looked at.
+///
+/// # Errors
+///
+/// Those of [`connect`] and of [`Options::base`], as an [`ExError`] with the
+/// routes tried.
+pub fn connect_ex<P: AsRef<Path>>(
+    path: P,
+    options: Options,
+) -> Result<Connected<UnixStream>, ExError> {
+    connect_with(path.as_ref(), false, &options)
+}
+
+/// [`connect_ex`] on a nonblocking socket, as [`connect_nonblocking`] is to
+/// [`connect`].
+///
+/// # Errors
+///
+/// Those of [`connect_ex`], and `EAGAIN` for a full backlog on Linux.
+pub fn connect_nonblocking_ex<P: AsRef<Path>>(
+    path: P,
+    options: Options,
+) -> Result<Connected<UnixStream>, ExError> {
+    connect_with(path.as_ref(), true, &options)
+}
+
+/// A spelling for a bind, from [`resolve_for_bind`]: hand [`ForBind::path`]
+/// to std (or any library) to bind.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct ForBind {
+    /// The spelling: the path itself when std accepts it, else one through
+    /// B, D and E that keeps naming the same place until
+    /// [`ForBind::cleanup`].
+    pub path: PathBuf,
+    /// What the spelling is good for once bound.
+    pub spelling: Spelling,
+    /// How it was made (`standard`, `link-dir`, `link-file`). Diagnostics only.
+    pub route: &'static str,
+    /// The B it goes through. Diagnostics only.
+    pub base: Option<&'static str>,
+    /// The routes passed over. Diagnostics only.
+    pub skipped: Vec<Skipped>,
+    link: Option<Arc<base::Link>>,
+    cwd: Option<(u64, u64)>,
+}
+
+impl ForBind {
+    /// Remove E, the first time only (later calls do nothing): the spelling
+    /// names nothing afterwards. Not the socket file: that is
+    /// [`ForBind::socket_file`]'s [`SocketFile::remove`].
+    ///
+    /// # Errors
+    ///
+    /// Those of `unlink(2)` on E (other than `ENOENT`).
+    pub fn cleanup(&self) -> io::Result<()> {
+        match &self.link {
+            Some(link) => link.cleanup(),
+            None => Ok(()),
+        }
+    }
+
+    /// The [`SocketFile`] of the socket bound by [`ForBind::path`]: call it
+    /// after the bind (and before the socket is closed). The spelling is
+    /// followed now, and the socket file's real path and `(st_dev, st_ino)`
+    /// taken; its [`SocketFile::remove`] removes the file and cleans up the
+    /// same E as [`ForBind::cleanup`] (once, whichever comes first). Without
+    /// calling this there is nothing that removes the file.
+    ///
+    /// A replacement of the file between the bind and this call is not told
+    /// apart.
+    ///
+    /// # Errors
+    ///
+    /// When the spelling cannot be followed (before the bind, after the
+    /// clean-up), when what it reaches is not a socket (`ENOTSOCK`), and for
+    /// a `CwdRelative` spelling when the cwd is not the one it was resolved
+    /// against.
+    pub fn socket_file(&self) -> io::Result<SocketFile> {
+        let r = route::remember_resolved(&self.path, self.cwd)?;
+        Ok(SocketFile::new(r, self.link.clone()))
+    }
+}
+
+/// A spelling for a connect, from [`resolve_for_connect`]: hand
+/// [`ForConnect::path`] to std's connect (or any library) as many times as
+/// needed, then [`ForConnect::cleanup`].
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct ForConnect {
+    /// The spelling: the path itself when std accepts it, else one through B,
+    /// D and E (a symlink to the socket file) until [`ForConnect::cleanup`].
+    pub path: PathBuf,
+    /// How it was made (`standard`, `link-file`). Diagnostics only.
+    pub route: &'static str,
+    /// The routes passed over. Diagnostics only.
+    pub skipped: Vec<Skipped>,
+    link: Option<Arc<base::Link>>,
+}
+
+impl ForConnect {
+    /// Remove E, the first time only (later calls do nothing).
+    ///
+    /// # Errors
+    ///
+    /// Those of `unlink(2)` on E (other than `ENOENT`).
+    pub fn cleanup(&self) -> io::Result<()> {
+        match &self.link {
+            Some(link) => link.cleanup(),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A short spelling of `path` for a bind made by std or any other library
+/// (hub SPEC "resolve"): `path` itself when std accepts it, else
+/// `B/D/E/<file name>` through a symlink to the socket's directory
+/// (link-dir), or on macOS and NetBSD `B/D/E` through a symlink to the socket
+/// file (link-file). The spelling keeps naming the same place until
+/// [`ForBind::cleanup`] (or, spelled through `/proc`, while this process
+/// lives); the socket file is removed by [`ForBind::socket_file`].
+///
+/// ```no_run
+/// let path = "/a/very/long/directory/.../server.sock";
+/// let spelled = sockat::resolve_for_bind(path, Default::default())?;
+/// let listener = std::os::unix::net::UnixListener::bind(&spelled.path)?;
+/// let file = spelled.socket_file()?;
+/// // ... serve ...
+/// file.remove()?; // the socket file and E
+/// drop(listener);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// # Errors
+///
+/// `ENAMETOOLONG` where only thread-cwd / at would reach the path (use
+/// [`bind`] / [`bind_ex`] for those), those of looking the socket's directory
+/// up (`ENOENT`, `ENOTDIR`), `InvalidInput` as for [`bind`], and those of
+/// [`Options::base`].
+pub fn resolve_for_bind<P: AsRef<Path>>(path: P, options: Options) -> Result<ForBind, ExError> {
+    let r = route::resolve(Use::Bind, path.as_ref(), &options, None)?;
+    Ok(ForBind {
+        path: r.path,
+        spelling: r.spelling,
+        route: r.route,
+        base: r.base,
+        skipped: r.skipped,
+        link: r.link,
+        cwd: r.cwd,
+    })
+}
+
+/// A short spelling of `path` to connect to, as many times as needed (hub
+/// SPEC "resolve"): `path` itself when std accepts it, else `B/D/E` through a
+/// symlink to the socket file, whatever the file name's length. Made once
+/// and reused, it saves making a spelling on each connect; clean it up by
+/// [`ForConnect::cleanup`]. `usable_cross_uid` is not looked at.
+///
+/// # Errors
+///
+/// `ENAMETOOLONG` when no B can be had or the spelling does not fit (use
+/// [`connect`], which also tries the routes that need no writing), those of
+/// looking the socket's directory up, `InvalidInput` as for [`bind`], and
+/// those of [`Options::base`].
+pub fn resolve_for_connect<P: AsRef<Path>>(
+    path: P,
+    options: Options,
+) -> Result<ForConnect, ExError> {
+    let r = route::resolve(Use::Connect, path.as_ref(), &options, None)?;
+    Ok(ForConnect {
+        path: r.path,
+        route: r.route,
+        skipped: r.skipped,
+        link: r.link,
+    })
+}
+
+/// Remove the D whose process is gone (no lock held on it), with their E, in
+/// this user's B of the automatic places (`/tmp/sockat-<uid>`,
+/// `$XDG_RUNTIME_DIR/sockat`, `$TMPDIR/sockat-<uid>`) that are there. Only
+/// when called: nothing does it on its own. A live process's D, this one's
+/// included, is left alone, and no B is made or removed.
+///
+/// # Errors
+///
+/// Those of listing a B.
+pub fn sweep() -> io::Result<()> {
+    base::sweep(&route::Config::from_env().places)
+}
+
+/// [`sweep`] of the B at `base` (an [`Options::base`] the application
+/// manages).
+///
+/// # Errors
+///
+/// Those of [`Options::base`]'s checks (`base` is not made), and of listing
+/// it.
+pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()> {
+    base::sweep_base(base.as_ref())
 }

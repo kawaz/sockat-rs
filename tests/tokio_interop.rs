@@ -52,24 +52,23 @@ async fn std_sockets_from_sockat_are_adopted_by_tokio() {
     assert_eq!(&buf, b"pong");
 }
 
-// bind_ex's listener goes to tokio like bind's (it is std's own type, moved
+// bind_ex's socket goes to tokio like bind's (it is std's own type, moved
 // into tokio::net::UnixListener::from_std), and the SocketFile stays behind:
-// once tokio's listener has served a connection, discard() removes the
-// socket file, before tokio's listener is dropped (discard() is called before
-// the listener is closed). This is why discard() does not close the listener
-// itself: it no longer has it.
+// once tokio's listener has served a connection, remove() removes the socket
+// file, before tokio's listener is dropped. This is why remove() does not
+// close the listener itself: it no longer has it.
 #[tokio::test]
-async fn bind_ex_discards_after_the_listener_went_to_tokio() {
+async fn bind_ex_removes_after_the_listener_went_to_tokio() {
     let t = tempfile::Builder::new()
         .prefix("sockat-")
         .tempdir_in("/tmp")
         .unwrap();
     let path = long_path(t.path(), 400);
 
-    let sockat::ExListener { listener, file, .. } =
-        sockat::bind_ex(&path, sockat::LastResort::Avoid).unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+    let sockat::Bound { socket, file, .. } =
+        sockat::bind_ex(&path, sockat::Options::default()).unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let listener = tokio::net::UnixListener::from_std(socket).unwrap();
     let client = sockat::connect_nonblocking(&path).unwrap();
     let mut client = tokio::net::UnixStream::from_std(client).unwrap();
     let (mut server, _) = listener.accept().await.unwrap();
@@ -79,7 +78,7 @@ async fn bind_ex_discards_after_the_listener_went_to_tokio() {
     assert_eq!(&buf, b"ping");
 
     assert!(path.exists());
-    file.discard().unwrap();
+    file.remove().unwrap();
     drop(listener);
     assert!(std::fs::symlink_metadata(&path).is_err());
 }
