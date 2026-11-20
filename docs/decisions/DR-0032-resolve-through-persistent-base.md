@@ -62,7 +62,7 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 - 置き場 1〜3 の B は `Held` が、普段の B と `usable_cross_uid` の B の 2 つの枠で持つ (普段の B が他の uid に辿らせる時は同じ B)。一度持ったらプロセスの間それを使い、作れなかった置き場は覚えず次の呼び出しで試し直す。外では `route::Config` がプロセスの 1 つの `Held` を運ぶ
 - 置き場の順に、何も作らずに分かること (置き場が無い、途中の確かめに外れる、`usable_cross_uid` で途中が other に x を持たない) で外れる置き場を飛ばし、最初に残った置き場で綴りの長さを見積もる。収まらなければ B を作らず、次の置き場にも移らない
 - 他の uid に辿らせるかは、B を持った時に判定して `Base` に覚え、後で見直さない。`Options.base` の確かめも、持っている B はその判定を使う
-- D を作れなかった B は、その呼び出しの間 (`route::Target`) 覚え、D を使う経路で作り直さない
+- D を作れなかった B は、その呼び出しの間 (`route::Target`) 覚え、D を使う経路で作り直さない。mode をそろえられない・開けない時は、作った空の D を消す
 - ソケットのディレクトリの B は procB の綴りでだけ使う (`route::forms` が実パスの綴りを出さない)
 - D は B ごとに 1 つ、`O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` の fd に `flock(LOCK_SH | LOCK_NB)` を掛けて持ち続ける。掛けた後に名前で引き直して同じ D かを確かめ、違えば作り直す
 - 作った B と D は、作った直後に名前で `fchmodat(0711)` してから開いて確かめる
@@ -86,7 +86,7 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 ### 試験の口
 
 - 環境を読む部分は `route::Config` (置き場、持っている置き場 1〜3 の B (`Held`)、`/proc` の場所、thread-cwd、widened、bind が symlink を辿るか、ソケットのディレクトリの開き方、cwd の引き直しの間) にして、試験が差し替える。試験は `Held` を試験ごとに持ち、同じプロセスで並ぶ試験の B が重ならない
-- D を作れない場面は、試験だけの thread_local (`base::FAIL_D`) で作る (書けない B は root には効かない)
+- D を整えられない場面は、試験だけの thread_local (`base::FAIL_D`) で、作った D を開くところを失敗させて作る (本物の失敗をそこで起こす手が無い)
 - プロセス全体に効く設定 (cwd、umask、実効 uid) と、終わったプロセスの D が要る試験は、試験のバイナリを子プロセスで起こす
 - `unsafe` は `src/sys.rs` だけ (`just lint-unsafe`)
 
