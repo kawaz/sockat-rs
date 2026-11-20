@@ -276,7 +276,7 @@ The results are structs with public fields, `#[non_exhaustive]` (fields may be a
 
 - `route` and `skipped` are for diagnostics and promise nothing about their content (routes may be added or renamed)
 - Every route tried before `route` was passed over. For a long path the first is `standard`
-- `skipped` holds only routes of the order the call tries (the row of [Order per OS](#order-per-os) for that OS and state; with `LastResort::Allow` the last resort at its end). On a Linux without `/proc`, for example, proc, proc-sockdir, proc-direct and proc-held are not in it
+- `skipped` holds only routes of the order the call tries (in [Order per OS](#order-per-os), a bind's column for that OS, a connect's row for that OS and state; with `LastResort::Allow` the last resort at its end). On a Linux without `/proc`, for example, a bind's proc and proc-sockdir are in it as "`/proc unusable`", and a connect's proc-direct, proc and proc-held are not
 
 A failure returns an `ExError`, with `error` (the `io::Error`), `route` and `skipped`.
 

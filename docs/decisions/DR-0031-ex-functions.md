@@ -89,7 +89,7 @@ impl SocketFile { pub fn discard(self) -> io::Result<()>; }
 | fork-cwd-direct | | `Forked` |
 
 - `route` は通った経路の名前 (ハブ SPEC の「経路の名前」、`Route::name`)。`skipped` は試して使えなかった経路の並び (試した順)。長いパスでは最初が `standard`
-- `skipped` に入るのは、その呼び出しで試す順の列 (ハブ SPEC の「試す順番」と、connect では OS と `/proc` を使えるかで決まる「connect の順」の 1 行。`LastResort::Allow` ならその最後に最終手段) にある経路だけで、その列の順に並ぶ。`/proc` を使えない Linux では proc・proc-sockdir・proc-direct・proc-held を入れず、Linux の bind は symlink-file を入れず、`LastResort::Avoid` の connect は fork-cwd-direct を入れない
+- `skipped` に入るのは、その呼び出しで試す順の列 (ハブ SPEC の「試す順番」と、connect では OS と `/proc` を使えるかで決まる「connect の順」の 1 行。`LastResort::Allow` ならその最後に最終手段) にある経路だけで、その列の順に並ぶ。bind の列は OS だけで決まり実行時の状態では変わらないので、`/proc` を使えない Linux の bind でも proc・proc-sockdir は列にあり、使えない理由 (`/proc unusable`) を付けて入る (ハブ SPEC 7ed5e00e)。connect は `/proc` を使えない Linux の行に proc-direct・proc・proc-held が無いので入らない。Linux の bind は symlink-file を入れず、`LastResort::Avoid` の connect は fork-cwd-direct を入れない
 - `route` より前に試した経路はすべて使えなかったもの (実際に bind / connect して失敗したら、そのエラーを返して次を試さない)。「使えたか」は持たない
 - `Loss` の名前は約束で、足すだけ。`as_str` と `Display` はハブ SPEC の名前。`route`・`skipped` の名前と `reason` は診断用で、中身を約束しない
 - 失敗した時は `ExError`: `error` は既定の関数と同じ `io::Error`、`route` は実際に bind / connect して失敗した経路の名前 (短いパスで std が失敗した時は `standard`。どの経路も使えない `ENAMETOOLONG` と、経路の前に断った時は `None`)、`skipped` は試して使えなかった経路。経路の前に断った時 (NUL、名前で終わらない、ソケットのディレクトリが無い・ディレクトリでない・realpath を引けない) は `skipped` も空

@@ -276,7 +276,7 @@ drop(bound.listener);
 
 - `route` と `skipped` は診断用で、中身を約束しない (経路は増えたり名前が変わったりする)
 - `route` より前に試した経路はすべて使えなかったもの。長いパスでは最初が `standard`
-- `skipped` に入るのは、その呼び出しで試す順の列 ([OS ごとに試す順番](#os-ごとに試す順番) の、その OS と状態の行。`LastResort::Allow` ならその最後に最終手段) にある経路だけ。例えば `/proc` を使えない Linux では、proc・proc-sockdir・proc-direct・proc-held は入らない
+- `skipped` に入るのは、その呼び出しで試す順の列 ([OS ごとに試す順番](#os-ごとに試す順番) の、bind はその OS の列、connect はその OS と状態の行。`LastResort::Allow` ならその最後に最終手段) にある経路だけ。例えば `/proc` を使えない Linux では、bind の proc・proc-sockdir は「`/proc unusable`」で入り、connect の proc-direct・proc・proc-held は入らない
 
 失敗した時は `ExError` を返す。`error` (`io::Error`)、`route`、`skipped` を持つ。
 

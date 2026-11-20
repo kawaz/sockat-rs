@@ -2775,16 +2775,17 @@ fn the_routes_passed_over_are_reported_in_the_order_tried() {
 }
 
 // skipped holds only the routes of the order this call tries on this platform
-// in its state (SPEC "公開する操作": the order of "試す順番", for a connect with
-// the one row of "connect の順" that the OS and the state, /proc usable or
-// not, pick), every one of them that could not be used; a route of no such
-// order is not reported. With the thread-cwd means off, /proc looked for where
+// (SPEC "公開する操作", hub 7ed5e00e: the order of a bind is the OS's alone,
+// whatever the state; a connect takes the one row of "connect の順" that the
+// OS and the state, /proc usable or not, pick), every one of them that could
+// not be used; a route of no such order is not reported. With the thread-cwd means off, /proc looked for where
 // nothing is on Linux (a Linux without /proc), D made nowhere and no place for
 // a connect's symlink:
 //
-// * a bind passes over standard, thread-cwd and fork through D, then
-//   thread-cwd-sockdir, and is made by fork-cwd-sockdir. proc and proc-sockdir
-//   are for a Linux with /proc only (SPEC "経路の名前"), so they are not there;
+// * a bind passes over standard, thread-cwd, (Linux) proc and fork through D,
+//   then thread-cwd-sockdir and (Linux) proc-sockdir, and is made by
+//   fork-cwd-sockdir. proc is in a Linux bind's order with /proc or without,
+//   so without /proc it is passed over as unusable;
 // * connect_ex with the last resort passes over standard and the row of a Linux without /proc
 //   (relative, thread-cwd, symlink; no proc-direct, proc or proc-held) or of
 //   Apple (relative, widened, thread-cwd, symlink), and is made by
@@ -2810,10 +2811,23 @@ fn only_the_routes_of_the_order_tried_are_reported() {
         "{:?}",
         reached.skipped
     );
-    assert_eq!(
-        names(&reached.skipped),
-        ["standard", "thread-cwd", "fork-cwd", "thread-cwd-sockdir"]
-    );
+    let bind_order: &[&str] = if linux {
+        &[
+            "standard",
+            "thread-cwd",
+            "proc",
+            "fork-cwd",
+            "thread-cwd-sockdir",
+            "proc-sockdir",
+        ]
+    } else {
+        &["standard", "thread-cwd", "fork-cwd", "thread-cwd-sockdir"]
+    };
+    assert_eq!(names(&reached.skipped), bind_order);
+    if linux {
+        let proc = reached.skipped.iter().find(|s| s.name == "proc").unwrap();
+        assert_eq!(proc.reason, "/proc unusable");
+    }
     assert!(is_socket(&p));
 
     let p = nest(&t.path().join("connect"), 600, "s.sock");

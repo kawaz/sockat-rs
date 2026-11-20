@@ -1099,9 +1099,10 @@ fn means_check(t: &Target<'_>, m: Means) -> Option<&'static str> {
     }
 }
 
-/// The means of a bind through D in order, those of this target and its state
-/// (the /proc means only where /proc can be used, as the SPEC's proc is for a
-/// Linux with /proc), each with why it cannot be used ([`means_check`]).
+/// The means of a bind through D in order, those of this target (the order of
+/// a bind is the target's alone, whatever its state: on a Linux without /proc
+/// the proc means is in it and passed over as unusable, hub SPEC 7ed5e00e),
+/// each with why it cannot be used ([`means_check`]).
 // Design rationale: each push is behind the cfg of the targets that have the
 // means, so on some targets the list is one push after `new`.
 #[allow(clippy::vec_init_then_push)]
@@ -1110,9 +1111,7 @@ fn bind_means(t: &Target<'_>) -> MeansList {
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     all.push((Means::ThreadCwd, means_check(t, Means::ThreadCwd)));
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    if t.proc().is_some() {
-        all.push((Means::Proc, means_check(t, Means::Proc)));
-    }
+    all.push((Means::Proc, means_check(t, Means::Proc)));
     // bindat cannot turn out unusable, so nothing comes after it.
     #[cfg(target_os = "freebsd")]
     all.push((Means::At, means_check(t, Means::At)));
