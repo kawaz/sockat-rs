@@ -1802,6 +1802,59 @@ fn sweep_base_sweeps_an_options_base() {
     assert_eq!(errno(&e), Some(libc::EPERM), "{e}");
 }
 
+// sweep and sweep_base take only the directories right under B whose name
+// has the form of a D: 10 of the 62 letters and digits, as D's names are made
+// (hub SPEC "sweep"). B is sockat's own, but what else is found in it is not
+// sockat's to remove, even a directory that would otherwise pass for a dead
+// D (no lock held on it, only symlinks or nothing in it): a name 1 shorter or
+// longer, or with a character that is not a letter or a digit. The dead D of
+// the form are removed. Checked in an Options.base (sweep_base) and in the B
+// of a place (sweep).
+#[test]
+fn sweep_takes_only_names_of_the_form_of_a_d() {
+    let not_d = [
+        "abcdefghi",
+        "abcdefghijk",
+        "abcde-ghij",
+        "abcde.ghij",
+        "abcde_ghij",
+        "abcde ghij",
+        "empty",
+    ];
+    let d_form = ["deadDDDDDD", "0123456789", "zZ9aA0bB1c"];
+    let plant = |b: &Path| {
+        for name in not_d.iter().chain(&d_form) {
+            let d = b.join(name);
+            std::fs::create_dir(&d).unwrap();
+            if *name != "empty" {
+                std::os::unix::fs::symlink("/", d.join("0")).unwrap();
+            }
+        }
+    };
+    let mut want: Vec<String> = not_d.iter().map(|s| s.to_string()).collect();
+    want.sort();
+
+    let t = tmp();
+    let given = t.path().join("b");
+    std::fs::create_dir(&given).unwrap();
+    plant(&given);
+    base::sweep_base(&given).unwrap();
+    assert_eq!(entries(&given), want);
+
+    let (t, place) = setup();
+    let cfg = real_link_dir(&place);
+    let _own = bind(&nest(t.path(), 200, "s.sock"), &opts(), &cfg).unwrap();
+    let b = b_of(&place);
+    let own_d = entries(&b);
+    assert_eq!(own_d.len(), 1);
+    plant(&b);
+    base::sweep(&cfg.places).unwrap();
+    let mut left = want.clone();
+    left.extend(own_d);
+    left.sort();
+    assert_eq!(entries(&b), left);
+}
+
 // ---------------------------------------------------------------------------
 // connect
 // ---------------------------------------------------------------------------
@@ -2047,7 +2100,7 @@ fn resolved_spellings_are_used_by_std() {
     assert!(is_socket(&p));
     let file = SocketFile::new(
         route::remember_resolved(&r.path, r.cwd).unwrap(),
-        r.link.clone(),
+        crate::Clean::new(r.link.clone()),
     );
 
     let rc = route::resolve(route::Use::Connect, &p, &opts(), Some(&cfg)).unwrap();
@@ -2079,7 +2132,7 @@ fn remove_removes_the_bound_file_once_and_not_a_replacement() {
     let p = nest(t.path(), 200, "s.sock");
     let mut r = bind(&p, &opts(), &cfg).unwrap();
     let l = listener(&mut r);
-    let file = SocketFile::new(r.file.take().unwrap(), r.link.clone());
+    let file = SocketFile::new(r.file.take().unwrap(), crate::Clean::new(r.link.clone()));
     file.remove().unwrap();
     assert!(!p.exists());
     assert_no_e(&b_of(&place));
@@ -2092,11 +2145,476 @@ fn remove_removes_the_bound_file_once_and_not_a_replacement() {
     let q = nest(&t.path().join("q"), 200, "s.sock");
     let mut r = bind(&q, &opts(), &cfg).unwrap();
     let _l = listener(&mut r);
-    let file = SocketFile::new(r.file.take().unwrap(), r.link.clone());
+    let file = SocketFile::new(r.file.take().unwrap(), crate::Clean::new(r.link.clone()));
     std::fs::remove_file(&q).unwrap();
     std::fs::write(&q, b"someone else's").unwrap();
     file.remove().unwrap();
     assert_eq!(std::fs::read(&q).unwrap(), b"someone else's");
+}
+
+// On macOS and NetBSD a bind follows a symlink in the last component of the
+// path and makes the socket where it points. What bind_ex remembers is then
+// the socket the symlink led to (its real path and (st_dev, st_ino)), not the
+// symlink: remove removes that socket and leaves the user's symlink (hub SPEC
+// "remove": remove must not remove the user's symlink). Checked by every
+// route a bind takes there: standard (a short path), link-dir, link-file,
+// and thread-cwd (Apple).
+#[cfg(any(target_vendor = "apple", target_os = "netbsd"))]
+#[test]
+fn remove_leaves_a_symlink_at_the_path_and_removes_where_it_led() {
+    let (t, place) = setup();
+    let real = t.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let mut cases = vec![
+        (names::STANDARD, t.path().join("s.sock"), config(&place)),
+        (
+            names::LINK_DIR,
+            nest(&t.path().join("ld"), 200, "s.sock"),
+            real_link_dir(&place),
+        ),
+        (
+            names::LINK_FILE,
+            nest(&t.path().join("lf"), 400, &"n".repeat(200)),
+            no_proc(config(&place)),
+        ),
+    ];
+    if cfg!(target_vendor = "apple") && thread_here() {
+        cases.push((
+            names::THREAD_CWD,
+            nest(&t.path().join("tc"), 250, &name_past_link_dir()),
+            real_link_dir(&place),
+        ));
+    }
+    for (i, (route, p, cfg)) in cases.into_iter().enumerate() {
+        let target = real.join(format!("{i}.sock"));
+        std::os::unix::fs::symlink(&target, &p).unwrap();
+        let mut r = bind(&p, &opts(), &cfg).unwrap_or_else(|f| panic!("{route}: {}", f.error));
+        assert_eq!(r.route, route);
+        let _l = listener(&mut r);
+        assert!(is_socket(&target), "{route}: the bind followed the symlink");
+        let file = SocketFile::new(r.file.take().unwrap(), crate::Clean::new(r.link.clone()));
+        assert_eq!(
+            file.path,
+            std::fs::canonicalize(&target).unwrap(),
+            "{route}"
+        );
+        file.remove().unwrap();
+        assert!(
+            std::fs::symlink_metadata(&target).is_err(),
+            "{route}: the socket is left"
+        );
+        assert!(p.is_symlink(), "{route}: the symlink is removed");
+    }
+}
+
+// ForBind's socket_file after the user's own bind through a path whose last
+// component is a symlink (followed by the bind on macOS and NetBSD)
+// remembers the socket the symlink led to, so its remove removes that socket
+// and leaves the symlink; a symlink to what is not a socket is ENOTSOCK and
+// nothing is remembered (hub SPEC "ForBind の SocketFile"). A short path (the
+// spelling is the path) and a long one (link-dir).
+#[cfg(any(target_vendor = "apple", target_os = "netbsd"))]
+#[test]
+fn socket_file_through_a_symlink_at_the_path_remembers_where_it_led() {
+    let (t, place) = setup();
+    let cfg = real_link_dir(&place);
+    let real = t.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let paths = [
+        t.path().join("s.sock"),
+        nest(&t.path().join("ld"), 200, "s.sock"),
+    ];
+    for (i, p) in paths.iter().enumerate() {
+        let target = real.join(format!("{i}.sock"));
+        std::os::unix::fs::symlink(&target, p).unwrap();
+        let r = route::resolve(route::Use::Bind, p, &opts(), Some(&cfg)).unwrap();
+        let _l = UnixListener::bind(&r.path).unwrap();
+        assert!(is_socket(&target));
+        let file = SocketFile::new(
+            route::remember_resolved(&r.path, r.cwd).unwrap(),
+            crate::Clean::new(r.link),
+        );
+        assert_eq!(file.path, std::fs::canonicalize(&target).unwrap());
+        file.remove().unwrap();
+        assert!(std::fs::symlink_metadata(&target).is_err(), "{p:?}");
+        assert!(p.is_symlink(), "{p:?}");
+
+        let q = p.with_file_name("q.sock");
+        let not_socket = real.join(format!("{i}.file"));
+        std::fs::write(&not_socket, b"not a socket").unwrap();
+        std::os::unix::fs::symlink(&not_socket, &q).unwrap();
+        let r = route::resolve(route::Use::Bind, &q, &opts(), Some(&cfg)).unwrap();
+        let e = route::remember_resolved(&r.path, r.cwd).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::ENOTSOCK), "{q:?}");
+    }
+}
+
+thread_local! {
+    /// The file the [`replace_after_bind`] hook puts in the socket's place.
+    // The initializer is `const`; clippy on illumos says otherwise of the
+    // macro's expansion there.
+    #[allow(clippy::missing_const_for_thread_local)]
+    static REPLACED: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// [`route::AFTER_BIND`] for the tests: the socket file at [`REPLACED`] is
+/// replaced by a regular file right after the bind, as another process could.
+fn replace_after_bind() {
+    REPLACED.with_borrow(|p| {
+        let p = p.as_ref().unwrap();
+        std::fs::remove_file(p).unwrap();
+        std::fs::write(p, b"not a socket").unwrap();
+    });
+}
+
+// What a bind_ex finds where the bind made the socket must be a socket: one
+// replaced right after the bind by something else (a regular file) is not
+// remembered, so remove cannot remove it (hub SPEC "remove": what the symlink
+// led to is not a socket, treated as not remembered). The call fails
+// (ENOTSOCK), the listener is closed, E is removed, and the replacement and
+// the user's symlink are left. Checked for a symlink at the path on macOS and
+// NetBSD (where the bind follows it), and for the socket file itself on
+// every target, by each route a bind takes here.
+#[test]
+fn a_bind_ex_that_finds_no_socket_where_it_bound_fails() {
+    let (t, place) = setup();
+    let real = t.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let mut cases = vec![
+        (names::STANDARD, t.path().join("s.sock"), config(&place)),
+        (
+            names::LINK_DIR,
+            nest(&t.path().join("ld"), 200, "s.sock"),
+            real_link_dir(&place),
+        ),
+    ];
+    if cfg!(any(target_vendor = "apple", target_os = "netbsd")) {
+        cases.push((
+            names::LINK_FILE,
+            nest(&t.path().join("lf"), 400, &"n".repeat(200)),
+            no_proc(config(&place)),
+        ));
+    }
+    if cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple"
+    )) && thread_here()
+    {
+        cases.push((
+            names::THREAD_CWD,
+            nest(&t.path().join("tc"), 250, &name_past_link_dir()),
+            real_link_dir(&place),
+        ));
+    }
+    let follows = cfg!(any(target_vendor = "apple", target_os = "netbsd"));
+    for (i, (route, p, cfg)) in cases.into_iter().enumerate() {
+        for through_symlink in [false, true] {
+            if through_symlink && !follows {
+                continue;
+            }
+            let p = match through_symlink {
+                false => p.clone(),
+                true => p.with_file_name(format!("l{}", p.file_name().unwrap().to_str().unwrap())),
+            };
+            let at = match through_symlink {
+                false => p.clone(),
+                true => {
+                    let target = real.join(format!("{i}.sock"));
+                    std::os::unix::fs::symlink(&target, &p).unwrap();
+                    target
+                }
+            };
+            REPLACED.set(Some(at.clone()));
+            route::AFTER_BIND.set(Some(replace_after_bind));
+            let f = bind(&p, &opts(), &cfg).err();
+            route::AFTER_BIND.set(None);
+            let f = f.unwrap_or_else(|| panic!("{route} {through_symlink}: bound"));
+            assert_eq!(errno(&f.error), Some(libc::ENOTSOCK), "{route}");
+            assert_eq!(f.route, Some(route));
+            assert_eq!(std::fs::read(&at).unwrap(), b"not a socket", "{route}");
+            if through_symlink {
+                assert!(p.is_symlink(), "{route}");
+            }
+            assert_no_e(&b_of(&place));
+        }
+    }
+}
+
+/// `f` with every removal of an E on this thread failing (`EPERM`, the E
+/// left), as the system could refuse it ([`base::FAIL_UNLINK_E`]).
+fn with_e_unremovable<T>(f: impl FnOnce() -> T) -> T {
+    base::FAIL_UNLINK_E.set(true);
+    let out = f();
+    base::FAIL_UNLINK_E.set(false);
+    out
+}
+
+/// The E left in `b`: directly in B (the plain connect's) and in its D.
+fn e_left(b: &Path) -> usize {
+    entries(b)
+        .iter()
+        .map(|name| match b.join(name) {
+            e if e.is_symlink() => 1,
+            d => entries(&d).len(),
+        })
+        .sum()
+}
+
+// A removal of E made inside a call that fails is passed over in silence: it
+// changes neither whether the call succeeds nor the error it returns (hub
+// SPEC-routes "経路の失敗の扱い": a failure to remove must not turn a
+// successful connect into a failure, nor replace the original error). Each
+// such removal: the plain connect's link-file E after a connect that
+// succeeded and after one that failed (ECONNREFUSED), the E of a bind that
+// failed for real (EADDRINUSE) through link-dir, link-file (macOS, NetBSD)
+// and thread-cwd (Linux, Apple), the thread-cwd E after a bind that
+// succeeded, and the E of a bind_ex that could not remember the socket file
+// (ENOTSOCK). Each E is still there afterwards, so the removal did fail.
+#[test]
+fn a_failed_removal_of_e_inside_a_call_changes_nothing() {
+    let (t, place) = setup();
+    let b = b_of(&place);
+
+    let cfg = no_thread(no_direct(no_proc(config(&place))));
+    let p = nest(&t.path().join("c"), 300, &"n".repeat(100));
+    let l = listen_at(&p);
+    let c = with_e_unremovable(|| connect(&p, &cfg)).unwrap();
+    assert_eq!(c.route, names::LINK_FILE);
+    ping(&l, c.socket.unwrap());
+    assert_eq!(e_left(&b), 1);
+    drop(l);
+    let f = with_e_unremovable(|| connect(&p, &cfg)).err().unwrap();
+    assert_eq!(errno(&f.error), Some(libc::ECONNREFUSED));
+    assert_eq!(f.route, Some(names::LINK_FILE));
+    assert_eq!(e_left(&b), 2);
+
+    let mut cases = vec![(
+        names::LINK_DIR,
+        nest(&t.path().join("ld"), 200, "s.sock"),
+        real_link_dir(&place),
+    )];
+    if cfg!(any(target_vendor = "apple", target_os = "netbsd")) {
+        cases.push((
+            names::LINK_FILE,
+            nest(&t.path().join("lf"), 400, &"n".repeat(200)),
+            no_proc(config(&place)),
+        ));
+    }
+    let thread = cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple"
+    )) && thread_here();
+    if thread {
+        cases.push((
+            names::THREAD_CWD,
+            nest(&t.path().join("tc"), 250, &name_past_link_dir()),
+            real_link_dir(&place),
+        ));
+    }
+    for (route, p, cfg) in &cases {
+        let before = e_left(&b);
+        std::fs::write(p, b"").unwrap();
+        let f = with_e_unremovable(|| bind(p, &opts(), cfg)).err().unwrap();
+        assert_eq!(errno(&f.error), Some(libc::EADDRINUSE), "{route}");
+        assert_eq!(f.route, Some(*route));
+        assert_eq!(e_left(&b), before + 1, "{route}");
+        std::fs::remove_file(p).unwrap();
+    }
+    if thread {
+        let p = nest(&t.path().join("tc2"), 250, &name_past_link_dir());
+        let before = e_left(&b);
+        let mut r = with_e_unremovable(|| bind(&p, &opts(), &real_link_dir(&place))).unwrap();
+        assert_eq!(r.route, names::THREAD_CWD);
+        assert!(r.file.is_some());
+        let l = listener(&mut r);
+        ping(
+            &l,
+            connect(&p, &real_link_dir(&place)).unwrap().socket.unwrap(),
+        );
+        assert_eq!(e_left(&b), before + 1);
+    }
+
+    let p = nest(&t.path().join("ns"), 200, "s.sock");
+    let before = e_left(&b);
+    REPLACED.set(Some(p.clone()));
+    route::AFTER_BIND.set(Some(replace_after_bind));
+    let f = with_e_unremovable(|| bind(&p, &opts(), &real_link_dir(&place))).err();
+    route::AFTER_BIND.set(None);
+    let f = f.unwrap();
+    assert_eq!(errno(&f.error), Some(libc::ENOTSOCK));
+    assert_eq!(f.route, Some(names::LINK_DIR));
+    assert_eq!(e_left(&b), before + 1);
+}
+
+// The cleanup() a user calls is not silent: a failure to remove E (other
+// than E being gone already) is its error, telling the user that what they
+// asked for was not done (hub SPEC "remove と cleanup"). A later call tries
+// again, and once E is removed later calls do nothing. remove() returns the
+// error of removing the socket file first, still doing the cleanup, and the
+// cleanup's error when the file was removed. ForBind / ForConnect /
+// SocketFile share the one cleanup of their E.
+#[test]
+fn a_cleanup_the_user_calls_returns_the_failure_to_remove_e() {
+    let (t, place) = setup();
+    let cfg = real_link_dir(&place);
+    let b = b_of(&place);
+
+    let p = nest(&t.path().join("r"), 200, "s.sock");
+    let r = route::resolve(route::Use::Connect, &p, &opts(), Some(&cfg)).unwrap();
+    let link = r.link.clone().unwrap();
+    let unlinks = || link.unlinks.load(std::sync::atomic::Ordering::Relaxed);
+    let for_connect = crate::ForConnect {
+        path: r.path,
+        route: r.route,
+        skipped: r.skipped,
+        clean: crate::Clean::new(r.link),
+    };
+    assert_eq!(e_left(&b), 1);
+    let e = with_e_unremovable(|| for_connect.cleanup()).unwrap_err();
+    assert_eq!(errno(&e), Some(libc::EPERM));
+    assert_eq!(e_left(&b), 1);
+    for_connect.cleanup().unwrap();
+    assert_eq!(e_left(&b), 0);
+    assert_eq!(unlinks(), 2);
+    for_connect.cleanup().unwrap();
+    assert_eq!(unlinks(), 2, "a call after the success does nothing");
+
+    // remove(): the file removed, E not: the cleanup's error; then both done.
+    let p = nest(&t.path().join("s"), 200, "s.sock");
+    let mut r = bind(&p, &opts(), &cfg).unwrap();
+    let _l = listener(&mut r);
+    let file = SocketFile::new(r.file.take().unwrap(), crate::Clean::new(r.link.clone()));
+    let link = r.link.clone().unwrap();
+    let unlinks = || link.unlinks.load(std::sync::atomic::Ordering::Relaxed);
+    let e = with_e_unremovable(|| file.remove()).unwrap_err();
+    assert_eq!(errno(&e), Some(libc::EPERM));
+    assert!(!p.exists());
+    assert_eq!(e_left(&b), 1);
+    file.remove().unwrap();
+    assert_eq!(e_left(&b), 0);
+    assert_eq!(unlinks(), 2);
+    let _again = listen_at(&p);
+    file.remove().unwrap();
+    assert!(is_socket(&p), "a call after the success does nothing");
+    assert_eq!(unlinks(), 2);
+
+    // remove(): neither the file nor E removed: the file's error (EACCES, the
+    // socket's directory not writable), the cleanup still tried. Not as root,
+    // whom the mode does not stop.
+    if sys::effective_uid() == 0 {
+        return;
+    }
+    let p = nest(&t.path().join("u"), 200, "s.sock");
+    let mut r = bind(&p, &opts(), &cfg).unwrap();
+    let _l = listener(&mut r);
+    let file = SocketFile::new(r.file.take().unwrap(), crate::Clean::new(r.link.clone()));
+    let dir = p.parent().unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let e = with_e_unremovable(|| file.remove()).unwrap_err();
+    assert_eq!(errno(&e), Some(libc::EACCES));
+    assert_eq!(e_left(&b), 1);
+    // The file still not removable, E now is: the file's error, E removed.
+    let e = file.remove().unwrap_err();
+    assert_eq!(errno(&e), Some(libc::EACCES));
+    assert_eq!(e_left(&b), 0);
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    file.remove().unwrap();
+    assert!(!p.exists());
+}
+
+// cleanup() and remove() called at once from many threads remove E once:
+// one unlink of E, every call Ok, E gone (hub SPEC "remove と cleanup": the
+// removal is one at a time even when called concurrently). After that a call
+// does nothing (no further unlink). Repeated over many E, each with its
+// callers released together, so that calls that are not one at a time would
+// meet.
+#[test]
+fn concurrent_cleanups_unlink_e_once() {
+    let (t, place) = setup();
+    let cfg = real_link_dir(&place);
+    let b = b_of(&place);
+    let threads = 8;
+    for i in 0..64 {
+        let p = nest(&t.path().join(format!("{i}")), 200, "s.sock");
+        let r = route::resolve(route::Use::Bind, &p, &opts(), Some(&cfg)).unwrap();
+        let link = r.link.unwrap();
+        let _l = UnixListener::bind(&r.path).unwrap();
+        let file = SocketFile::new(
+            route::remember_resolved(&r.path, None).unwrap(),
+            crate::Clean::new(Some(link.clone())),
+        );
+        let barrier = std::sync::Barrier::new(threads);
+        std::thread::scope(|s| {
+            for k in 0..threads {
+                let (barrier, file) = (&barrier, &file);
+                s.spawn(move || {
+                    barrier.wait();
+                    match k % 2 {
+                        0 => file.remove().unwrap(),
+                        _ => file.cleanup().unwrap(),
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            link.unlinks.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "E {i}"
+        );
+        assert!(!p.exists());
+        assert_eq!(e_left(&b), 0);
+        file.cleanup().unwrap();
+        file.remove().unwrap();
+        assert_eq!(link.unlinks.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+}
+
+// The SocketFiles one ForBind gives (socket_file() called more than once)
+// and the ForBind itself share one lock for removing the socket file and E
+// (hub SPEC "remove と cleanup": one at a time even when called at once).
+// Each SocketFile removed from its own thread at once, with the ForBind's
+// cleanup beside them: the socket file is unlinked once (the others find it
+// gone: Ok), and E once. Two removals of the file not one at a time could
+// both find it still the one bound and both unlink it, the second removing a
+// socket bound at the path in between. Repeated over many paths, the
+// callers of each released together.
+#[test]
+fn removals_through_one_for_bind_are_one_at_a_time() {
+    let t = tmp();
+    let options = Options {
+        base: Some(t.path().join("b")),
+        ..opts()
+    };
+    let threads = 8;
+    for i in 0..64 {
+        let p = nest(&t.path().join(format!("{i}")), 200, "s.sock");
+        let for_bind = crate::resolve_for_bind(&p, options.clone()).unwrap();
+        let _l = UnixListener::bind(&for_bind.path).unwrap();
+        let files: Vec<SocketFile> = (0..threads)
+            .map(|_| for_bind.socket_file().unwrap())
+            .collect();
+        let barrier = std::sync::Barrier::new(threads + 1);
+        std::thread::scope(|s| {
+            for file in &files {
+                let barrier = &barrier;
+                s.spawn(move || {
+                    barrier.wait();
+                    file.remove().unwrap();
+                });
+            }
+            s.spawn(|| {
+                barrier.wait();
+                for_bind.cleanup().unwrap();
+            });
+        });
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(for_bind.clean.file_unlinks.load(relaxed), 1, "file {i}");
+        let link = for_bind.clean.link.as_ref().unwrap();
+        assert_eq!(link.unlinks.load(relaxed), 1, "E {i}");
+        assert!(!p.exists());
+    }
 }
 
 // A relative path bound with the socket file taken, while the cwd changes

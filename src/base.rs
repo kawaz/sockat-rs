@@ -26,7 +26,7 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::sys;
@@ -104,6 +104,14 @@ pub(crate) fn random_name() -> io::Result<String> {
         .iter()
         .map(|b| ALPHABET[*b as usize % 62] as char)
         .collect())
+}
+
+/// Whether `name` has the form of the names [`random_name`] draws:
+/// `RANDOM_LEN` ASCII letters and digits. [`sweep`] takes only directories
+/// named so (hub SPEC "`sweep`").
+pub(crate) fn is_random_name(name: &OsStr) -> bool {
+    let name = name.as_encoded_bytes();
+    name.len() == RANDOM_LEN && name.iter().all(u8::is_ascii_alphanumeric)
 }
 
 /// `n` in base 36 (`0`-`9`, `a`-`z`): the name of the n-th E a D holds (`0`,
@@ -828,7 +836,9 @@ impl Dir {
                     return Ok(Link {
                         dir: Arc::clone(self),
                         name,
-                        done: AtomicBool::new(false),
+                        done: Mutex::new(false),
+                        #[cfg(test)]
+                        unlinks: AtomicU64::new(0),
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -849,7 +859,12 @@ impl Dir {
 pub(crate) struct Link {
     dir: Arc<Dir>,
     name: OsString,
-    done: AtomicBool,
+    /// Whether E has been removed; held while it is being removed, so the
+    /// removal is one at a time.
+    done: Mutex<bool>,
+    /// Test-only: how many times [`Link::cleanup`] has unlinked E.
+    #[cfg(test)]
+    pub(crate) unlinks: AtomicU64,
 }
 
 impl Link {
@@ -858,17 +873,45 @@ impl Link {
         Path::new(&self.dir.name).join(&self.name)
     }
 
-    /// Remove E, the first time only; later calls do nothing. E already gone
-    /// is not an error.
+    /// Remove E; once it is removed, later calls do nothing. E already gone
+    /// is not an error. A failure is returned, and a later call tries again
+    /// (hub SPEC "remove と cleanup": a failure remembered would leave no way
+    /// to clean up). Calls at once remove it one at a time.
     pub(crate) fn cleanup(&self) -> io::Result<()> {
-        if self.done.swap(true, Ordering::AcqRel) {
+        let mut done = lock(&self.done);
+        if *done {
             return Ok(());
         }
-        match sys::unlink_at(self.dir.fd.as_fd(), &self.name, false) {
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
-            done => done,
+        #[cfg(test)]
+        self.unlinks.fetch_add(1, Ordering::Relaxed);
+        match unlink_e(self.dir.fd.as_fd(), &self.name) {
+            Err(e) if e.raw_os_error() != Some(libc::ENOENT) => Err(e),
+            _ => {
+                *done = true;
+                Ok(())
+            }
         }
     }
+}
+
+/// Remove the E named `name` in `dir` (D, or B for the plain connect's).
+fn unlink_e(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_UNLINK_E.get() {
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    }
+    sys::unlink_at(dir, name, false)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: `true` makes every removal of an E on this thread fail
+    /// (`EPERM`, as for an immutable E) and leave the E, as a removal refused
+    /// by the system would.
+    // The initializer is `const`; clippy on illumos says otherwise of the
+    // macro's expansion there.
+    #[allow(clippy::missing_const_for_thread_local)]
+    pub(crate) static FAIL_UNLINK_E: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// An E with a random name, removed when this is dropped: the E of
@@ -901,7 +944,7 @@ impl Drop for TempLink<'_> {
     fn drop(&mut self) {
         // Best effort: the call is made by then. Nobody else can create or
         // remove entries in B or D, so the name is still this E.
-        let _ = sys::unlink_at(self.dir, &self.name, false);
+        let _ = unlink_e(self.dir, &self.name);
     }
 }
 
@@ -962,15 +1005,17 @@ fn own_d_at(b: &Base) -> Option<OsString> {
         .and_then(|r| r.own_d())
 }
 
-/// Each directory of this user in `b`, other than this process's D, that an
-/// exclusive `flock` can be taken on has its entries and then itself
-/// removed. Another process's live D keeps its shared lock and is skipped.
+/// Each directory of this user in `b` named in the form of a D, other than
+/// this process's D, that an exclusive `flock` can be taken on has its
+/// entries and then itself removed. Another process's live D keeps its
+/// shared lock and is skipped. B is sockat's own, yet anything else in it is
+/// left alone: only what has the form of a D is sockat's (hub SPEC "`sweep`").
 fn sweep_in(b: &Base) -> io::Result<()> {
     let own = own_d_at(b);
     for entry in std::fs::read_dir(&b.path)? {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name();
-        if own.as_deref() == Some(name.as_os_str()) {
+        if !is_random_name(&name) || own.as_deref() == Some(name.as_os_str()) {
             continue;
         }
         let Ok(st) = sys::stat_at(b.fd.as_fd(), &name) else {

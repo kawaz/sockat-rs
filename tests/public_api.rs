@@ -312,6 +312,42 @@ fn bind_ex_returns_the_socket_file_and_the_spelling() {
     assert!(!short.exists());
 }
 
+// On macOS and NetBSD a bind follows a symlink in the last component of the
+// path and makes the socket where it points. bind_ex's SocketFile, and the
+// one ForBind::socket_file gives after the user's own bind, then hold the
+// socket the symlink led to: remove removes that socket and leaves the
+// user's symlink (hub SPEC "remove"), for a short path and a long one.
+#[cfg(any(target_vendor = "apple", target_os = "netbsd"))]
+#[test]
+fn remove_leaves_a_symlink_at_the_path() {
+    let t = tmp();
+    let real = t.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let paths = [
+        t.path().join("s.sock"),
+        nest(&t.path().join("long"), 300, "s.sock"),
+    ];
+    for (i, p) in paths.iter().enumerate() {
+        let target = real.join(format!("{i}.sock"));
+        std::os::unix::fs::symlink(&target, p).unwrap();
+        let bound = sockat::bind_ex(p, own_base(&t)).unwrap();
+        assert!(is_socket(&target));
+        let mut c = sockat::connect(p).unwrap();
+        ping(&bound.socket, &mut c);
+        bound.file.remove().unwrap();
+        assert!(std::fs::symlink_metadata(&target).is_err(), "{p:?}");
+        assert!(p.is_symlink(), "{p:?}");
+
+        let for_bind = sockat::resolve_for_bind(p, own_base(&t)).unwrap();
+        let _listener = UnixListener::bind(&for_bind.path).unwrap();
+        assert!(is_socket(&target));
+        let file = for_bind.socket_file().unwrap();
+        file.remove().unwrap();
+        assert!(std::fs::symlink_metadata(&target).is_err(), "{p:?}");
+        assert!(p.is_symlink(), "{p:?}");
+    }
+}
+
 // An _ex function that fails keeps the errno, converts into the io::Error by
 // `?`, and reports the route that made the call (None when the path was
 // refused before any route: the directory missing; nothing skipped then).

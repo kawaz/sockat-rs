@@ -428,6 +428,9 @@ fn run_unchecked(
         if let Some(cfg) = cfg {
             (cfg.between_cwd_lookups)();
         }
+        if req.is_bind() {
+            after_bind();
+        }
         let file = match remember && req.is_bind() {
             true => Some(remembered_at(path).map_err(failed)?),
             false => None,
@@ -510,11 +513,39 @@ fn too_long() -> io::Error {
     io::Error::from_raw_os_error(libc::ENAMETOOLONG)
 }
 
-/// The [`Remembered`] of the socket file at `path`, bound just now by std:
-/// `realpath(3)` of `path`, and `lstat(2)` of that.
+#[cfg(test)]
+thread_local! {
+    /// Test-only: called on the calling thread right after a bind succeeds,
+    /// before the socket file is looked up ([`after_bind`]). The tests put a
+    /// replacement of the file there, as another process could.
+    // The initializer is `const`; clippy on illumos says otherwise of the
+    // macro's expansion there.
+    #[allow(clippy::missing_const_for_thread_local)]
+    pub(crate) static AFTER_BIND: Cell<Option<fn()>> = const { Cell::new(None) };
+}
+
+/// Where a bind has succeeded and the socket file is yet to be looked up.
+/// Does nothing outside the tests ([`AFTER_BIND`]).
+fn after_bind() {
+    #[cfg(test)]
+    if let Some(f) = AFTER_BIND.get() {
+        f();
+    }
+}
+
+/// The [`Remembered`] of the socket file a bind reached by `path` just now:
+/// `realpath(3)` of `path` and `lstat(2)` of that, which must be a socket
+/// (`ENOTSOCK` otherwise). A symlink in the last component is followed, as
+/// the bind followed it on macOS and NetBSD (hub SPEC "remove"): what is
+/// remembered is the socket it led to, never the user's symlink. Anything but
+/// a socket there is not what the bind made (it was replaced), and is not
+/// remembered, so `remove` cannot remove it.
 fn remembered_at(path: &Path) -> io::Result<Remembered> {
     let path = std::fs::canonicalize(path)?;
     let m = std::fs::symlink_metadata(&path)?;
+    if !std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()) {
+        return Err(io::Error::from_raw_os_error(libc::ENOTSOCK));
+    }
     Ok(Remembered {
         path,
         id: (m.dev(), m.ino()),
@@ -886,8 +917,9 @@ fn bind_order(t: &Target<'_>, remember: bool) -> Step {
 /// Bind by the spelling of `th`. On success the E stays (the kernel keeps the
 /// spelling); on failure it is removed before the error is returned (hub
 /// SPEC-routes "経路の失敗の扱い"). With `remember`, the socket file is looked
-/// up by the spelling (E followed, the socket file itself not) while E is
-/// there; when that fails, the socket is closed and E removed.
+/// up ([`remember_spelled`]) while E is there; when that fails, the socket is
+/// closed and E removed. A failure to remove E there is passed over: the
+/// error returned is the call's (as for every E removed inside a call).
 fn bind_through(t: &Target<'_>, th: Through, route: &'static str, remember: bool) -> Step {
     let socket = match plain(t.req, &th.spelling) {
         Ok(socket) => socket,
@@ -896,6 +928,7 @@ fn bind_through(t: &Target<'_>, th: Through, route: &'static str, remember: bool
             return Step::done(route, Err(e));
         }
     };
+    after_bind();
     let file = match remember {
         false => None,
         true => match remember_spelled(t, &th.spelling) {
@@ -919,22 +952,18 @@ fn bind_through(t: &Target<'_>, th: Through, route: &'static str, remember: bool
     )
 }
 
-/// The socket file bound just now through `spelling`: `(st_dev, st_ino)` by
-/// `lstat` of the socket file itself (the real path of the socket's
-/// directory joined with the file name), which the spelling reaches.
+/// The socket file bound just now through `spelling`: [`remembered_at`] the
+/// real path of the socket's directory joined with the file name (a symlink
+/// there followed, as the bind followed it), which the spelling must reach.
 fn remember_spelled(t: &Target<'_>, spelling: &Path) -> io::Result<Remembered> {
-    let path = t.real_dir.join(t.name);
-    let m = std::fs::symlink_metadata(&path)?;
+    let r = remembered_at(&t.real_dir.join(t.name))?;
     let by_spelling = std::fs::metadata(spelling)?;
-    if (by_spelling.dev(), by_spelling.ino()) != (m.dev(), m.ino()) {
+    if (by_spelling.dev(), by_spelling.ino()) != r.id {
         return Err(io::Error::other(
             "the socket file was replaced right after the bind",
         ));
     }
-    Ok(Remembered {
-        path,
-        id: (m.dev(), m.ino()),
-    })
+    Ok(r)
 }
 
 /// The bind's link-file: E in D pointing to the socket file (the path made
@@ -977,6 +1006,7 @@ fn link_file_bind(t: &Target<'_>, b: Result<&Base, &&'static str>, remember: boo
             return Step::done(names::LINK_FILE, Err(e));
         }
     };
+    after_bind();
     let file = match remember {
         false => None,
         true => match remembered_at(&t.real_dir.join(t.name)) {
@@ -1069,11 +1099,11 @@ fn in_d(
     let Some(result) = call(d.fd(), &addr) else {
         return Step::Next;
     };
+    if result.is_ok() && t.req.is_bind() {
+        after_bind();
+    }
     let file = match (&result, remember) {
-        (Ok(_), true) => Some(sys::id_at(d.fd(), rel.as_os_str()).map(|id| Remembered {
-            path: t.real_dir.join(t.name),
-            id,
-        })),
+        (Ok(_), true) => Some(remembered_at(&t.real_dir.join(t.name))),
         _ => None,
     };
     drop(e);
@@ -1432,9 +1462,9 @@ fn resolve_connect(t: &Target<'_>) -> io::Result<Option<Through>> {
 }
 
 /// The socket file a resolved bind spelling reaches now (`ForBind`'s
-/// `socket_file()`): its real path and `(st_dev, st_ino)`, the spelling
-/// followed. For a `CwdRelative` spelling the cwd must still be the one it
-/// was resolved against.
+/// `socket_file()`): [`remembered_at`] the spelling (followed to the end, a
+/// symlink in the last component of the path too). For a `CwdRelative`
+/// spelling the cwd must still be the one it was resolved against.
 pub(crate) fn remember_resolved(
     spelling: &Path,
     cwd: Option<(u64, u64)>,
@@ -1444,15 +1474,7 @@ pub(crate) fn remember_resolved(
             "the current directory changed since the path relative to it was resolved",
         ));
     }
-    let path = std::fs::canonicalize(spelling)?;
-    let m = std::fs::symlink_metadata(&path)?;
-    if !std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()) {
-        return Err(io::Error::from_raw_os_error(libc::ENOTSOCK));
-    }
-    Ok(Remembered {
-        path,
-        id: (m.dev(), m.ino()),
-    })
+    remembered_at(spelling)
 }
 
 // ---------------------------------------------------------------------------

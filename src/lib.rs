@@ -182,8 +182,8 @@ use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use route::{Connect, Request, Use};
 use sys::SockType;
@@ -231,7 +231,8 @@ pub struct Options {
     /// `InvalidInput`, whatever the length of the path). The check is
     /// made before any route is tried, for a long path only; B is made only
     /// when a route that uses it is reached. Used for the binds and the
-    /// connects.
+    /// connects. B is sockat's own: put nothing else in it ([`sweep_base`]
+    /// looks only at directories named in the form of a D).
     pub base: Option<PathBuf>,
 }
 
@@ -394,30 +395,82 @@ impl From<route::Failed> for ExError {
 /// The socket file a bind made (its real path and `(st_dev, st_ino)`, taken
 /// right after the bind), and the E its spelling goes through.
 ///
+/// When the last component of the path is a symlink, which a bind follows on
+/// macOS and NetBSD (making the socket where it points), the file is the
+/// socket the symlink led to: removing it leaves the symlink.
+///
 /// Dropping it does nothing: the file is removed only by
 /// [`SocketFile::remove`], E only by it or [`SocketFile::cleanup`].
 #[derive(Debug)]
 pub struct SocketFile {
     path: PathBuf,
     id: (u64, u64),
-    link: Option<Arc<base::Link>>,
+    clean: Arc<Clean>,
+    /// Whether this file has been removed (read and set under `clean`'s
+    /// lock).
     removed: AtomicBool,
 }
 
+/// What the holders of one spelling share for its clean-up: the E it goes
+/// through (none for a spelling through no E), and the lock that every
+/// removal of the socket file and of E takes, so that they are one at a time
+/// across the [`ForBind`] (or [`ForConnect`]) and every [`SocketFile`] of the
+/// spelling (hub SPEC "remove と cleanup"). Two removals of the file at once
+/// could otherwise both find it still the one bound, and the second remove a
+/// socket bound at the path in between.
+#[derive(Debug)]
+struct Clean {
+    link: Option<Arc<base::Link>>,
+    lock: Mutex<()>,
+    /// Test-only: how many times a [`SocketFile::remove`] has unlinked the
+    /// socket file.
+    #[cfg(test)]
+    file_unlinks: std::sync::atomic::AtomicU64,
+}
+
+impl Clean {
+    fn new(link: Option<Arc<base::Link>>) -> Arc<Self> {
+        Arc::new(Self {
+            link,
+            lock: Mutex::new(()),
+            #[cfg(test)]
+            file_unlinks: Default::default(),
+        })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Remove E (once it is removed, nothing), the lock held by the caller.
+    fn cleanup_locked(&self) -> io::Result<()> {
+        match &self.link {
+            Some(link) => link.cleanup(),
+            None => Ok(()),
+        }
+    }
+
+    fn cleanup(&self) -> io::Result<()> {
+        let _held = self.lock();
+        self.cleanup_locked()
+    }
+}
+
 impl SocketFile {
-    fn new(r: route::Remembered, link: Option<Arc<base::Link>>) -> Self {
+    fn new(r: route::Remembered, clean: Arc<Clean>) -> Self {
         Self {
             path: r.path,
             id: r.id,
-            link,
+            clean,
             removed: AtomicBool::new(false),
         }
     }
 
-    /// Remove the socket file, the first time only, if what is at its real
-    /// path now is still the file the bind made (the same `(st_dev,
-    /// st_ino)`, looked up without following a symlink), and clean up E
-    /// ([`SocketFile::cleanup`]). Later calls do nothing.
+    /// Remove the socket file if what is at its real path now is still the
+    /// file the bind made (the same `(st_dev, st_ino)`, looked up without
+    /// following a symlink), and clean up E ([`SocketFile::cleanup`]). Once
+    /// that has succeeded, later calls do nothing; calls at once remove one
+    /// at a time.
     ///
     /// Anything else there (another socket bound since, a file put in its
     /// place) is left alone, and so is nothing at all: both are `Ok(())`. The
@@ -432,42 +485,47 @@ impl SocketFile {
     /// # Errors
     ///
     /// Those of `lstat(2)` (other than `ENOENT` and `ENOTDIR`) and `unlink(2)`
-    /// on the path, and of removing E; a call after an error tries again.
+    /// on the path; when the file was removed, those of removing E
+    /// ([`SocketFile::cleanup`], which is done either way). A call after an
+    /// error tries again.
     pub fn remove(&self) -> io::Result<()> {
-        if self.removed.load(Ordering::Acquire) {
+        let _held = self.clean.lock();
+        if self.removed.load(Ordering::Relaxed) {
             return Ok(());
         }
         let gone = |e: &io::Error| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR));
         let removed = match file_id(&self.path) {
-            Ok(id) if id == self.id => match std::fs::remove_file(&self.path) {
-                Err(e) if gone(&e) => Ok(()),
-                removed => removed,
-            },
+            Ok(id) if id == self.id => {
+                #[cfg(test)]
+                self.clean.file_unlinks.fetch_add(1, Ordering::Relaxed);
+                match std::fs::remove_file(&self.path) {
+                    Err(e) if gone(&e) => Ok(()),
+                    removed => removed,
+                }
+            }
             Ok(_) => Ok(()),
             Err(e) if gone(&e) => Ok(()),
             Err(e) => Err(e),
         };
         // E is cleaned up even when the file could not be removed; the
         // file's error is the one returned (hub SPEC "remove").
-        let cleaned = self.cleanup();
+        let cleaned = self.clean.cleanup_locked();
         removed?;
         cleaned?;
-        self.removed.store(true, Ordering::Release);
+        self.removed.store(true, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Remove the E the spelling goes through, the first time only (later
-    /// calls do nothing). The spelling names nothing afterwards; the socket
+    /// Remove the E the spelling goes through; once it is removed, later
+    /// calls do nothing. The spelling names nothing afterwards; the socket
     /// file and the socket stay. Nothing to do for a spelling through no E.
     ///
     /// # Errors
     ///
-    /// Those of `unlink(2)` on E (other than `ENOENT`).
+    /// Those of `unlink(2)` on E (other than `ENOENT`); a call after an error
+    /// tries again.
     pub fn cleanup(&self) -> io::Result<()> {
-        match &self.link {
-            Some(link) => link.cleanup(),
-            None => Ok(()),
-        }
+        self.clean.cleanup()
     }
 }
 
@@ -508,7 +566,10 @@ pub(crate) fn bind_with(
         Ok(socket) => socket,
         Err(error) => return Err(failed(r, error)),
     };
-    let file = r.file.take().map(|f| SocketFile::new(f, r.link.clone()));
+    let file = r
+        .file
+        .take()
+        .map(|f| SocketFile::new(f, Clean::new(r.link.clone())));
     if remember && file.is_none() {
         drop(socket);
         return Err(failed(
@@ -626,13 +687,17 @@ fn connect_with(
 /// ([`Bound`]). `options` chooses B ([`Options`]).
 ///
 /// The socket file's real path and `(st_dev, st_ino)` are taken right after
-/// the bind, before this returns. For a relative `path`, the cwd's `(st_dev,
-/// st_ino)` must be the same before the bind and after that look-up (another
-/// thread changing it would make the file looked up another one); otherwise
-/// the listener is closed and an error returned (the socket file stays, and
-/// so does nothing else). A listener short of a [`SocketFile`] that could
-/// remove the file is never handed out. Unlike std's and [`bind`]'s, nothing
-/// is removed when the listener is closed even for a short path: remove by
+/// the bind, before this returns: when the last component of `path` is a
+/// symlink (followed by the bind on macOS and NetBSD), those of the socket it
+/// led to, so [`SocketFile::remove`] leaves the symlink. What is found there
+/// must be a socket (`ENOTSOCK` otherwise: it was replaced, and is not taken).
+/// For a relative `path`, the cwd's `(st_dev, st_ino)` must be the same
+/// before the bind and after that look-up (another thread changing it would
+/// make the file looked up another one); otherwise the listener is closed
+/// and an error returned (the socket file stays, and so does nothing else).
+/// A listener short of a [`SocketFile`] that could remove the file is never
+/// handed out. Unlike std's and [`bind`]'s, nothing is removed when the
+/// listener is closed even for a short path: remove by
 /// [`SocketFile::remove`].
 ///
 /// ```no_run
@@ -701,23 +766,21 @@ pub struct ForBind {
     pub base: Option<&'static str>,
     /// The routes passed over. Diagnostics only.
     pub skipped: Vec<Skipped>,
-    link: Option<Arc<base::Link>>,
+    clean: Arc<Clean>,
     cwd: Option<(u64, u64)>,
 }
 
 impl ForBind {
-    /// Remove E, the first time only (later calls do nothing): the spelling
+    /// Remove E; once it is removed, later calls do nothing: the spelling
     /// names nothing afterwards. Not the socket file: that is
     /// [`ForBind::socket_file`]'s [`SocketFile::remove`].
     ///
     /// # Errors
     ///
-    /// Those of `unlink(2)` on E (other than `ENOENT`).
+    /// Those of `unlink(2)` on E (other than `ENOENT`); a call after an error
+    /// tries again.
     pub fn cleanup(&self) -> io::Result<()> {
-        match &self.link {
-            Some(link) => link.cleanup(),
-            None => Ok(()),
-        }
+        self.clean.cleanup()
     }
 
     /// The [`SocketFile`] of the socket bound by [`ForBind::path`]: call it
@@ -725,10 +788,14 @@ impl ForBind {
     /// followed now, and the socket file's real path and `(st_dev, st_ino)`
     /// taken; its [`SocketFile::remove`] removes the file and cleans up the
     /// same E as [`ForBind::cleanup`] (once, whichever comes first). Without
-    /// calling this there is nothing that removes the file.
+    /// calling this there is nothing that removes the file. Called more than
+    /// once, it gives [`SocketFile`]s that remove one at a time with each
+    /// other and with the [`ForBind`].
     ///
-    /// A replacement of the file between the bind and this call is not told
-    /// apart.
+    /// When the last component of the path is a symlink (which the bind
+    /// follows on macOS and NetBSD), the file taken is the socket it led to,
+    /// so removing it leaves the symlink. A replacement of the file between
+    /// the bind and this call is not told apart.
     ///
     /// # Errors
     ///
@@ -738,7 +805,7 @@ impl ForBind {
     /// against.
     pub fn socket_file(&self) -> io::Result<SocketFile> {
         let r = route::remember_resolved(&self.path, self.cwd)?;
-        Ok(SocketFile::new(r, self.link.clone()))
+        Ok(SocketFile::new(r, Arc::clone(&self.clean)))
     }
 }
 
@@ -755,20 +822,18 @@ pub struct ForConnect {
     pub route: &'static str,
     /// The routes passed over. Diagnostics only.
     pub skipped: Vec<Skipped>,
-    link: Option<Arc<base::Link>>,
+    clean: Arc<Clean>,
 }
 
 impl ForConnect {
-    /// Remove E, the first time only (later calls do nothing).
+    /// Remove E; once it is removed, later calls do nothing.
     ///
     /// # Errors
     ///
-    /// Those of `unlink(2)` on E (other than `ENOENT`).
+    /// Those of `unlink(2)` on E (other than `ENOENT`); a call after an error
+    /// tries again.
     pub fn cleanup(&self) -> io::Result<()> {
-        match &self.link {
-            Some(link) => link.cleanup(),
-            None => Ok(()),
-        }
+        self.clean.cleanup()
     }
 }
 
@@ -805,7 +870,7 @@ pub fn resolve_for_bind<P: AsRef<Path>>(path: P, options: Options) -> Result<For
         route: r.route,
         base: r.base,
         skipped: r.skipped,
-        link: r.link,
+        clean: Clean::new(r.link),
         cwd: r.cwd,
     })
 }
@@ -831,7 +896,7 @@ pub fn resolve_for_connect<P: AsRef<Path>>(
         path: r.path,
         route: r.route,
         skipped: r.skipped,
-        link: r.link,
+        clean: Clean::new(r.link),
     })
 }
 
@@ -839,7 +904,9 @@ pub fn resolve_for_connect<P: AsRef<Path>>(
 /// this user's B of the automatic bases (`/tmp/sockat-<uid>`,
 /// `$XDG_RUNTIME_DIR/sockat`, `$TMPDIR/sockat-<uid>`) that are there. Only
 /// when called: nothing does it on its own. A live process's D, this one's
-/// included, is left alone, and no B is made or removed.
+/// included, is left alone, and no B is made or removed. Only the
+/// directories right under B named in the form of a D (10 ASCII letters and
+/// digits) are looked at; anything else in B is left alone.
 ///
 /// # Errors
 ///
