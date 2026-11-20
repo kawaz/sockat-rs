@@ -25,6 +25,7 @@ Use sockat's functions where you would use std's.
 - The results are std's own types
 - A path of a length std accepts goes to std unchanged, so it behaves exactly as with std
 - Even for a long path, the socket file is created at the path given
+- A bind at a long path leaves D and E outside the app's own directories (`/tmp/sockat-<uid>` etc.). They go with the OS's cleaning of temporary directories or `sockat::sweep()`. Removing a live process's D by hand only makes the spelling unreachable; the socket at the original path keeps working. Where tests run over and over, one call of `sweep()` keeps dead D from piling up (`sweep_base` for a B put at `Options::base`). See [What differs from std for a long path](#what-differs-from-std-for-a-long-path)
 - Nothing forks, and neither the cwd of the process nor that of the calling thread is changed
 - To remove the socket file later, or to know whether the spelling can be used later and how the path was reached, use the `_ex` functions (`bind_ex`, ...). To hand a spelling to std yourself, use `resolve_for_bind` / `resolve_for_connect`
 

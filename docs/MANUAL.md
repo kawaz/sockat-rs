@@ -277,7 +277,7 @@ The OS's cleaning of temporary directories:
 | macOS's `$TMPDIR` | dirhelper may remove it after 3 days | the same |
 | FreeBSD, NetBSD, OpenBSD, illumos | by default not removed, or removed at a reboot | the same |
 
-When a live D is removed, the spelling just cannot be followed any more; nothing unsafe happens. Across an exec the fd holding D's lock is closed, so even while an inherited listener lives, D and E may be removed by `sweep` or the OS's cleaning. A procB spelling cannot be followed from the exec on.
+When a live D is removed (by hand included), the spelling just cannot be followed any more; nothing unsafe happens, and the socket at the original path keeps working. Across an exec the fd holding D's lock is closed, so even while an inherited listener lives, D and E may be removed by `sweep` or the OS's cleaning. A procB spelling cannot be followed from the exec on.
 
 ### sweep and sweep_base
 
@@ -286,6 +286,7 @@ When a live D is removed, the spelling just cannot be followed any more; nothing
 - They look only at the directories right under B whose name has the form of a D (10 ASCII letters and digits). B is sockat's own; what has another name is left alone
 - The D of a live process (this process's included) is not removed. E directly under B, and a D holding anything that is not a symlink, are left alone
 - Neither is called automatically (resolve and bind do not list B each time)
+- Where tests run over and over (CI, repeated checks), one call of `sweep()` (`sweep_base` for a B at `Options::base`) keeps dead D from piling up
 
 ## resolve
 
