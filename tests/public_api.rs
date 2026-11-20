@@ -132,6 +132,50 @@ fn std_errno(case: Short) -> i32 {
         .unwrap_or_else(|| panic!("{case:?}: std's error has no errno: {e}"))
 }
 
+/// Whether this std drops the last byte of the path when it reads a socket
+/// address (`local_addr`, `peer_addr`, `recv_from`): Rust 1.99 and earlier
+/// do on OpenBSD (rust-lang/rust#118925, fixed in 1.100.0). Measured rather
+/// than told by the target or the version: std binds a short path, and the
+/// address its own `local_addr()` reads is compared with that path. Anything
+/// but the path or the path less its last byte fails, as a std this test
+/// does not know.
+fn std_drops_last_byte() -> bool {
+    let t = tmp();
+    let p = t.path().join("s.sock");
+    let l = UnixListener::bind(&p).unwrap();
+    let read = l.local_addr().unwrap();
+    let read = read.as_pathname().unwrap();
+    if read == p {
+        return false;
+    }
+    let bytes = p.as_os_str().as_bytes();
+    assert_eq!(
+        read.as_os_str().as_bytes(),
+        &bytes[..bytes.len() - 1],
+        "std reads {read:?} for {p:?}"
+    );
+    true
+}
+
+/// Connect through `listener`'s spelling, as std's `local_addr()` reads it,
+/// and exchange a message. Where std drops the last byte of what it reads
+/// ([`std_drops_last_byte`]) that reading names nothing whatever sockat
+/// does, so the step is left out with the reason on stderr, naming
+/// `kernel_check`, the test in src/tests.rs that connects through the
+/// spelling read by getsockname.
+fn ping_through_spelling(listener: &UnixListener, kernel_check: &str) {
+    if std_drops_last_byte() {
+        eprintln!(
+            "connect through the spelling not tried: this std drops the last byte of the \
+             addresses it reads on OpenBSD (rust-lang/rust#118925, fixed in Rust 1.100.0); \
+             checked with getsockname by {kernel_check} in src/tests.rs"
+        );
+        return;
+    }
+    let mut c = UnixStream::connect(reported(listener)).unwrap();
+    ping(listener, &mut c);
+}
+
 fn reported(listener: &UnixListener) -> PathBuf {
     listener
         .local_addr()
@@ -176,9 +220,9 @@ fn bind_and_connect_work_at_any_length() {
 // Short paths are std's business: sockat hands them over unchanged, so the
 // addresses the sockets report (local_addr, peer_addr) are exactly what std
 // reports for the same path. Compared with std's own answer rather than with
-// the path: std's answer is not always the path (on OpenBSD std's local_addr
-// drops the last byte of it, observed in CI), and "the same as std" is the
-// promise.
+// the path: std's answer is not always the path (on OpenBSD the local_addr
+// of Rust 1.99 and earlier drops the last byte of it, rust-lang/rust#118925),
+// and "the same as std" is the promise.
 #[test]
 fn a_short_path_behaves_exactly_like_std() {
     let t = tmp();
@@ -359,7 +403,16 @@ fn a_datagram_connect_to_a_socket_nobody_holds_fails_as_std_does() {
 // standard was passed over first. SocketFile::remove removes the socket file
 // and cleans up E, does not close the listener, and does nothing the second
 // time; a listener of bind_ex does not remove the file when closed, even for
-// a short path.
+// a short path. A Linked spelling, as std's local_addr reads it, names
+// something before remove and nothing after it. That step is left out, with
+// the reason on stderr, only where std itself drops the last byte of the
+// address it reads (Rust 1.99 and earlier on OpenBSD, rust-lang/rust#118925,
+// fixed in 1.100.0; measured by std_drops_last_byte): std's reading names
+// nothing there to begin with. The same promise at the kernel's level is
+// checked in src/tests.rs, which reads the spelling with getsockname itself:
+// remove_removes_the_bound_file_once_and_not_a_replacement (no E left) and
+// a_spelling_cleaned_up_names_nothing (the spelling reached the socket and
+// names nothing once cleaned up).
 #[test]
 fn bind_ex_returns_the_socket_file_and_the_spelling() {
     let t = tmp();
@@ -372,11 +425,22 @@ fn bind_ex_returns_the_socket_file_and_the_spelling() {
         other => panic!("{other:?}"),
     }
     let spelling = reported(&bound.socket);
+    let check_spelling =
+        matches!(bound.spelling, Spelling::Linked { .. }) && !std_drops_last_byte();
+    if check_spelling {
+        assert!(std::fs::symlink_metadata(&spelling).is_ok());
+    } else if matches!(bound.spelling, Spelling::Linked { .. }) {
+        eprintln!(
+            "spelling {spelling:?} not checked: this std drops the last byte of the addresses \
+             it reads on OpenBSD (rust-lang/rust#118925, fixed in Rust 1.100.0); checked with \
+             getsockname by a_spelling_cleaned_up_names_nothing in src/tests.rs"
+        );
+    }
     let mut c = sockat::connect(&p).unwrap();
     ping(&bound.socket, &mut c);
     bound.file.remove().unwrap();
     assert!(!p.exists());
-    if let Spelling::Linked { .. } = bound.spelling {
+    if check_spelling {
         assert!(std::fs::symlink_metadata(&spelling).is_err());
     }
     bound.socket.set_nonblocking(true).unwrap();
@@ -495,8 +559,18 @@ fn resolved_spellings_go_to_std() {
 
 // Datagram sockets at long paths through the public API: a receiver bound by
 // datagram::bind, an unbound sender connected by datagram::connect, and a
-// bound sender whose reported address the receiver replies to. The _ex
-// versions report their routes.
+// sender bound by datagram::bind_ex whose address, as std's recv_from gives
+// it, the receiver replies to when the spelling is Linked: what a user does.
+// The _ex versions report their routes. The reply is left out, with the
+// reason on stderr, only where std itself drops the last byte of the address
+// it reads (Rust 1.99 and earlier on OpenBSD, rust-lang/rust#118925, fixed
+// in 1.100.0; measured by std_drops_last_byte): there the reply to std's
+// address cannot arrive whatever sockat does, also for a short path. The
+// same promise at the kernel's level (the sender's spelling, as the kernel
+// gives it with the datagram, reaches the sender) is checked by
+// datagram_bind_connect_and_reply in src/tests.rs, which reads the address
+// with recvfrom itself. The receive, the reports and remove are checked here
+// with every std.
 #[test]
 fn datagrams_at_long_paths() {
     let t = tmp();
@@ -518,9 +592,19 @@ fn datagrams_at_long_paths() {
     assert_eq!(&buf[..n], b"two");
     if let Some(from) = from.as_pathname() {
         if matches!(bound.spelling, Spelling::Linked { .. }) {
-            server.send_to(b"back", from).unwrap();
-            let n = bound.socket.recv(&mut buf).unwrap();
-            assert_eq!(&buf[..n], b"back");
+            if std_drops_last_byte() {
+                eprintln!(
+                    "reply to {from:?} not tried: this std drops the last byte of the \
+                     addresses it reads on OpenBSD (rust-lang/rust#118925, fixed in Rust \
+                     1.100.0), so a reply to std's from cannot arrive; the reply to the \
+                     kernel's spelling is checked by datagram_bind_connect_and_reply in \
+                     src/tests.rs with recvfrom"
+                );
+            } else {
+                server.send_to(b"back", from).unwrap();
+                let n = bound.socket.recv(&mut buf).unwrap();
+                assert_eq!(&buf[..n], b"back");
+            }
         }
     }
     bound.file.remove().unwrap();
@@ -530,9 +614,12 @@ fn datagrams_at_long_paths() {
 
 // Options.base puts B where the application says: a long-path bind_ex goes
 // through it (base `given`) when its spelling is through B, the connects
-// leave nothing in it, and sweep_base keeps this process's live D. An
-// Options.base that fails its check (its parent missing) is ENOENT with
-// nothing made.
+// leave nothing in it, and sweep_base keeps this process's live D (a Linked
+// spelling still reaches the socket after it). An Options.base that fails
+// its check (its parent missing) is ENOENT with nothing made. The connect
+// through the spelling is left out where std drops the last byte of the
+// address it reads (ping_through_spelling); options_base_is_b_and_is_made_only_when_used
+// in src/tests.rs checks the same with the spelling read by getsockname.
 #[test]
 fn options_base_holds_b() {
     let t = tmp();
@@ -557,8 +644,10 @@ fn options_base_holds_b() {
     let mut c = sockat::connect(&p).unwrap();
     ping(&bound.socket, &mut c);
     if let Spelling::Linked { .. } = bound.spelling {
-        let mut c = UnixStream::connect(reported(&bound.socket)).unwrap();
-        ping(&bound.socket, &mut c);
+        ping_through_spelling(
+            &bound.socket,
+            "options_base_is_b_and_is_made_only_when_used",
+        );
     }
 
     let bad = Options {
@@ -573,7 +662,10 @@ fn options_base_holds_b() {
 // sweep() leaves this process's live D (a spelling bound by bind_ex keeps
 // working after it) and makes no B. The test of the default places: it goes
 // through the shared B, where it adds only its own D and leaves B (and the
-// live D of other processes, locked) in place.
+// live D of other processes, locked) in place. The connect through the
+// spelling is left out where std drops the last byte of the address it reads
+// (ping_through_spelling); sweep_removes_only_dead_processes_d in
+// src/tests.rs checks the same with the spelling read by getsockname.
 #[test]
 fn sweep_keeps_this_processs_d() {
     let t = tmp();
@@ -581,8 +673,7 @@ fn sweep_keeps_this_processs_d() {
     let bound = sockat::bind_ex(&p, Options::default()).unwrap();
     sockat::sweep().unwrap();
     if let Spelling::Linked { .. } = bound.spelling {
-        let mut c = UnixStream::connect(reported(&bound.socket)).unwrap();
-        ping(&bound.socket, &mut c);
+        ping_through_spelling(&bound.socket, "sweep_removes_only_dead_processes_d");
     }
     bound.file.remove().unwrap();
 }

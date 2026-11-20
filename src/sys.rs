@@ -799,16 +799,81 @@ pub(crate) fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
     std::fs::File::open("/dev/urandom")?.read_exact(buf)
 }
 
-/// The length `getsockname(2)` reports for `sock`'s address, asked with room
-/// for the widest address any target here builds ([`ADDR_STORAGE`] bytes).
-/// Test-only: checks whether a bound address fits a `sockaddr_un` (Apple).
-#[cfg(all(test, target_vendor = "apple"))]
-pub(crate) fn local_address_len(sock: BorrowedFd<'_>) -> io::Result<usize> {
+/// The path in an address the kernel wrote into `storage` with length `len`:
+/// the bytes of `sun_path` within that length up to the first NUL (unix(7):
+/// `strnlen(sun_path, len - offsetof(sun_path))`), so a length that counts
+/// the NUL, one that does not, and one of the whole structure all read the
+/// same path. Test-only, for [`local_address`] and [`recv_from`] (and the
+/// test of this reading itself).
+#[cfg(test)]
+pub(crate) fn path_in(storage: &[u8], len: usize) -> std::path::PathBuf {
+    let end = len.min(storage.len());
+    let raw = storage.get(SUN_PATH_OFFSET..end).unwrap_or_default();
+    let path = raw.split(|&b| b == 0).next().unwrap_or_default();
+    OsStr::from_bytes(path).into()
+}
+
+/// `getsockname(2)` for `sock`: the length the kernel reports and the path in
+/// it ([`path_in`]), asked with room for the widest address any target here
+/// builds ([`ADDR_STORAGE`] bytes).
+///
+/// Test-only: the tests check the spelling the kernel keeps, read as the
+/// kernel wrote it rather than through std's `SocketAddr`, whose reading
+/// differs by Rust version (Rust 1.99 and earlier drop the last byte of the
+/// path on OpenBSD, rust-lang/rust#118925, fixed in 1.100.0). The length
+/// tells whether a bound address fits a `sockaddr_un` (Apple).
+#[cfg(test)]
+pub(crate) fn local_address(sock: BorrowedFd<'_>) -> io::Result<(usize, std::path::PathBuf)> {
     let mut storage = [0u8; ADDR_STORAGE];
     let mut len = ADDR_STORAGE as libc::socklen_t;
     // SAFETY: the kernel writes at most `len` bytes into `storage`.
     cvt(unsafe { libc::getsockname(sock.as_raw_fd(), storage.as_mut_ptr().cast(), &mut len) })?;
-    Ok(len as usize)
+    Ok((len as usize, path_in(&storage, len as usize)))
+}
+
+/// `recvfrom(2)` on `sock` into `buf`: the number of bytes received and the
+/// path of the sender's address as the kernel wrote it ([`path_in`]).
+/// Test-only, for the same reason as [`local_address`]: the reply goes to the
+/// address the kernel gives, not to std's reading of it.
+#[cfg(test)]
+pub(crate) fn recv_from(
+    sock: BorrowedFd<'_>,
+    buf: &mut [u8],
+) -> io::Result<(usize, std::path::PathBuf)> {
+    let mut storage = [0u8; ADDR_STORAGE];
+    let mut len = ADDR_STORAGE as libc::socklen_t;
+    // SAFETY: the kernel writes at most `buf.len()` bytes into `buf` and at
+    // most `len` bytes into `storage`.
+    let n = unsafe {
+        libc::recvfrom(
+            sock.as_raw_fd(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            0,
+            storage.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((n as usize, path_in(&storage, len as usize)))
+}
+
+/// Give up root for good in this process: no supplementary groups, then the
+/// group and user ids `id` (`setgroups(2)`, `setgid(2)`, `setuid(2)`, which
+/// set the real, effective and saved ids, and on Linux drop the
+/// capabilities). Test-only, and only for a child process of the test binary
+/// run by root: the ids are process-wide (glibc and musl apply them to every
+/// thread).
+#[cfg(test)]
+pub(crate) fn drop_root(id: libc::uid_t) -> io::Result<()> {
+    // SAFETY: an empty list; the pointer is not read.
+    cvt(unsafe { libc::setgroups(0, std::ptr::null()) })?;
+    // SAFETY: plain syscalls without pointers.
+    cvt(unsafe { libc::setgid(id as libc::gid_t) })?;
+    // SAFETY: as above.
+    cvt(unsafe { libc::setuid(id) }).map(drop)
 }
 
 /// Set the file mode creation mask of the process (`umask(2)`, which cannot

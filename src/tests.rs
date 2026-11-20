@@ -331,14 +331,12 @@ fn thread_here() -> bool {
     false
 }
 
-/// What `listener`'s `local_addr()` reports: the spelling the kernel keeps.
+/// The spelling the kernel keeps for `listener`, read from `getsockname` as
+/// the kernel wrote it ([`sys::local_address`]), not through std's
+/// `local_addr()`: Rust 1.99 and earlier drop its last byte on OpenBSD
+/// (rust-lang/rust#118925), and what sockat promises is the kernel's spelling.
 fn reported(listener: &UnixListener) -> PathBuf {
-    listener
-        .local_addr()
-        .unwrap()
-        .as_pathname()
-        .unwrap()
-        .to_path_buf()
+    sys::local_address(listener.as_fd()).unwrap().1
 }
 
 /// Run one test of this test binary in a child process with `env` added, and
@@ -405,12 +403,37 @@ fn child_bind_and_exit() {
 // short paths
 // ---------------------------------------------------------------------------
 
+// The tests read the spelling the kernel keeps from the address it writes
+// (sys::path_in, behind reported() and sys::recv_from), so that reading must
+// give the whole path whichever length the kernel reports with it: one that
+// counts the NUL (Linux), one that does not (FreeBSD, NetBSD, a caller that
+// bound without it), and the whole structure (OpenBSD's getsockname, the
+// case std's reading of Rust 1.99 and earlier cuts short). A length past the
+// buffer reads only the buffer, and one shorter than the header reads
+// nothing. Only the reading is checked here, as OpenBSD is not at hand.
+#[test]
+fn the_kernels_address_is_read_up_to_the_nul_whatever_length_comes_with_it() {
+    let offset = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+    let path = b"/tmp/x/s.sock";
+    let mut storage = [0u8; 256];
+    storage[offset..offset + path.len()].copy_from_slice(path);
+    let whole = offset + sys::SUN_PATH_CAP;
+    for len in [offset + path.len(), offset + path.len() + 1, whole, 1000] {
+        assert_eq!(
+            sys::path_in(&storage, len),
+            Path::new("/tmp/x/s.sock"),
+            "{len}"
+        );
+    }
+    assert_eq!(sys::path_in(&storage, offset - 1), Path::new(""));
+}
+
 // A path std accepts goes to std unchanged: the longest one (sun_path less
 // the NUL: 107 on Linux / illumos, 103 on Apple and the BSDs) is bound by
-// std (route standard, its own address, nothing made in the place), and one
-// byte more is not (a route through B, with standard passed over). The
-// boundary is the one std itself draws, so every path std can take behaves
-// as with std.
+// std (route standard, the whole path, its last byte included, kept by the
+// kernel as the address, nothing made in the place), and one byte more is not
+// (a route through B, with standard passed over). The boundary is the one std
+// itself draws, so every path std can take behaves as with std.
 #[test]
 fn the_longest_path_std_accepts_goes_to_std_and_one_byte_more_does_not() {
     let (t, place) = setup();
@@ -569,7 +592,9 @@ fn concurrent_binds_share_one_d_and_get_their_own_e() {
 // unrelated file) are untouched. That is why E sits in a D of this process
 // with a random name, rather than the path being spelled by an fd number or
 // the file name alone, which a later lookup could resolve to an unrelated
-// file.
+// file. Before the cleanup the spelling reaches the socket file, so the
+// ENOENT after it comes from the cleanup and not from a spelling that never
+// named anything.
 #[test]
 fn a_spelling_cleaned_up_names_nothing() {
     let (t, place) = setup();
@@ -579,6 +604,9 @@ fn a_spelling_cleaned_up_names_nothing() {
     std::fs::write(&other, b"keep").unwrap();
     let mut r = bind(&p, &opts(), &cfg).unwrap();
     let spelling = reported(&listener(&mut r));
+    let reached = std::fs::metadata(&spelling).unwrap();
+    let file = std::fs::symlink_metadata(&p).unwrap();
+    assert_eq!((reached.dev(), reached.ino()), (file.dev(), file.ino()));
     r.link.as_ref().unwrap().cleanup().unwrap();
     let e = std::fs::remove_file(&spelling).unwrap_err();
     assert_eq!(errno(&e), Some(libc::ENOENT));
@@ -851,7 +879,14 @@ fn the_callers_own_thread_cwd_is_left_as_it_is() {
 // its Unix sockets (Apple, FreeBSD, NetBSD, DragonFly), so does sockat, so a
 // write to a closed peer returns EPIPE instead of raising SIGPIPE whatever
 // the route. Compared with std's own socket on the same system, so the
-// promise is "the same as std".
+// promise is "the same as std". Only the sockets sockat makes itself are
+// worth checking: a bind makes one on the routes that bind a socket of its
+// own (thread-cwd on Apple, at on FreeBSD, taken here by a file name too long
+// for link-dir with link-file out of the order), while standard, link-dir and
+// link-file hand the spelling to std's bind, so on NetBSD and DragonFly every
+// bind socket is std's and the listener is made by std instead. A nonblocking
+// connect always makes its own socket (std cannot connect one), on every
+// route.
 #[cfg(any(
     target_vendor = "apple",
     target_os = "freebsd",
@@ -868,9 +903,19 @@ fn sockets_carry_so_nosigpipe_where_std_sets_it() {
     assert_eq!(sys::so_nosigpipe(std_listener.as_fd()).unwrap(), std_says);
     let cfg = real_link_dir(&place);
     let long = nest(t.path(), 250, &name_past_link_dir());
-    let mut r = bind(&long, &opts(), &cfg).unwrap();
-    let l = listener(&mut r);
-    assert_eq!(sys::so_nosigpipe(l.as_fd()).unwrap(), std_says);
+    let _l = if cfg!(any(target_vendor = "apple", target_os = "freebsd")) {
+        let mut r = bind(&long, &opts(), &cfg).unwrap();
+        assert!(
+            [names::THREAD_CWD, names::AT].contains(&r.route),
+            "{}",
+            r.route
+        );
+        let l = listener(&mut r);
+        assert_eq!(sys::so_nosigpipe(l.as_fd()).unwrap(), std_says);
+        l
+    } else {
+        listen_at(&long)
+    };
     let nb = Request::Connect(Connect::Stream { nonblocking: true });
     let c = route::run(nb, &long, &opts(), false, Some(&cfg)).unwrap();
     assert_eq!(
@@ -1123,7 +1168,10 @@ fn options_base_that_fails_its_check_fails_before_any_route() {
 
 // With Options.base, B is the given directory (made when missing, mode
 // 0711), this process's D goes in it, the automatic place is left alone,
-// and the diagnostic base is `given` whatever the form of the spelling. A
+// and the diagnostic base is `given` whatever the form of the spelling. The
+// spelling the kernel keeps (read from getsockname) reaches the socket
+// through that B, and still does after sweep_base, which leaves this
+// process's live D. A
 // connect reached by a route that needs no B (relative, proc-direct,
 // thread-cwd-direct, ...) does not make B.
 #[test]
@@ -1137,9 +1185,13 @@ fn options_base_is_b_and_is_made_only_when_used() {
     let p = nest(t.path(), 200, "s.sock");
     for cfg in [no_link_file(config(&auto)), real_link_dir(&auto)] {
         let q = nest(&t.path().join(base::random_name().unwrap()), 200, "s.sock");
-        let r = bind(&q, &options, &cfg).unwrap();
+        let mut r = bind(&q, &options, &cfg).unwrap();
         assert_eq!(r.route, names::LINK_DIR);
         assert_eq!(r.base, Some("given"));
+        let l = listener(&mut r);
+        ping(&l, UnixStream::connect(reported(&l)).unwrap().into());
+        base::sweep_base(&base).unwrap();
+        ping(&l, UnixStream::connect(reported(&l)).unwrap().into());
     }
     assert_eq!(std::fs::metadata(&base).unwrap().mode() & 0o7777, 0o711);
     assert_eq!(entries(&base).len(), 1);
@@ -1494,26 +1546,60 @@ fn a_d_that_cannot_be_made_is_not_tried_again_nor_another_b_looked_for() {
     );
 }
 
-/// A directory where `mkdir` fails for everyone (root included) although
-/// the check of `Options.base` passes (owned by root, nobody can write to
-/// it): `/proc` on Linux, `/dev` elsewhere.
-fn unmakeable_parent() -> &'static Path {
-    Path::new(if cfg!(any(target_os = "linux", target_os = "android")) {
-        "/proc"
-    } else {
-        "/dev"
-    })
+/// The uid and gid a child gives up root to ([`unprivileged`]): nobody on
+/// Linux and the BSDs; any unused number serves.
+const NOBODY: libc::uid_t = 65534;
+
+/// Whether the test named `test` (its full name, `tests::...`) is to run its
+/// body here, as a user that a directory's mode stops. Not root: yes, here.
+/// Root (whom the mode does not stop): no; the test runs in a child process
+/// ([`run_child`]) that gives up root for good first ([`sys::drop_root`] to
+/// [`NOBODY`]), and the child's result is the test's. The child makes its own
+/// temporary directories after giving up root, so it owns everything it walks
+/// through below the sticky `/tmp`; `TMPDIR` is set to `/tmp` for it, as the
+/// parent's may be a directory only root can enter.
+fn unprivileged(test: &str) -> bool {
+    if in_child() {
+        if sys::effective_uid() == 0 {
+            sys::drop_root(NOBODY).unwrap();
+        }
+        assert_ne!(sys::effective_uid(), 0);
+        return true;
+    }
+    if sys::effective_uid() == 0 {
+        run_child(test, &[("TMPDIR", OsStr::new("/tmp"))]);
+        return false;
+    }
+    true
 }
 
 // An Options.base that passes its check but cannot be made (mkdir fails) is
 // that error, with no route (no route made the call) and the routes passed
 // over before it in skipped, for a bind, a connect (whose link-file is the
-// route that needs B) and resolve_for_bind; nothing is made in another place.
+// route that needs B) and resolve_for_bind; nothing is made there or in
+// another place. The base is under a directory of this user with mode 0500:
+// the check passes (owned by this user, nobody else can write to it) and
+// mkdir fails with the errno std's mkdir gets there (EACCES), which is none
+// of the errnos the check returns (ENOENT, ENOTDIR, EPERM), so the error seen
+// is mkdir's. Root, whom the mode does not stop, runs it in a child that has
+// given up root ([`unprivileged`]).
 #[test]
 fn an_options_base_that_cannot_be_made_after_its_check_is_that_error() {
+    if !unprivileged("tests::an_options_base_that_cannot_be_made_after_its_check_is_that_error") {
+        return;
+    }
     let (t, auto) = setup();
-    let given = unmakeable_parent().join(format!("sockat-test-{}", base::random_name().unwrap()));
-    let want = std::fs::create_dir(&given).unwrap_err().raw_os_error();
+    let ro = t.path().join("ro");
+    std::fs::create_dir(&ro).unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let given = ro.join("b");
+    let want = std::fs::create_dir(&given)
+        .expect_err("the premise: mkdir in a 0500 directory fails")
+        .raw_os_error();
+    assert!(
+        ![libc::ENOENT, libc::ENOTDIR, libc::EPERM].contains(&want.unwrap()),
+        "the premise: mkdir's errno {want:?} is not one the check returns"
+    );
     let options = Options {
         base: Some(given.clone()),
         ..opts()
@@ -1541,6 +1627,7 @@ fn an_options_base_that_cannot_be_made_after_its_check_is_that_error() {
     assert_eq!(f.skipped.first().map(|s| s.name), Some(names::STANDARD));
     assert!(!skipped_names(&f.skipped).contains(&names::LINK_FILE));
     assert!(entries(&auto).is_empty());
+    assert!(entries(&ro).is_empty());
 }
 
 // The B in the socket's directory (made when no place 1-3 can be) is used
@@ -1780,8 +1867,10 @@ fn socket_file_of_what_is_not_a_socket_is_an_error() {
 
 // sweep removes the D of a process that ended (no lock held on it), with its
 // E, and leaves: a live process's D (a child that binds and waits), this
-// process's own D, a D holding something but symlinks (not one sockat left),
-// an E directly in B (a connect's), and B itself.
+// process's own D (the spelling the kernel keeps for its bind, read from
+// getsockname, still reaches the socket after the sweep), a D holding
+// something but symlinks (not one sockat left), an E directly in B (a
+// connect's), and B itself.
 #[test]
 fn sweep_removes_only_dead_processes_d() {
     let (t, place) = setup();
@@ -1810,7 +1899,8 @@ fn sweep_removes_only_dead_processes_d() {
         assert_eq!(out.read(&mut byte).unwrap(), 1, "child ended early");
         seen.push(byte[0]);
     }
-    let _own = bind(&nest(&t.path().join("own"), 200, "s.sock"), &opts(), &cfg).unwrap();
+    let mut own = bind(&nest(&t.path().join("own"), 200, "s.sock"), &opts(), &cfg).unwrap();
+    let own = listener(&mut own);
     let foreign = b.join("notsockatD");
     std::fs::create_dir(&foreign).unwrap();
     std::fs::write(foreign.join("file"), b"").unwrap();
@@ -1821,6 +1911,7 @@ fn sweep_removes_only_dead_processes_d() {
     assert_eq!(entries(&b).len(), 4, "{:?}", in_b(&b));
     assert!(foreign.join("file").exists());
     assert!(b.join("connectE00").is_symlink());
+    ping(&own, UnixStream::connect(reported(&own)).unwrap().into());
     drop(child.stdin.take());
     child.wait().unwrap();
     base::sweep(&cfg.places).unwrap();
@@ -2006,7 +2097,7 @@ fn widened_connects_up_to_253_bytes_on_apple() {
     let p = nest(t.path(), 253, "s.sock");
     let mut r = bind(&p, &opts(), &cfg).unwrap();
     assert_ne!(r.route, names::WIDENED);
-    let len = sys::local_address_len(r.socket.as_ref().unwrap().as_fd()).unwrap();
+    let (len, _) = sys::local_address(r.socket.as_ref().unwrap().as_fd()).unwrap();
     assert!(len <= 2 + DIRECT_MAX + 1, "{len}");
     let l = listener(&mut r);
     let c = connect(&p, &cfg).unwrap();
@@ -2137,10 +2228,12 @@ fn a_missing_directory_is_enoent_before_any_route() {
 
 // Datagram sockets take the same routes: a receiver bound at a long path, a
 // sender bound at a long path of its own and connected to the receiver by its
-// long path. The receiver replies to the sender's reported address (its
-// kept spelling), and the reply arrives: the spelling keeps naming the
-// sender's socket file. A datagram connect leaves nothing and returns no new
-// socket.
+// long path. The receiver replies to the sender's address as the kernel gives
+// it with the datagram (its kept spelling, read from `recvfrom` as the kernel
+// wrote it rather than through std's `SocketAddr`, which drops the last byte
+// on OpenBSD with Rust 1.99 and earlier, rust-lang/rust#118925), and the
+// reply arrives: the spelling keeps naming the sender's socket file. A
+// datagram connect leaves nothing and returns no new socket.
 #[test]
 fn datagram_bind_connect_and_reply() {
     let (t, place) = setup();
@@ -2158,11 +2251,10 @@ fn datagram_bind_connect_and_reply() {
     assert!(c.socket.is_none());
     client.send(b"ping").unwrap();
     let mut buf = [0u8; 4];
-    let (n, from) = server.recv_from(&mut buf).unwrap();
+    let (n, from) = sys::recv_from(server.as_fd(), &mut buf).unwrap();
     assert_eq!(&buf[..n], b"ping");
-    server
-        .send_to(b"pong", from.as_pathname().unwrap())
-        .unwrap();
+    assert_eq!(from, sys::local_address(client.as_fd()).unwrap().1);
+    server.send_to(b"pong", &from).unwrap();
     let n = client.recv(&mut buf).unwrap();
     assert_eq!(&buf[..n], b"pong");
 }

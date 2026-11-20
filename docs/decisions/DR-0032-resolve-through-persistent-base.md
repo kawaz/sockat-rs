@@ -93,6 +93,8 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 - D を整えられない場面は、試験だけの thread_local (`base::FAIL_D`) で、作った D を開くところを失敗させて作る (本物の失敗をそこで起こす手が無い)
 - E を消せない場面は、試験だけの thread_local (`base::FAIL_UNLINK_E`) で、そのスレッドの E の unlink を `EPERM` にして作る。bind の直後にソケットのファイルが置き換わる場面は、試験だけの thread_local (`route::AFTER_BIND`) で、bind が通ってから覚えるまでの間に置き換えを入れて作る (どちらも呼び出しの途中に他のプロセスが割り込む形で、試験から外の手で起こせない)。E とソケットのファイルを消した回数は試験だけのフィールド (`Link::unlinks`・`Clean::file_unlinks`) で数え、並行の呼び出しで消す操作が 1 回だけかを確かめる
 - プロセス全体に効く設定 (cwd、umask、実効 uid) と、終わったプロセスの D が要る試験は、試験のバイナリを子プロセスで起こす
+- mode で止まる利用者として確かめる試験 (`Options.base` を作れない場面を 0500 のディレクトリで作る) は、root で走る時、子プロセスが setgroups・setgid・setuid で root を手放してから行う (`sys::drop_root`)
+- カーネルが覚える綴りは、試験では std の `SocketAddr` を通さず、`getsockname` / `recvfrom` が書いたアドレスを NUL まで読む (`sys::local_address`・`sys::recv_from`)。std の読み方は Rust の版で違う (Rust 1.99 以前は OpenBSD でパスの最後の 1 バイトを落とす、rust-lang/rust#118925)
 - `unsafe` は `src/sys.rs` だけ (`just lint-unsafe`)
 
 理由:
