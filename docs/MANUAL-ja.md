@@ -279,8 +279,8 @@ OS の一時ディレクトリの掃除:
 
 ### sweep と sweep_base
 
-- `sockat::sweep()` は、置き場 1〜3 の既定の名前の B (`/tmp/sockat-<uid>`、`$XDG_RUNTIME_DIR/sockat`、`$TMPDIR/sockat-<uid>`) のうち、あるものの中で、持ち主のプロセスが死んだ D (`flock(LOCK_EX | LOCK_NB)` が取れた D) を中の E ごと消す。B は作らない
-- `sockat::sweep_base(path)` は、`Options::base` に渡した B に同じことをする。その B を管理するアプリが呼ぶ
+- `sockat::sweep()` は、置き場 1〜3 の既定の名前の B (`/tmp/sockat-<uid>`、`$XDG_RUNTIME_DIR/sockat`、`$TMPDIR/sockat-<uid>`) のうち、あるものの中で、持ち主のプロセスが死んだ D (`flock(LOCK_EX | LOCK_NB)` が取れた D) を中の E ごと消す。B は作らない。確かめに外れた置き場・B は黙って飛ばす
+- `sockat::sweep_base(path)` は、`Options::base` に渡した B に同じことをする。その B を管理するアプリが呼ぶ。B か親が無ければ何もせず成功する。形の誤りは `InvalidInput`、symlink は `EPERM`、ディレクトリでなければ `ENOTDIR`、他人の物・group / other が書ける B・途中が他人に書ける時は `EPERM`
 - 生きているプロセスの D (このプロセスの物を含む) は消さない。B の直下の E と、symlink でない物がある D には触らない
 - 自動では呼ばれない (resolve や bind のたびに B の中を一覧しない)
 

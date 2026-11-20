@@ -937,15 +937,20 @@ pub(crate) fn sweep(places: &[(Place, PathBuf)]) -> io::Result<()> {
 }
 
 /// [`sweep`] of the B at `base` (an `Options.base`), which must pass the
-/// checks of [`given`].
+/// checks of [`given`]. A parent or B that is not there has nothing to sweep:
+/// that is success, and nothing is made (hub SPEC "`sweep`").
 ///
 /// # Errors
 ///
-/// Those of [`given`] finding it (never making it), and of listing it.
+/// Those of [`given`] finding it (never making it), other than its not being
+/// there, and of listing it.
 pub(crate) fn sweep_base(base: &Path) -> io::Result<()> {
     let (parent, name) = split_given(base)?;
-    let b = Base::make(parent, name, Place::Given, Existing::FindOnly, false)?;
-    sweep_in(&b)
+    match Base::make(parent, name, Place::Given, Existing::FindOnly, false) {
+        Ok(b) => sweep_in(&b),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// The D of this process in a registered B at the same place as `b`.

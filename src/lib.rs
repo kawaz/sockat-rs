@@ -849,12 +849,13 @@ pub fn sweep() -> io::Result<()> {
 }
 
 /// [`sweep`] of the B at `base` (an [`Options::base`] the application
-/// manages).
+/// manages). When `base` or its parent is not there, there is nothing to
+/// sweep, and this succeeds without making anything.
 ///
 /// # Errors
 ///
-/// Those of [`Options::base`]'s checks (`base` is not made), and of listing
-/// it.
+/// Those of [`Options::base`]'s checks other than its not being there (`base`
+/// is not made), and of listing it.
 pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()> {
     base::sweep_base(base.as_ref())
 }

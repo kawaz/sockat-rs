@@ -1766,8 +1766,11 @@ fn child_bind_and_wait() {
     io::stdin().read_to_end(&mut rest).unwrap();
 }
 
-// sweep_base does the same in an Options.base, and fails (making nothing)
-// for one that fails its check.
+// sweep_base does the same in an Options.base. A parent or B that is not
+// there has nothing to sweep: success, nothing made (hub SPEC "sweep"). One
+// that fails its check is that check's error, making nothing: a relative
+// path is InvalidInput, a symlink EPERM, a file ENOTDIR, a B others can write
+// to EPERM.
 #[test]
 fn sweep_base_sweeps_an_options_base() {
     let t = tmp();
@@ -1778,9 +1781,25 @@ fn sweep_base_sweeps_an_options_base() {
     std::os::unix::fs::symlink("/", dead_d.join("0")).unwrap();
     base::sweep_base(&base).unwrap();
     assert!(entries(&base).is_empty());
-    let e = base::sweep_base(&t.path().join("none/b")).unwrap_err();
-    assert_eq!(errno(&e), Some(libc::ENOENT));
+    base::sweep_base(&t.path().join("none/b")).unwrap();
     assert!(!t.path().join("none").exists());
+    base::sweep_base(&t.path().join("nob")).unwrap();
+    assert!(!t.path().join("nob").exists());
+
+    let e = base::sweep_base(Path::new("rel/b")).unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+    let link = t.path().join("link");
+    std::os::unix::fs::symlink(&base, &link).unwrap();
+    let e = base::sweep_base(&link).unwrap_err();
+    assert_eq!(errno(&e), Some(libc::EPERM), "{e}");
+    let file = t.path().join("file");
+    std::fs::write(&file, b"").unwrap();
+    let e = base::sweep_base(&file).unwrap_err();
+    assert_eq!(errno(&e), Some(libc::ENOTDIR), "{e}");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o771)).unwrap();
+    let e = base::sweep_base(&base).unwrap_err();
+    assert_eq!(errno(&e), Some(libc::EPERM), "{e}");
 }
 
 // ---------------------------------------------------------------------------

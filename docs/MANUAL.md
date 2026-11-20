@@ -279,8 +279,8 @@ When a live D is removed, the spelling just cannot be followed any more; nothing
 
 ### sweep and sweep_base
 
-- `sockat::sweep()` looks in those of the default-named B of bases 1 to 3 (`/tmp/sockat-<uid>`, `$XDG_RUNTIME_DIR/sockat`, `$TMPDIR/sockat-<uid>`) that exist, and removes each D whose owning process is dead (a D on which `flock(LOCK_EX | LOCK_NB)` succeeds), with the E in it. It makes no B
-- `sockat::sweep_base(path)` does the same for a B passed as `Options::base`. The application that manages that B calls it
+- `sockat::sweep()` looks in those of the default-named B of bases 1 to 3 (`/tmp/sockat-<uid>`, `$XDG_RUNTIME_DIR/sockat`, `$TMPDIR/sockat-<uid>`) that exist, and removes each D whose owning process is dead (a D on which `flock(LOCK_EX | LOCK_NB)` succeeds), with the E in it. It makes no B. A base or B that fails the checks is skipped silently
+- `sockat::sweep_base(path)` does the same for a B passed as `Options::base`. The application that manages that B calls it. When B or its parent is not there it does nothing and succeeds. A path of the wrong form is `InvalidInput`, a symlink `EPERM`, something not a directory `ENOTDIR`, and a B owned by someone else, writable by group or others, or reached through a directory others can write to `EPERM`
 - The D of a live process (this process's included) is not removed. E directly under B, and a D holding anything that is not a symlink, are left alone
 - Neither is called automatically (resolve and bind do not list B each time)
 
