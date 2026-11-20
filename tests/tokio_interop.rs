@@ -57,6 +57,8 @@ async fn std_sockets_from_sockat_are_adopted_by_tokio() {
 // once tokio's listener has served a connection, remove() removes the socket
 // file, before tokio's listener is dropped. This is why remove() does not
 // close the listener itself: it no longer has it.
+// Its B is the test's own (Options.base), not the one the tests of every
+// sockat implementation share.
 #[tokio::test]
 async fn bind_ex_removes_after_the_listener_went_to_tokio() {
     let t = tempfile::Builder::new()
@@ -65,8 +67,14 @@ async fn bind_ex_removes_after_the_listener_went_to_tokio() {
         .unwrap();
     let path = long_path(t.path(), 400);
 
-    let sockat::Bound { socket, file, .. } =
-        sockat::bind_ex(&path, sockat::Options::default()).unwrap();
+    let sockat::Bound { socket, file, .. } = sockat::bind_ex(
+        &path,
+        sockat::Options {
+            base: Some(t.path().join("b")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     socket.set_nonblocking(true).unwrap();
     let listener = tokio::net::UnixListener::from_std(socket).unwrap();
     let client = sockat::connect_nonblocking(&path).unwrap();

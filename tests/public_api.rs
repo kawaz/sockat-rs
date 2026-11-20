@@ -1,8 +1,14 @@
 //! The public API as a user sees it: paths of any length on whatever route
-//! the platform picks, with the environment's own places for B (`/tmp`
-//! first). Which route ran is looked at only through the diagnostics the
-//! `_ex` functions return; the route-forcing tests live in the crate's unit
-//! tests.
+//! the platform picks. Which route ran is looked at only through the
+//! diagnostics the `_ex` functions return; the route-forcing tests live in
+//! the crate's unit tests.
+//!
+//! The functions without options use the environment's own places for B
+//! (`/tmp/sockat-<uid>` first), which the tests of every sockat
+//! implementation share: there a test only adds its own D (held by its lock)
+//! and its own E, and never removes B, relies on what else is in it, or
+//! counts it. The `_ex` and resolve functions are given a B of the test's own
+//! ([`own_base`]).
 
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -48,6 +54,15 @@ fn tmp() -> tempfile::TempDir {
         .prefix("sockat-")
         .tempdir_in("/tmp")
         .unwrap()
+}
+
+/// Options with a B of this test's own, `<t>/b`, so the test neither leans on
+/// nor changes the B the tests of every sockat implementation share.
+fn own_base(t: &tempfile::TempDir) -> Options {
+    Options {
+        base: Some(t.path().join("b")),
+        ..Default::default()
+    }
 }
 
 fn is_socket(p: &Path) -> bool {
@@ -264,7 +279,7 @@ fn long_path_errors_through_the_public_api() {
 fn bind_ex_returns_the_socket_file_and_the_spelling() {
     let t = tmp();
     let p = nest(t.path(), 300, "s.sock");
-    let bound = sockat::bind_ex(&p, Options::default()).unwrap();
+    let bound = sockat::bind_ex(&p, own_base(&t)).unwrap();
     assert_eq!(bound.skipped[0].name, "standard");
     match bound.spelling {
         Spelling::Linked { .. } => assert!(bound.base.is_some()),
@@ -288,7 +303,7 @@ fn bind_ex_returns_the_socket_file_and_the_spelling() {
     bound.file.cleanup().unwrap();
 
     let short = t.path().join("short.sock");
-    let b = sockat::bind_ex(&short, Options::default()).unwrap();
+    let b = sockat::bind_ex(&short, own_base(&t)).unwrap();
     assert_eq!(b.spelling, Spelling::Original);
     assert_eq!(b.route, "standard");
     drop(b.socket);
@@ -305,13 +320,13 @@ fn an_ex_error_keeps_the_errno_and_the_routes() {
     let t = tmp();
     let p = nest(t.path(), 300, "s.sock");
     let missing = p.parent().unwrap().join("none/s.sock");
-    let e = sockat::connect_ex(&missing, Options::default()).unwrap_err();
+    let e = sockat::connect_ex(&missing, own_base(&t)).unwrap_err();
     assert_eq!(e.route, None);
     assert!(e.skipped.is_empty());
     let io: io::Error = e.into();
     assert_eq!(io.raw_os_error(), Some(libc::ENOENT));
     std::fs::write(&p, b"").unwrap();
-    let e = sockat::bind_ex(&p, Options::default()).unwrap_err();
+    let e = sockat::bind_ex(&p, own_base(&t)).unwrap_err();
     assert_eq!(e.error.raw_os_error(), Some(libc::EADDRINUSE));
     assert!(e.route.is_some());
     assert_eq!(e.skipped[0].name, "standard");
@@ -325,13 +340,13 @@ fn an_ex_error_keeps_the_errno_and_the_routes() {
 fn resolved_spellings_go_to_std() {
     let t = tmp();
     let p = nest(t.path(), 300, "s.sock");
-    let for_bind = sockat::resolve_for_bind(&p, Options::default()).unwrap();
+    let for_bind = sockat::resolve_for_bind(&p, own_base(&t)).unwrap();
     assert!(for_bind.path.as_os_str().len() <= std_max());
     assert!(for_bind.socket_file().is_err(), "nothing bound yet");
     let listener = UnixListener::bind(&for_bind.path).unwrap();
     assert!(is_socket(&p));
     let file = for_bind.socket_file().unwrap();
-    let for_connect = sockat::resolve_for_connect(&p, Options::default()).unwrap();
+    let for_connect = sockat::resolve_for_connect(&p, own_base(&t)).unwrap();
     assert_eq!(for_connect.route, "link-file");
     for _ in 0..3 {
         let mut c = UnixStream::connect(&for_connect.path).unwrap();
@@ -344,7 +359,7 @@ fn resolved_spellings_go_to_std() {
     for_bind.cleanup().unwrap();
 
     let short = t.path().join("s.sock");
-    let r = sockat::resolve_for_bind(&short, Options::default()).unwrap();
+    let r = sockat::resolve_for_bind(&short, own_base(&t)).unwrap();
     assert_eq!(r.path, short);
     assert_eq!(r.spelling, Spelling::Original);
 }
@@ -366,9 +381,8 @@ fn datagrams_at_long_paths() {
     let n = server.recv(&mut buf).unwrap();
     assert_eq!(&buf[..n], b"one");
 
-    let bound = sockat::datagram::bind_ex(&client_path, Options::default()).unwrap();
-    let report =
-        sockat::datagram::connect_ex(&bound.socket, &server_path, Options::default()).unwrap();
+    let bound = sockat::datagram::bind_ex(&client_path, own_base(&t)).unwrap();
+    let report = sockat::datagram::connect_ex(&bound.socket, &server_path, own_base(&t)).unwrap();
     assert!(!report.route.is_empty());
     bound.socket.send(b"two").unwrap();
     let (n, from) = server.recv_from(&mut buf).unwrap();
@@ -428,7 +442,9 @@ fn options_base_holds_b() {
 }
 
 // sweep() leaves this process's live D (a spelling bound by bind_ex keeps
-// working after it) and makes no B.
+// working after it) and makes no B. The test of the default places: it goes
+// through the shared B, where it adds only its own D and leaves B (and the
+// live D of other processes, locked) in place.
 #[test]
 fn sweep_keeps_this_processs_d() {
     let t = tmp();
