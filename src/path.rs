@@ -174,9 +174,10 @@ mod tests {
 
     // `split` decides which directory a long path's socket is created in and
     // under which name, for every route that does not hand the whole path to
-    // the kernel (proc-direct, symlink-file, the fork routes,
-    // bindat). A wrong split creates the socket somewhere else than the path
-    // says, so each row of the table in its doc comment is pinned here.
+    // the kernel (link-dir, thread-cwd, at, proc-direct, at-direct,
+    // thread-cwd-direct). A wrong split creates the socket somewhere else than
+    // the path says, so each row of the table in its doc comment is pinned
+    // here.
     #[test]
     fn split_takes_the_bytes_after_the_last_slash() {
         let cases: &[(&str, &str, &str)] = &[
