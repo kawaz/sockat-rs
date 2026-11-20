@@ -36,7 +36,7 @@ std's `bind` / `connect` refuse a path that does not fit `sun_path`. The file sy
 
 The kernel keeps a bind's spelling for the life of the socket and reports it by `getsockname`. Libraries above remove the socket file by that spelling, and a DGRAM receiver replies to it. So a bind's spelling must keep naming the same place when it is followed later.
 
-- **B**: this user's directory in a place. `/tmp/sockat-<uid>` (failing that `$XDG_RUNTIME_DIR/sockat`, `$TMPDIR/sockat-<uid>`, the socket's directory). Mode 0711, reused, never removed by sockat
+- **B**: this user's directory in a base. `/tmp/sockat-<uid>` (failing that `$XDG_RUNTIME_DIR/sockat`, `$TMPDIR/sockat-<uid>`, the socket's directory). Mode 0711, reused, never removed by sockat
 - **D**: a directory per process in B. The process keeps a `flock` on it; a dead process's D is removed by the OS's cleaning of temporary directories or by `sockat::sweep()`
 - **E**: a symlink in D. It points to the socket's directory (link-dir, spelling `B/D/E/<file name>`) or to the socket file (link-file, spelling `B/D/E`; macOS and NetBSD, where a bind follows a symlink)
 

@@ -119,12 +119,6 @@ pub(crate) fn counted_name(mut n: u64) -> String {
     }
 }
 
-/// `(st_dev, st_ino)` of an open fd (`fstat(2)`).
-fn fd_id(fd: BorrowedFd<'_>) -> io::Result<(u64, u64)> {
-    let m = std::fs::File::from(fd.try_clone_to_owned()?).metadata()?;
-    Ok((m.dev(), m.ino()))
-}
-
 /// Open the directory `path` without following a symlink at its last
 /// component, to use as the base of `*at` calls and of `fchdir`: `O_PATH`
 /// on Linux, `O_SEARCH` on Apple (`O_RDONLY` when the kernel refuses it on a
@@ -377,8 +371,17 @@ impl Base {
                     return Err(e);
                 }
             };
-            let id = fd_id(fd.as_fd())?;
-            if sys::id_at(parent_fd.as_fd(), &name)? != id {
+            // What was opened must be a directory of this user and still be
+            // what is at the name (`fstat` of the fd, `lstat` by the name).
+            let m = std::fs::File::from(fd.try_clone()?).metadata()?;
+            let id = (m.dev(), m.ino());
+            let held = m.is_dir()
+                && m.uid() == sys::effective_uid()
+                && sys::id_at(parent_fd.as_fd(), &name).is_ok_and(|named| named == id);
+            if !held {
+                if created {
+                    let _ = sys::unlink_at(parent_fd.as_fd(), &name, true);
+                }
                 return Err(refused());
             }
             let b_search = mode & 0o001 != 0;

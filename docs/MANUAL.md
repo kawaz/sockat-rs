@@ -46,7 +46,7 @@ server.read_exact(&mut buf)?;
 - **`connect`** replaces std's `UnixStream::connect`. It blocks
 - **`connect_nonblocking`** is for async runtimes. The socket is made nonblocking before the connect and returned as it is, ready for tokio's `UnixStream::from_std`. When the peer's backlog is full it fails at once (`EAGAIN` on Linux, `ECONNREFUSED` on macOS). A Unix-domain connect completes or fails within the call, and sockat's clean-up afterwards is only an unlink, so there is nothing to wait for
 
-A connect leaves nothing, neither in the process nor in the places.
+A connect leaves nothing, neither in the process nor in the bases.
 
 ## How a long path is reached
 
@@ -63,14 +63,14 @@ A longer path is handed to the kernel by a short spelling that names the same pl
 
 | | Content | How many | Stays |
 |---|---|---|---|
-| B | this user's directory in a place (mode 0711). `/tmp/sockat-<uid>`, failing that `$XDG_RUNTIME_DIR/sockat`, `$TMPDIR/sockat-<uid>`, and last `.sockat.<10 random characters>` in the socket's directory | one per user, reused across processes | sockat never removes it |
+| B | this user's directory in a base (mode 0711). `/tmp/sockat-<uid>`, failing that `$XDG_RUNTIME_DIR/sockat`, `$TMPDIR/sockat-<uid>`, and last `.sockat.<10 random characters>` in the socket's directory | one per user, reused across processes | sockat never removes it |
 | D | a directory in B with a name of 10 random characters (mode 0711) | one per process and B | the process keeps an fd with a shared lock (`flock`) on it. A dead process's D is removed by the OS's cleaning of temporary directories or by [`sweep`](#sweep-and-sweep_base) |
 | E | a symlink in D: one to the socket's directory (link-dir) or one to the socket file (link-file) | one per bind and per resolve | until `cleanup` / `remove`. The default `bind`'s E is removed together with D after the process ends |
 
-- The place for B is checked and spelled by its real path after realpath (B in macOS's `/tmp` is `/private/tmp/sockat-<uid>`)
-- B is used only when every directory from the root to the place is "owned by root or the caller, and either writable by neither group nor others, or sticky", and B itself is "a real directory, owned by the caller, writable by neither group nor others". When B with the default name fails this, `sockat-<uid>.<10 random characters>` is made. When the place is not writable, the next place is tried
-- A `$XDG_RUNTIME_DIR` or `$TMPDIR` that is empty or relative is not used as a place
-- A process uses one B in places 1 to 3 (one more only with `usable_cross_uid`). A B in the socket's directory is one per directory
+- The base for B is checked and spelled by its real path after realpath (B in macOS's `/tmp` is `/private/tmp/sockat-<uid>`)
+- B is used only when every directory from the root to the base is "owned by root or the caller, and either writable by neither group nor others, or sticky", and B itself is "a real directory, owned by the caller, writable by neither group nor others". When B with the default name fails this, `sockat-<uid>.<10 random characters>` is made. When the place is not writable, the next place is tried
+- A `$XDG_RUNTIME_DIR` or `$TMPDIR` that is empty or relative is not used as a base
+- A process uses one B in bases 1 to 3 (one more only with `usable_cross_uid`). A B in the socket's directory is one per directory
 - When it is known beforehand that the spelling will not fit, no B is made
 - With [`Options::base`](#options), B is at that place
 
@@ -189,8 +189,8 @@ The `_ex` functions and resolve take `sockat::Options`. `Options::default()` is 
 
 | Field | Content |
 |---|---|
-| `usable_cross_uid: bool` | make a bind's spelling one another uid can follow too. Only a B in a place where every directory on the way and B itself give others x is used, and procB is not. When that cannot be met, the bind goes on to thread-cwd / at (`Dangling`). The connects do not look at it |
-| `base: Option<PathBuf>` | where B itself is (for example `/tmp/my-app-1000/sockat`). Made when missing (mode 0711). When the checks fail, `ENOENT` / `ENOTDIR` / `EPERM`, never falling back to the automatic places. A relative path and a path that does not end with a name are `InvalidInput`, whatever the length of the socket path. A symlink at the base is `EPERM`. The check is made for a long path before any route is tried, and B is made only when a route that uses B is reached. Used by both the binds and the connects |
+| `usable_cross_uid: bool` | make a bind's spelling one another uid can follow too. Only a B in a base where every directory on the way and B itself give others x is used, and procB is not. When that cannot be met, the bind goes on to thread-cwd / at (`Dangling`). The connects do not look at it |
+| `base: Option<PathBuf>` | where B itself is (for example `/tmp/my-app-1000/sockat`). Made when missing (mode 0711). When the checks fail, `ENOENT` / `ENOTDIR` / `EPERM`, never falling back to the automatic bases. A relative path and a path that does not end with a name are `InvalidInput`, whatever the length of the socket path. A symlink at the base is `EPERM`. The check is made for a long path before any route is tried, and B is made only when a route that uses B is reached. Used by both the binds and the connects |
 
 ```rust
 let options = sockat::Options {
@@ -253,7 +253,7 @@ bound.file.remove()?; // before the listener is closed
 drop(bound.socket);
 ```
 
-### What stays in the places
+### What stays in the base
 
 - The default `bind` returns no `SocketFile`, so its E stays until the process ends and is removed together with D by the OS's cleaning of temporary directories or by `sweep`. If clean-up matters, use `bind_ex` or resolve
 - A connect leaves nothing (when it made B for the first time, that B goes on being used as the process's B)
@@ -261,7 +261,7 @@ drop(bound.socket);
 
 The OS's cleaning of temporary directories:
 
-| Place | A dead D | A live D |
+| Base | A dead D | A live D |
 |---|---|---|
 | Linux's `/tmp` | systemd-tmpfiles removes it after 10 days | a directory with a flock on it is skipped (systemd v242 and later). In older environments (RHEL 8, ...) it may be removed after 10 days |
 | `$XDG_RUNTIME_DIR` | stays until the last logout or a reboot | the same |
@@ -273,7 +273,7 @@ When a live D is removed, the spelling just cannot be followed any more; nothing
 
 ### sweep and sweep_base
 
-- `sockat::sweep()` looks in those of the default-named B of places 1 to 3 (`/tmp/sockat-<uid>`, `$XDG_RUNTIME_DIR/sockat`, `$TMPDIR/sockat-<uid>`) that exist, and removes each D whose owning process is dead (a D on which `flock(LOCK_EX | LOCK_NB)` succeeds), with the E in it. It makes no B
+- `sockat::sweep()` looks in those of the default-named B of bases 1 to 3 (`/tmp/sockat-<uid>`, `$XDG_RUNTIME_DIR/sockat`, `$TMPDIR/sockat-<uid>`) that exist, and removes each D whose owning process is dead (a D on which `flock(LOCK_EX | LOCK_NB)` succeeds), with the E in it. It makes no B
 - `sockat::sweep_base(path)` does the same for a B passed as `Options::base`. The application that manages that B calls it
 - The D of a live process (this process's included) is not removed. E directly under B, and a D holding anything that is not a symlink, are left alone
 - Neither is called automatically (resolve and bind do not list B each time)
@@ -331,7 +331,7 @@ client.send(b"ping")?;
 | When the listener is closed | as with std, the socket file is not removed when the listener is closed |
 | The directory is resolved first | the E of link-dir, thread-cwd and at points to the real path of the socket's directory, and proc-direct, at-direct and thread-cwd-direct open the directory first and then pass the file name. A rename or a repointed symlink in between is not reflected |
 | Another thread's chdir | relative returns an `Other` error when the cwd changed in between and stays changed. A change and change back is not seen |
-| State grows outside the application's own place | B, D and E stay in `/tmp`, `$XDG_RUNTIME_DIR` and `$TMPDIR` ([What stays in the places](#what-stays-in-the-places)) |
+| State grows outside the application's own place | B, D and E stay in `/tmp`, `$XDG_RUNTIME_DIR` and `$TMPDIR` ([What stays in the places](#what-stays-in-the-base)) |
 | Environments where a live D can be removed | Linux with systemd older than v242, and B in macOS's `$TMPDIR`. The spelling just cannot be followed any more |
 | A peer with `PrivateTmp` | when the peer's `/tmp` is isolated, the peer cannot follow a spelling through `/tmp`. On Linux procB is used first, so this hardly happens. `usable_with_private_tmp` tells |
 | Permissions | the socket's directory is opened `O_SEARCH` on macOS and `O_PATH` on Linux, which need no more permission than a plain bind / connect. Other Unix targets open it `O_RDONLY`, so proc-direct, at-direct and thread-cwd-direct need read permission too |

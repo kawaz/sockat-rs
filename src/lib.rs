@@ -149,7 +149,7 @@
 //! accepts that does not end with a file name, and for a path of any length
 //! with a NUL byte (on Linux a leading NUL, the abstract namespace, goes to
 //! std as it is). [`Options::base`] that fails its checks is `ENOENT`,
-//! `ENOTDIR` or `EPERM`, never another place (`InvalidInput` when it is
+//! `ENOTDIR` or `EPERM`, never another base (`InvalidInput` when it is
 //! relative or does not end with a name). The `_ex` functions return an
 //! [`ExError`], which converts into the `io::Error` by `?`.
 //!
@@ -222,11 +222,11 @@ pub struct Options {
     /// do not look at it (their spelling is kept nowhere).
     pub usable_cross_uid: bool,
     /// Where B is (B itself, for example `/tmp/my-app-1000/sockat`), instead
-    /// of the automatic places: an application's own directory, which it
+    /// of the automatic bases: an application's own directory, which it
     /// cleans up itself ([`sweep_base`]). Made when missing, checked (the
     /// directories on the way no other user can change, B this user's and not
     /// writable by group and others), and an error (`ENOENT`, `ENOTDIR`,
-    /// `EPERM`; a symlink there is `EPERM`) rather than another place when
+    /// `EPERM`; a symlink there is `EPERM`) rather than another base when
     /// the check fails; it must be absolute and end with a name (else
     /// `InvalidInput`, whatever the length of the path). The check is
     /// made before any route is tried, for a long path only; B is made only
@@ -819,7 +819,7 @@ pub fn resolve_for_connect<P: AsRef<Path>>(
 }
 
 /// Remove the D whose process is gone (no lock held on it), with their E, in
-/// this user's B of the automatic places (`/tmp/sockat-<uid>`,
+/// this user's B of the automatic bases (`/tmp/sockat-<uid>`,
 /// `$XDG_RUNTIME_DIR/sockat`, `$TMPDIR/sockat-<uid>`) that are there. Only
 /// when called: nothing does it on its own. A live process's D, this one's
 /// included, is left alone, and no B is made or removed.
