@@ -52,8 +52,11 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 | `Skipped` | `name`、`reason` (どちらも `&'static str`) |
 
 - 返す構造体は `#[non_exhaustive]` で、フィールドを公開する (分解して受け取れる)
-- `remove` と `cleanup` は `&self` で、内側の印で 1 回だけ働く。`ForBind` と、その `socket_file()` が返す `SocketFile` は同じ E を `Arc` で持ち、片付けはどちらから呼んでも 1 回
-- `remove` は失敗しても `cleanup` まで行い、ファイルの側のエラーを返す
+- `remove` と `cleanup` は `&self` で、内側の印で 1 回だけ働く。1 つの綴りの持ち主 (`ForBind` か `ForConnect`、`bind_ex` の `SocketFile`) と、`ForBind` の `socket_file()` が返す全ての `SocketFile` は、E と 1 つの lock を `Arc<Clean>` で共有し、ファイルと E を消す操作はどれもその lock を持って行う。複数のスレッドから、別々の `SocketFile` や `ForBind` を通して同時に呼ばれても、消す操作は同時に 1 つ (lock が `SocketFile` ごとだと、2 つが同時にファイルを bind した物と確かめて両方が unlink し、後の方がその間に bind された別のソケットを消しうる)。片付けはどこから呼んでも 1 回。E の印 (`base::Link`) も自分の lock を持ち、経路の中の片付けと合わせて E の unlink を同時に 1 つにする
+- 利用者が呼ぶ `cleanup` は E の unlink の失敗 (`ENOENT` 以外) をエラーで返す。印を立てるのは消せた時 (と既に無い時) だけで、失敗した後の呼び出しはもう一度消しに行く
+- `remove` は失敗しても `cleanup` まで行い、ファイルの側のエラーを先に、無ければ `cleanup` のエラーを返す。印を立てるのは両方が通った時だけで、失敗した後の呼び出しはもう一度確かめて消しに行く
+- 呼び出しの中で消す E (bind が失敗した時・ソケットのファイルを覚えられなかった時の E、thread-cwd・at の E、既定の connect の E) は、消すのに失敗しても捨てる (`let _`、`TempLink` の Drop)。呼び出しの成否も元のエラーも変えない
+- bind の後に覚えるソケットのファイルは、どの経路も `route::remembered_at` で引く: パスを `realpath` し (最後の要素の symlink も辿る。Apple・NetBSD の bind はそこを辿ってその先にソケットを作る)、その `lstat` を覚える。ソケットでなければ `ENOTSOCK` で覚えない。standard は元のパス、link-dir・link-file・thread-cwd・at はソケットのディレクトリの実パスとファイル名を引き、link-dir は加えて綴りの `stat` が同じ物かを確かめる。`ForBind::socket_file()` は綴りを同じ関数で引く
 - 作らないもの: `datagram::send_to`・`send_to_ex` と `seqpacket` (ハブ SPEC の「未確定」)
 
 ### B・D・E の持ち方 (`src/base.rs`)
@@ -68,6 +71,7 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 - 作った B と D は、作った直後に名前で `fchmodat(0711)` してから開いて確かめる
 - resolve の E は D の中のカウンタ (36 進)、thread-cwd・at の E と B 直下の E は乱数 10 文字 (`arc4random_buf` / `getrandom`)
 - procB の綴りは `/proc/<getpid()>/fd/<B の fd>`。その stat が B の fd と同じ `(st_dev, st_ino)` の時だけ使う
+- `sweep`・`sweep_base` が見るのは、B の直下の、名前が D の形 (`base::is_random_name`: ASCII の英数字 10 文字) のディレクトリだけ。他の名前の物には触らない
 
 ### OS ごとの試す順
 
@@ -87,6 +91,7 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 
 - 環境を読む部分は `route::Config` (置き場、持っている置き場 1〜3 の B (`Held`)、`/proc` の場所、thread-cwd、widened、bind が symlink を辿るか、ソケットのディレクトリの開き方、cwd の引き直しの間) にして、試験が差し替える。試験は `Held` を試験ごとに持ち、同じプロセスで並ぶ試験の B が重ならない
 - D を整えられない場面は、試験だけの thread_local (`base::FAIL_D`) で、作った D を開くところを失敗させて作る (本物の失敗をそこで起こす手が無い)
+- E を消せない場面は、試験だけの thread_local (`base::FAIL_UNLINK_E`) で、そのスレッドの E の unlink を `EPERM` にして作る。bind の直後にソケットのファイルが置き換わる場面は、試験だけの thread_local (`route::AFTER_BIND`) で、bind が通ってから覚えるまでの間に置き換えを入れて作る (どちらも呼び出しの途中に他のプロセスが割り込む形で、試験から外の手で起こせない)。E とソケットのファイルを消した回数は試験だけのフィールド (`Link::unlinks`・`Clean::file_unlinks`) で数え、並行の呼び出しで消す操作が 1 回だけかを確かめる
 - プロセス全体に効く設定 (cwd、umask、実効 uid) と、終わったプロセスの D が要る試験は、試験のバイナリを子プロセスで起こす
 - `unsafe` は `src/sys.rs` だけ (`just lint-unsafe`)
 
@@ -94,6 +99,8 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 
 - `Options` を `#[non_exhaustive]` にすると crate の外で構造体式も更新構文も書けず、setter が要る。0.x の間は項目を足すのを破壊的変更として受け入れ、Rust で普通の書き方を選ぶ
 - `remove` を `self` を消費する形にすると、`ForBind` と `SocketFile` で E を共有できず、SPEC の「2 回目以降は何もしない」を型でなく所有で表すことになる
+- 失敗した `cleanup` の後の呼び出しをもう一度消しに行かせるのは、印を先に立てると 2 回目が E を残したまま成功を返し、利用者に頼まれた片付けの失敗を隠すため
+- ソケットでない物を覚えないのを、SPEC が求める最後の要素が symlink の時に限らずどの場合にも行うのは、`bind_ex` が bind した直後の名前にソケットでない物があれば置き換わった物で、覚えると `remove` がそれを消すため (`ForBind::socket_file()` と同じ確かめ)
 - B・D はプロセスごとの状態 (ハブ DR-0017) なので、プロセス全体の登録簿に置く。試験は置き場を試験ごとの一時ディレクトリにするので、登録簿を共有しても B は重ならない
 - 置き場 1〜3 の B は置き場によらずプロセスに 1 つなので、置き場で引く登録簿では表せない。プロセスに 1 つの `Held` を `Config` で運ぶと、外の振る舞いはそのままで、試験は試験ごとの `Held` で 1 つのプロセスを模せる
 - 作った直後に名前で mode を変えるのは、Linux の B の fd が `O_PATH` (`fchmod` を受け付けない) で、umask が持ち主の読み・辿る権限を削ると `O_RDONLY` / `O_SEARCH` では開けないため。親は途中の確かめに通っていて、作った物を他人は付け替えられない (sticky な `/tmp` でも、消す・名前を変えるのは持ち主だけ)

@@ -195,7 +195,7 @@ The `_ex` functions and resolve take `sockat::Options`. `Options::default()` is 
 | Field | Content |
 |---|---|
 | `usable_cross_uid: bool` | make a bind's spelling one another uid can follow too. Only a B in a base where every directory on the way and B itself give others x is used, and procB is not. When that cannot be met, the bind goes on to thread-cwd / at (`Dangling`). Whether a B lets another uid follow it is judged when the process takes that B, and kept (also for the B of `Options::base`). The connects do not look at it |
-| `base: Option<PathBuf>` | where B itself is (for example `/tmp/my-app-1000/sockat`). Made when missing (mode 0711). When the checks fail, `ENOENT` / `ENOTDIR` / `EPERM`, never falling back to the automatic bases. A relative path and a path that does not end with a name are `InvalidInput`, whatever the length of the socket path. A symlink at the base is `EPERM`. The check is made for a long path on every call, before any route is tried, and B is made only when a route that uses B is reached. Used by both the binds and the connects |
+| `base: Option<PathBuf>` | where B itself is (for example `/tmp/my-app-1000/sockat`). Made when missing (mode 0711). When the checks fail, `ENOENT` / `ENOTDIR` / `EPERM`, never falling back to the automatic bases. A relative path and a path that does not end with a name are `InvalidInput`, whatever the length of the socket path. A symlink at the base is `EPERM`. The check is made for a long path on every call, before any route is tried, and B is made only when a route that uses B is reached. Used by both the binds and the connects. This B is sockat's own: put nothing else in it (`sweep_base` looks only at directories named in the form of a D) |
 
 ```rust
 let options = sockat::Options {
@@ -242,13 +242,15 @@ The names in `route`, `base` and `skipped`, and `reason`, are for diagnostics an
 
 | Method | What it does |
 |---|---|
-| `remove(&self)` | removes the socket file, the first time only, and does `cleanup` too. Removes it only when what is at that path has the `(st_dev, st_ino)` taken. When it has been replaced or is already gone, removes nothing and returns `Ok(())`. On failure it still goes on to `cleanup` and returns the error about the file |
-| `cleanup(&self)` | removes the E the spelling goes through, the first time only. The spelling then names nothing; the socket file and the socket stay |
+| `remove(&self)` | removes the socket file, the first time only, and does `cleanup` too. Removes it only when what is at that path has the `(st_dev, st_ino)` taken. When it has been replaced or is already gone, removes nothing and returns `Ok(())`. On failure it still goes on to `cleanup`, and returns the error about the file first, else the error of `cleanup` |
+| `cleanup(&self)` | removes the E the spelling goes through, the first time only. The spelling then names nothing; the socket file and the socket stay. When E cannot be removed (other than being gone already), returns the error of `unlink` |
 
-- Both do nothing from the second call on. Dropping does nothing
+- Both do nothing once they have succeeded. A call after a failure tries again. Called from several threads at once, they remove one at a time (also between a `ForBind` and the `SocketFile`s got by calling its `socket_file()` more than once). Dropping does nothing
+- When the last component of the path is a symlink (which the bind follows on macOS and NetBSD, making the socket where it points), what is remembered is the socket it led to. `remove` removes that socket and leaves the user's symlink
 - `remove` does not close the listener. Closing it is up to the user
 - The promise covers replacements while the listener is open. Once it is closed, a file removed and made again cannot be told apart on file systems that reuse inode numbers at once (ext4, the BSDs' UFS / FFS). Call `remove` before closing the listener
-- When `bind_ex` cannot remember the socket file, it closes the listener, cleans up E, and returns an error without removing the socket file (removing a file it could not check might remove what replaced it)
+- When `bind_ex` cannot remember the socket file, it closes the listener, cleans up E, and returns an error without removing the socket file (removing a file it could not check might remove what replaced it). When what is there right after the bind (where a symlink leads, for a symlink) is not a socket, it was replaced: it is not remembered, and the error is `ENOTSOCK`
+- The E removed inside a call (the E of a bind that failed or could not remember the file, the E of thread-cwd and at, the E after a connect) is passed over in silence when it cannot be removed: neither whether the call succeeds nor the original error changes. Only `cleanup` and `remove` called by the user return a failure to remove
 - For a relative path, `bind_ex` compares the cwd's `(st_dev, st_ino)` before looking the path up and after the bind and the realpath taken to remember the file; when they differ, it returns an `Other` error as when the file cannot be remembered
 - Someone who can write to the socket's directory and swaps the file between the check and the removal is not stopped (POSIX has no way to remove a file by its inode)
 
@@ -281,6 +283,7 @@ When a live D is removed, the spelling just cannot be followed any more; nothing
 
 - `sockat::sweep()` looks in those of the default-named B of bases 1 to 3 (`/tmp/sockat-<uid>`, `$XDG_RUNTIME_DIR/sockat`, `$TMPDIR/sockat-<uid>`) that exist, and removes each D whose owning process is dead (a D on which `flock(LOCK_EX | LOCK_NB)` succeeds), with the E in it. It makes no B. A base or B that fails the checks is skipped silently
 - `sockat::sweep_base(path)` does the same for a B passed as `Options::base`. The application that manages that B calls it. When B or its parent is not there it does nothing and succeeds. A path of the wrong form is `InvalidInput`, a symlink `EPERM`, something not a directory `ENOTDIR`, and a B owned by someone else, writable by group or others, or reached through a directory others can write to `EPERM`
+- They look only at the directories right under B whose name has the form of a D (10 ASCII letters and digits). B is sockat's own; what has another name is left alone
 - The D of a live process (this process's included) is not removed. E directly under B, and a D holding anything that is not a symlink, are left alone
 - Neither is called automatically (resolve and bind do not list B each time)
 
@@ -295,7 +298,7 @@ For those who hand a spelling to std or another library themselves. A spelling i
 
 - A path of a length std accepts is returned as it is (`Original` / `CwdRelative`)
 - When no spelling fits (a length only thread-cwd / at reach, or B cannot be made), `ENAMETOOLONG`. To reach such a length, use `bind` / `connect`
-- Call `ForBind::socket_file()` after the bind. It follows the spelling at that point and returns a `SocketFile` holding the socket file's real path and `(st_dev, st_ino)` (an error before the bind or after the clean-up; `ENOTSOCK` when what it reaches is not a socket). Its `remove` removes the file and cleans up the same E as the `ForBind`. Without calling it, there is nothing that removes the file
+- Call `ForBind::socket_file()` after the bind. It follows the spelling at that point and returns a `SocketFile` holding the socket file's real path and `(st_dev, st_ino)` (an error before the bind or after the clean-up; `ENOTSOCK` when what it reaches is not a socket). When the last component of the path is a symlink (which the bind follows on macOS and NetBSD), it takes the socket the symlink led to. Its `remove` removes the file and cleans up the same E as the `ForBind`. Without calling it, there is nothing that removes the file
 - `ForConnect`'s spelling can be used for any number of connects; call `cleanup()` at the end
 - `resolve_for_connect` does not look at `usable_cross_uid`
 
@@ -398,6 +401,8 @@ fn serve(path: &Path) -> io::Result<()> {
 | A path too long for std that does not end with a name (`dir/`, `dir/.`, `..`, ...) | `InvalidInput` |
 | A path containing a NUL (at any length) | `InvalidInput` |
 | The cwd changed during relative, or during `bind_ex` of a relative path | `Other` |
+| Right after `bind_ex`'s bind, what is there (where a symlink leads, when the last component is one) is not a socket. What `socket_file()` reaches is not a socket | `ENOTSOCK` |
+| `cleanup` / `remove` cannot remove E (other than it being gone already) | the error of `unlink` |
 
 - The directory is looked up first, so `ENOENT` and `ENOTDIR` are settled before the length is judged, and no route is tried (`ExError`'s `route` is `None`, `skipped` empty)
 - `Options::base` is checked before the routes; when it fails, `route` is `None` and `skipped` empty. When B cannot be made after the check passed, `route` is `None` and `skipped` holds the routes passed over until then

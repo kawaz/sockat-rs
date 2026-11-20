@@ -195,7 +195,7 @@ Linux の bind は、ファイル名がおよそ 96 バイトを超えるか、s
 | 項目 | 中身 |
 |---|---|
 | `usable_cross_uid: bool` | bind の綴りを別の uid も辿れる物にする。途中と B 自身が other に x を持つ置き場の B だけを使い、procB を使わない。満たせなければ thread-cwd / at (`Dangling`) に進む。B が他の uid に辿らせるかは、プロセスがその B を持った時に判定して覚え、後で見直さない (`Options::base` の B も)。connect 系は見ない |
-| `base: Option<PathBuf>` | B そのものの場所 (例 `/tmp/my-app-1000/sockat`)。無ければ作り (mode 0711)、確かめに外れたら `ENOENT` / `ENOTDIR` / `EPERM` で、自動の置き場に落とさない。相対パスと、名前で終わらないパスは、パスの長さによらず `InvalidInput`。base の場所が symlink なら `EPERM`。確かめは長いパスで呼び出しのたびに経路を試す前に行い、B を作るのは B を使う経路に来た時だけ。bind 系も connect 系も使う |
+| `base: Option<PathBuf>` | B そのものの場所 (例 `/tmp/my-app-1000/sockat`)。無ければ作り (mode 0711)、確かめに外れたら `ENOENT` / `ENOTDIR` / `EPERM` で、自動の置き場に落とさない。相対パスと、名前で終わらないパスは、パスの長さによらず `InvalidInput`。base の場所が symlink なら `EPERM`。確かめは長いパスで呼び出しのたびに経路を試す前に行い、B を作るのは B を使う経路に来た時だけ。bind 系も connect 系も使う。この B は sockat 専用で、他の物を置かない (`sweep_base` は D の形の名前のディレクトリだけを見る) |
 
 ```rust
 let options = sockat::Options {
@@ -242,13 +242,15 @@ let bound = sockat::bind_ex(path, options)?;
 
 | メソッド | すること |
 |---|---|
-| `remove(&self)` | ソケットのファイルを 1 回だけ消し、`cleanup` もする。そのパスの `(st_dev, st_ino)` が覚えた物と同じ時だけ消す。置き換わっていた・既に無い時は消さずに `Ok(())`。失敗しても `cleanup` まで行い、ファイルの側のエラーを返す |
-| `cleanup(&self)` | 綴りが通る E を 1 回だけ消す。綴りはどこにも届かなくなり、ソケットのファイルとソケットは残る |
+| `remove(&self)` | ソケットのファイルを 1 回だけ消し、`cleanup` もする。そのパスの `(st_dev, st_ino)` が覚えた物と同じ時だけ消す。置き換わっていた・既に無い時は消さずに `Ok(())`。失敗しても `cleanup` まで行い、ファイルの側のエラーを先に、無ければ `cleanup` のエラーを返す |
+| `cleanup(&self)` | 綴りが通る E を 1 回だけ消す。綴りはどこにも届かなくなり、ソケットのファイルとソケットは残る。E を消せなければ (既に無い時を除く) `unlink` のエラーを返す |
 
-- どちらも 2 回目以降は何もしない。Drop では何もしない
+- どちらも成功した後の呼び出しは何もしない。失敗した後の呼び出しはやり直す。複数のスレッドから同時に呼んでも、消す操作は同時に 1 つ (`ForBind` と、その `socket_file()` を何度か呼んで得た `SocketFile` どうしの間でも)。Drop では何もしない
+- パスの最後の要素が symlink の時 (macOS・NetBSD の bind はそれを辿り、その先にソケットを作る)、覚えるのは辿った先のソケット。`remove` はそのソケットを消し、利用者の symlink は残す
 - `remove` は listener を閉じない。閉じるのは利用者
 - 約束は listener を開いている間の置き換えまで。閉じた後に消して作り直された物は、番号をすぐ使い回すファイルシステム (ext4、BSD の UFS / FFS) で見分けられない。`remove` は listener を閉じる前に呼ぶ
-- `bind_ex` がソケットのファイルを覚えられない時は、listener を閉じ、E を片付け、ソケットのファイルは消さずにエラーを返す (確かめられないファイルを消すと、置き換わった物を消しうる)
+- `bind_ex` がソケットのファイルを覚えられない時は、listener を閉じ、E を片付け、ソケットのファイルは消さずにエラーを返す (確かめられないファイルを消すと、置き換わった物を消しうる)。bind した直後にそこ (symlink なら辿った先) にあるのがソケットでなければ、置き換わった物なので覚えず `ENOTSOCK`
+- 呼び出しの中で消す E (bind が失敗した時・覚えられない時の E、thread-cwd・at の E、connect の後の E) は、消すのに失敗しても黙る。呼び出しの成否も元のエラーも変わらない。利用者が呼ぶ `cleanup` と `remove` だけが消す失敗を返す
 - 相対パスの `bind_ex` は、パスを引く前と、bind と覚えるための realpath の後で cwd の `(st_dev, st_ino)` を比べ、違えば覚えられない時と同じに `Other` のエラーを返す
 - 確かめてから消すまでの間に、ソケットのディレクトリに書ける者がファイルをすり替えるのは防げない (inode を指定して消す手段が POSIX に無い)
 
@@ -281,6 +283,7 @@ OS の一時ディレクトリの掃除:
 
 - `sockat::sweep()` は、置き場 1〜3 の既定の名前の B (`/tmp/sockat-<uid>`、`$XDG_RUNTIME_DIR/sockat`、`$TMPDIR/sockat-<uid>`) のうち、あるものの中で、持ち主のプロセスが死んだ D (`flock(LOCK_EX | LOCK_NB)` が取れた D) を中の E ごと消す。B は作らない。確かめに外れた置き場・B は黙って飛ばす
 - `sockat::sweep_base(path)` は、`Options::base` に渡した B に同じことをする。その B を管理するアプリが呼ぶ。B か親が無ければ何もせず成功する。形の誤りは `InvalidInput`、symlink は `EPERM`、ディレクトリでなければ `ENOTDIR`、他人の物・group / other が書ける B・途中が他人に書ける時は `EPERM`
+- 見るのは B の直下の、名前が D の形 (ASCII の英数字 10 文字) のディレクトリだけ。B は sockat 専用で、他の名前の物には触らない
 - 生きているプロセスの D (このプロセスの物を含む) は消さない。B の直下の E と、symlink でない物がある D には触らない
 - 自動では呼ばれない (resolve や bind のたびに B の中を一覧しない)
 
@@ -295,7 +298,7 @@ OS の一時ディレクトリの掃除:
 
 - std が受け付ける長さのパスはそのまま返す (`Original` / `CwdRelative`)
 - 綴りが収まらない時 (thread-cwd・at でしか届かない長さ、B を作れない) は `ENAMETOOLONG`。その長さに届かせたい時は `bind` / `connect` を使う
-- `ForBind::socket_file()` は、bind した後に呼ぶ。その時点で綴りを辿り、ソケットのファイルの実パスと `(st_dev, st_ino)` を覚えた `SocketFile` を返す (bind の前や片付けた後はエラー、ソケットでない物なら `ENOTSOCK`)。その `remove` はファイルを消して、`ForBind` と同じ E を片付ける。呼ばなければ消す口は無い
+- `ForBind::socket_file()` は、bind した後に呼ぶ。その時点で綴りを辿り、ソケットのファイルの実パスと `(st_dev, st_ino)` を覚えた `SocketFile` を返す (bind の前や片付けた後はエラー、ソケットでない物なら `ENOTSOCK`)。パスの最後の要素が symlink なら (macOS・NetBSD の bind が辿る)、辿った先のソケットを覚える。その `remove` はファイルを消して、`ForBind` と同じ E を片付ける。呼ばなければ消す口は無い
 - `ForConnect` の綴りは何度でも connect に使え、最後に `cleanup()` する
 - `resolve_for_connect` は `usable_cross_uid` を見ない
 
@@ -398,6 +401,8 @@ fn serve(path: &Path) -> io::Result<()> {
 | std にそのまま渡せない長さのパスで、名前で終わらない (`dir/`、`dir/.`、`..` 等) | `InvalidInput` |
 | NUL を含むパス (長さによらない) | `InvalidInput` |
 | relative の途中、または相対パスの `bind_ex` の途中で cwd が変わった | `Other` |
+| `bind_ex` が bind した直後、そこ (最後の要素が symlink なら辿った先) にソケットでない物がある。`socket_file()` が辿った先がソケットでない | `ENOTSOCK` |
+| `cleanup` / `remove` で E を消せない (既に無い時を除く) | `unlink` のエラー |
 
 - ディレクトリを先に引くので、`ENOENT` と `ENOTDIR` は長さの判定より前に決まり、経路は試されない (`ExError` の `route` は `None`、`skipped` は空)
 - `Options::base` の確かめは経路の前に行い、外れたら `route` は `None`、`skipped` は空。確かめに通った後に B を作れなかった時は、`route` は `None`、`skipped` はそれまでに飛ばした経路
