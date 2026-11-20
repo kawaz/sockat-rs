@@ -357,6 +357,10 @@ fn the_longest_path_std_accepts_goes_to_std_and_one_byte_more_does_not() {
     assert!(entries(&place).is_empty(), "a short path made B");
 
     let over = nest(t.path(), DIRECT_MAX + 1, "b.sock");
+    // The boundary is std's own: std refuses one byte more (and took
+    // DIRECT_MAX above).
+    let refused = UnixListener::bind(&over).unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
     let r = bind(&over, &opts(), &cfg).unwrap();
     assert_eq!(r.route, names::LINK_DIR);
     assert_eq!(skipped_names(&r.skipped), vec![names::STANDARD]);
