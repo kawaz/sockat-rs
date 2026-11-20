@@ -334,6 +334,11 @@ impl Base {
                 },
             };
             let st = sys::stat_at(parent_fd.as_fd(), &name)?;
+            // A symlink is not a real directory (EPERM: the check fails);
+            // anything else that is not a directory is ENOTDIR.
+            if st.is_symlink {
+                return Err(refused());
+            }
             if !st.is_dir {
                 return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
             }
@@ -532,7 +537,7 @@ pub(crate) fn in_socket_dir(real_dir: &Path) -> Option<Arc<Base>> {
 /// `Options.base` split into its parent and B's name: it must be absolute and
 /// end with a name (not `dir/`, `.`, `..` or `/`), else it is an argument
 /// error (hub SPEC "エラー").
-fn split_given(base: &Path) -> io::Result<(&Path, &OsStr)> {
+pub(crate) fn split_given(base: &Path) -> io::Result<(&Path, &OsStr)> {
     let refuse = || {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -561,6 +566,9 @@ pub(crate) fn check_given(base: &Path, others_search: bool) -> io::Result<()> {
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
         Err(e) => return Err(e),
     };
+    if m.file_type().is_symlink() {
+        return Err(refused());
+    }
     if !m.is_dir() {
         return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
     }

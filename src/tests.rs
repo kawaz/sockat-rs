@@ -947,9 +947,52 @@ fn an_existing_b_is_used_as_it_is_or_replaced_by_a_random_name() {
     assert_eq!(entries(&b2).len(), 1);
 }
 
+// An Options.base of the wrong form (relative, or not ending with a name) is
+// an argument error whatever the length of the path, a short one included,
+// like a NUL in the path: no route, nothing skipped, nothing made.
+#[test]
+fn an_options_base_of_the_wrong_form_is_invalid_input_at_any_length() {
+    let (t, place) = setup();
+    let cfg = real_link_dir(&place);
+    let short = t.path().join("s.sock");
+    let long = nest(t.path(), 200, "s.sock");
+    for base in [
+        PathBuf::from("relative/b"),
+        PathBuf::from(format!("{}/", t.path().join("b").display())),
+        t.path().join(".."),
+        PathBuf::from("/"),
+    ] {
+        let options = Options {
+            base: Some(base.clone()),
+            ..opts()
+        };
+        for p in [&short, &long] {
+            for req in [BIND, CONNECT] {
+                let f = route::run(req, p, &options, true, Some(&cfg))
+                    .err()
+                    .unwrap();
+                assert_eq!(
+                    f.error.kind(),
+                    io::ErrorKind::InvalidInput,
+                    "{base:?} {p:?}"
+                );
+                assert_eq!(f.route, None);
+                assert!(f.skipped.is_empty());
+            }
+            let f = route::resolve(route::Use::Bind, p, &options, Some(&cfg))
+                .err()
+                .unwrap();
+            assert_eq!(f.error.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+    assert!(!short.exists());
+    assert!(entries(&place).is_empty());
+}
+
 // Options.base is checked before any route, for a bind and a connect alike,
 // without making anything: a missing directory on the way is ENOENT, a base
-// that is not a directory ENOTDIR, one writable by group / others EPERM, and
+// that is neither a directory nor a symlink ENOTDIR, a symlink (not a real
+// directory) or one writable by group / others EPERM, and
 // a relative base or one not ending with a name an argument error. The
 // failure has no route and no skipped (not even standard: no route was
 // tried), and nothing is made, at the base or in another place: an
@@ -964,10 +1007,16 @@ fn options_base_that_fails_its_check_fails_before_any_route() {
     let writable = t.path().join("w");
     std::fs::create_dir(&writable).unwrap();
     std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o770)).unwrap();
+    // A symlink to a directory of this user's is not a real directory.
+    let real = t.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = t.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
     let cases: Vec<(PathBuf, Option<i32>)> = vec![
         (t.path().join("none/b"), Some(libc::ENOENT)),
         (file.clone(), Some(libc::ENOTDIR)),
         (writable.clone(), Some(libc::EPERM)),
+        (link.clone(), Some(libc::EPERM)),
         (PathBuf::from("relative/b"), None),
         (t.path().join("b/"), None),
         (t.path().join(".."), None),

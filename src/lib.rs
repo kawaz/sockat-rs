@@ -226,8 +226,9 @@ pub struct Options {
     /// cleans up itself ([`sweep_base`]). Made when missing, checked (the
     /// directories on the way no other user can change, B this user's and not
     /// writable by group and others), and an error (`ENOENT`, `ENOTDIR`,
-    /// `EPERM`) rather than another place when the check fails; it must be
-    /// absolute and end with a name (else `InvalidInput`). The check is
+    /// `EPERM`; a symlink there is `EPERM`) rather than another place when
+    /// the check fails; it must be absolute and end with a name (else
+    /// `InvalidInput`, whatever the length of the path). The check is
     /// made before any route is tried, for a long path only; B is made only
     /// when a route that uses it is reached. Used for the binds and the
     /// connects.

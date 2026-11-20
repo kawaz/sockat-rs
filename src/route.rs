@@ -438,6 +438,7 @@ fn run_unchecked(
             skipped: Vec::new(),
         })
     };
+    refuse_bad_base(options)?;
     if path::is_abstract(path) {
         return direct(req, path);
     }
@@ -485,6 +486,18 @@ fn run_unchecked(
             route: None,
             skipped,
         }),
+    }
+}
+
+/// `InvalidInput` for an `Options.base` that is relative or does not end with
+/// a name, whatever the length of the path (hub SPEC "エラー": an argument of
+/// the wrong form, like a NUL in the path), before anything else.
+fn refuse_bad_base(options: &Options) -> Result<(), Failed> {
+    match &options.base {
+        Some(b) => base::split_given(b)
+            .map(drop)
+            .map_err(Failed::before_routes),
+        None => Ok(()),
     }
 }
 
@@ -1269,6 +1282,7 @@ pub(crate) fn resolve(
             _ => None,
         },
     };
+    refuse_bad_base(options)?;
     if path::is_abstract(path) {
         return Ok(short(path));
     }
