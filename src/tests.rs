@@ -246,6 +246,71 @@ fn errno(e: &io::Error) -> Option<i32> {
     e.raw_os_error()
 }
 
+/// A situation in which sockat returns the error the OS gave, as std meets it
+/// at a short path ([`std_errno`]).
+#[derive(Clone, Copy, Debug)]
+enum Short {
+    /// A stream bind whose directory is missing.
+    BindInAMissingDirectory,
+    /// A stream bind whose directory is a regular file.
+    BindUnderAFile,
+    /// A stream bind with a regular file at the path.
+    BindOntoAFile,
+    /// A stream connect with nothing at the path (its directory there).
+    ConnectToNothing,
+    /// A stream connect to a socket file nobody listens on.
+    ConnectToNobodyListening,
+    /// Removing a file from a directory its owner cannot write to (not as
+    /// root, whom the mode does not stop).
+    RemoveFromAnUnwritableDirectory,
+}
+
+/// The errno std's own call returns for `case` on this OS, the situation made
+/// at a short path in a directory of the call's own. A test compares the
+/// errno sockat returns with this rather than with a constant: sockat returns
+/// the OS's error unchanged, and the OSes may answer the same situation with
+/// different errnos (illumos answers a datagram connect to a socket file no
+/// socket holds with EDESTADDRREQ where Linux and macOS say ECONNREFUSED; hub
+/// SPEC "エラー"). std must fail here, with an errno: if it succeeds the situation
+/// was not made, and an errno equal to nothing would prove nothing.
+fn std_errno(case: Short) -> i32 {
+    let t = tmp();
+    let p = t.path().join("s.sock");
+    let r = match case {
+        Short::BindInAMissingDirectory => {
+            UnixListener::bind(t.path().join("none/s.sock")).map(drop)
+        }
+        Short::BindUnderAFile => {
+            std::fs::write(t.path().join("f"), b"").unwrap();
+            UnixListener::bind(t.path().join("f/s.sock")).map(drop)
+        }
+        Short::BindOntoAFile => {
+            std::fs::write(&p, b"").unwrap();
+            UnixListener::bind(&p).map(drop)
+        }
+        Short::ConnectToNothing => UnixStream::connect(&p).map(drop),
+        Short::ConnectToNobodyListening => {
+            drop(UnixListener::bind(&p).unwrap());
+            UnixStream::connect(&p).map(drop)
+        }
+        Short::RemoveFromAnUnwritableDirectory => {
+            assert_ne!(sys::effective_uid(), 0, "the mode does not stop root");
+            let dir = t.path().join("u");
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("f"), b"").unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let r = std::fs::remove_file(dir.join("f"));
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            r
+        }
+    };
+    let Err(e) = r else {
+        panic!("{case:?}: std succeeded at a short path")
+    };
+    e.raw_os_error()
+        .unwrap_or_else(|| panic!("{case:?}: std's error has no errno: {e}"))
+}
+
 fn skipped_names(s: &[route::Skipped]) -> Vec<&'static str> {
     s.iter().map(|s| s.name).collect()
 }
@@ -373,7 +438,9 @@ fn the_longest_path_std_accepts_goes_to_std_and_one_byte_more_does_not() {
 // A relative path std accepts goes to std as it is: its spelling is
 // CwdRelative (after the cwd changes it names another place, a hazard std
 // has on its own, reported all the same), an absolute one Original; a
-// failure there is std's own, from the route standard.
+// failure there is std's own, from the route standard: the errno std's bind
+// gives for a missing directory on this OS, not a constant (the OS's errno is
+// passed on unchanged, and OSes may differ).
 #[test]
 fn a_short_path_is_original_or_cwd_relative() {
     let rel = route::resolve(route::Use::Bind, Path::new("s.sock"), &opts(), None).unwrap();
@@ -390,7 +457,10 @@ fn a_short_path_is_original_or_cwd_relative() {
     )
     .err()
     .unwrap();
-    assert_eq!(errno(&f.error), Some(libc::ENOENT));
+    assert_eq!(
+        errno(&f.error),
+        Some(std_errno(Short::BindInAMissingDirectory))
+    );
     assert_eq!(f.route, Some(names::STANDARD));
 }
 
@@ -516,11 +586,13 @@ fn a_spelling_cleaned_up_names_nothing() {
     assert_eq!(std::fs::read(&other).unwrap(), b"keep");
 }
 
-// A bind through link-dir that fails for real (EADDRINUSE: a file is at the
-// path) is that failure, from link-dir, and the E made for it is removed
-// before the error is returned: a failed bind leaves no E. The routes after
-// it are not tried (they would fail the same way), so nothing but standard
-// is in skipped.
+// A bind through link-dir that fails for real (a file is at the path) is that
+// failure, from link-dir, with the errno std's bind gives a short path with
+// a file at it on this OS (EADDRINUSE where it has been seen; the OS's errno
+// is passed on unchanged, so it is compared, not fixed), and the E made for
+// it is removed before the error is returned: a failed bind leaves no E. The
+// routes after it are not tried (they would fail the same way), so nothing
+// but standard is in skipped.
 #[test]
 fn a_failed_bind_through_link_dir_removes_its_e_and_is_not_retried() {
     let (t, place) = setup();
@@ -528,7 +600,7 @@ fn a_failed_bind_through_link_dir_removes_its_e_and_is_not_retried() {
     let p = nest(t.path(), 200, "s.sock");
     std::fs::write(&p, b"").unwrap();
     let f = bind(&p, &opts(), &cfg).err().unwrap();
-    assert_eq!(errno(&f.error), Some(libc::EADDRINUSE));
+    assert_eq!(errno(&f.error), Some(std_errno(Short::BindOntoAFile)));
     assert_eq!(f.route, Some(names::LINK_DIR));
     assert_eq!(skipped_names(&f.skipped), vec![names::STANDARD]);
     assert_no_e(&b_of(&place));
@@ -838,8 +910,10 @@ fn link_file_reaches_any_file_name_length() {
 }
 
 // Where a bind follows the symlink, a link-file bind onto a path with a file
-// at it fails for real (EADDRINUSE): that is the result, E is removed, and
-// the next route is not tried.
+// at it fails for real: that is the result, with the errno std's bind gives a
+// short path with a file at it on this OS (compared, not fixed: the OS's
+// errno is passed on unchanged), E is removed, and the next route is not
+// tried.
 #[cfg(any(target_vendor = "apple", target_os = "netbsd"))]
 #[test]
 fn a_failed_link_file_bind_is_the_failure() {
@@ -848,7 +922,7 @@ fn a_failed_link_file_bind_is_the_failure() {
     let p = nest(t.path(), 400, &"n".repeat(200));
     std::fs::write(&p, b"").unwrap();
     let f = bind(&p, &opts(), &cfg).err().unwrap();
-    assert_eq!(errno(&f.error), Some(libc::EADDRINUSE));
+    assert_eq!(errno(&f.error), Some(std_errno(Short::BindOntoAFile)));
     assert_eq!(f.route, Some(names::LINK_FILE));
     assert_no_e(&b_of(&place));
 }
@@ -856,9 +930,10 @@ fn a_failed_link_file_bind_is_the_failure() {
 // Where whether a bind follows the symlink is not known (told at run time),
 // a failed link-file bind with nothing at the path means the kernel did not
 // follow it: link-file is passed over, its E removed, and the next route
-// tried. With something at the path the same failure is the result. Forced
-// here on a kernel that does not follow (it binds the symlink's own name,
-// which exists: EADDRINUSE).
+// tried. With something at the path the same failure is the result: the
+// errno std's bind gives a short path with a file at it on this OS (compared,
+// not fixed: the OS's errno is passed on unchanged). Forced here on a kernel
+// that does not follow (it binds the symlink's own name, which exists).
 #[cfg(any(
     target_os = "linux",
     target_os = "android",
@@ -885,7 +960,7 @@ fn link_file_told_at_run_time_is_passed_over_when_not_followed() {
     let q = nest(&t.path().join("q"), 250, &name_past_link_dir());
     std::fs::write(&q, b"").unwrap();
     let f = bind(&q, &opts(), &cfg).err().unwrap();
-    assert_eq!(errno(&f.error), Some(libc::EADDRINUSE));
+    assert_eq!(errno(&f.error), Some(std_errno(Short::BindOntoAFile)));
     assert_eq!(f.route, Some(names::LINK_FILE));
     assert_no_e(&b_of(&place));
 }
@@ -1940,9 +2015,11 @@ fn widened_connects_up_to_253_bytes_on_apple() {
 }
 
 // A connect's real failure is the result, and later routes are not tried
-// (they would only fail the same way, after writing): ECONNREFUSED for a
-// socket nobody listens on, ENOENT for nothing at the path. Nothing is left
-// in B.
+// (they would only fail the same way, after writing), for a socket nobody
+// listens on and for nothing at the path. The errno is the OS's, passed on
+// unchanged, so it is compared with what std's connect gives a short path in
+// the same situation on this OS (ECONNREFUSED and ENOENT where they have been
+// seen) rather than fixed. Nothing is left in B.
 #[test]
 fn a_connect_failure_is_not_retried() {
     let (t, place) = setup();
@@ -1952,10 +2029,13 @@ fn a_connect_failure_is_not_retried() {
     let p = nest(t.path(), 200, "s.sock");
     bind_in_child(&p, &other);
     let f = connect(&p, &cfg).err().unwrap();
-    assert_eq!(errno(&f.error), Some(libc::ECONNREFUSED));
+    assert_eq!(
+        errno(&f.error),
+        Some(std_errno(Short::ConnectToNobodyListening))
+    );
     assert!(f.route.is_some());
     let f = connect(&p.with_file_name("none.sock"), &cfg).err().unwrap();
-    assert_eq!(errno(&f.error), Some(libc::ENOENT));
+    assert_eq!(errno(&f.error), Some(std_errno(Short::ConnectToNothing)));
     assert!(entries(&b_of(&place)).is_empty());
 }
 
@@ -2025,8 +2105,13 @@ fn paths_without_a_file_name_or_with_nul_are_invalid_input() {
     assert!(entries(&place).is_empty());
 }
 
-// The socket's directory is looked up first: a missing one is ENOENT and a
-// file in its place ENOTDIR, before any route (none named, none skipped).
+// The socket's directory is looked up first: a missing one, and a file in its
+// place, fail before any route (none named, none skipped), with the errno a
+// bind through the path would give: the one std's bind gives a short path in
+// the same situation on this OS (ENOENT and ENOTDIR where they have been
+// seen). Compared rather than fixed: the missing directory's errno is the
+// OS's, passed on unchanged, and the file's is made to be what the OS's bind
+// would answer.
 #[test]
 fn a_missing_directory_is_enoent_before_any_route() {
     let (t, place) = setup();
@@ -2034,11 +2119,14 @@ fn a_missing_directory_is_enoent_before_any_route() {
     let deep = nest(t.path(), 200, "x");
     let missing = deep.parent().unwrap().join("none/s.sock");
     let f = bind(&missing, &opts(), &cfg).err().unwrap();
-    assert_eq!(errno(&f.error), Some(libc::ENOENT));
+    assert_eq!(
+        errno(&f.error),
+        Some(std_errno(Short::BindInAMissingDirectory))
+    );
     assert!(f.skipped.is_empty() && f.route.is_none());
     std::fs::write(&deep, b"").unwrap();
     let f = bind(&deep.join("s.sock"), &opts(), &cfg).err().unwrap();
-    assert_eq!(errno(&f.error), Some(libc::ENOTDIR));
+    assert_eq!(errno(&f.error), Some(std_errno(Short::BindUnderAFile)));
     assert!(f.skipped.is_empty() && f.route.is_none());
     assert!(entries(&place).is_empty());
 }
@@ -2366,11 +2454,15 @@ fn e_left(b: &Path) -> usize {
 // SPEC-routes "経路の失敗の扱い": a failure to remove must not turn a
 // successful connect into a failure, nor replace the original error). Each
 // such removal: the plain connect's link-file E after a connect that
-// succeeded and after one that failed (ECONNREFUSED), the E of a bind that
-// failed for real (EADDRINUSE) through link-dir, link-file (macOS, NetBSD)
-// and thread-cwd (Linux, Apple), the thread-cwd E after a bind that
-// succeeded, and the E of a bind_ex that could not remember the socket file
-// (ENOTSOCK). Each E is still there afterwards, so the removal did fail.
+// succeeded and after one that failed (nobody listening), the E of a bind
+// that failed for real (a file at the path) through link-dir, link-file
+// (macOS, NetBSD) and thread-cwd (Linux, Apple), the thread-cwd E after a
+// bind that succeeded, and the E of a bind_ex that could not remember the
+// socket file (ENOTSOCK, sockat's own). The original error of a connect or a
+// bind is the OS's, passed on unchanged, so it is compared with what std
+// gives a short path in the same situation on this OS, not fixed (the
+// removal's error is EPERM, from the test hook). Each E is still there
+// afterwards, so the removal did fail.
 #[test]
 fn a_failed_removal_of_e_inside_a_call_changes_nothing() {
     let (t, place) = setup();
@@ -2385,7 +2477,10 @@ fn a_failed_removal_of_e_inside_a_call_changes_nothing() {
     assert_eq!(e_left(&b), 1);
     drop(l);
     let f = with_e_unremovable(|| connect(&p, &cfg)).err().unwrap();
-    assert_eq!(errno(&f.error), Some(libc::ECONNREFUSED));
+    assert_eq!(
+        errno(&f.error),
+        Some(std_errno(Short::ConnectToNobodyListening))
+    );
     assert_eq!(f.route, Some(names::LINK_FILE));
     assert_eq!(e_left(&b), 2);
 
@@ -2413,11 +2508,12 @@ fn a_failed_removal_of_e_inside_a_call_changes_nothing() {
             real_link_dir(&place),
         ));
     }
+    let onto_a_file = std_errno(Short::BindOntoAFile);
     for (route, p, cfg) in &cases {
         let before = e_left(&b);
         std::fs::write(p, b"").unwrap();
         let f = with_e_unremovable(|| bind(p, &opts(), cfg)).err().unwrap();
-        assert_eq!(errno(&f.error), Some(libc::EADDRINUSE), "{route}");
+        assert_eq!(errno(&f.error), Some(onto_a_file), "{route}");
         assert_eq!(f.route, Some(*route));
         assert_eq!(e_left(&b), before + 1, "{route}");
         std::fs::remove_file(p).unwrap();
@@ -2500,12 +2596,18 @@ fn a_cleanup_the_user_calls_returns_the_failure_to_remove_e() {
     assert!(is_socket(&p), "a call after the success does nothing");
     assert_eq!(unlinks(), 2);
 
-    // remove(): neither the file nor E removed: the file's error (EACCES, the
-    // socket's directory not writable), the cleanup still tried. Not as root,
-    // whom the mode does not stop.
+    // remove(): neither the file nor E removed: the file's error (the
+    // socket's directory not writable), the cleanup still tried. The file's
+    // error is the OS's, passed on unchanged, so it is compared with what
+    // std's remove_file gives a short path in the same situation on this OS
+    // (EACCES where it has been seen), not fixed; it must differ from the
+    // cleanup's (EPERM, from the test hook), or which of the two came back
+    // could not be told. Not as root, whom the mode does not stop.
     if sys::effective_uid() == 0 {
         return;
     }
+    let unwritable = std_errno(Short::RemoveFromAnUnwritableDirectory);
+    assert_ne!(unwritable, libc::EPERM, "the file's error is the cleanup's");
     let p = nest(&t.path().join("u"), 200, "s.sock");
     let mut r = bind(&p, &opts(), &cfg).unwrap();
     let _l = listener(&mut r);
@@ -2513,11 +2615,11 @@ fn a_cleanup_the_user_calls_returns_the_failure_to_remove_e() {
     let dir = p.parent().unwrap();
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
     let e = with_e_unremovable(|| file.remove()).unwrap_err();
-    assert_eq!(errno(&e), Some(libc::EACCES));
+    assert_eq!(errno(&e), Some(unwritable));
     assert_eq!(e_left(&b), 1);
     // The file still not removable, E now is: the file's error, E removed.
     let e = file.remove().unwrap_err();
-    assert_eq!(errno(&e), Some(libc::EACCES));
+    assert_eq!(errno(&e), Some(unwritable));
     assert_eq!(e_left(&b), 0);
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     file.remove().unwrap();
@@ -2708,9 +2810,12 @@ fn child_cwd_changes_through_link_dir() {
     let e = connect(&abs, &real_link_dir(&root.join("p")))
         .err()
         .unwrap();
+    // The listener was closed: the connect meets a socket file nobody listens
+    // on, and fails with what std's connect gives a short path in that
+    // situation on this OS (the OS's errno, passed on unchanged).
     assert_eq!(
         errno(&e.error),
-        Some(libc::ECONNREFUSED),
+        Some(std_errno(Short::ConnectToNobodyListening)),
         "the listener is open"
     );
 }

@@ -80,6 +80,58 @@ fn ping(listener: &UnixListener, client: &mut UnixStream) {
     assert_eq!(&buf, b"pong");
 }
 
+/// A situation in which sockat returns the error the OS gave, as std meets it
+/// at a short path ([`std_errno`]).
+#[derive(Clone, Copy, Debug)]
+enum Short {
+    /// A stream bind whose directory is missing.
+    BindInAMissingDirectory,
+    /// A stream connect whose directory is missing.
+    ConnectInAMissingDirectory,
+    /// A stream bind with a regular file at the path.
+    BindOntoAFile,
+    /// A stream connect to a socket file nobody listens on.
+    ConnectToNobodyListening,
+    /// A datagram connect to a socket file no socket holds (its socket bound
+    /// and closed).
+    DatagramConnectToNobodyHolding,
+}
+
+/// The errno std's own call returns for `case` on this OS, the situation made
+/// at a short path in a directory of the call's own. A test compares the
+/// errno sockat returns with this rather than with a constant: sockat returns
+/// the OS's error unchanged, and the OSes may answer the same situation with
+/// different errnos (illumos answers a datagram connect to a socket file no
+/// socket holds with EDESTADDRREQ where Linux and macOS say ECONNREFUSED; hub
+/// SPEC "エラー"). std must fail here, with an errno: if it succeeds the situation
+/// was not made, and an errno equal to nothing would prove nothing.
+fn std_errno(case: Short) -> i32 {
+    let t = tmp();
+    let p = t.path().join("s.sock");
+    let missing = t.path().join("none/s.sock");
+    let r = match case {
+        Short::BindInAMissingDirectory => UnixListener::bind(&missing).map(drop),
+        Short::ConnectInAMissingDirectory => UnixStream::connect(&missing).map(drop),
+        Short::BindOntoAFile => {
+            std::fs::write(&p, b"").unwrap();
+            UnixListener::bind(&p).map(drop)
+        }
+        Short::ConnectToNobodyListening => {
+            drop(UnixListener::bind(&p).unwrap());
+            UnixStream::connect(&p).map(drop)
+        }
+        Short::DatagramConnectToNobodyHolding => {
+            drop(UnixDatagram::bind(&p).unwrap());
+            UnixDatagram::unbound().unwrap().connect(&p)
+        }
+    };
+    let Err(e) = r else {
+        panic!("{case:?}: std succeeded at a short path")
+    };
+    e.raw_os_error()
+        .unwrap_or_else(|| panic!("{case:?}: std's error has no errno: {e}"))
+}
+
 fn reported(listener: &UnixListener) -> PathBuf {
     listener
         .local_addr()
@@ -234,22 +286,30 @@ fn concurrent_calls_leave_the_cwd_alone() {
     assert!(checks.load(Ordering::Relaxed) > 0);
 }
 
-// The documented errors for a long path, through the public API: ENOENT for a
-// missing directory, EADDRINUSE for an existing file, ECONNREFUSED for a
-// socket nobody listens on, InvalidInput for a path without a file name or
-// with a NUL byte.
+// The documented errors for a long path, through the public API: a missing
+// directory, an existing file and a socket nobody listens on fail as std
+// fails at a short path, with the same errno on this OS (ENOENT, EADDRINUSE
+// and ECONNREFUSED where they have been seen; the OS's errno is passed on
+// unchanged and OSes may differ, so it is compared, not fixed). A path
+// without a file name or with a NUL byte is InvalidInput, sockat's own.
 #[test]
 fn long_path_errors_through_the_public_api() {
     let t = tmp();
     let p = nest(t.path(), 300, "s.sock");
     let missing = p.parent().unwrap().join("none/s.sock");
     let e = sockat::bind(&missing).unwrap_err();
-    assert_eq!(e.raw_os_error(), Some(libc::ENOENT));
+    assert_eq!(
+        e.raw_os_error(),
+        Some(std_errno(Short::BindInAMissingDirectory))
+    );
     let e = sockat::connect(&missing).unwrap_err();
-    assert_eq!(e.raw_os_error(), Some(libc::ENOENT));
+    assert_eq!(
+        e.raw_os_error(),
+        Some(std_errno(Short::ConnectInAMissingDirectory))
+    );
     std::fs::write(&p, b"").unwrap();
     let e = sockat::bind(&p).unwrap_err();
-    assert_eq!(e.raw_os_error(), Some(libc::EADDRINUSE));
+    assert_eq!(e.raw_os_error(), Some(std_errno(Short::BindOntoAFile)));
     std::fs::remove_file(&p).unwrap();
     let e = sockat::bind(p.parent().unwrap().join("..")).unwrap_err();
     assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
@@ -265,7 +325,32 @@ fn long_path_errors_through_the_public_api() {
     let q = nest(&t.path().join("q"), 300, "q.sock");
     drop(sockat::bind(&q).unwrap());
     let e = sockat::connect(&q).unwrap_err();
-    assert_eq!(e.raw_os_error(), Some(libc::ECONNREFUSED));
+    assert_eq!(
+        e.raw_os_error(),
+        Some(std_errno(Short::ConnectToNobodyListening))
+    );
+}
+
+// A datagram connect at a long path to a socket file no socket holds (bound,
+// then closed) fails as std's datagram connect fails at a short path in the
+// same situation, with the same errno on this OS. sockat hands the connect's
+// error back unchanged, and that errno is the OS's own choice: ECONNREFUSED
+// on Linux and macOS, EDESTADDRREQ on illumos (hub SPEC "エラー", measured
+// in sockat-go's CI). So the test compares with std on the same OS rather
+// than fixing either: a fixed ECONNREFUSED would fail on illumos for a
+// sockat that does exactly what it should.
+#[test]
+fn a_datagram_connect_to_a_socket_nobody_holds_fails_as_std_does() {
+    let t = tmp();
+    let p = nest(t.path(), 300, "d.sock");
+    drop(sockat::datagram::bind(&p).unwrap());
+    assert!(is_socket(&p));
+    let unbound = sockat::datagram::unbound().unwrap();
+    let e = sockat::datagram::connect(&unbound, &p).unwrap_err();
+    assert_eq!(
+        e.raw_os_error(),
+        Some(std_errno(Short::DatagramConnectToNobodyHolding))
+    );
 }
 
 // bind_ex returns the listener (std's type), the SocketFile, what the
@@ -351,6 +436,8 @@ fn remove_leaves_a_symlink_at_the_path() {
 // An _ex function that fails keeps the errno, converts into the io::Error by
 // `?`, and reports the route that made the call (None when the path was
 // refused before any route: the directory missing; nothing skipped then).
+// The errno kept is the OS's, the one std gives a short path in the same
+// situation on this OS (compared, not fixed: OSes may differ).
 #[test]
 fn an_ex_error_keeps_the_errno_and_the_routes() {
     let t = tmp();
@@ -360,10 +447,16 @@ fn an_ex_error_keeps_the_errno_and_the_routes() {
     assert_eq!(e.route, None);
     assert!(e.skipped.is_empty());
     let io: io::Error = e.into();
-    assert_eq!(io.raw_os_error(), Some(libc::ENOENT));
+    assert_eq!(
+        io.raw_os_error(),
+        Some(std_errno(Short::ConnectInAMissingDirectory))
+    );
     std::fs::write(&p, b"").unwrap();
     let e = sockat::bind_ex(&p, own_base(&t)).unwrap_err();
-    assert_eq!(e.error.raw_os_error(), Some(libc::EADDRINUSE));
+    assert_eq!(
+        e.error.raw_os_error(),
+        Some(std_errno(Short::BindOntoAFile))
+    );
     assert!(e.route.is_some());
     assert_eq!(e.skipped[0].name, "standard");
 }
