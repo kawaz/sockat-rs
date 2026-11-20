@@ -7,19 +7,26 @@ A Rust library that binds and connects Unix domain sockets even when the path is
 The language-independent behaviour is defined by the [sockat specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md); sockat-rs is its Rust implementation.
 
 ```rust
-let listener = sockat::bind("/a/very/deep/directory/.../server.sock")?;
-let stream = sockat::connect("/a/very/deep/directory/.../server.sock")?;
+let listener = sockat::bind("/a/very/long/directory/.../server.sock")?;
+let stream = sockat::connect("/a/very/long/directory/.../server.sock")?;
 ```
 
 ## Usage
 
-Use `sockat::bind` / `sockat::connect` where you would use std's `UnixListener::bind` / `UnixStream::connect`. In async code, use `sockat::connect_nonblocking`, which does not wait and returns a nonblocking stream.
+Use sockat's functions where you would use std's.
 
-- The results are std's own `UnixListener` / `UnixStream`
-- A path that std accepts is handed to std unchanged, so it behaves exactly as with std
+| sockat | std it replaces |
+|---|---|
+| `sockat::bind(path)` | `UnixListener::bind(path)` |
+| `sockat::connect(path)` | `UnixStream::connect(path)` |
+| `sockat::connect_nonblocking(path)` | (none; returns a nonblocking stream without waiting) |
+| `sockat::datagram::bind(path)`, `unbound()`, `connect(&sock, path)` | the functions of `UnixDatagram` with the same names |
+
+- The results are std's own types
+- A path of a length std accepts goes to std unchanged, so it behaves exactly as with std
 - Even for a long path, the socket file is created at the path given
-- `connect` too tries every route before fork-cwd-direct, so in an ordinary environment it reaches long paths as well
-- To remove the socket file later, or to know how the path was reached and what was given up, use `sockat::bind_ex` / `sockat::connect_ex` / `sockat::connect_nonblocking_ex` ([The _ex functions](#the-_ex-functions-clean-up-and-diagnostics))
+- Nothing forks, and neither the cwd of the process nor that of the calling thread is changed
+- To remove the socket file later, or to know whether the spelling can be used later and how the path was reached, use the `_ex` functions (`bind_ex`, ...). To hand a spelling to std yourself, use `resolve_for_bind` / `resolve_for_connect`
 
 ## Why
 
@@ -27,96 +34,55 @@ std's `bind` / `connect` refuse a path that does not fit `sun_path`. The file sy
 
 ## How a long path is reached
 
-A path that std accepts (up to `sun_path` − 1 bytes) is handed to std unchanged.
+The kernel keeps a bind's spelling for the life of the socket and reports it by `getsockname`. Libraries above remove the socket file by that spelling, and a DGRAM receiver replies to it. So a bind's spelling must keep naming the same place when it is followed later.
 
-| OS | Handed to std |
-|---|---|
-| Linux / Android / illumos | up to 107 bytes |
-| macOS / iOS / FreeBSD / NetBSD / OpenBSD | up to 103 bytes |
+- **B**: this user's directory in a place. `/tmp/sockat-<uid>` (failing that `$XDG_RUNTIME_DIR/sockat`, `$TMPDIR/sockat-<uid>`, the socket's directory). Mode 0711, reused, never removed by sockat
+- **D**: a directory per process in B. The process keeps a `flock` on it; a dead process's D is removed by the OS's cleaning of temporary directories or by `sockat::sweep()`
+- **E**: a symlink in D. It points to the socket's directory (link-dir, spelling `B/D/E/<file name>`) or to the socket file (link-file, spelling `B/D/E`; macOS and NetBSD, where a bind follows a symlink)
 
-A longer path is bound, where a bind follows a symlink (macOS, NetBSD and the like; not Linux, FreeBSD, OpenBSD or illumos), first through **symlink-file** (a symlink to the socket file made in a place; its spelling holds no file name, so any file name length is reached), and else through **the routes through D**. sockat makes a directory D of its own (`sockat.XXXXXXXXXX`, mode 0700) and holds it by an fd, makes in it a symlink R with a random name (pointing to the socket's directory), binds with `R/<file name>` relative to D's fd, and removes R and D. The spelling the kernel keeps is `R/<file name>`; R is gone by then, so wherever it is resolved later, it hits nothing. The routes' names are those of the [sockat specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md) ("route names").
+B is spelled `/proc/<pid>/fd/<B's fd>` (Linux) or by its real path. A bind that still does not fit is made by a sockat thread that alone moves its cwd into D (Linux, Apple OSes), and on FreeBSD by `bindat(2)`. A connect's spelling stays nowhere on the peer, so a connect tries first the routes that need neither writing nor a thread (`/proc/self/fd`, a path relative to the cwd, macOS's widened sockaddr, FreeBSD's `connectat(2)`), then the thread cwd, then a symlink made directly in B and removed at once, and leaves nothing.
 
-| OS | bind (in this order) |
-|---|---|
-| Linux / Android | thread-cwd → proc → fork-cwd |
-| macOS / iOS and the other Apple OSes | symlink-file → thread-cwd → fork-cwd |
-| FreeBSD | at |
-| NetBSD / other Unix | symlink-file → fork-cwd |
-| OpenBSD / illumos | fork-cwd |
-| Windows | not supported (compile error) |
+| OS | bind | connect |
+|---|---|---|
+| Linux, Android | link-dir, thread-cwd | proc-direct (relative without `/proc`), thread-cwd-direct, link-file |
+| macOS, iOS (Apple) | link-dir, link-file, thread-cwd | relative, widened, thread-cwd-direct, link-file |
+| FreeBSD | link-dir, at | at-direct, link-file |
+| NetBSD | link-dir, link-file | relative, link-file |
+| OpenBSD, illumos | link-dir | relative, link-file |
 
-- **symlink-file**: when the bind fails with something at the path, that is the real failure (`EADDRINUSE`, ...); with nothing there, the kernel is taken not to have followed the symlink, and the next route is tried (checked to follow on macOS and NetBSD; not tried on the OSes checked not to)
-
-- **thread-cwd**: move the cwd of a throwaway thread, and of it alone, into D (Linux: `unshare(CLONE_FS)` and `fchdir`; Apple OSes: `pthread_fchdir_np`). It has no side effects, so every function tries it. Not used on Linux under a seccomp filter
-- **proc**: pass `/proc/self/fd/<D's fd>/R/<file name>`
-- **at**: pass D's fd to `bindat` / `connectat`
-- **fork-cwd**: fork a child that `fchdir`s into D and binds. The caller listens afterwards, so it has no side effect visible to peers
-- D goes in `TMPDIR`, `/tmp` or the socket's directory (`.sockat.XXXXXXXXXX`), the first where it can be made. A place needs to be neither safe nor short (D is held by its fd). Where D can be made nowhere, a bind makes R in the socket's directory and tries the same order (thread-cwd-sockdir → proc-sockdir → fork-cwd-sockdir; at-sockdir on FreeBSD)
-
-A connect tries the routes that need neither writing (making D, R or a symlink) nor a thread first, and the routes through D (thread-cwd, proc, at, and proc-held, through a symlink in D) and symlink-file after them. When an earlier route reaches the socket, neither D nor a symlink is made. The kernel keeps no spelling of a connect, so apart from the routes through D these carry no random part. D is made at most once in a call and shared by the routes that use it.
-
-| OS | connect (in this order) |
-|---|---|
-| Linux / Android (`/proc` usable) | proc-direct → thread-cwd → proc → proc-held → symlink-file |
-| Linux / Android (no `/proc`) | relative → thread-cwd → symlink-file |
-| macOS / iOS and the other Apple OSes | relative → widened → thread-cwd → symlink-file |
-| FreeBSD | at-direct → at |
-| NetBSD / OpenBSD / illumos / other Unix | relative → symlink-file |
-
-- **proc-direct**: pass `/proc/self/fd/<directory fd>/<file name>`
-- **relative**: when std accepts the path relative to the cwd, pass that. Only the path string is rewritten; the cwd is never changed
-- **widened**: pass a sockaddr carrying up to 253 bytes, which the macOS kernel accepts (the address of a socket bound through it is cut short and breaks its readers, so a bind never uses it)
-- **at-direct**: pass the socket's directory's fd and the file name to `connectat`
-- **proc-held**: make a symlink to the socket file in D and pass `/proc/self/fd/<D's fd>/s`
-- **symlink-file**: create a short symlink to the socket file under `TMPDIR` or `/tmp`, in a place where no other user can replace it, go through it, and remove it at once
-
-With `LastResort::Allow`, the `connect_ex` ones fork last when none of these reaches the path (fork-cwd-direct). None of the routes changes the cwd of the calling process or thread, so they can be used from multi-threaded programs.
-
-`connect` / `connect_nonblocking` never fork. Where only the fork route would reach the path, they return `ENAMETOOLONG`, as a plain connect to a path too long for `sun_path` does. That happens only when the routes through D cannot be used for a connect (NetBSD / OpenBSD / illumos, Linux under a seccomp filter without `/proc`, an Apple OS without `pthread_fchdir_np`) and no route without D reaches the path either. With a usable `/tmp`, `connect` reaches the path whatever the directory depth and the file name length. The length limits of each route, and where reaching stops, are in [docs/MANUAL.md](./docs/MANUAL.md#how-a-long-path-is-reached).
+The routes and how far they reach are in the [manual](docs/MANUAL.md#how-a-long-path-is-reached).
 
 ## The _ex functions: clean-up and diagnostics
 
-`bind_ex` / `connect_ex` / `connect_nonblocking_ex` bind / connect by the routes of the plain functions and also say how the path was reached and what was given up. The one choice their argument makes is whether to take the last resort (`sockat::LastResort`).
-
-- `LastResort::Avoid` (the default): the order of the plain function
-- `LastResort::Allow`: also the last resort, last, for the rare environment where no default route can be used and the path must be reached at the cost of something
-  - `bind_ex`: binds through a symlink to the socket's directory in a place (`XDG_RUNTIME_DIR`, `TMPDIR`, `/tmp`; symlink-dir). In a shared place (`/tmp`, ...) another user can make the name in the address the kernel reports again
-  - `connect_ex` / `connect_nonblocking_ex`: have a forked child make the connect (fork-cwd-direct; the child exits at once). The peer pid the server sees is then that of the exited child
-- The results (`ExListener` / `ExStream`) hold std's listener / stream, what was given up (`losses`: `respelled` / `forked` / `recreatable-spelling` / `cwd-relative`), the name of the route taken (`route`) and the routes tried and passed over (`skipped`, names and reasons). `ExListener` also holds a `SocketFile` ([Removing the socket file](#removing-the-socket-file))
-- On failure an `ExError` holds `skipped` too and converts back into the `io::Error` by `?` (the errno kept). `route` and `skipped` are for diagnostics and promise nothing about their content
-
 ```rust
-use sockat::{ExStream, LastResort, Loss};
-
-let ExStream { stream, losses, .. } = sockat::connect_ex(&path, LastResort::Allow)?;
-if losses.contains(&Loss::Forked) {
-    // a forked child made the connect
+let bound = sockat::bind_ex(path, Default::default())?;
+match bound.spelling {
+    sockat::Spelling::Linked { removable, .. } => { /* the spelling can be followed. When removable is false, removing by the spelling removes only E */ }
+    sockat::Spelling::Dangling => { /* the spelling names nothing */ }
+    _ => { /* the original path */ }
 }
+// ... accept on bound.socket (it may go to tokio etc.) ...
+bound.file.remove()?; // removes the socket file and E. Before the listener is closed
+drop(bound.socket);
 ```
 
-Details in [docs/MANUAL.md](./docs/MANUAL.md#the-_ex-functions-clean-up-and-diagnostics).
+- `bind_ex`, `connect_ex`, `connect_nonblocking_ex`, `datagram::bind_ex` and `datagram::connect_ex` take `sockat::Options` (`usable_cross_uid`: ask for a spelling another uid can follow too; `base`: put B in the application's own place) and return the route taken, the B and the routes passed over
+- `bind_ex` returns whether the spelling can be used later (`Spelling`) and a `SocketFile` that removes the socket file (`remove()`, `cleanup()`)
+- A failure is an `ExError` (it keeps the errno and converts back into `io::Error` by `?`)
 
 ## What differs from std for a long path
 
-- `local_addr()` / `peer_addr()` do not return the path: they return the spelling handed to the kernel at bind time (`R/<file name>`, `/proc/self/fd/<fd>/R/<file name>`, symlink-file's `<place>/sockat.XXXXXXXXXX`, ...; illumos's `peer_addr()` returns the spelling of the connect). R and the place's symlink are gone, so it hits nothing. Keep the path yourself
-- A bind through D reaches shorter file names, by R's length (up to 96 bytes on Linux / illumos, 92 on the Apple OSes / the BSDs). A bind on macOS and NetBSD reaches any file name length through symlink-file
-- A path longer than std accepts that does not end with a file name (ending in `dir/`, `dir/.`, `..`) is an `InvalidInput` error
-- The rest (the fork's side effects, the directory being looked up first, D or R left behind if the process dies midway) is in [docs/MANUAL.md](./docs/MANUAL.md#what-differs-from-std-for-a-long-path)
+- **The address the kernel reports is not the original path.** `local_addr()`, `peer_addr()`, `ss -x` and the like report the bind's spelling. Whether it can be used later is told by `Spelling`. Remove the socket file by the original path or by `SocketFile::remove()`
+- **State grows outside the application's own place.** B and D stay in `/tmp` and the like. The default `bind`'s E and a dead process's D stay until the OS's cleaning of temporary directories or `sweep()`. A B in the socket's directory and a B made after the checks failed (`sockat-<uid>.<random>`) may be removed neither by `sweep()` nor by the OS's cleaning
+- **Do not use a spelling after its clean-up.** Once B in `/tmp` is gone, someone else may make it again under the same name. A spelling through `/proc` cannot be followed after the process ends
+- **There are environments where a live D can be removed.** Linux with systemd older than v242, and B in macOS's `$TMPDIR` (the spelling just cannot be followed any more)
+- **A peer with `PrivateTmp`** cannot follow a spelling through `/tmp` (`Spelling`'s `usable_with_private_tmp`)
 
-## Removing the socket file
-
-`bind_ex` returns the listener and a `SocketFile` (`listener` and `file` of `ExListener`). `SocketFile::discard()` removes the socket file taken right after the bind, only while what is at its path has the same `(st_dev, st_ino)` (another socket bound at the path since is left alone). The listener stays std's type and may go to tokio etc.; closing it is up to whoever holds it. Call `discard()` before closing the listener (the promise: what replaced the file while the listener was open is not removed; once the listener is closed, a file removed and made again at the path may get the same inode number on ext4 or the BSDs' UFS / FFS, cannot be told apart, and may be removed (as removing by the path would)).
-
-```rust
-let bound = sockat::bind_ex(&path, sockat::LastResort::Avoid)?;
-// ...
-bound.file.discard()?;
-drop(bound.listener);
-```
+Details in the [manual](docs/MANUAL.md#what-differs-from-std-for-a-long-path) and [Patterns not to use](docs/MANUAL.md#patterns-not-to-use).
 
 ## Async runtimes
 
-The only dependency is libc; no runtime is required. With tokio, convert from the std types:
+The results are std types, so they go to tokio and the like as they are.
 
 ```rust
 let listener = sockat::bind(&path)?;
@@ -127,10 +93,13 @@ let stream = sockat::connect_nonblocking(&path)?;
 let stream = tokio::net::UnixStream::from_std(stream)?;
 ```
 
+`connect_nonblocking` does not wait (its clean-up is only an unlink) and returns the stream still nonblocking, so it can be called on the runtime's worker threads directly.
+
 ## Documentation
 
-- [docs/MANUAL.md](./docs/MANUAL.md) — usage, the routes in detail, what differs from std, errors
-- [docs/decisions/](./docs/decisions/INDEX.md) — design decisions (DRs, in Japanese)
+- [Manual](docs/MANUAL.md): usage, routes, clean-up, what differs from std, errors
+- [sockat specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md): the language-independent behaviour
+- [Design decisions (DR)](docs/decisions/INDEX.md), in Japanese
 
 ## License
 

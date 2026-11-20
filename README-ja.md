@@ -13,13 +13,20 @@ let stream = sockat::connect("/とても/深い/ディレクトリ/.../server.so
 
 ## 使い方
 
-std の `UnixListener::bind` / `UnixStream::connect` の代わりに `sockat::bind` / `sockat::connect` を使う。非同期のコードでは、待たずに非ブロッキングの stream を返す `sockat::connect_nonblocking` を使う。
+std の関数の代わりに sockat の関数を使う。
 
-- 戻り値は std の `UnixListener` / `UnixStream` そのもの
+| sockat | 代わりにする std |
+|---|---|
+| `sockat::bind(path)` | `UnixListener::bind(path)` |
+| `sockat::connect(path)` | `UnixStream::connect(path)` |
+| `sockat::connect_nonblocking(path)` | (無し。待たずに非ブロッキングの stream を返す) |
+| `sockat::datagram::bind(path)`・`unbound()`・`connect(&sock, path)` | `UnixDatagram` の同じ名前の関数 |
+
+- 戻り値は std の型そのもの
 - std が受け付ける長さのパスは std にそのまま渡すので、std と同じに振る舞う
 - 長いパスでも、ソケットファイルは渡したパスにできる
-- `connect` も fork-cwd-direct の手前の経路までは試すので、普通の環境では長いパスでも届く
-- ソケットファイルを後で消したい時や、どう届いたか・何を失ったかを知りたい時は `sockat::bind_ex` / `sockat::connect_ex` / `sockat::connect_nonblocking_ex` を使う ([後始末と診断つきの _ex](#後始末と診断つきの-_ex))
+- fork はせず、プロセスの cwd も呼び出し元のスレッドの cwd も変えない
+- ソケットファイルを後で消したい時、綴りを後で使えるかやどう届いたかを知りたい時は `_ex` (`bind_ex` 等) を、綴りを自分で std に渡したい時は `resolve_for_bind` / `resolve_for_connect` を使う
 
 ## なぜ要るか
 
@@ -27,96 +34,55 @@ std の `bind` / `connect` は `sun_path` に収まらないパスを断る。�
 
 ## 長いパスへの届き方
 
-std が受け付ける長さ (`sun_path` − 1) のパスは std にそのまま渡す。
+カーネルは bind の綴りをソケットの寿命の間覚え、`getsockname` で返す。上のライブラリはその綴りでソケットのファイルを消し、DGRAM の受け手はその綴りへ返信する。だから bind の綴りは、後で辿っても同じ所を指し続ける物にする。
 
-| OS | std にそのまま渡す長さ |
-|---|---|
-| Linux / Android / illumos | 107 バイトまで |
-| macOS / iOS / FreeBSD / NetBSD / OpenBSD | 103 バイトまで |
+- **B**: この利用者の置き場のディレクトリ。`/tmp/sockat-<uid>` (無理なら `$XDG_RUNTIME_DIR/sockat`、`$TMPDIR/sockat-<uid>`、ソケットのディレクトリ)。mode 0711、使い回し、sockat は消さない
+- **D**: B の中の、プロセスごとのディレクトリ。プロセスが `flock` を掛け続け、死んだプロセスの D は OS の一時ディレクトリの掃除か `sockat::sweep()` で消える
+- **E**: D の中の symlink。ソケットのディレクトリを指す (link-dir、綴り `B/D/E/<ファイル名>`) か、ソケットのファイルを指す (link-file、綴り `B/D/E`。bind が symlink を辿る macOS と NetBSD)
 
-それを超えるパスの bind は、bind が symlink を辿る OS (macOS・NetBSD 等。Linux・FreeBSD・OpenBSD・illumos は辿らない) では、まず**symlink-file** (置き場に作った、ソケットのファイルを指す symlink を通す。綴りにファイル名が出ないので、ファイル名の長さによらず届く) で、それが使えなければ**D を通す経路**で届く。自分専用のディレクトリ D (`sockat.XXXXXXXXXX`、mode 0700) を作って fd で掴み、その中に乱数の名前の symlink R (ソケットのディレクトリを指す) を作り、D の fd を基準に `R/<ファイル名>` で bind して、R と D を消す。カーネルが覚える綴りは `R/<ファイル名>` で、R はもう無いので、後でどこで解決されても何にも当たらない。経路の名前は [sockat の仕様](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md) の「経路の名前」と同じ。
+B は `/proc/<pid>/fd/<B の fd>` (Linux) か実パスで綴る。それでも収まらない bind は、sockat のスレッドだけが cwd を D に移して (Linux、Apple の OS)、FreeBSD は `bindat(2)` で届かせる。connect の綴りは相手に残らないので、connect は書き込みもスレッドも要らない経路 (`/proc/self/fd`、cwd からの相対パス、macOS の広げた sockaddr、FreeBSD の `connectat(2)`) を先に、スレッドの cwd、B の直下にすぐ消す symlink の順に試し、何も残さない。
 
-| OS | bind (この順) |
-|---|---|
-| Linux / Android | thread-cwd → proc → fork-cwd |
-| macOS / iOS 等 Apple の OS | symlink-file → thread-cwd → fork-cwd |
-| FreeBSD | at |
-| NetBSD / その他の Unix | symlink-file → fork-cwd |
-| OpenBSD / illumos | fork-cwd |
-| Windows | 対象外 (compile エラー) |
+| OS | bind | connect |
+|---|---|---|
+| Linux、Android | link-dir、thread-cwd | proc-direct (`/proc` が無ければ relative)、thread-cwd-direct、link-file |
+| macOS、iOS (Apple) | link-dir、link-file、thread-cwd | relative、widened、thread-cwd-direct、link-file |
+| FreeBSD | link-dir、at | at-direct、link-file |
+| NetBSD | link-dir、link-file | relative、link-file |
+| OpenBSD、illumos | link-dir | relative、link-file |
 
-- **symlink-file**: bind が失敗した時に元のパスに物があれば、それが本当の失敗 (`EADDRINUSE` 等)。無ければカーネルが symlink を辿らなかったとみなして次の経路へ進む (辿ると確かめたのは macOS と NetBSD。辿らないと確かめた OS では試さない)
-
-- **thread-cwd**: 使い捨てのスレッドだけ cwd を D に移す (Linux は `unshare(CLONE_FS)` と `fchdir`、Apple の OS は `pthread_fchdir_np`)。副作用が無いので、どの関数も試す。seccomp の filter が掛かった Linux では使わない
-- **proc**: `/proc/self/fd/<D の fd>/R/<ファイル名>` で渡す
-- **at**: `bindat` / `connectat` に D の fd を渡す
-- **fork-cwd**: D に `fchdir` した子を fork し、子が bind する。bind の後の listen は呼び出し元がするので、相手から見える副作用が無い
-- D は `TMPDIR`、`/tmp`、ソケットのディレクトリ (`.sockat.XXXXXXXXXX`) の順に、作れた所に作る。置き場は安全でなくても深くてもよい (fd で掴む)。どこにも作れなければ、bind はソケットのディレクトリに R を作り、同じ順 (thread-cwd-sockdir → proc-sockdir → fork-cwd-sockdir、FreeBSD は at-sockdir) で試す
-
-connect は、書き込み (D・R・symlink を作る) もスレッドも要らない経路を先に試し、D を通す経路 (thread-cwd・proc・at、D に置く symlink を通す proc-held) と symlink-file をその後に試す。前の経路で届けば D も symlink も作らない。connect の綴りはカーネルに残らないので、D を通す経路の他は綴りにランダムな部品を挟まない。D は 1 回の呼び出しで 1 度だけ作り、D を使う経路で共有する。
-
-| OS | connect (この順) |
-|---|---|
-| Linux / Android (`/proc` あり) | proc-direct → thread-cwd → proc → proc-held → symlink-file |
-| Linux / Android (`/proc` 無し) | relative → thread-cwd → symlink-file |
-| macOS / iOS 等 Apple の OS | relative → widened → thread-cwd → symlink-file |
-| FreeBSD | at-direct → at |
-| NetBSD / OpenBSD / illumos / その他の Unix | relative → symlink-file |
-
-- **proc-direct**: `/proc/self/fd/<ディレクトリの fd>/<ファイル名>` で渡す
-- **relative**: cwd からの相対パスが std にそのまま渡せる長さなら、それで渡す。パスを文字列で書き直すだけで、cwd は変えない
-- **widened**: macOS のカーネルが受け付ける、253 バイトまで入る sockaddr で渡す (広げた形で bind したソケットのアドレスは途中で切れ、読む側を壊すので、bind は使わない)
-- **at-direct**: `connectat` にソケットのディレクトリの fd とファイル名を渡す
-- **proc-held**: D の中にソケットのファイルを指す symlink を作り、`/proc/self/fd/<D の fd>/s` で渡す
-- **symlink-file**: `TMPDIR` か `/tmp` の、他人が差し替えられない置き場に、ソケットのファイルを指す短い symlink を作り、それを通して渡して、すぐ消す
-
-`connect_ex` 系に `LastResort::Allow` を渡すと、それでも届かない時に最後に fork する (fork-cwd-direct)。どの経路も呼び出し元のプロセスとスレッドの cwd を変えないので、マルチスレッドのプログラムから使える。
-
-`connect` / `connect_nonblocking` は fork しない。fork でしか届かない時は、パスが `sun_path` に入らない普通の connect と同じく `ENAMETOOLONG` を返す。そうなるのは、D を通す経路を connect に使えず (NetBSD / OpenBSD / illumos、seccomp の filter が掛かり `/proc` の無い Linux、`pthread_fchdir_np` の無い Apple の OS)、D を通さない経路も届かない時だけである。`/tmp` が使えれば、`connect` はディレクトリの深さにもファイル名の長さにもよらず届く。各経路の長さの上限と、どこから届かなくなるかは [docs/MANUAL-ja.md](./docs/MANUAL-ja.md#長いパスへの届き方) にある。
+経路と、どこまで届くかは [マニュアル](docs/MANUAL-ja.md#長いパスへの届き方)。
 
 ## 後始末と診断つきの _ex
 
-`bind_ex` / `connect_ex` / `connect_nonblocking_ex` は、既定の関数と同じ経路で bind / connect し、どう届いたかと何を失ったかを返す。引数で選べるのは最終手段を使うか (`sockat::LastResort`) の 1 つだけ。
-
-- `LastResort::Avoid` (既定): 既定の関数と同じ順に試す
-- `LastResort::Allow`: 既定の経路が全部使えないよほど珍しい環境で、何かを失ってでも届かせる最終手段も最後に試す
-  - `bind_ex`: 置き場 (`XDG_RUNTIME_DIR`、`TMPDIR`、`/tmp`) にソケットのディレクトリを指す symlink を作って bind する (symlink-dir)。共有の置き場 (`/tmp` 等) では、カーネルが返すアドレスの名前を他の利用者が作り直せる
-  - `connect_ex` / `connect_nonblocking_ex`: fork した子に connect させる (fork-cwd-direct。子はすぐ終了する)。サーバに見える peer の pid は、もう終了した子の pid になる
-- 戻り値 (`ExListener` / `ExStream`) は std の listener / stream と、失ったものの並び `losses` (`respelled` / `forked` / `recreatable-spelling` / `cwd-relative`)、通った経路の名前 `route`、試して使えなかった経路の並び `skipped` (名前と理由) を持つ。`ExListener` は加えて `SocketFile` を持つ ([ソケットのファイルを消す](#ソケットのファイルを消す))
-- 失敗した時の `ExError` も `skipped` を持ち、`io::Error` に `?` で戻る (errno はそのまま)。`route` と `skipped` は診断用で、中身を約束しない
-
 ```rust
-use sockat::{ExStream, LastResort, Loss};
-
-let ExStream { stream, losses, .. } = sockat::connect_ex(&path, LastResort::Allow)?;
-if losses.contains(&Loss::Forked) {
-    // fork した子が connect した
+let bound = sockat::bind_ex(path, Default::default())?;
+match bound.spelling {
+    sockat::Spelling::Linked { removable, .. } => { /* 綴りは辿れる。removable が false なら綴りで消すと E が消えるだけ */ }
+    sockat::Spelling::Dangling => { /* 綴りはどこにも届かない */ }
+    _ => { /* 元のパス */ }
 }
+// ... bound.socket で accept する (tokio 等に渡してもよい) ...
+bound.file.remove()?; // ソケットのファイルと E を消す。listener を閉じる前に
+drop(bound.socket);
 ```
 
-詳しくは [docs/MANUAL-ja.md](./docs/MANUAL-ja.md#後始末と診断つきの-_ex)。
+- `bind_ex`・`connect_ex`・`connect_nonblocking_ex`・`datagram::bind_ex`・`datagram::connect_ex` は、`sockat::Options` (`usable_cross_uid`: 別の uid も辿れる綴りを求める、`base`: B をアプリの場所に置く) を取り、通った経路・B・飛ばした経路を返す
+- `bind_ex` は、綴りを後で使えるか (`Spelling`) と、ソケットのファイルを消す `SocketFile` (`remove()`・`cleanup()`) を返す
+- 失敗は `ExError` (errno を保ち、`?` で `io::Error` に戻る)
 
 ## 長いパスで std と違う点
 
-- `local_addr()` / `peer_addr()` は元のパスを返さず、bind の時にカーネルに渡した綴り (`R/<ファイル名>`、`/proc/self/fd/<fd>/R/<ファイル名>`、symlink-file の `<置き場>/sockat.XXXXXXXXXX` 等) を返す (illumos の `peer_addr()` は connect の時に渡した綴り)。R も置き場の symlink ももう無いので何にも当たらない。元のパスは自分で持っておく
-- D を通す経路で bind できるファイル名は R の分だけ短い (Linux / illumos 96 バイト、Apple の OS / BSD 92 バイトまで)。macOS と NetBSD の bind は symlink-file で、ファイル名の長さによらず届く
-- std にそのまま渡せない長さのパスで、名前で終わらないもの (`dir/`、`dir/.`、`..` で終わるもの) は `InvalidInput` になる
-- その他 (fork の副作用、ディレクトリを先に引くこと、途中でプロセスが死ぬと D や R が残りうること) は [docs/MANUAL-ja.md](./docs/MANUAL-ja.md#長いパスで-std-と違う点)
+- **カーネルが返すアドレスは元のパスでない。** `local_addr()`・`peer_addr()`、`ss -x` 等は bind の綴りを返す。後で使えるかは `Spelling` で分かる。ソケットのファイルは元のパスか `SocketFile::remove()` で消す
+- **状態がアプリの置き場の外に増える。** B と D が `/tmp` 等に残る。既定の `bind` の E と死んだプロセスの D は、OS の一時ディレクトリの掃除か `sweep()` まで残る。ソケットのディレクトリの B と、確かめに外れて作った B (`sockat-<uid>.<乱数>`) は、`sweep()` でも OS の掃除でも消えないことがある
+- **片付けた後の綴りは使わない。** `/tmp` の B は消えた後に他人が同じ名前で作り直しうる。`/proc` を通る綴りはプロセスが終われば辿れない
+- **生きている D が消されうる環境がある。** systemd v242 より古い Linux と、B が macOS の `$TMPDIR` にある時 (綴りが辿れなくなるだけ)
+- **`PrivateTmp` の相手** は `/tmp` を通る綴りを辿れない (`Spelling` の `usable_with_private_tmp`)
 
-## ソケットのファイルを消す
-
-`bind_ex` は listener と `SocketFile` を返す (`ExListener` の `listener` と `file`)。`SocketFile::discard()` は、bind の直後に覚えたソケットのファイルを、そのパスの `(st_dev, st_ino)` が同じ時だけ消す (後から同じパスに bind された別のソケットは消さない)。listener は std の型のままで tokio 等へ渡せ、閉じるのは利用者。`discard()` は listener を閉じる前に呼ぶ (約束するのは「listener を開いている間に置き換えられた物は消さない」まで。listener を閉じた後に消して作り直された物は、ext4 や BSD の UFS / FFS では inode 番号が使い回されて見分けられず、消しうる (元のパスで消すのと同じ))。
-
-```rust
-let bound = sockat::bind_ex(&path, sockat::LastResort::Avoid)?;
-// ...
-bound.file.discard()?;
-drop(bound.listener);
-```
+詳しくは [マニュアル](docs/MANUAL-ja.md#長いパスで-std-と違う点) と [使ってはいけない書き方](docs/MANUAL-ja.md#使ってはいけない書き方)。
 
 ## async ランタイム
 
-依存は libc だけで、ランタイムには依存しない。tokio なら std の型から変換する:
+戻り値は std の型なので、tokio 等にそのまま渡せる。
 
 ```rust
 let listener = sockat::bind(&path)?;
@@ -127,10 +93,13 @@ let stream = sockat::connect_nonblocking(&path)?;
 let stream = tokio::net::UnixStream::from_std(stream)?;
 ```
 
+`connect_nonblocking` は待たず (後片付けも unlink だけ)、非ブロッキングのまま返すので、runtime の worker から直接呼べる。
+
 ## ドキュメント
 
-- [docs/MANUAL-ja.md](./docs/MANUAL-ja.md) — 使い方、経路の詳細、std と違う点、エラー
-- [docs/decisions/](./docs/decisions/INDEX.md) — 設計の判断 (DR)
+- [マニュアル](docs/MANUAL-ja.md): 使い方、経路、片付け、std と違う点、エラー
+- [sockat の仕様](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md): 言語によらない振る舞いの正本
+- [設計の判断 (DR)](docs/decisions/INDEX.md)
 
 ## ライセンス
 
