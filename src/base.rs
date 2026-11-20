@@ -419,11 +419,6 @@ impl Base {
                 return Ok(Arc::clone(d));
             }
         }
-        #[cfg(test)]
-        if let Some(tries) = FAIL_D.get() {
-            FAIL_D.set(Some(tries + 1));
-            return Err(io::Error::from_raw_os_error(libc::EACCES));
-        }
         let d = Arc::new(Dir::make(self.fd.as_fd())?);
         *slot = Some(Arc::clone(&d));
         Ok(d)
@@ -769,7 +764,7 @@ impl Dir {
             // is at the name is the directory just made; one that cannot be
             // made ready is removed again (it is empty).
             let opened = sys::chmod_at(b, &name, 0o711)
-                .and_then(|()| sys::open_dir_at(b, &name, libc::O_RDONLY))
+                .and_then(|()| open_d(b, &name))
                 .and_then(|fd| {
                     let m = std::fs::File::from(fd.try_clone()?).metadata()?;
                     match m.is_dir() && m.uid() == sys::effective_uid() {
@@ -1005,11 +1000,21 @@ fn sweep_in(b: &Base) -> io::Result<()> {
     Ok(())
 }
 
+/// Open D (named `name` in the B held by `b`) to hold it.
+fn open_d(b: BorrowedFd<'_>, name: &OsStr) -> io::Result<OwnedFd> {
+    #[cfg(test)]
+    if let Some(tries) = FAIL_D.get() {
+        FAIL_D.set(Some(tries + 1));
+        return Err(io::Error::from_raw_os_error(libc::EACCES));
+    }
+    sys::open_dir_at(b, name, libc::O_RDONLY)
+}
+
 #[cfg(test)]
 thread_local! {
-    /// Test-only: `Some(n)` makes every D this thread asks to have made fail
-    /// (`EACCES`, as a B it cannot write to would), counting the tries in `n`.
-    /// Per thread, so the tests running beside it are not touched.
+    /// Test-only: `Some(n)` makes this thread's every D fail to open right
+    /// after it is made and its mode set (`EACCES`), counting the tries in
+    /// `n`. Per thread, so the tests running beside it are not touched.
     // The initializer is `const`; clippy on illumos says otherwise of the
     // macro's expansion there.
     #[allow(clippy::missing_const_for_thread_local)]

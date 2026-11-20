@@ -1369,12 +1369,13 @@ fn usable_cross_uid_is_judged_when_b_is_taken() {
     ));
 }
 
-// When D cannot be made in B, the routes that use D cannot be used in that
-// call (link-dir, link-file, thread-cwd / at: each "D not made"), D is not
-// tried again for each of them, and no other B is looked for (no B in the
-// later place, none in the socket's directory): the process's B stays what
-// it is. D is made to fail by the test hook (a real one, a B this user cannot
-// write to, does not fail for root).
+// When D cannot be made ready in B (made, but its mode cannot be set or it
+// cannot be opened), the empty D is removed again, the routes that use D
+// cannot be used in that call (link-dir, link-file, thread-cwd / at: each "D
+// not made"), D is not tried again for each of them, and no other B is
+// looked for (no B in the later place, none in the socket's directory): the
+// process's B stays what it is (hub SPEC-routes "D の作り方" 2). The open is
+// made to fail by the test hook (no real failure there is open to a test).
 #[test]
 fn a_d_that_cannot_be_made_is_not_tried_again_nor_another_b_looked_for() {
     let t = tmp();
@@ -1410,6 +1411,7 @@ fn a_d_that_cannot_be_made_is_not_tried_again_nor_another_b_looked_for() {
     assert_eq!(tries, Some(1), "D tried more than once in one call");
     assert!(entries(&later).is_empty());
     assert!(b_of(&first).is_dir());
+    assert!(entries(&b_of(&first)).is_empty(), "the empty D left in B");
     assert!(
         entries(p.parent().unwrap())
             .iter()
