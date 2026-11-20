@@ -491,18 +491,30 @@ pub(crate) fn bind_with(
     remember: bool,
 ) -> Result<(OwnedFd, Option<SocketFile>, route::Reached), ExError> {
     let mut r = route::run(Request::Bind(ty), path, options, remember, None)?;
-    let socket = new_socket(r.socket.take()).map_err(|error| ExError {
-        error,
-        route: Some(r.route),
-        skipped: r.skipped.clone(),
-    })?;
-    let file = r.file.take().map(|f| SocketFile::new(f, r.link.clone()));
-    if remember && file.is_none() {
-        return Err(ExError {
-            error: io::Error::other("the socket file was not looked up"),
+    // Neither happens (a bind makes its socket, and looks the file up when
+    // asked); if one did, the listener is closed and E removed, the socket
+    // file left, as when the file cannot be looked up (hub SPEC "SocketFile").
+    let failed = |r: route::Reached, error: io::Error| {
+        if let Some(link) = &r.link {
+            let _ = link.cleanup();
+        }
+        ExError {
+            error,
             route: Some(r.route),
             skipped: r.skipped,
-        });
+        }
+    };
+    let socket = match new_socket(r.socket.take()) {
+        Ok(socket) => socket,
+        Err(error) => return Err(failed(r, error)),
+    };
+    let file = r.file.take().map(|f| SocketFile::new(f, r.link.clone()));
+    if remember && file.is_none() {
+        drop(socket);
+        return Err(failed(
+            r,
+            io::Error::other("the socket file was not looked up"),
+        ));
     }
     Ok((socket, file, r))
 }
@@ -511,7 +523,12 @@ pub(crate) fn bind_with(
 pub(crate) fn bound<S: From<OwnedFd>>(
     (socket, file, r): (OwnedFd, Option<SocketFile>, route::Reached),
 ) -> Result<Bound<S>, ExError> {
+    // `bind_with` with `remember` never hands back a bind without the file.
     let Some(file) = file else {
+        drop(socket);
+        if let Some(link) = &r.link {
+            let _ = link.cleanup();
+        }
         return Err(ExError {
             error: io::Error::other("the socket file was not looked up"),
             route: Some(r.route),

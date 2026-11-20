@@ -122,10 +122,13 @@ const BIND: Request<'static> = Request::Bind(SockType::Stream);
 const CONNECT: Request<'static> = Request::Connect(Connect::Stream { nonblocking: false });
 
 /// The route order's inputs as outside the tests, except that the only place
-/// for B is `place` (its B is `<real path of place>/sockat-<uid>`).
+/// for B is `place` (its B is `<real path of place>/sockat-<uid>`), and the B
+/// of the places is held as by a process of its own (clones of the config
+/// share it).
 fn config(place: &Path) -> Config {
     let mut c = Config::from_vars(None, None);
     c.places = vec![(Place::Tmp, place.to_path_buf())];
+    c.held = Default::default();
     c
 }
 
@@ -1147,6 +1150,554 @@ fn usable_cross_uid_with_a_base_others_cannot_search() {
 }
 
 // ---------------------------------------------------------------------------
+// B: which one the process uses
+// ---------------------------------------------------------------------------
+
+/// `c` with the places 1-3 `places`, in order.
+fn with_places(c: Config, places: &[(Place, &Path)]) -> Config {
+    Config {
+        places: places.iter().map(|(k, p)| (*k, p.to_path_buf())).collect(),
+        ..c
+    }
+}
+
+/// A file name one byte too long for link-dir through B's real path
+/// `<real path of place>/sockat-<uid>` (`B/D/E/<name>` with a one-letter E).
+fn name_just_past(place: &Path) -> String {
+    let b = path::len(&b_of(place));
+    "n".repeat(DIRECT_MAX + 1 - (b + 1 + base::RANDOM_LEN + 1 + 1 + 1))
+}
+
+/// The skipped of a call, whether it reached the path or not.
+fn skipped_of(r: &Result<Reached, route::Failed>) -> Vec<(&'static str, &'static str)> {
+    let s = match r {
+        Ok(r) => &r.skipped,
+        Err(f) => &f.skipped,
+    };
+    s.iter().map(|s| (s.name, s.reason)).collect()
+}
+
+// The process's B is the first place in the order where B can be made,
+// whatever the path's length. When the spelling through that place is known
+// not to fit (from the place's real path), B is not made there and the bind
+// does not move on to a later place where it would fit: the routes through B
+// are passed over (link-dir, too long), and the later place is left empty.
+// Otherwise the process's B would depend on the length of the path of each
+// call (hub SPEC-routes "実体の置き場").
+#[test]
+fn a_spelling_too_long_through_the_first_place_does_not_move_to_the_next() {
+    let t = tmp();
+    let first = t.path().join("l".repeat(40));
+    let later = t.path().join("p");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&later).unwrap();
+    let cfg = with_places(
+        no_link_file(no_proc(config(&first))),
+        &[(Place::Tmp, &first), (Place::Tmpdir, &later)],
+    );
+    let p = nest(t.path(), 250, &name_just_past(&first));
+    let r = bind(&p, &opts(), &cfg);
+    assert!(
+        skipped_of(&r).contains(&(names::LINK_DIR, names::TOO_LONG)),
+        "{:?}",
+        r.as_ref().map(|r| (r.route, r.base))
+    );
+    assert!(entries(&later).is_empty(), "B made in the later place");
+}
+
+// A B the process holds (the places 1-3) is the B for the rest of the
+// process: a later call whose spelling would fit only through a later place
+// still goes through it (and passes over the routes through B, too long),
+// and nothing is made in the later place. A place where B could not be made
+// is not remembered: once B can be made there, the next call makes it.
+#[test]
+fn a_b_held_is_kept_and_a_place_that_failed_is_tried_again() {
+    let t = tmp();
+    let first = t.path().join("l".repeat(40));
+    let later = t.path().join("p");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&later).unwrap();
+    let cfg = with_places(
+        no_link_file(no_proc(config(&first))),
+        &[(Place::Tmp, &first), (Place::Tmpdir, &later)],
+    );
+    let r = bind(&nest(&t.path().join("a"), 200, "s"), &opts(), &cfg).unwrap();
+    assert_eq!(r.base, Some("tmp"));
+    let r = bind(
+        &nest(&t.path().join("b"), 250, &name_just_past(&first)),
+        &opts(),
+        &cfg,
+    );
+    assert!(skipped_of(&r).contains(&(names::LINK_DIR, names::TOO_LONG)));
+    assert!(entries(&later).is_empty(), "B made in the later place");
+
+    let (t2, missing) = setup();
+    std::fs::remove_dir(&missing).unwrap();
+    let cfg2 = no_thread(real_link_dir(&missing));
+    let _ = bind(&nest(&t2.path().join("a"), 200, "s.sock"), &opts(), &cfg2);
+    std::fs::create_dir(&missing).unwrap();
+    let r = bind(&nest(&t2.path().join("b"), 200, "s.sock"), &opts(), &cfg2).unwrap();
+    assert_eq!(r.base, Some("tmp"));
+}
+
+// The usual B and the B for usable_cross_uid are held apart: once the usual
+// B is in a later place (the first could not be made then), a usable_cross_uid
+// bind that makes its B in the first place does not change the usual B, and
+// the next plain bind still goes through the later place (one process uses a
+// second B of the places 1-3 only for usable_cross_uid).
+#[test]
+fn the_usual_b_and_the_b_for_another_uid_are_held_apart() {
+    let t = tmp();
+    std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+    let first = t.path().join("p1");
+    let closed = t.path().join("q");
+    std::fs::create_dir(&closed).unwrap();
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let later = closed.join("p2");
+    std::fs::create_dir(&later).unwrap();
+    let cfg = with_places(
+        no_link_file(no_proc(config(&first))),
+        &[(Place::Tmp, &first), (Place::Tmpdir, &later)],
+    );
+    let cross = Options {
+        usable_cross_uid: true,
+        ..opts()
+    };
+    let r = bind(&nest(&t.path().join("a"), 200, "s"), &opts(), &cfg).unwrap();
+    assert_eq!(r.base, Some("tmpdir"));
+    std::fs::create_dir(&first).unwrap();
+    std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o711)).unwrap();
+    let r = bind(&nest(&t.path().join("b"), 200, "s"), &cross, &cfg).unwrap();
+    assert_eq!(r.base, Some("tmp"));
+    assert!(matches!(
+        r.spelling,
+        Some(Spelling::Linked {
+            usable_cross_uid: true,
+            ..
+        })
+    ));
+    let r = bind(&nest(&t.path().join("c"), 200, "s"), &opts(), &cfg).unwrap();
+    assert_eq!(r.base, Some("tmpdir"));
+}
+
+// Whether another uid can search the way to a B (the directories on the way
+// and B itself) is judged when the process first takes B, and kept: a B
+// that was 0700 then is not taken for usable_cross_uid after it is made 0711
+// (link-dir passes it over, no second D is made in it), and a B that was 0711
+// then still gives a spelling marked usable_cross_uid after it is made 0700.
+// The same holds for an Options.base: one taken while 0700 is EPERM for
+// usable_cross_uid before any route even once it is 0711 (hub SPEC-routes
+// "実体の置き場").
+#[test]
+fn usable_cross_uid_is_judged_when_b_is_taken() {
+    let t = tmp();
+    std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+    let cross = Options {
+        usable_cross_uid: true,
+        ..opts()
+    };
+    let mode = |p: &Path, m: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    };
+
+    let shut = t.path().join("shut");
+    std::fs::create_dir(&shut).unwrap();
+    mode(&shut, 0o711);
+    let b = b_of(&shut);
+    std::fs::create_dir(&b).unwrap();
+    mode(&b, 0o700);
+    let cfg = no_link_file(no_proc(config(&shut)));
+    let r = bind(&nest(&t.path().join("a"), 200, "s"), &opts(), &cfg).unwrap();
+    assert_eq!(r.base, Some("tmp"));
+    mode(&b, 0o711);
+    let r = bind(&nest(&t.path().join("b"), 200, "s"), &cross, &cfg);
+    assert!(
+        skipped_of(&r).contains(&(names::LINK_DIR, names::NO_CROSS_UID_BASE)),
+        "{:?}",
+        r.as_ref().map(|r| (r.route, r.spelling))
+    );
+    assert_eq!(entries(&b).len(), 1, "a second D in B");
+
+    let open = t.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    mode(&open, 0o711);
+    let cfg = no_link_file(no_proc(config(&open)));
+    bind(&nest(&t.path().join("c"), 200, "s"), &opts(), &cfg).unwrap();
+    mode(&b_of(&open), 0o700);
+    let r = bind(&nest(&t.path().join("d"), 200, "s"), &cross, &cfg).unwrap();
+    assert!(matches!(
+        r.spelling,
+        Some(Spelling::Linked {
+            usable_cross_uid: true,
+            ..
+        })
+    ));
+
+    let given = t.path().join("given");
+    std::fs::create_dir(&given).unwrap();
+    mode(&given, 0o700);
+    let at = |cross: bool| Options {
+        usable_cross_uid: cross,
+        base: Some(given.clone()),
+    };
+    let r = bind(&nest(&t.path().join("e"), 200, "s"), &at(false), &cfg).unwrap();
+    assert_eq!(r.base, Some("given"));
+    mode(&given, 0o711);
+    let f = bind(&nest(&t.path().join("f"), 200, "s"), &at(true), &cfg)
+        .err()
+        .unwrap();
+    assert_eq!(errno(&f.error), Some(libc::EPERM));
+    assert_eq!(f.route, None);
+    assert!(f.skipped.is_empty());
+    assert_eq!(entries(&given).len(), 1, "a second D in the given B");
+
+    let made = t.path().join("made");
+    let at_made = |cross: bool| Options {
+        usable_cross_uid: cross,
+        base: Some(made.clone()),
+    };
+    bind(&nest(&t.path().join("g"), 200, "s"), &at_made(false), &cfg).unwrap();
+    mode(&made, 0o700);
+    let r = bind(&nest(&t.path().join("h"), 200, "s"), &at_made(true), &cfg).unwrap();
+    assert_eq!(r.base, Some("given"));
+    assert!(matches!(
+        r.spelling,
+        Some(Spelling::Linked {
+            usable_cross_uid: true,
+            ..
+        })
+    ));
+}
+
+// When D cannot be made in B, the routes that use D cannot be used in that
+// call (link-dir, link-file, thread-cwd / at: each "D not made"), D is not
+// tried again for each of them, and no other B is looked for (no B in the
+// later place, none in the socket's directory): the process's B stays what
+// it is. D is made to fail by the test hook (a real one, a B this user cannot
+// write to, does not fail for root).
+#[test]
+fn a_d_that_cannot_be_made_is_not_tried_again_nor_another_b_looked_for() {
+    let t = tmp();
+    let first = t.path().join("p1");
+    let later = t.path().join("p2");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&later).unwrap();
+    let cfg = with_places(
+        no_proc(config(&first)),
+        &[(Place::Tmp, &first), (Place::Tmpdir, &later)],
+    );
+    let p = nest(&t.path().join("s"), 200, "s.sock");
+    base::FAIL_D.set(Some(0));
+    let r = bind(&p, &opts(), &cfg);
+    let tries = base::FAIL_D.replace(None);
+    let f = r.err().unwrap();
+    assert_eq!(errno(&f.error), Some(libc::ENAMETOOLONG));
+    assert!(
+        f.skipped
+            .iter()
+            .any(|s| s.name == names::LINK_DIR && s.reason == names::NO_D),
+        "{:?}",
+        f.skipped
+    );
+    for s in &f.skipped {
+        if [names::LINK_FILE, names::THREAD_CWD, names::AT].contains(&s.name) {
+            assert!(
+                [names::NO_D, names::SECCOMP, names::NOT_FOLLOWED].contains(&s.reason),
+                "{s:?}"
+            );
+        }
+    }
+    assert_eq!(tries, Some(1), "D tried more than once in one call");
+    assert!(entries(&later).is_empty());
+    assert!(b_of(&first).is_dir());
+    assert!(
+        entries(p.parent().unwrap())
+            .iter()
+            .all(|n| !n.starts_with(base::SOCKDIR_PREFIX))
+    );
+}
+
+/// A directory where `mkdir` fails for everyone (root included) although
+/// the check of `Options.base` passes (owned by root, nobody can write to
+/// it): `/proc` on Linux, `/dev` elsewhere.
+fn unmakeable_parent() -> &'static Path {
+    Path::new(if cfg!(any(target_os = "linux", target_os = "android")) {
+        "/proc"
+    } else {
+        "/dev"
+    })
+}
+
+// An Options.base that passes its check but cannot be made (mkdir fails) is
+// that error, with no route (no route made the call) and the routes passed
+// over before it in skipped, for a bind, a connect (whose link-file is the
+// route that needs B) and resolve_for_bind; nothing is made in another place.
+#[test]
+fn an_options_base_that_cannot_be_made_after_its_check_is_that_error() {
+    let (t, auto) = setup();
+    let given = unmakeable_parent().join(format!("sockat-test-{}", base::random_name().unwrap()));
+    let want = std::fs::create_dir(&given).unwrap_err().raw_os_error();
+    let options = Options {
+        base: Some(given.clone()),
+        ..opts()
+    };
+    let p = nest(t.path(), 200, "s.sock");
+    let f = bind(&p, &options, &real_link_dir(&auto)).err().unwrap();
+    assert_eq!(errno(&f.error), want);
+    assert_eq!(f.route, None);
+    assert_eq!(skipped_names(&f.skipped), vec![names::STANDARD]);
+
+    let f = route::resolve(route::Use::Bind, &p, &options, Some(&real_link_dir(&auto)))
+        .err()
+        .unwrap();
+    assert_eq!(errno(&f.error), want);
+    assert_eq!(f.route, None);
+    assert_eq!(skipped_names(&f.skipped), vec![names::STANDARD]);
+
+    let _l = listen_at(&p);
+    let cfg = no_thread(no_direct(no_proc(config(&auto))));
+    let f = route::run(CONNECT, &p, &options, false, Some(&cfg))
+        .err()
+        .unwrap();
+    assert_eq!(errno(&f.error), want);
+    assert_eq!(f.route, None);
+    assert_eq!(f.skipped.first().map(|s| s.name), Some(names::STANDARD));
+    assert!(!skipped_names(&f.skipped).contains(&names::LINK_FILE));
+    assert!(entries(&auto).is_empty());
+}
+
+// The B in the socket's directory (made when no place 1-3 can be) is used
+// only through the procB spelling: its real path is the socket's directory
+// and more, so the spelling through it reaches a socket file only as far as
+// the path does, and a B made in the user's own directory for a spelling is
+// what the procB form is for. Here /proc is stood in for by a directory with
+// `self/fd` (so /proc looks usable) where the procB form of B names nothing,
+// and the socket's directory is reached by a long symlink to a short real
+// one (so B's real path would fit): the bind takes no Linked spelling
+// through that B (thread-cwd / at with Dangling, or ENAMETOOLONG).
+#[test]
+fn a_b_in_the_socket_directory_is_spelled_only_through_proc() {
+    let t = tmp();
+    let real = t.path().join("x");
+    std::fs::create_dir(&real).unwrap();
+    let long = t.path().join("l".repeat(150));
+    std::os::unix::fs::symlink(&real, &long).unwrap();
+    let fake = t.path().join("proc");
+    std::fs::create_dir_all(fake.join("self/fd")).unwrap();
+    let mut cfg = config(&t.path().join("none"));
+    cfg.proc = fake;
+    let p = long.join("s.sock");
+    assert!(path::len(&p) > DIRECT_MAX);
+    match bind(&p, &opts(), &cfg) {
+        Ok(r) => {
+            assert_eq!(
+                (r.route, r.base, r.spelling),
+                (
+                    if cfg!(target_os = "freebsd") {
+                        names::AT
+                    } else {
+                        names::THREAD_CWD
+                    },
+                    None,
+                    Some(Spelling::Dangling)
+                )
+            );
+            assert!(is_socket(&real.join("s.sock")));
+        }
+        Err(f) => assert_eq!(errno(&f.error), Some(libc::ENAMETOOLONG)),
+    }
+}
+
+// A B or D the process holds that has been removed (by the OS's clean-up of
+// temporary directories, or by hand) is let go and made again by the next
+// call: after D is removed the next bind makes a new D in the same B, and
+// after B is removed (with its D) the next bind makes B again at the same
+// place. Both binds reach the path through link-dir.
+#[test]
+fn a_b_or_d_removed_is_made_again_by_the_next_call() {
+    let (t, place) = setup();
+    let cfg = real_link_dir(&place);
+    let b = b_of(&place);
+    bind(&nest(&t.path().join("a"), 200, "s.sock"), &opts(), &cfg).unwrap();
+    let d = entries(&b);
+    std::fs::remove_dir_all(b.join(&d[0])).unwrap();
+    let p = nest(&t.path().join("b"), 200, "s.sock");
+    let mut r = bind(&p, &opts(), &cfg).unwrap();
+    assert_eq!(r.route, names::LINK_DIR);
+    let now = entries(&b);
+    assert_eq!(now.len(), 1);
+    assert_ne!(now, d);
+    ping(
+        &listener(&mut r),
+        connect(&p, &cfg).unwrap().socket.unwrap(),
+    );
+
+    std::fs::remove_dir_all(&b).unwrap();
+    let p = nest(&t.path().join("c"), 200, "s.sock");
+    let mut r = bind(&p, &opts(), &cfg).unwrap();
+    assert_eq!((r.route, r.base), (names::LINK_DIR, Some("tmp")));
+    assert_eq!(entries(&b).len(), 1);
+    ping(
+        &listener(&mut r),
+        connect(&p, &cfg).unwrap().socket.unwrap(),
+    );
+}
+
+// A directory held by an fd counts as removed when the fd shows no links,
+// even when its name now gives the same (st_dev, st_ino): a file system may
+// give the number of a removed directory to a new one at the same name, and
+// then only the link count tells. Here the reuse is stood in for by passing
+// the new directory's number as the one held. Where a removed directory
+// keeps its link count (macOS's APFS) there is nothing to tell this way, and
+// the test says so.
+#[test]
+fn a_directory_held_counts_as_removed_when_it_has_no_links() {
+    let t = tmp();
+    let old = t.path().join("old");
+    std::fs::create_dir(&old).unwrap();
+    let held = std::fs::File::open(&old).unwrap();
+    std::fs::remove_dir(&old).unwrap();
+    if held.metadata().unwrap().nlink() != 0 {
+        eprintln!("a removed directory keeps its link count here");
+        return;
+    }
+    std::fs::create_dir(&old).unwrap();
+    let m = std::fs::symlink_metadata(&old).unwrap();
+    let id = (m.dev(), m.ino());
+    assert!(!base::still_named(held.as_fd(), id, Ok(id)));
+    let live = std::fs::File::open(&old).unwrap();
+    assert!(base::still_named(live.as_fd(), id, Ok(id)));
+}
+
+// "Myself" is the effective uid: B's name is `sockat-<effective uid>`, and B
+// is taken as this user's when its owner is the effective uid. Run in a
+// child that root turns into effective uid 1000 (the real uid stays 0); its
+// B is `sockat-1000`, owned by 1000. Only root can run it.
+#[test]
+fn the_uid_is_the_effective_one() {
+    if sys::effective_uid() != 0 {
+        eprintln!("only root can change its effective uid");
+        return;
+    }
+    let t = tmp();
+    let place = t.path().join("p");
+    std::fs::create_dir(&place).unwrap();
+    let p = nest(t.path(), 200, "s.sock");
+    let mut dir = p.parent().unwrap();
+    while dir != Path::new("/tmp") {
+        std::os::unix::fs::chown(dir, Some(1000), Some(1000)).unwrap();
+        dir = dir.parent().unwrap();
+    }
+    std::os::unix::fs::chown(&place, Some(1000), Some(1000)).unwrap();
+    run_child(
+        "tests::child_effective_uid",
+        &[
+            ("SOCKAT_CHILD_PATH", p.as_os_str()),
+            ("SOCKAT_CHILD_PLACE", place.as_os_str()),
+        ],
+    );
+    let b = std::fs::canonicalize(&place).unwrap().join("sockat-1000");
+    assert_eq!(std::fs::metadata(&b).unwrap().uid(), 1000);
+    assert_eq!(entries(&place), vec!["sockat-1000"]);
+}
+
+#[test]
+fn child_effective_uid() {
+    if !in_child() {
+        return;
+    }
+    sys::set_effective_uid(1000).unwrap();
+    assert_eq!(sys::real_uid(), 0);
+    let p = env_path("SOCKAT_CHILD_PATH");
+    let r = bind(&p, &opts(), &real_link_dir(&env_path("SOCKAT_CHILD_PLACE"))).unwrap();
+    assert_eq!((r.route, r.base), (names::LINK_DIR, Some("tmp")));
+}
+
+// skipped names only the routes of this OS's order (hub SPEC "結果"): a route
+// the OS has no means for (thread-cwd on NetBSD / OpenBSD / illumos, the
+// bind's link-file where a bind does not follow a symlink, proc-direct
+// without /proc) is not in it. With every route unusable here (no place for
+// B, no /proc, no thread-cwd, the socket's directory unopenable, a path too
+// far from the cwd for relative), a bind and a connect fail with
+// ENAMETOOLONG after passing over exactly the routes of this OS's row.
+#[test]
+fn skipped_holds_only_the_routes_of_this_os() {
+    let t = tmp();
+    let cfg = no_thread(no_direct(no_proc(config(&t.path().join("none")))));
+    let p = nest(t.path(), 200, "s.sock");
+    let r = bind(&p, &opts(), &cfg);
+    let bind_row: &[&str] = if cfg!(any(target_os = "linux", target_os = "android")) {
+        &[names::STANDARD, names::LINK_DIR, names::THREAD_CWD]
+    } else if cfg!(target_vendor = "apple") {
+        &[
+            names::STANDARD,
+            names::LINK_DIR,
+            names::LINK_FILE,
+            names::THREAD_CWD,
+        ]
+    } else if cfg!(target_os = "freebsd") {
+        &[names::STANDARD, names::LINK_DIR, names::AT]
+    } else if cfg!(any(target_os = "openbsd", target_os = "illumos")) {
+        &[names::STANDARD, names::LINK_DIR]
+    } else {
+        &[names::STANDARD, names::LINK_DIR, names::LINK_FILE]
+    };
+    match r {
+        // FreeBSD's at works in a B in the socket's directory, which can be
+        // made: the routes before it are passed over.
+        Ok(r) => {
+            assert_eq!(r.route, names::AT);
+            assert_eq!(skipped_names(&r.skipped), &bind_row[..2]);
+            std::fs::remove_file(&p).unwrap();
+        }
+        Err(f) => {
+            assert_eq!(errno(&f.error), Some(libc::ENAMETOOLONG));
+            assert_eq!(skipped_names(&f.skipped), bind_row);
+        }
+    }
+
+    let _l = listen_at(&p);
+    let f = connect(&p, &cfg).err().unwrap();
+    assert_eq!(errno(&f.error), Some(libc::ENAMETOOLONG));
+    let connect_row: &[&str] = if cfg!(any(target_os = "linux", target_os = "android")) {
+        &[
+            names::STANDARD,
+            names::RELATIVE,
+            names::THREAD_CWD_DIRECT,
+            names::LINK_FILE,
+        ]
+    } else if cfg!(target_vendor = "apple") {
+        &[
+            names::STANDARD,
+            names::RELATIVE,
+            names::WIDENED,
+            names::THREAD_CWD_DIRECT,
+            names::LINK_FILE,
+        ]
+    } else if cfg!(target_os = "freebsd") {
+        &[names::STANDARD, names::AT_DIRECT, names::LINK_FILE]
+    } else {
+        &[names::STANDARD, names::RELATIVE, names::LINK_FILE]
+    };
+    assert_eq!(skipped_names(&f.skipped), connect_row);
+}
+
+// ForBind's socket_file follows the spelling after the bind and fails when
+// what it reaches is not a socket (ENOTSOCK): a file put at the path instead
+// of the socket is not taken, so its remove cannot remove that file.
+#[test]
+fn socket_file_of_what_is_not_a_socket_is_an_error() {
+    let (t, place) = setup();
+    let cfg = real_link_dir(&place);
+    let p = nest(t.path(), 200, "s.sock");
+    let r = route::resolve(route::Use::Bind, &p, &opts(), Some(&cfg)).unwrap();
+    std::fs::write(&p, b"not a socket").unwrap();
+    let e = route::remember_resolved(&r.path, r.cwd).unwrap_err();
+    assert_eq!(errno(&e), Some(libc::ENOTSOCK));
+    assert_eq!(std::fs::read(&p).unwrap(), b"not a socket");
+}
+
+// ---------------------------------------------------------------------------
 // sweep
 // ---------------------------------------------------------------------------
 
@@ -1563,6 +2114,98 @@ fn child_cwd_changes() {
         .unwrap();
     assert_eq!(f.error.kind(), io::ErrorKind::Other);
     assert_eq!(f.route, Some(names::STANDARD));
+}
+
+// When bind_ex cannot remember the socket file (here: a long relative path,
+// the cwd changed between the bind and the look-up), the listener is closed,
+// the E of the spelling (link-dir) is removed, and the socket file is left
+// where it is: it could not be told to be the one bound, so removing it might
+// remove what replaced it (hub SPEC "SocketFile"). Run in a child: the cwd is
+// process-wide.
+#[test]
+fn a_bind_ex_that_cannot_remember_closes_cleans_e_and_keeps_the_file() {
+    let t = tmp();
+    std::fs::create_dir(t.path().join("p")).unwrap();
+    std::fs::create_dir(t.path().join("b")).unwrap();
+    std::fs::create_dir_all(t.path().join("a").join(long_relative().parent().unwrap())).unwrap();
+    run_child(
+        "tests::child_cwd_changes_through_link_dir",
+        &[("SOCKAT_CHILD_PATH", t.path().as_os_str())],
+    );
+    let file = t.path().join("a").join(long_relative());
+    assert!(is_socket(&file));
+    let b = b_of(&t.path().join("p"));
+    assert_eq!(entries(&b).len(), 1);
+    assert_no_e(&b);
+}
+
+/// A relative path longer than std accepts.
+fn long_relative() -> PathBuf {
+    let p = PathBuf::from("d".repeat(60))
+        .join("e".repeat(60))
+        .join("f".repeat(60))
+        .join("s.sock");
+    assert!(path::len(&p) > DIRECT_MAX);
+    p
+}
+
+#[test]
+fn child_cwd_changes_through_link_dir() {
+    if !in_child() {
+        return;
+    }
+    let root = env_path("SOCKAT_CHILD_PATH");
+    std::env::set_current_dir(root.join("a")).unwrap();
+    let mut cfg = real_link_dir(&root.join("p"));
+    cfg.between_cwd_lookups = || {
+        std::env::set_current_dir(env_path("SOCKAT_CHILD_PATH").join("b")).unwrap();
+    };
+    let f = route::run(BIND, &long_relative(), &opts(), true, Some(&cfg))
+        .err()
+        .unwrap();
+    assert_eq!(f.error.kind(), io::ErrorKind::Other);
+    assert_eq!(f.route, Some(names::LINK_DIR));
+    let abs = root.join("a").join(long_relative());
+    let e = connect(&abs, &real_link_dir(&root.join("p")))
+        .err()
+        .unwrap();
+    assert_eq!(
+        errno(&e.error),
+        Some(libc::ECONNREFUSED),
+        "the listener is open"
+    );
+}
+
+// An Options.base of the wrong form is an argument error before the name in
+// the abstract namespace is looked at (Linux / Android): an abstract name is
+// otherwise handed to std as is (a bind's error would come from standard,
+// and resolve would hand the name back), and the wrong base would go unseen
+// (hub SPEC "エラー": the form is checked before the abstract name). No route
+// is named.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn an_options_base_of_the_wrong_form_is_refused_before_an_abstract_name() {
+    let (_t, place) = setup();
+    let cfg = config(&place);
+    let name = format!("\0sockat-test-{}", base::random_name().unwrap());
+    let p = PathBuf::from(OsStr::from_bytes(name.as_bytes()));
+    let options = Options {
+        base: Some(PathBuf::from("relative/b")),
+        ..opts()
+    };
+    for req in [BIND, CONNECT] {
+        let f = route::run(req, &p, &options, true, Some(&cfg))
+            .err()
+            .unwrap();
+        assert_eq!(f.error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(f.route, None);
+        assert!(f.skipped.is_empty());
+    }
+    let f = route::resolve(route::Use::Bind, &p, &options, Some(&cfg))
+        .err()
+        .unwrap();
+    assert_eq!(f.error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(f.route, None);
 }
 
 // ---------------------------------------------------------------------------

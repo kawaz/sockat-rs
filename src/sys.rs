@@ -822,6 +822,22 @@ pub(crate) fn set_umask(mask: u32) {
     }
 }
 
+/// Set this process's effective uid to `uid` (`seteuid(2)`), leaving the
+/// real uid as it is. Test-only, and only for a child process of the test
+/// binary run by root: the uid is process-wide.
+#[cfg(test)]
+pub(crate) fn set_effective_uid(uid: libc::uid_t) -> io::Result<()> {
+    // SAFETY: plain syscall without pointers.
+    cvt(unsafe { libc::seteuid(uid) }).map(drop)
+}
+
+/// The real uid of this process (`getuid(2)`). Test-only.
+#[cfg(test)]
+pub(crate) fn real_uid() -> libc::uid_t {
+    // SAFETY: plain syscall without arguments; it always succeeds.
+    unsafe { libc::getuid() }
+}
+
 /// Whether `fd` is `O_NONBLOCK`. Test-only (the connect option tests run on
 /// Linux and Apple).
 #[cfg(all(

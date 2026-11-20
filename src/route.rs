@@ -28,7 +28,7 @@ use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::base::{self, Base, Link, Place, TempLink};
+use crate::base::{self, Automatic, Base, Dir, Link, Place, TempLink};
 use crate::path;
 use crate::sys::{self, Op, SockAddr, SockType};
 use crate::{Options, Spelling, Until};
@@ -192,6 +192,9 @@ const FOLLOWS: Follows = Follows::Unknown;
 pub(crate) struct Config {
     /// The places 1-3 for B, in order ([`base::places_from`]).
     pub(crate) places: Vec<(Place, PathBuf)>,
+    /// The B of the places 1-3 held: this process's ([`base::Held::process`])
+    /// outside the tests, which hold their own.
+    pub(crate) held: Arc<base::Held>,
     /// Where `/proc` is: `/proc` outside the tests, which point it elsewhere
     /// to stand in for a system without it.
     pub(crate) proc: PathBuf,
@@ -238,6 +241,7 @@ impl Config {
     pub(crate) fn from_vars(tmpdir: Option<OsString>, runtime_dir: Option<OsString>) -> Self {
         Self {
             places: base::places_from(tmpdir, runtime_dir),
+            held: base::Held::process(),
             proc: PathBuf::from("/proc"),
             #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
             thread_cwd: true,
@@ -553,6 +557,9 @@ struct Target<'a> {
     /// Whether a connect may still use the widened `sockaddr_un` (Apple).
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     wide: Cell<bool>,
+    /// The Bs (by `(st_dev, st_ino)`) in which D could not be made during
+    /// this call: the routes that use D cannot be used for the rest of it.
+    no_d: RefCell<Vec<(u64, u64)>>,
     skipped: RefCell<Vec<Skipped>>,
 }
 
@@ -596,6 +603,7 @@ impl<'a> Target<'a> {
             dir_fd: OnceCell::new(),
             proc_self: OnceCell::new(),
             wide: Cell::new(wide_allowed(cfg)),
+            no_d: RefCell::new(Vec::new()),
             skipped: RefCell::new(vec![Skipped {
                 name: names::STANDARD,
                 reason: names::TOO_LONG,
@@ -612,6 +620,21 @@ impl<'a> Target<'a> {
             Some(s) => s.reason = reason,
             None => skipped.push(Skipped { name, reason }),
         }
+    }
+
+    /// This process's D in `b`; `None` when it cannot be made, and from then
+    /// on for the rest of the call, without trying again (hub SPEC-routes
+    /// "実体の置き場": the routes that use D cannot be used in this call, and
+    /// no other B is looked for).
+    fn dir(&self, b: &Base) -> Option<Arc<Dir>> {
+        if self.no_d.borrow().contains(&b.id) {
+            return None;
+        }
+        let d = b.dir().ok();
+        if d.is_none() {
+            self.no_d.borrow_mut().push(b.id);
+        }
+        d
     }
 
     /// Whether the bind asks for a spelling another uid can follow (the
@@ -694,8 +717,10 @@ fn fits_through(prefix_len: usize, e_len: usize, name: Option<&OsStr>) -> bool {
 
 /// The forms of B's spelling to try for `b`, in order (hub SPEC-routes "綴り
 /// の形"): `/proc/<pid>/fd/<B's fd>` when `/proc` can be used and another uid
-/// need not follow it, then B's real path. Each with the diagnostic `base`,
-/// how long it is followed, and whether another uid can follow it.
+/// need not follow it, then B's real path (not for a B in the socket's
+/// directory, whose real path is longer than the path itself: it is spelled
+/// only through procB). Each with the diagnostic `base`, how long it is
+/// followed, and whether another uid can follow it.
 /// The last item is whether a peer with a `/tmp` of its own follows it: always
 /// for procB (its spelling goes through no `/tmp`), for B's real path when
 /// neither the place as given nor the real path goes through `/tmp` or
@@ -711,6 +736,9 @@ fn forms(
             out.push((p, b.place.proc_name(), Until::Process, false, true));
         }
     }
+    if b.place == Place::SocketDir {
+        return out;
+    }
     out.push((
         b.path.clone(),
         b.place.real_name(),
@@ -722,12 +750,12 @@ fn forms(
 }
 
 /// The B for the spellings through B (link-dir, link-file, resolve): at
-/// `Options.base` when given (an error there is the result), else the first
-/// of the places 1-3 a spelling may fit through, else (not for another uid)
-/// one in the socket's directory when `/proc` can spell it. `link_file`
+/// `Options.base` when given (an error there is the result), else the
+/// process's B of the places 1-3 ([`base::automatic`]), else (not for another
+/// uid) one in the socket's directory when `/proc` can spell it. `link_file`
 /// says whether a link-file spelling may be tried after link-dir. Without a
-/// B, why: no spelling would fit through any place (nothing is made then),
-/// or none could be had.
+/// B, why: no spelling would fit through the process's B (nothing is made
+/// then), or none could be had.
 fn spelled_base(
     t: &Target<'_>,
     link_file: bool,
@@ -745,21 +773,17 @@ fn spelled_base(
         let real = path::len(b);
         fits_through(real, 1, Some(t.name)) || by_proc || (link_file && fits_through(real, 1, None))
     };
-    if let Some(b) = base::automatic(&t.cfg.places, cross, fits) {
-        return Ok(Ok(b));
-    }
     let none = if cross {
         names::NO_CROSS_UID_BASE
     } else {
         names::NO_BASE
     };
-    let any_fits = t.cfg.places.iter().any(|(place, parent)| {
-        std::fs::canonicalize(parent).is_ok_and(|real| fits(&real.join(place.b_name())))
-    });
-    if !cross && by_proc {
-        return Ok(base::in_socket_dir(&t.real_dir).ok_or(none));
+    match base::automatic(&t.cfg.places, &t.cfg.held, cross, fits) {
+        Automatic::Base(b) => Ok(Ok(b)),
+        Automatic::TooLong => Ok(Err(names::TOO_LONG)),
+        Automatic::Missing if !cross && by_proc => Ok(base::in_socket_dir(&t.real_dir).ok_or(none)),
+        Automatic::Missing => Ok(Err(none)),
     }
-    Ok(Err(if any_fits { none } else { names::TOO_LONG }))
 }
 
 /// What a spelling through B and D is: a counted E in D, and the spelling
@@ -780,13 +804,17 @@ fn through(t: &Target<'_>, b: &Base, link_file: Option<&Path>) -> Result<Through
         None => Some(t.name),
         Some(_) => None,
     };
-    let mut why = names::TOO_LONG;
-    for (prefix, diag, until, others, private_tmp) in forms(t.cfg, b, t.cross_uid()) {
+    let forms = forms(t.cfg, b, t.cross_uid());
+    let mut why = match forms.is_empty() {
+        true => names::PROC_UNUSABLE,
+        false => names::TOO_LONG,
+    };
+    for (prefix, diag, until, others, private_tmp) in forms {
         if !fits_through(path::len(&prefix), 1, name) {
             why = names::TOO_LONG;
             continue;
         }
-        let d = b.dir().map_err(|_| names::NO_D)?;
+        let d = t.dir(b).ok_or(names::NO_D)?;
         if !fits_through(path::len(&prefix), d.next_e_len(), name) {
             why = names::TOO_LONG;
             continue;
@@ -985,9 +1013,13 @@ fn d_base(t: &Target<'_>) -> Result<Option<Arc<Base>>, io::Error> {
     if let Some(given) = &t.options.base {
         return base::given(given, t.cross_uid()).map(Some);
     }
+    // Nothing is spelled through B here, so any B fits (never TooLong).
     Ok(
-        base::automatic(&t.cfg.places, false, |_| true)
-            .or_else(|| base::in_socket_dir(&t.real_dir)),
+        match base::automatic(&t.cfg.places, &t.cfg.held, false, |_| true) {
+            Automatic::Base(b) => Some(b),
+            Automatic::TooLong => None,
+            Automatic::Missing => base::in_socket_dir(&t.real_dir),
+        },
     )
 }
 
@@ -1021,7 +1053,7 @@ fn in_d(
         }
         Err(e) => return Step::base_error(e),
     };
-    let Ok(d) = b.dir() else {
+    let Some(d) = t.dir(&b) else {
         t.skip(route, names::NO_D);
         return Step::Next;
     };
@@ -1213,9 +1245,10 @@ fn link_file_connect(t: &Target<'_>) -> Step {
             Ok(b) => b,
             Err(e) => return Step::base_error(e),
         },
-        None => match base::automatic(&t.cfg.places, false, fits) {
-            Some(b) => b,
-            None => return skip(names::NO_BASE),
+        None => match base::automatic(&t.cfg.places, &t.cfg.held, false, fits) {
+            Automatic::Base(b) => b,
+            Automatic::TooLong => return skip(names::TOO_LONG),
+            Automatic::Missing => return skip(names::NO_BASE),
         },
     };
     if !fits(&b.path) {

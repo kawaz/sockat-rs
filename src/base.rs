@@ -13,9 +13,11 @@
 //!   at) or to the socket file (link-file); or directly in B for the plain
 //!   connect's link-file.
 //!
-//! The Bs this process uses are kept in a registry, looked up by the place and
-//! checked to still be the directory held (the same `(st_dev, st_ino)` at
-//! B's spelling) before each use.
+//! The Bs this process uses are kept in a registry and checked to still be
+//! the directory held (the same `(st_dev, st_ino)` at B's spelling) before
+//! each use. Of the places 1-3 the process holds one B (and one more for
+//! `usable_cross_uid` when that is elsewhere, [`Held`]); a B in the socket's
+//! directory or at `Options.base` is looked up by where it is.
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -244,7 +246,8 @@ pub(crate) struct Base {
     /// path), which the registry finds B by.
     given_parent: PathBuf,
     fd: OwnedFd,
-    id: (u64, u64),
+    /// `(st_dev, st_ino)` of B.
+    pub(crate) id: (u64, u64),
     /// Whether another uid can follow a spelling through B's real path:
     /// every directory on the way and B itself let others search (D is
     /// always 0711).
@@ -279,7 +282,8 @@ impl Base {
 
     /// Whether B's spelling still names the directory held.
     fn current(&self) -> bool {
-        std::fs::symlink_metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.id)
+        let named = std::fs::symlink_metadata(&self.path).map(|m| (m.dev(), m.ino()));
+        still_named(self.fd.as_fd(), self.id, named)
     }
 
     /// Make (or find) B named `name` in the directory `parent` (hub
@@ -411,9 +415,14 @@ impl Base {
     pub(crate) fn dir(&self) -> io::Result<Arc<Dir>> {
         let mut slot = lock(&self.d);
         if let Some(d) = slot.as_ref() {
-            if sys::id_at(self.fd.as_fd(), &d.name).is_ok_and(|id| id == d.id) {
+            if still_named(d.fd.as_fd(), d.id, sys::id_at(self.fd.as_fd(), &d.name)) {
                 return Ok(Arc::clone(d));
             }
+        }
+        #[cfg(test)]
+        if let Some(tries) = FAIL_D.get() {
+            FAIL_D.set(Some(tries + 1));
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
         }
         let d = Arc::new(Dir::make(self.fd.as_fd())?);
         *slot = Some(Arc::clone(&d));
@@ -424,6 +433,26 @@ impl Base {
     fn own_d(&self) -> Option<OsString> {
         lock(&self.d).as_ref().map(|d| d.name.clone())
     }
+}
+
+/// Whether the directory held by `fd` (whose `(st_dev, st_ino)` was `id`)
+/// is still there and still what its name names (`named`, by `lstat`): it
+/// has not been removed (`fstat` shows links) and the name gives the same
+/// `(st_dev, st_ino)` (hub SPEC-routes "実体の置き場": a B or D removed, by
+/// the OS's clean-up or by hand, is let go and made again by the next call).
+/// The link count tells a removed directory whose number the file system has
+/// already given to a new one at the name (a removed directory shows 0 links
+/// on Linux; macOS's APFS keeps the count, so there only the name tells).
+pub(crate) fn still_named(
+    fd: BorrowedFd<'_>,
+    id: (u64, u64),
+    named: io::Result<(u64, u64)>,
+) -> bool {
+    let linked = fd
+        .try_clone_to_owned()
+        .and_then(|fd| std::fs::File::from(fd).metadata())
+        .is_ok_and(|m| m.nlink() > 0);
+    linked && named.is_ok_and(|n| n == id)
 }
 
 /// A random name for B in `place`: `.sockat.<10 random>` in the socket's
@@ -437,19 +466,31 @@ fn fallback_name(place: Place) -> io::Result<OsString> {
     }))
 }
 
-/// The Bs this process uses.
-static REGISTRY: Mutex<Vec<Arc<Base>>> = Mutex::new(Vec::new());
+/// Every B this process holds.
+struct Registry {
+    all: Vec<Arc<Base>>,
+}
 
-/// The B in `registry` that `pick` chooses and that is still at its spelling;
-/// a B no longer there is dropped from the registry (what still uses it keeps
-/// its D held).
-fn registered(registry: &mut Vec<Arc<Base>>, pick: impl Fn(&Base) -> bool) -> Option<Arc<Base>> {
-    let i = registry.iter().position(|b| pick(b))?;
-    if registry[i].current() {
-        return Some(Arc::clone(&registry[i]));
+static REGISTRY: Mutex<Registry> = Mutex::new(Registry { all: Vec::new() });
+
+impl Registry {
+    /// The B that `pick` chooses and that is still at its spelling; a B no
+    /// longer there is dropped (what still uses it keeps its D held).
+    fn find(&mut self, pick: impl Fn(&Base) -> bool) -> Option<Arc<Base>> {
+        let i = self.all.iter().position(|b| pick(b))?;
+        if self.all[i].current() {
+            return Some(Arc::clone(&self.all[i]));
+        }
+        self.all.remove(i);
+        None
     }
-    registry.remove(i);
-    None
+
+    /// The B at `Options.base` (`parent`, `name` as given).
+    fn given(&mut self, parent: &Path, name: &OsStr) -> Option<Arc<Base>> {
+        self.find(|b| {
+            b.place == Place::Given && b.given_parent == parent && b.path.file_name() == Some(name)
+        })
+    }
 }
 
 /// The places 1-3 (hub SPEC-routes "実体の置き場"), in order: `/tmp`, then
@@ -475,35 +516,107 @@ pub(crate) fn places_from(
     out
 }
 
-/// The B of the places 1-3: the first of `places` where B is (or can be
-/// made). With `others_search`, only a place where every directory on the
-/// way and B itself let others search ("別の uid と PrivateTmp"). A place
-/// whose B spelled by its real path `fits` rejects is passed over before
-/// anything is made there (hub SPEC-routes "実体の置き場": B is not made when
-/// the spelling is known not to fit). `None` when there is none.
+/// The B of the places 1-3 a process holds (hub SPEC-routes "実体の置き場"):
+/// the usual one ([`USUAL`]) and the one for `usable_cross_uid` ([`CROSS`]),
+/// the same B when the usual one lets others search the way to it.
+// Design rationale: carried by `route::Config` rather than kept only in a
+// static, so that each test holds Bs of its own places while the tests share
+// one process; outside the tests every call carries the one of the process
+// (`Held::process`).
+#[derive(Debug, Default)]
+pub(crate) struct Held {
+    slots: Mutex<[Option<Arc<Base>>; 2]>,
+}
+
+const USUAL: usize = 0;
+const CROSS: usize = 1;
+
+impl Held {
+    /// The one this process holds.
+    pub(crate) fn process() -> Arc<Held> {
+        static PROCESS: std::sync::OnceLock<Arc<Held>> = std::sync::OnceLock::new();
+        Arc::clone(PROCESS.get_or_init(Arc::default))
+    }
+}
+
+/// The B in `slots[slot]` when it is still at its spelling; one no longer
+/// there is let go (what still uses it keeps its D held).
+fn held_in(slots: &mut [Option<Arc<Base>>; 2], slot: usize) -> Option<Arc<Base>> {
+    let b = slots[slot].clone()?;
+    if b.current() {
+        return Some(b);
+    }
+    slots[slot] = None;
+    lock(&REGISTRY).all.retain(|r| !Arc::ptr_eq(r, &b));
+    None
+}
+
+/// What [`automatic`] found.
+pub(crate) enum Automatic {
+    /// The process's B, and a spelling through it may fit.
+    Base(Arc<Base>),
+    /// The process's B is (or would be made) where the spelling is known not
+    /// to fit: the routes through B are passed over, and nothing is made.
+    TooLong,
+    /// B can be made in none of the places.
+    Missing,
+}
+
+/// The process's B of the places 1-3 (hub SPEC-routes "実体の置き場"): the
+/// one it holds, else the first of `places` where B can be made, which it
+/// then holds for the rest of its life. A place where it could not be made
+/// is not remembered, and is tried again by the next call.
+///
+/// With `others_search` (`usable_cross_uid`), only a place where every
+/// directory on the way and B itself let others search ("別の uid と
+/// PrivateTmp"); that B is held apart from the usual one, and is the usual one
+/// when that allows it. Whether a B allows it is judged when the process
+/// takes it and kept.
+///
+/// When the spelling through that first place is known not to fit (`fits`
+/// of B's real path there), B is not made, and the next place is not tried
+/// either: the process's B does not depend on the length of a path.
 pub(crate) fn automatic(
     places: &[(Place, PathBuf)],
+    held: &Held,
     others_search: bool,
     fits: impl Fn(&Path) -> bool,
-) -> Option<Arc<Base>> {
-    let mut registry = lock(&REGISTRY);
-    // The process uses one B of the places 1-3 (and, with `others_search`,
-    // one that allows it): once it has one, that is the B, whether or not a
-    // spelling through it fits this time.
-    for (place, parent) in places {
-        let found = registered(&mut registry, |b| {
-            b.place == *place && b.given_parent == *parent && (!others_search || b.others_search)
-        });
-        if let Some(b) = found {
-            return fits(&b.path).then_some(b);
-        }
+) -> Automatic {
+    let mut slots = lock(&held.slots);
+    let slot = if others_search { CROSS } else { USUAL };
+    let found = |b: Arc<Base>| match fits(&b.path) {
+        true => Automatic::Base(b),
+        false => Automatic::TooLong,
+    };
+    if let Some(b) = held_in(&mut slots, slot) {
+        return found(b);
     }
+    let other = held_in(&mut slots, 1 - slot);
     for (place, parent) in places {
+        // The B held for the other slot is this place's B when it is here,
+        // with what it allows as judged when it was taken.
+        if let Some(b) = other
+            .as_ref()
+            .filter(|b| b.place == *place && b.given_parent == *parent)
+        {
+            if others_search && !b.others_search {
+                continue;
+            }
+            slots[slot] = Some(Arc::clone(b));
+            return found(Arc::clone(b));
+        }
+        // What can be told without making anything: a place that is not
+        // there, or that the way to does not pass the checks, is not where B
+        // can be made.
         let Ok(real) = std::fs::canonicalize(parent) else {
             continue;
         };
+        match chain(&real) {
+            Ok(c) if c.safe && (c.others_search || !others_search) => {}
+            _ => continue,
+        }
         if !fits(&real.join(place.b_name())) {
-            continue;
+            return Automatic::TooLong;
         }
         let name = OsString::from(place.b_name());
         if let Ok(b) = Base::make(
@@ -514,11 +627,12 @@ pub(crate) fn automatic(
             others_search,
         ) {
             let b = Arc::new(b);
-            registry.push(Arc::clone(&b));
-            return Some(b);
+            lock(&REGISTRY).all.push(Arc::clone(&b));
+            slots[slot] = Some(Arc::clone(&b));
+            return Automatic::Base(b);
         }
     }
-    None
+    Automatic::Missing
 }
 
 /// The B in the socket's directory (`.sockat.<10 random>`), for when no place
@@ -526,14 +640,12 @@ pub(crate) fn automatic(
 /// socket's directory's real path.
 pub(crate) fn in_socket_dir(real_dir: &Path) -> Option<Arc<Base>> {
     let mut registry = lock(&REGISTRY);
-    if let Some(b) = registered(&mut registry, |b| {
-        b.place == Place::SocketDir && b.given_parent == real_dir
-    }) {
+    if let Some(b) = registry.find(|b| b.place == Place::SocketDir && b.given_parent == real_dir) {
         return Some(b);
     }
     let name = fallback_name(Place::SocketDir).ok()?;
     let b = Arc::new(Base::make(real_dir, &name, Place::SocketDir, Existing::New, false).ok()?);
-    registry.push(Arc::clone(&b));
+    registry.all.push(Arc::clone(&b));
     Some(b)
 }
 
@@ -556,9 +668,12 @@ pub(crate) fn split_given(base: &Path) -> io::Result<(&Path, &OsStr)> {
 /// Check `Options.base` without making anything (hub SPEC-routes "B の作り方":
 /// made before any route is tried, for a bind and a connect alike): the
 /// directories on the way, and B itself when it is there. `others_search` is
-/// `Options.usable_cross_uid` of a bind. The errors are those of [`given`].
+/// `Options.usable_cross_uid` of a bind; for a B this process already holds,
+/// whether others can search the way to it is the judgement made when it was
+/// taken ([`automatic`]). The errors are those of [`given`].
 pub(crate) fn check_given(base: &Path, others_search: bool) -> io::Result<()> {
     let (parent, name) = split_given(base)?;
+    let held = lock(&REGISTRY).given(parent, name);
     let parent_real = std::fs::canonicalize(parent)?;
     let c = chain(&parent_real)?;
     if !c.safe || (others_search && !c.others_search) {
@@ -576,7 +691,11 @@ pub(crate) fn check_given(base: &Path, others_search: bool) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
     }
     let ours = m.uid() == sys::effective_uid() && m.mode() & 0o022 == 0;
-    if !ours || (others_search && m.mode() & 0o001 == 0) {
+    let searchable = match &held {
+        Some(b) => b.others_search,
+        None => m.mode() & 0o001 != 0,
+    };
+    if !ours || (others_search && !searchable) {
         return Err(refused());
     }
     Ok(())
@@ -591,16 +710,15 @@ pub(crate) fn check_given(base: &Path, others_search: bool) -> io::Result<()> {
 /// on the way is not a directory, `EPERM` when a check fails (a directory on
 /// the way another user can change, B someone else's or writable by group or
 /// others; with `others_search`, a directory on the way or B others cannot
-/// search). Never another place instead.
+/// search; for a B this process holds, as judged when it was taken). Never
+/// another place instead.
 pub(crate) fn given(base: &Path, others_search: bool) -> io::Result<Arc<Base>> {
     let (parent, name) = split_given(base)?;
     let mut registry = lock(&REGISTRY);
-    if let Some(b) = registered(&mut registry, |b| {
-        b.place == Place::Given
-            && b.given_parent == parent
-            && b.path.file_name() == Some(name)
-            && (!others_search || b.others_search)
-    }) {
+    if let Some(b) = registry.given(parent, name) {
+        if others_search && !b.others_search {
+            return Err(refused());
+        }
         return Ok(b);
     }
     let b = Arc::new(Base::make(
@@ -610,7 +728,7 @@ pub(crate) fn given(base: &Path, others_search: bool) -> io::Result<Arc<Base>> {
         Existing::UseOrRefuse,
         others_search,
     )?);
-    registry.push(Arc::clone(&b));
+    registry.all.push(Arc::clone(&b));
     Ok(b)
 }
 
@@ -838,6 +956,7 @@ pub(crate) fn sweep_base(base: &Path) -> io::Result<()> {
 /// The D of this process in a registered B at the same place as `b`.
 fn own_d_at(b: &Base) -> Option<OsString> {
     lock(&REGISTRY)
+        .all
         .iter()
         .find(|r| r.id == b.id)
         .and_then(|r| r.own_d())
@@ -886,12 +1005,24 @@ fn sweep_in(b: &Base) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: `Some(n)` makes every D this thread asks to have made fail
+    /// (`EACCES`, as a B it cannot write to would), counting the tries in `n`.
+    /// Per thread, so the tests running beside it are not touched.
+    // The initializer is `const`; clippy on illumos says otherwise of the
+    // macro's expansion there.
+    #[allow(clippy::missing_const_for_thread_local)]
+    pub(crate) static FAIL_D: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 /// The number of the fd this process holds on the registered B at `path`
 /// (test-only: stands in for `/proc/<pid>/fd/<B's fd>` where there is no
 /// `/proc`).
 #[cfg(test)]
 pub(crate) fn registered_fd(path: &Path) -> Option<std::os::fd::RawFd> {
     lock(&REGISTRY)
+        .all
         .iter()
         .find(|b| b.path == path)
         .map(|b| b.fd.as_raw_fd())
