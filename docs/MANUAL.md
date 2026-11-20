@@ -195,7 +195,7 @@ The `_ex` functions and resolve take `sockat::Options`. `Options::default()` is 
 | Field | Content |
 |---|---|
 | `usable_cross_uid: bool` | make a bind's spelling one another uid can follow too. Only a B in a base where every directory on the way and B itself give others x is used, and procB is not. When that cannot be met, the bind goes on to thread-cwd / at (`Dangling`). Whether a B lets another uid follow it is judged when the process takes that B, and kept (also for the B of `Options::base`). The connects do not look at it |
-| `base: Option<PathBuf>` | where B itself is (for example `/tmp/my-app-1000/sockat`). Made when missing (mode 0711). When the checks fail, `ENOENT` / `ENOTDIR` / `EPERM`, never falling back to the automatic bases. A relative path and a path that does not end with a name are `InvalidInput`, whatever the length of the socket path. A symlink at the base is `EPERM`. The check is made for a long path before any route is tried, and B is made only when a route that uses B is reached. Used by both the binds and the connects |
+| `base: Option<PathBuf>` | where B itself is (for example `/tmp/my-app-1000/sockat`). Made when missing (mode 0711). When the checks fail, `ENOENT` / `ENOTDIR` / `EPERM`, never falling back to the automatic bases. A relative path and a path that does not end with a name are `InvalidInput`, whatever the length of the socket path. A symlink at the base is `EPERM`. The check is made for a long path on every call, before any route is tried, and B is made only when a route that uses B is reached. Used by both the binds and the connects |
 
 ```rust
 let options = sockat::Options {

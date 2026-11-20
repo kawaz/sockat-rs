@@ -58,10 +58,10 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 
 ### B・D・E の持ち方 (`src/base.rs`)
 
-- プロセスの中の登録簿 (`Mutex<Vec<Arc<Base>>>`) が、このプロセスの B を持つ。B は fd で掴み、プロセスが終わるまで閉じない (close-on-exec)。使う前に、fd の `fstat` の `st_nlink` が 0 でなく、B の綴りの `lstat` が持っている `(st_dev, st_ino)` と同じかを確かめ、外れたら外して次に作り直す。D も同じ
+- プロセスの中の登録簿 (`Mutex<Vec<Arc<Base>>>`) が、このプロセスの B を持つ。B は fd で掴み、プロセスが終わるまで閉じない (close-on-exec)。使う前に、fd の `fstat` の `st_nlink` が 0 でなく、B の綴りの `lstat` が持っている `(st_dev, st_ino)` と同じかを確かめ、外れたら外して次に作り直す。D も同じ。消したディレクトリの `st_nlink` は Linux では 0 になるが macOS の APFS では 2 のままなので、名前の確かめは省かない
 - 置き場 1〜3 の B は `Held` が、普段の B と `usable_cross_uid` の B の 2 つの枠で持つ (普段の B が他の uid に辿らせる時は同じ B)。一度持ったらプロセスの間それを使い、作れなかった置き場は覚えず次の呼び出しで試し直す。外では `route::Config` がプロセスの 1 つの `Held` を運ぶ
 - 置き場の順に、何も作らずに分かること (置き場が無い、途中の確かめに外れる、`usable_cross_uid` で途中が other に x を持たない) で外れる置き場を飛ばし、最初に残った置き場で綴りの長さを見積もる。収まらなければ B を作らず、次の置き場にも移らない
-- 他の uid に辿らせるかは、B を持った時に判定して `Base` に覚え、後で見直さない。`Options.base` の確かめも、持っている B はその判定を使う
+- 他の uid に辿らせるか (other の x) は、B を持った時に判定して `Base` に覚え、後で見直さない。`Options.base` の安全の確かめ (途中、持ち主、他人が書けない) は呼び出しのたびに行い、other の x だけは持っている B の判定を使う
 - D を作れなかった B は、その呼び出しの間 (`route::Target`) 覚え、D を使う経路で作り直さない。mode をそろえられない・開けない時は、作った空の D を消す
 - ソケットのディレクトリの B は procB の綴りでだけ使う (`route::forms` が実パスの綴りを出さない)
 - D は B ごとに 1 つ、`O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` の fd に `flock(LOCK_SH | LOCK_NB)` を掛けて持ち続ける。掛けた後に名前で引き直して同じ D かを確かめ、違えば作り直す
