@@ -1,6 +1,6 @@
 # DR-0025: fork の経路の bind は listen を必ず親がする
 
-- Status: Accepted
+- Status: Superseded by DR-0032
 - Date: 2026-11-18
 
 ## Context

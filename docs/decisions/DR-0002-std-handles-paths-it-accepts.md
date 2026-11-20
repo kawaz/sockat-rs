@@ -5,7 +5,7 @@
 
 ## Context
 
-std の `UnixListener::bind` / `UnixStream::connect` は `sun_path` に収まるパスなら受け付ける。sockat はそれより長いパスに届くための crate で、どこから自前の経路 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) に回すかの境界を決める必要がある。
+std の `UnixListener::bind` / `UnixStream::connect` は `sun_path` に収まるパスなら受け付ける。sockat はそれより長いパスに届くための crate で、どこから自前の経路 ([DR-0032](DR-0032-resolve-through-persistent-base.md)) に回すかの境界を決める必要がある。
 
 ## Decision
 
@@ -17,12 +17,12 @@ std の `UnixListener::bind` / `UnixStream::connect` は `sun_path` に収まる
   | Linux / Android / illumos | 108 | 107 バイトまで |
   | macOS / iOS / FreeBSD / NetBSD / OpenBSD | 104 | 103 バイトまで |
 
-- std の判定と同じ境界にする。std (`library/std/src/os/unix/net/addr.rs` の `sockaddr_un`) は `bytes.len() >= addr.sun_path.len()` のパスを `InvalidInput` で断る (試験 `a_path_std_accepts_goes_to_std_unchanged_and_one_byte_more_does_not` が std 自身で確かめる)
-- ブロックしない connect ([DR-0010](DR-0010-public-api.md)) は std では作れないので、自前のソケット ([DR-0015](DR-0015-own-socket-matches-std.md)) に std と同じアドレスのバイト列を渡す
+- std の判定と同じ境界にする。std (`library/std/src/os/unix/net/addr.rs` の `sockaddr_un`) は `bytes.len() >= addr.sun_path.len()` のパスを `InvalidInput` で断る (試験 `the_longest_path_std_accepts_goes_to_std_and_one_byte_more_does_not` が std 自身で確かめる)
+- ブロックしない connect ([DR-0032](DR-0032-resolve-through-persistent-base.md)) は std では作れないので、自前のソケット ([DR-0015](DR-0015-own-socket-matches-std.md)) に std と同じアドレスのバイト列を渡す
 
 ## 理由
 
-- std が受け付けるパスは std に完全に任せる。閾値を小さくすると std が受け付けるパスまで他の経路に回り、std より悪くなる (例: Linux の 101〜107 バイトのパスが /proc の経路に回り、`local_addr()` が `/proc/self/fd/N/name` になる)
+- std が受け付けるパスは std に完全に任せる。閾値を小さくすると std が受け付けるパスまで他の経路に回り、std より悪くなる (例: Linux の 101〜107 バイトのパスが B を通る経路に回り、`local_addr()` が `/proc/<pid>/fd/<n>/<D>/<E>/<name>` になる)
 - どの OS でも同じパスが同じ扱いになることは利用者への約束ではない
 
 ## 却下した案

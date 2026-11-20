@@ -5,7 +5,7 @@
 
 ## Context
 
-async ランタイム (tokio 等) から sockat を使いたい利用者がいる。戻り値は std の型 ([DR-0010](DR-0010-public-api.md))。
+async ランタイム (tokio 等) から sockat を使いたい利用者がいる。戻り値は std の型 ([DR-0032](DR-0032-resolve-through-persistent-base.md))。
 
 ## Decision
 

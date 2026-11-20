@@ -1,6 +1,6 @@
 # DR-0013: local_addr / peer_addr はカーネルに渡した綴りを返すままにし、元のパスは利用者が持つ
 
-- Status: Accepted
+- Status: Superseded by DR-0032
 - Date: 2026-11-18
 
 ## Context

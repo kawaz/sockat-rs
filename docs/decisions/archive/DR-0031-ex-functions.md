@@ -1,6 +1,6 @@
 # DR-0031: 既定の操作ごとに後始末・診断つきの `_ex` を置き、最終手段を使うかを `LastResort` で選ぶ
 
-- Status: Accepted
+- Status: Superseded by DR-0032
 - Date: 2026-11-19
 
 ## Context

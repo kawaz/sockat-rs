@@ -65,11 +65,26 @@ test *ARGS: check
 # Linux の試験を docker で回す (macOS の手元から Linux の経路を確かめる)
 #
 # target は target-linux/ に分ける (macOS の target/ と混ぜない)。registry は
-# named volume に置いて 2 回目以降の取得を省く。
-[doc("Linux の試験を docker (rust:1) で回す")]
+# named volume に置いて 2 回目以降の取得を省く。docker の既定の seccomp の
+# profile は filter を掛けるので、スレッド cwd の経路は使われない。
+[doc("Linux の試験を docker (rust:1、既定の seccomp) で回す")]
 test-linux *ARGS:
     docker run --rm -v "$PWD":/work -w /work -e CARGO_TARGET_DIR=/work/target-linux/docker \
       -v sockat-cargo-registry:/usr/local/cargo/registry rust:1 cargo test "$@"
+
+# seccomp の filter を外した Linux (スレッド cwd の経路を通す)
+[doc("Linux の試験を docker (seccomp=unconfined) で回す")]
+test-linux-unconfined *ARGS:
+    docker run --rm --security-opt seccomp=unconfined -v "$PWD":/work -w /work \
+      -e CARGO_TARGET_DIR=/work/target-linux/docker \
+      -v sockat-cargo-registry:/usr/local/cargo/registry rust:1 cargo test "$@"
+
+# root でない uid 1000 の Linux (置き場と B の持ち主の確かめを root 以外で通す)。
+# リポは読み取り専用で mount し、target と cargo の置き場はコンテナの中に置く。
+[doc("Linux の試験を docker (uid 1000) で回す")]
+test-linux-user *ARGS:
+    docker run --rm --user 1000:1000 -e HOME=/tmp/home -e CARGO_HOME=/tmp/cargo \
+      -e CARGO_TARGET_DIR=/tmp/target -v "$PWD":/work:ro -w /work rust:1 cargo test "$@"
 
 # ---------- 適合試験 (ハブの conformance) ----------
 

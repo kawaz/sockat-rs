@@ -5,7 +5,7 @@
 
 ## Context
 
-sockat の経路 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) は Unix のシステムコールと libc の `sockaddr_un` で組まれている。Unix 以外の target で何をするかを決める必要がある。
+sockat の経路 ([DR-0032](DR-0032-resolve-through-persistent-base.md)) は Unix のシステムコールと libc の `sockaddr_un` で組まれている。Unix 以外の target で何をするかを決める必要がある。
 
 ## Decision
 

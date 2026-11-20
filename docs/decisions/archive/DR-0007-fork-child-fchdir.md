@@ -1,6 +1,6 @@
 # DR-0007: 最後の手として、ディレクトリに fchdir した子を fork する
 
-- Status: Accepted
+- Status: Superseded by DR-0032
 - Date: 2026-11-18
 
 ## Context

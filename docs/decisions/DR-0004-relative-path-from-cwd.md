@@ -9,7 +9,7 @@
 
 ## Decision
 
-connect の順 ([DR-0027](DR-0027-own-directory-and-fallback-routes.md)) の最初の経路にする (`/proc` の無い Linux / Android、Apple の OS、NetBSD / OpenBSD / illumos 等)。bind には使わない (カーネルが覚える綴りが後で cwd 次第で別の場所に当たる)。元のパスが絶対パスで、相対パスが std にそのまま渡せる長さ ([DR-0002](DR-0002-std-handles-paths-it-accepts.md)) なら、それを std に渡す。パスを文字列で書き直すだけで、cwd は変えない。
+connect の順 ([DR-0032](DR-0032-resolve-through-persistent-base.md)) の、書き込みもスレッドも要らない経路にする (`/proc` の無い Linux / Android、Apple の OS、NetBSD / OpenBSD / illumos 等)。bind には使わない (カーネルが覚える綴りが後で cwd 次第で別の場所に当たる)。元のパスが絶対パスで、相対パスが std にそのまま渡せる長さ ([DR-0002](DR-0002-std-handles-paths-it-accepts.md)) なら、それを std に渡す。パスを文字列で書き直すだけで、cwd は変えない。
 
 相対パスは 2 つの作り方を、この順に試す。
 

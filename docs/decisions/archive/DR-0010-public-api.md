@@ -1,6 +1,6 @@
 # DR-0010: 公開 API は std の型を返す同期関数。connect は「fork するか」「ブロックするか」で 4 つ
 
-- Status: Accepted
+- Status: Superseded by DR-0032
 - Date: 2026-11-18
 
 ## Context

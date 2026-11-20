@@ -5,7 +5,7 @@
 
 ## Context
 
-ブロックしない connect ([DR-0010](DR-0010-public-api.md))、スレッド cwd・bindat ([DR-0027](DR-0027-own-directory-and-fallback-routes.md))、広げた sockaddr ([DR-0005](DR-0005-widened-sockaddr-on-macos.md))、fork ([DR-0007](DR-0007-fork-child-fchdir.md)) の経路では、std を通さず sockat がソケットを作り、それを std の型にして返す。
+ブロックしない connect、thread-cwd・thread-cwd-direct、bindat・connectat、広げた sockaddr、DGRAM の経路 ([DR-0032](DR-0032-resolve-through-persistent-base.md)、[DR-0005](DR-0005-widened-sockaddr-on-macos.md)) では、std を通さず sockat がソケットを作り、それを std の型にして返す。
 
 ## Decision
 
@@ -13,11 +13,11 @@
   - close-on-exec
   - `SO_NOSIGPIPE`: std が付ける OS (Apple、FreeBSD、NetBSD、DragonFly) で付ける (閉じた相手への書き込みが SIGPIPE でなく `EPIPE` になる)
   - listen の backlog: std と同じ値 (macOS / Linux / FreeBSD / OpenBSD は -1、他は `SOMAXCONN`)
-- ソケットファイルは listener を閉じても消さない (std と同じ)。消すのは利用者で、元のパスで `remove_file` するか、`bind_ex` の `SocketFile::discard` を使う ([DR-0031](DR-0031-ex-functions.md))。unlink には `sun_path` の上限が無い
+- ソケットファイルは listener を閉じても消さない (std と同じ)。消すのは利用者で、元のパスで `remove_file` するか、`bind_ex` の `SocketFile::remove` を使う
 
 ## 理由
 
-- 理由の記録なし
+- 戻り値は std の型で、std の代わりに置き換えて使う。自前のソケットだけ設定が違うと、経路によって振る舞いが変わる
 
 ## 判断の出所
 

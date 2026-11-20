@@ -1,6 +1,6 @@
 # DR-0006: 安全な置き場の、ソケットのファイルを指す短い symlink を経由する経路 (symlink-file)
 
-- Status: Accepted
+- Status: Superseded by DR-0032
 - Date: 2026-11-18
 
 ## Context

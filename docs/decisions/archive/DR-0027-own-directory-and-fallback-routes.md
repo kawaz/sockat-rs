@@ -1,6 +1,6 @@
 # DR-0027: 長いパスは bind が symlink を辿る OS ではソケットのファイルを指す symlink、他は自分専用のディレクトリ D の中の乱数の symlink R を通して bind し、connect は書き込みもスレッドも要らない経路を先に試す
 
-- Status: Accepted
+- Status: Superseded by DR-0032
 - Date: 2026-11-19
 
 ## Context

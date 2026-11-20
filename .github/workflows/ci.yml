@@ -18,8 +18,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The routes differ per OS (Linux: /proc; macOS: relative / widened
-        # sockaddr / symlink / fork), so each OS runs the whole suite.
+        # The routes differ per OS (Linux: /proc and the thread cwd; macOS:
+        # relative, widened sockaddr, link-file, the thread cwd), so each OS
+        # runs the whole suite.
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
@@ -47,9 +48,10 @@ jobs:
           prepare: pkg install -y rust
           run: cargo test
 
-  # The Unix systems without a dirfd-relative bind / connect. They run the whole
-  # suite in a VM so the routes they share with macOS (relative path, symlink)
-  # and the fork route are exercised on their own kernels.
+  # The Unix systems without a thread cwd or a dirfd-relative bind / connect.
+  # They run the whole suite in a VM so the routes through B and those they
+  # share with macOS (relative path, link-file) are exercised on their own
+  # kernels.
   netbsd:
     name: Test (NetBSD VM)
     runs-on: ubuntu-latest
@@ -100,8 +102,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The fork-only route (no dirfd primitive) and the BSD sockaddr layout.
-        target: [x86_64-unknown-netbsd, x86_64-unknown-freebsd, aarch64-apple-ios]
+        # The routes behind cfg per OS (no thread cwd, bindat) and the BSD
+        # sockaddr layout.
+        target: [x86_64-unknown-netbsd, x86_64-unknown-freebsd, aarch64-apple-ios, x86_64-unknown-illumos]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
