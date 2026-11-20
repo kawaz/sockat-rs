@@ -724,7 +724,10 @@ fn spelled_base(
         return base::given(given, cross).map(Ok);
     }
     let proc_len = proc_prefix_estimate(t.cfg);
-    let by_proc = !cross && fits_through(proc_len, 1, Some(t.name));
+    // Where /proc cannot be used at all, no B can be spelled by it, so a
+    // spelling that only procB would fit is known not to fit.
+    let proc_usable = std::fs::metadata(t.cfg.proc.join("self").join("fd")).is_ok();
+    let by_proc = !cross && proc_usable && fits_through(proc_len, 1, Some(t.name));
     let fits = |b: &Path| {
         let real = path::len(b);
         fits_through(real, 1, Some(t.name)) || by_proc || (link_file && fits_through(real, 1, None))

@@ -114,6 +114,31 @@
 //! * branching on `route`, `base` or `skipped`: they are diagnostics; branch
 //!   on [`Spelling`].
 //!
+//! What to do instead, run as a test:
+//!
+//! ```
+//! use std::io;
+//! use std::path::Path;
+//!
+//! fn serve(path: &Path) -> io::Result<()> {
+//!     let path = std::path::absolute(path)?; // absolute before the bind
+//!     let bound = sockat::bind_ex(&path, Default::default())?;
+//!     if let sockat::Spelling::Linked { removable: false, .. } = bound.spelling {
+//!         // removing by local_addr()'s spelling would remove E: use the path or remove()
+//!     }
+//!     // ... accept on bound.socket (it may go to tokio etc.) ...
+//!     bound.file.remove()?; // before the listener is closed
+//!     drop(bound.socket);
+//!     Ok(())
+//! }
+//! # let dir = tempfile::Builder::new().prefix("sockat-").tempdir_in("/tmp")?;
+//! # let deep = dir.path().join("d".repeat(150));
+//! # std::fs::create_dir(&deep)?;
+//! # serve(&deep.join("s.sock"))?;
+//! # assert_eq!(std::fs::read_dir(&deep)?.count(), 0);
+//! # Ok::<(), io::Error>(())
+//! ```
+//!
 //! # Errors
 //!
 //! The errors of `bind(2)`, `listen(2)` and `connect(2)` as
@@ -124,7 +149,8 @@
 //! accepts that does not end with a file name, and for a path of any length
 //! with a NUL byte (on Linux a leading NUL, the abstract namespace, goes to
 //! std as it is). [`Options::base`] that fails its checks is `ENOENT`,
-//! `ENOTDIR` or `EPERM`, never another place. The `_ex` functions return an
+//! `ENOTDIR` or `EPERM`, never another place (`InvalidInput` when it is
+//! relative or does not end with a name). The `_ex` functions return an
 //! [`ExError`], which converts into the `io::Error` by `?`.
 //!
 //! # Async runtimes
@@ -200,7 +226,8 @@ pub struct Options {
     /// cleans up itself ([`sweep_base`]). Made when missing, checked (the
     /// directories on the way no other user can change, B this user's and not
     /// writable by group and others), and an error (`ENOENT`, `ENOTDIR`,
-    /// `EPERM`) rather than another place when the check fails. The check is
+    /// `EPERM`) rather than another place when the check fails; it must be
+    /// absolute and end with a name (else `InvalidInput`). The check is
     /// made before any route is tried, for a long path only; B is made only
     /// when a route that uses it is reached. Used for the binds and the
     /// connects.

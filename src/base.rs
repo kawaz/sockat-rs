@@ -636,12 +636,25 @@ impl Dir {
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
             }
-            sys::chmod_at(b, &name, 0o711)?;
-            let fd = sys::open_dir_at(b, &name, libc::O_RDONLY)?;
-            let m = std::fs::File::from(fd.try_clone()?).metadata()?;
-            if !(m.is_dir() && m.uid() == sys::effective_uid()) {
-                return Err(refused());
-            }
+            // Nothing but this process makes entries in B (its own), so what
+            // is at the name is the directory just made; one that cannot be
+            // made ready is removed again (it is empty).
+            let opened = sys::chmod_at(b, &name, 0o711)
+                .and_then(|()| sys::open_dir_at(b, &name, libc::O_RDONLY))
+                .and_then(|fd| {
+                    let m = std::fs::File::from(fd.try_clone()?).metadata()?;
+                    match m.is_dir() && m.uid() == sys::effective_uid() {
+                        true => Ok((fd, m)),
+                        false => Err(refused()),
+                    }
+                });
+            let (fd, m) = match opened {
+                Ok(done) => done,
+                Err(e) => {
+                    let _ = sys::unlink_at(b, &name, true);
+                    return Err(e);
+                }
+            };
             if !sys::lock(fd.as_fd(), sys::Lock::Shared)? {
                 continue;
             }
