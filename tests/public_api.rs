@@ -375,6 +375,68 @@ fn long_path_errors_through_the_public_api() {
     );
 }
 
+// An empty path is an argument error through every public function (hub
+// SPEC "短いパス"), whatever the OS: InvalidInput with no errno, before std
+// sees it (std's bind on Linux would autobind to an unnamed abstract address,
+// a socket the caller did not name; macOS's kernel answers EINVAL). The _ex
+// and resolve functions report no route and nothing skipped (no route was
+// tried), and nothing is made at the Options.base they are given.
+#[test]
+fn an_empty_path_is_invalid_input_everywhere() {
+    let t = tmp();
+    let check = |what: &str, e: io::Error| {
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{what}: {e}");
+        assert_eq!(e.raw_os_error(), None, "{what}: {e}");
+    };
+    let check_ex = |what: &str, e: sockat::ExError| {
+        assert_eq!(e.route, None, "{what}");
+        assert!(e.skipped.is_empty(), "{what}");
+        check(what, e.error);
+    };
+    let caller = UnixDatagram::unbound().unwrap();
+    check("bind", sockat::bind("").unwrap_err());
+    check("connect", sockat::connect("").unwrap_err());
+    check(
+        "connect_nonblocking",
+        sockat::connect_nonblocking("").unwrap_err(),
+    );
+    check("datagram::bind", sockat::datagram::bind("").unwrap_err());
+    check(
+        "datagram::connect",
+        sockat::datagram::connect(&caller, "").unwrap_err(),
+    );
+    check_ex("bind_ex", sockat::bind_ex("", own_base(&t)).err().unwrap());
+    check_ex(
+        "connect_ex",
+        sockat::connect_ex("", own_base(&t)).err().unwrap(),
+    );
+    check_ex(
+        "connect_nonblocking_ex",
+        sockat::connect_nonblocking_ex("", own_base(&t))
+            .err()
+            .unwrap(),
+    );
+    check_ex(
+        "datagram::bind_ex",
+        sockat::datagram::bind_ex("", own_base(&t)).err().unwrap(),
+    );
+    check_ex(
+        "datagram::connect_ex",
+        sockat::datagram::connect_ex(&caller, "", own_base(&t))
+            .err()
+            .unwrap(),
+    );
+    check_ex(
+        "resolve_for_bind",
+        sockat::resolve_for_bind("", own_base(&t)).err().unwrap(),
+    );
+    check_ex(
+        "resolve_for_connect",
+        sockat::resolve_for_connect("", own_base(&t)).err().unwrap(),
+    );
+    assert!(!t.path().join("b").exists(), "Options.base was made");
+}
+
 // A datagram connect at a long path to a socket file no socket holds (bound,
 // then closed) fails as std's datagram connect fails at a short path in the
 // same situation, with the same errno on this OS. sockat hands the connect's

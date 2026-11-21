@@ -168,6 +168,10 @@ Linux の bind は、ファイル名がおよそ 96 バイトを超えるか、s
 
 先頭以外に NUL を含むパスは、長さによらず何も作らずに `InvalidInput` を返す (カーネルは NUL の手前までしか読まず、別の場所にソケットができるため)。Linux / Android で先頭が NUL のパス (abstract namespace) は長さによらず std にそのまま渡す (std は `InvalidInput` を返す。abstract の名前は std の `SocketAddr::from_abstract_name` と `bind_addr` / `connect_addr` で扱う)。
 
+### 空のパス
+
+空のパスは、どの関数でも std に渡さず、何も作らずに `InvalidInput` を返す (`ExError` の `route` は `None`、`skipped` は空)。Linux の std は空のパスの bind を名前の無い abstract のアドレスに autobind する (macOS は `EINVAL`) が、それは渡したパスのソケットではないため。
+
 ## 綴りの性質 Spelling
 
 `bind_ex` と `resolve_for_bind` は、bind の綴りを後で使えるかを `Spelling` で返す。分岐はこれで行う。
@@ -401,6 +405,7 @@ fn serve(path: &Path) -> io::Result<()> {
 | `Options::base` の確かめに通った後、B を作れない | 作れなかったエラー |
 | std にそのまま渡せない長さのパスで、名前で終わらない (`dir/`、`dir/.`、`..` 等) | `InvalidInput` |
 | NUL を含むパス (長さによらない) | `InvalidInput` |
+| 空のパス | `InvalidInput` |
 | relative の途中、または相対パスの `bind_ex` の途中で cwd が変わった | `Other` |
 | `bind_ex` が bind した直後、そこ (最後の要素が symlink なら辿った先) にソケットでない物がある。`socket_file()` が辿った先がソケットでない | `ENOTSOCK` |
 | `cleanup` / `remove` で E を消せない (既に無い時を除く) | `unlink` のエラー |

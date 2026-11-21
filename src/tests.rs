@@ -2194,6 +2194,58 @@ fn a_nonblocking_connect_does_not_wait() {
 // arguments
 // ---------------------------------------------------------------------------
 
+// An empty path is an argument error (hub SPEC "短いパス"), refused at the
+// entry of every call before std sees it: std's bind on Linux takes it as a
+// request to autobind to an unnamed abstract address, a socket the caller
+// did not name (and bind_ex then failed with ENOENT looking for its file),
+// while macOS's kernel answers EINVAL. So every request (stream and datagram
+// bind, blocking and nonblocking connect, datagram connect, with or without
+// remembering the file) and both resolves give InvalidInput with no errno,
+// no route and nothing skipped (no route was tried), and nothing is made in
+// the place for B or at Options.base.
+#[test]
+fn an_empty_path_is_invalid_input_before_std() {
+    let (t, place) = setup();
+    let cfg = config(&place);
+    let given = Options {
+        base: Some(t.path().join("given")),
+        ..opts()
+    };
+    let caller = UnixDatagram::unbound().unwrap();
+    let requests = [
+        BIND,
+        Request::Bind(SockType::Datagram),
+        CONNECT,
+        Request::Connect(Connect::Stream { nonblocking: true }),
+        Request::Connect(Connect::Datagram(&caller)),
+    ];
+    let empty = Path::new("");
+    for options in [opts(), given.clone()] {
+        for req in requests {
+            for remember in [false, true] {
+                let Err(f) = route::run(req, empty, &options, remember, Some(&cfg)) else {
+                    panic!("{req:?}: an empty path was taken")
+                };
+                assert_eq!(f.error.kind(), io::ErrorKind::InvalidInput, "{req:?}");
+                assert_eq!(f.error.raw_os_error(), None, "{req:?}: {}", f.error);
+                assert_eq!(f.route, None, "{req:?}");
+                assert!(f.skipped.is_empty(), "{req:?}");
+            }
+        }
+        for for_ in [route::Use::Bind, route::Use::Connect] {
+            let Err(f) = route::resolve(for_, empty, &options, Some(&cfg)) else {
+                panic!("{for_:?}: an empty path was resolved")
+            };
+            assert_eq!(f.error.kind(), io::ErrorKind::InvalidInput, "{for_:?}");
+            assert_eq!(f.error.raw_os_error(), None, "{for_:?}");
+            assert_eq!(f.route, None, "{for_:?}");
+            assert!(f.skipped.is_empty(), "{for_:?}");
+        }
+    }
+    assert!(entries(&place).is_empty());
+    assert!(!t.path().join("given").exists());
+}
+
 // A long path that does not end with a file name, and a path of any length
 // with a NUL byte, are InvalidInput before anything is looked up or made: no
 // route, nothing skipped, no B.

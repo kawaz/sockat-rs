@@ -354,10 +354,11 @@ impl Step {
 /// Bind or connect `path` by the first route that can be used.
 ///
 /// A path of at most [`DIRECT_MAX`] bytes goes to std as is, before anything
-/// else is looked at (the environment included). A NUL byte is looked at
-/// before the length: a path with one is `InvalidInput` at any length, except
-/// a leading NUL on Linux / Android (a name in the abstract namespace, which
-/// goes to std as is).
+/// else is looked at (the environment included). An empty path and a NUL
+/// byte are looked at before the length: an empty path is `InvalidInput`
+/// (before the abstract namespace is looked at), and so is a path with a NUL
+/// at any length, except a leading NUL on Linux / Android (a name in the
+/// abstract namespace, which goes to std as is).
 ///
 /// With `remember` (`bind_ex`), the socket file is looked up right after the
 /// bind ([`Remembered`]). A relative path is resolved against the cwd both by
@@ -446,6 +447,7 @@ fn run_unchecked(
         })
     };
     refuse_bad_base(options)?;
+    path::refuse_empty(path).map_err(Failed::before_routes)?;
     if path::is_abstract(path) {
         return direct(req, path);
     }
@@ -1346,6 +1348,7 @@ pub(crate) fn resolve(
         },
     };
     refuse_bad_base(options)?;
+    path::refuse_empty(path).map_err(Failed::before_routes)?;
     if path::is_abstract(path) {
         return Ok(short(path));
     }

@@ -57,6 +57,7 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 - `remove` は失敗しても `cleanup` まで行い、ファイルの側のエラーを先に、無ければ `cleanup` のエラーを返す。印を立てるのは両方が通った時だけで、失敗した後の呼び出しはもう一度確かめて消しに行く
 - 呼び出しの中で消す E (bind が失敗した時・ソケットのファイルを覚えられなかった時の E、thread-cwd・at の E、既定の connect の E) は、消すのに失敗しても捨てる (`let _`、`TempLink` の Drop)。呼び出しの成否も元のエラーも変えない
 - bind の後に覚えるソケットのファイルは、どの経路も `route::remembered_at` で引く: パスを `realpath` し (最後の要素の symlink も辿る。Apple・NetBSD の bind はそこを辿ってその先にソケットを作る)、その `lstat` を覚える。ソケットでなければ `ENOTSOCK` で覚えない。standard は元のパス、link-dir・link-file・thread-cwd・at はソケットのディレクトリの実パスとファイル名を引き、link-dir は加えて綴りの `stat` が同じ物かを確かめる。`ForBind::socket_file()` は綴りを同じ関数で引く
+- std に渡す前に引数の誤り (`InvalidInput`、`route` は `None`、`skipped` は空) にする物は、先頭以外の NUL (ハブ DR-0006) と空のパス (ハブ SPEC「短いパス」)。どちらも長さによらず、全ての関数の入口 (`route::run`・`route::resolve`) で、abstract の名前の判定より前に断る (`path::refuse_empty`・`path::refuse_nul`)。`Options.base` の形の検査はその前
 - 作らないもの: `datagram::send_to`・`send_to_ex` と `seqpacket` (ハブ SPEC の「未確定」)
 
 ### B・D・E の持ち方 (`src/base.rs`)
@@ -105,6 +106,7 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 - ソケットでない物を覚えないのを、SPEC が求める最後の要素が symlink の時に限らずどの場合にも行うのは、`bind_ex` が bind した直後の名前にソケットでない物があれば置き換わった物で、覚えると `remove` がそれを消すため (`ForBind::socket_file()` と同じ確かめ)
 - B・D はプロセスごとの状態 (ハブ DR-0017) なので、プロセス全体の登録簿に置く。試験は置き場を試験ごとの一時ディレクトリにするので、登録簿を共有しても B は重ならない
 - 置き場 1〜3 の B は置き場によらずプロセスに 1 つなので、置き場で引く登録簿では表せない。プロセスに 1 つの `Held` を `Config` で運ぶと、外の振る舞いはそのままで、試験は試験ごとの `Held` で 1 つのプロセスを模せる
+- 空のパスを std に渡さないのは、[DR-0002](DR-0002-std-handles-paths-it-accepts.md) の「std が受け付けるパスには何も足さない」の例外 (先頭以外の NUL と同じ)。Linux の std は空のパスの bind を名前の無い abstract のアドレスに autobind し、それは呼び出し側が頼んだソケットのファイルではない (`bind_ex` が覚えるファイルも無い)。macOS の std は `EINVAL` を返すので、errno の無い `InvalidInput` に変わるが `ErrorKind` は同じ
 - B 自身の other の x だけを見直すのは、2 つのプロセスが同時に B を初めて作ると、片方の `mkdirat` (0700) と `fchmodat` (0711) の間にもう片方がその B を開いて 0700 と覚えうるため (ハブ SPEC-routes「実体の置き場」)。見直しは B の fd の `fstat` 1 回で、B を作り直さない。持っていると分かった後は覚えて見直さない (持っていると覚えた B を見直さないのと同じ)
 - 作った直後に名前で mode を変えるのは、Linux の B の fd が `O_PATH` (`fchmod` を受け付けない) で、umask が持ち主の読み・辿る権限を削ると `O_RDONLY` / `O_SEARCH` では開けないため。親は途中の確かめに通っていて、作った物を他人は付け替えられない (sticky な `/tmp` でも、消す・名前を変えるのは持ち主だけ)
 

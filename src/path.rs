@@ -23,6 +23,24 @@ pub(crate) fn is_abstract(path: &Path) -> bool {
         && path.as_os_str().as_bytes().first() == Some(&0)
 }
 
+/// `InvalidInput` when `path` is empty (hub SPEC "短いパス": an argument
+/// error).
+///
+/// Refused before std sees it, although std would take it on Linux: there a
+/// bind with an empty path autobinds to an unnamed abstract address, a socket
+/// the caller did not name (and no file `bind_ex` could remember). Like a
+/// NUL ([`refuse_nul`]), an exception to handing std every path it accepts.
+/// Checked before [`is_abstract`] (an empty path names nothing at all).
+pub(crate) fn refuse_empty(path: &Path) -> io::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path is empty",
+        ));
+    }
+    Ok(())
+}
+
 /// `InvalidInput` when `path` contains a NUL byte, at any length.
 ///
 /// The kernel takes a socket path up to its first NUL, so a path with a NUL
@@ -144,7 +162,7 @@ mod tests {
     // the directory part, in the file name, at the end and at the start (the
     // Linux abstract namespace, a leading NUL, is set aside by the caller with
     // is_abstract before this is asked). A path without one is left alone, the
-    // empty path included (std and the kernel judge that one).
+    // empty path included (refuse_empty judges that one).
     #[test]
     fn refuse_nul_refuses_a_nul_anywhere() {
         for bad in [&b"/d\0/s.sock"[..], b"/d/s\0.sock", b"/d/s.sock\0", b"\0s"] {

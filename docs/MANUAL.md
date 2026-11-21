@@ -168,6 +168,10 @@ A bind on Linux is `ENAMETOOLONG` when the file name is over about 96 bytes, or 
 
 A path with a NUL anywhere but at the start is `InvalidInput` at any length, with nothing created (the kernel reads only up to the NUL, so the socket would be made elsewhere). On Linux / Android a path starting with a NUL (the abstract namespace) goes to std as it is at any length (std returns `InvalidInput`; abstract names are handled with std's `SocketAddr::from_abstract_name` and `bind_addr` / `connect_addr`).
 
+### The empty path
+
+An empty path is `InvalidInput` from every function, with nothing created and nothing handed to std (`ExError`'s `route` is `None`, `skipped` empty). Linux's std autobinds a bind with an empty path to an unnamed abstract address (macOS answers `EINVAL`), which is not a socket at the path given.
+
 ## Spelling properties: Spelling
 
 `bind_ex` and `resolve_for_bind` tell by `Spelling` whether a bind's spelling can be used later. Branch on it.
@@ -401,6 +405,7 @@ fn serve(path: &Path) -> io::Result<()> {
 | `Options::base` passes its check, but B cannot be made | the error of making it |
 | A path too long for std that does not end with a name (`dir/`, `dir/.`, `..`, ...) | `InvalidInput` |
 | A path containing a NUL (at any length) | `InvalidInput` |
+| The empty path | `InvalidInput` |
 | The cwd changed during relative, or during `bind_ex` of a relative path | `Other` |
 | Right after `bind_ex`'s bind, what is there (where a symlink leads, when the last component is one) is not a socket. What `socket_file()` reaches is not a socket | `ENOTSOCK` |
 | `cleanup` / `remove` cannot remove E (other than it being gone already) | the error of `unlink` |

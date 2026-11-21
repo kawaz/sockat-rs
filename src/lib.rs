@@ -145,10 +145,11 @@
 //! [`std::io::Error`]s: `ENOENT` for a missing directory or socket,
 //! `ENOTDIR`, `EADDRINUSE`, `ECONNREFUSED`, `EAGAIN` for a full backlog on a
 //! nonblocking connect (Linux; macOS answers `ECONNREFUSED`). `ENAMETOOLONG`
-//! when no route reaches the path. `InvalidInput` for a path longer than std
-//! accepts that does not end with a file name, and for a path of any length
-//! with a NUL byte (on Linux a leading NUL, the abstract namespace, goes to
-//! std as it is). [`Options::base`] that fails its checks is `ENOENT`,
+//! when no route reaches the path. `InvalidInput` for an empty path (which
+//! std's bind on Linux would autobind to an unnamed abstract address), for a
+//! path longer than std accepts that does not end with a file name, and for a
+//! path of any length with a NUL byte (on Linux a leading NUL, the abstract
+//! namespace, goes to std as it is). [`Options::base`] that fails its checks is `ENOENT`,
 //! `ENOTDIR` or `EPERM`, never another base (`InvalidInput` when it is
 //! relative or does not end with a name). The `_ex` functions return an
 //! [`ExError`], which converts into the `io::Error` by `?`.
@@ -620,9 +621,10 @@ pub(crate) fn bound<S: From<OwnedFd>>(
 ///
 /// The errors of `bind(2)` / `listen(2)`, for example `EADDRINUSE` when `path`
 /// exists and `ENOENT` when its directory does not; `ENAMETOOLONG` when no
-/// route reaches the path; `InvalidInput` for a path longer than std accepts
-/// that does not end with a file name, or for a path that contains a NUL
-/// byte.
+/// route reaches the path; `InvalidInput` for an empty path (on Linux std's
+/// bind would autobind it to an unnamed abstract address), for a path longer
+/// than std accepts that does not end with a file name, or for a path that
+/// contains a NUL byte.
 pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
     let (socket, _, _) = bind_with(SockType::Stream, path.as_ref(), &Options::default(), false)?;
     Ok(UnixListener::from(socket))
