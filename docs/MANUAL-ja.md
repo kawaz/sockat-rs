@@ -314,6 +314,7 @@ let stream = tokio::net::UnixStream::from_std(stream)?;
 
 - **OpenBSD の Rust 1.99 以前の std はアドレスの最後の 1 バイトを落とす。** `local_addr()`・`peer_addr()`・`recv_from()` が返すパスの最後の 1 バイトが欠ける (std の不具合で、sockat に関係なく短いパスでも同じ。[rust-lang/rust#118925](https://github.com/rust-lang/rust/issues/118925)、Rust 1.100.0 で修正)。カーネルが返すアドレスは欠けていない。std の `recv_from` のアドレスへ DGRAM を返信するには Rust 1.100 以上が要る
 - **Linux の std は空のパスの bind を abstract のアドレスに autobind する。** sockat は空のパスを std に渡さず `InvalidInput` にする ([空のパス](#空のパス))
+- **std はパスで渡した abstract の名前 (先頭が NUL) を受け付けない。** `bind`・`bind_ex` は std に渡し、std の `InvalidInput` を返す。abstract の名前は std の `SocketAddr::from_abstract_name` と `bind_addr` で bind する。`resolve_for_bind` に渡した abstract の名前はそのまま返り、その `socket_file()` はファイルを持たない `SocketFile` を返す (`remove()` はファイルを消さない。仕様の [`remove`](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#remove))
 
 ## 確かめていないこと
 

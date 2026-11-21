@@ -314,6 +314,7 @@ let stream = tokio::net::UnixStream::from_std(stream)?;
 
 - **On OpenBSD, std in Rust 1.99 and earlier drops the last byte of an address.** The path from `local_addr()`, `peer_addr()` and `recv_from()` lacks its last byte (a bug in std, the same for a short path and without sockat; [rust-lang/rust#118925](https://github.com/rust-lang/rust/issues/118925), fixed in Rust 1.100.0). The address the kernel reports is whole. Replying to a datagram at the address from std's `recv_from` needs Rust 1.100 or later
 - **Linux's std autobinds a bind with an empty path to an abstract address.** sockat does not hand an empty path to std and makes it `InvalidInput` ([The empty path](#the-empty-path))
+- **std does not take an abstract name (a leading NUL) given as a path.** `bind` and `bind_ex` hand it to std and return std's `InvalidInput`. Bind an abstract name with std's `SocketAddr::from_abstract_name` and `bind_addr`. `resolve_for_bind` hands an abstract name back as it is, and its `socket_file()` gives a `SocketFile` with no file (its `remove()` removes no file; the spec's [`remove`](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#remove))
 
 ## Not checked
 

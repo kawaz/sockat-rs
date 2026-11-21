@@ -344,8 +344,9 @@ impl From<route::Failed> for ExError {
 /// [`SocketFile::remove`], E only by it or [`SocketFile::cleanup`].
 #[derive(Debug)]
 pub struct SocketFile {
-    path: PathBuf,
-    id: (u64, u64),
+    /// The socket file's real path and `(st_dev, st_ino)`; none for a name
+    /// in the abstract namespace, which is no file.
+    file: Option<route::Remembered>,
     clean: Arc<Clean>,
     /// Whether this file has been removed (read and set under `clean`'s
     /// lock).
@@ -398,13 +399,21 @@ impl Clean {
 }
 
 impl SocketFile {
-    fn new(r: route::Remembered, clean: Arc<Clean>) -> Self {
+    fn new(kept: route::Kept, clean: Arc<Clean>) -> Self {
         Self {
-            path: r.path,
-            id: r.id,
+            file: match kept {
+                route::Kept::File(r) => Some(r),
+                route::Kept::Abstract => None,
+            },
             clean,
             removed: AtomicBool::new(false),
         }
+    }
+
+    /// The socket file's real path (test-only).
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.file.as_ref().expect("a socket file").path
     }
 
     /// Remove the socket file if what is at its real path now is still the
@@ -423,6 +432,10 @@ impl SocketFile {
     /// someone who can write to the directory, is removed instead (POSIX has
     /// no way to remove a file by its inode).
     ///
+    /// For a name in the abstract namespace (Linux / Android, a path whose
+    /// first byte is NUL) there is no file: this removes none, and only
+    /// cleans up as [`SocketFile::cleanup`] does.
+    ///
     /// # Errors
     ///
     /// Those of `lstat(2)` (other than `ENOENT` and `ENOTDIR`) and `unlink(2)`
@@ -435,18 +448,21 @@ impl SocketFile {
             return Ok(());
         }
         let gone = |e: &io::Error| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR));
-        let removed = match file_id(&self.path) {
-            Ok(id) if id == self.id => {
-                #[cfg(test)]
-                self.clean.file_unlinks.fetch_add(1, Ordering::Relaxed);
-                match std::fs::remove_file(&self.path) {
-                    Err(e) if gone(&e) => Ok(()),
-                    removed => removed,
+        let removed = match &self.file {
+            None => Ok(()),
+            Some(file) => match file_id(&file.path) {
+                Ok(id) if id == file.id => {
+                    #[cfg(test)]
+                    self.clean.file_unlinks.fetch_add(1, Ordering::Relaxed);
+                    match std::fs::remove_file(&file.path) {
+                        Err(e) if gone(&e) => Ok(()),
+                        removed => removed,
+                    }
                 }
-            }
-            Ok(_) => Ok(()),
-            Err(e) if gone(&e) => Ok(()),
-            Err(e) => Err(e),
+                Ok(_) => Ok(()),
+                Err(e) if gone(&e) => Ok(()),
+                Err(e) => Err(e),
+            },
         };
         // E is cleaned up even when the file could not be removed; the
         // file's error is the one returned (hub SPEC "remove").

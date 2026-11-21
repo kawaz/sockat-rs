@@ -2959,7 +2959,7 @@ fn remove_leaves_a_symlink_at_the_path_and_removes_where_it_led() {
         assert!(is_socket(&target), "{route}: the bind followed the symlink");
         let file = SocketFile::new(r.file.take().unwrap(), crate::Clean::new(r.link.clone()));
         assert_eq!(
-            file.path,
+            file.path(),
             std::fs::canonicalize(&target).unwrap(),
             "{route}"
         );
@@ -2999,7 +2999,7 @@ fn socket_file_through_a_symlink_at_the_path_remembers_where_it_led() {
             route::remember_resolved(&r.path, r.cwd).unwrap(),
             crate::Clean::new(r.link),
         );
-        assert_eq!(file.path, std::fs::canonicalize(&target).unwrap());
+        assert_eq!(file.path(), std::fs::canonicalize(&target).unwrap());
         file.remove().unwrap();
         assert!(std::fs::symlink_metadata(&target).is_err(), "{p:?}");
         assert!(p.is_symlink(), "{p:?}");
@@ -3151,7 +3151,7 @@ fn a_bind_through_a_symlink_and_dot_dot_is_not_folded() {
             got.file.take().unwrap(),
             crate::Clean::new(got.link.clone()),
         );
-        assert_eq!(file.path, x.real, "{route}");
+        assert_eq!(file.path(), x.real, "{route}");
         file.remove().unwrap();
         assert!(std::fs::symlink_metadata(&x.real).is_err(), "{route}");
         x.untouched(route);
@@ -3257,7 +3257,7 @@ fn child_relative_path_through_a_symlink_and_dot_dot() {
         got.file.take().unwrap(),
         crate::Clean::new(got.link.clone()),
     );
-    assert_eq!(file.path, x.real);
+    assert_eq!(file.path(), x.real);
     file.remove().unwrap();
     assert!(std::fs::symlink_metadata(&x.real).is_err());
     x.untouched("standard");
@@ -3268,7 +3268,11 @@ fn child_relative_path_through_a_symlink_and_dot_dot() {
     let resolved = route::resolve(route::Use::Bind, rel, &opts(), Some(&config(&place))).unwrap();
     assert_eq!(resolved.path, rel);
     let _l = UnixListener::bind(&resolved.path).unwrap();
-    let remembered = route::remember_resolved(&resolved.path, resolved.cwd).unwrap();
+    let route::Kept::File(remembered) =
+        route::remember_resolved(&resolved.path, resolved.cwd).unwrap()
+    else {
+        panic!("no file remembered")
+    };
     assert_eq!(remembered.path, y.real);
     y.untouched("resolve_for_bind");
 

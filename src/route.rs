@@ -299,7 +299,7 @@ pub(crate) struct Reached {
     /// The E the bind's spelling goes through (link-dir, link-file), kept.
     pub(crate) link: Option<Arc<Link>>,
     /// The socket file, when asked for (`bind_ex`).
-    pub(crate) file: Option<Remembered>,
+    pub(crate) file: Option<Kept>,
     pub(crate) skipped: Vec<Skipped>,
 }
 
@@ -460,7 +460,10 @@ fn run_unchecked(
             after_bind();
         }
         let file = match remember && req.is_bind() {
-            true => Some(remembered_at(path).map_err(failed)?),
+            true => Some(match path::is_abstract(path) {
+                true => Kept::Abstract,
+                false => Kept::File(remembered_at(path).map_err(failed)?),
+            }),
             false => None,
         };
         Ok(Reached {
@@ -506,7 +509,7 @@ fn run_unchecked(
             base: hit.base,
             spelling: hit.spelling,
             link: hit.link,
-            file: hit.file,
+            file: hit.file.map(Kept::File),
             skipped,
         }),
         Step::Done {
@@ -560,6 +563,15 @@ fn after_bind() {
     if let Some(f) = AFTER_BIND.get() {
         f();
     }
+}
+
+/// What a bind leaves for `remove` to look at (hub SPEC "remove"): the socket
+/// file it made, or no file at all for a name in the abstract namespace
+/// (Linux / Android), whose `remove` removes no file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Kept {
+    File(Remembered),
+    Abstract,
 }
 
 /// The [`Remembered`] of the socket file a bind reached by `path` just now:
@@ -1604,18 +1616,19 @@ fn resolve_connect(t: &Target<'_>) -> io::Result<Option<Through>> {
 
 /// The socket file a resolved bind spelling reaches now (`ForBind`'s
 /// `socket_file()`): [`remembered_at`] the spelling (followed to the end, a
-/// symlink in the last component of the path too). For a `CwdRelative`
-/// spelling the cwd must still be the one it was resolved against.
-pub(crate) fn remember_resolved(
-    spelling: &Path,
-    cwd: Option<(u64, u64)>,
-) -> io::Result<Remembered> {
+/// symlink in the last component of the path too), or no file for a name in
+/// the abstract namespace (hub SPEC "remove"). For a `CwdRelative` spelling
+/// the cwd must still be the one it was resolved against.
+pub(crate) fn remember_resolved(spelling: &Path, cwd: Option<(u64, u64)>) -> io::Result<Kept> {
+    if path::is_abstract(spelling) {
+        return Ok(Kept::Abstract);
+    }
     if cwd.is_some() && dir_id(Path::new(".")) != cwd {
         return Err(io::Error::other(
             "the current directory changed since the path relative to it was resolved",
         ));
     }
-    remembered_at(spelling)
+    remembered_at(spelling).map(Kept::File)
 }
 
 // ---------------------------------------------------------------------------

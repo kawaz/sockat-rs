@@ -400,6 +400,38 @@ fn default_binds_in_one_directory_share_their_e() {
     ping_through_spelling(&a, "default_binds_share_one_link_dir_e_per_directory");
 }
 
+// A name in the abstract namespace (Linux / Android: a path whose first byte
+// is NUL) is no file (hub SPEC "remove"). resolve_for_bind hands it back as
+// it is (Original); bound by the user through std's abstract address,
+// socket_file() gives a SocketFile with no file, whose remove() removes
+// nothing and succeeds (and again), and the socket goes on answering. std's
+// bind of such a path refuses it (InvalidInput: std takes abstract names only
+// through SocketAddr), and bind_ex hands that refusal back as std's.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn an_abstract_name_gets_a_socket_file_with_no_file() {
+    use std::os::linux::net::SocketAddrExt;
+    let name = format!("sockat-rs-test-{}-{}", std::process::id(), line!());
+    let mut bytes = vec![0u8];
+    bytes.extend_from_slice(name.as_bytes());
+    let path = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
+
+    let spelled = sockat::resolve_for_bind(&path, Default::default()).unwrap();
+    assert_eq!(spelled.path, path);
+    assert_eq!(spelled.spelling, Spelling::Original);
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+    let listener = UnixListener::bind_addr(&addr).unwrap();
+    let file = spelled.socket_file().unwrap();
+    file.remove().unwrap();
+    file.remove().unwrap();
+    let mut c = UnixStream::connect_addr(&addr).unwrap();
+    ping(&listener, &mut c);
+
+    let e = sockat::bind_ex(&path, Default::default()).err().unwrap();
+    assert_eq!(e.error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(e.route, Some("standard"));
+}
+
 // An empty path is an argument error through every public function (hub
 // SPEC "短いパス"), whatever the OS: InvalidInput with no errno, before std
 // sees it (std's bind on Linux would autobind to an unnamed abstract address,
