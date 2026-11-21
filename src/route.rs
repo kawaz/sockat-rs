@@ -733,13 +733,30 @@ fn wide_allowed(_cfg: &Config) -> bool {
 // B and the spellings through it
 // ---------------------------------------------------------------------------
 
-/// The length of `/proc/<pid>/fd/<fd>` before B is open: the fd is taken to
-/// get a number of as many digits as the lowest free one now plus one.
-fn proc_prefix_estimate(cfg: &Config) -> usize {
-    let fd_digits = std::fs::File::open("/")
-        .map(|f| (f.as_raw_fd() + 1).to_string().len())
-        .unwrap_or(2);
-    path::len(&cfg.proc) + 1 + sys::process_id().to_string().len() + "/fd/".len() + fd_digits
+/// Whether `<proc>/<dir>/<fd's number>` names what `fd` is open on: the
+/// same `(st_dev, st_ino)` by `stat` as by `fstat` of the fd (hub SPEC "用語":
+/// `/proc` can be used only so, as a PID namespace and the mount of `/proc`
+/// may disagree). `dir` is `self/fd` or `<pid>/fd`.
+pub(crate) fn names_fd(proc_dir_fd: &Path, fd: BorrowedFd<'_>) -> Option<PathBuf> {
+    let p = proc_dir_fd.join(fd.as_raw_fd().to_string());
+    let named = std::fs::metadata(&p).ok()?;
+    let held = std::fs::File::from(fd.try_clone_to_owned().ok()?)
+        .metadata()
+        .ok()?;
+    ((named.dev(), named.ino()) == (held.dev(), held.ino())).then_some(p)
+}
+
+/// The length of `/proc/<pid>/fd/<fd>` before B is open, when procB can be
+/// used: a directory opened now (`/`) must be what `/proc/<pid>/fd/<its fd>`
+/// names (hub SPEC-routes "綴りの形": the estimate is checked as procB is,
+/// with another open directory's fd). B's fd is taken to get a number of as
+/// many digits as that fd's plus one. `None` when procB cannot be used.
+fn proc_prefix_estimate(cfg: &Config) -> Option<usize> {
+    let root = open_socket_dir(Path::new("/")).ok()?;
+    let pid = sys::process_id().to_string();
+    names_fd(&cfg.proc.join(&pid).join("fd"), root.as_fd())?;
+    let fd_digits = (root.as_raw_fd() + 1).to_string().len();
+    Some(path::len(&cfg.proc) + 1 + pid.len() + "/fd/".len() + fd_digits)
 }
 
 /// `<prefix>/<D>/<E>/<name>` (link-dir) or `<prefix>/<D>/<E>` (link-file)
@@ -802,11 +819,10 @@ fn spelled_base(
     if let Some(given) = &t.options.base {
         return base::given(given, cross).map(Ok);
     }
-    let proc_len = proc_prefix_estimate(t.cfg);
-    // Where /proc cannot be used at all, no B can be spelled by it, so a
-    // spelling that only procB would fit is known not to fit.
-    let proc_usable = std::fs::metadata(t.cfg.proc.join("self").join("fd")).is_ok();
-    let by_proc = !cross && proc_usable && fits_through(proc_len, 1, Some(t.name));
+    // Where procB cannot be used, no B can be spelled by it, so a spelling
+    // that only procB would fit is known not to fit.
+    let by_proc =
+        !cross && proc_prefix_estimate(t.cfg).is_some_and(|len| fits_through(len, 1, Some(t.name)));
     let fits = |b: &Path| {
         let real = path::len(b);
         fits_through(real, 1, Some(t.name)) || by_proc || (link_file && fits_through(real, 1, None))
@@ -1691,20 +1707,22 @@ pub(crate) fn open_socket_dir(dir: &Path) -> io::Result<OwnedFd> {
 pub(crate) mod linux {
     use super::*;
 
-    /// Whether `proc_self_fd` lists the fds of this process: `<it>/<fd>` of
-    /// `/`, opened by [`open_socket_dir`], can be looked up. The number that
-    /// fd got, or `None` when `/proc` cannot be used.
+    /// Whether `proc_self_fd` lists the fds of this process, which chooses
+    /// the connect's row (proc-direct or relative; hub SPEC "用語"): `<it>/<fd>`
+    /// of `/`, opened by [`open_socket_dir`], names what that fd is open on.
+    /// The number that fd got, or `None` when `/proc` cannot be used.
     pub(crate) fn probe(proc_self_fd: &Path) -> Option<RawFd> {
         let root = open_socket_dir(Path::new("/")).ok()?;
         fd_dir(proc_self_fd, root.as_fd())?;
         Some(root.as_raw_fd())
     }
 
-    /// `<proc_self_fd>/<fd>`, or `None` when it cannot be looked up.
+    /// `<proc_self_fd>/<fd>`, or `None` when it does not name what `fd` is
+    /// open on ([`names_fd`]). proc-direct checks so the fd of each call's
+    /// socket's directory, apart from the check that chose the row (hub
+    /// SPEC-routes "proc-direct").
     pub(crate) fn fd_dir(proc_self_fd: &Path, fd: BorrowedFd<'_>) -> Option<PathBuf> {
-        let fd_dir = proc_self_fd.join(fd.as_raw_fd().to_string());
-        std::fs::metadata(&fd_dir).ok()?;
-        Some(fd_dir)
+        names_fd(proc_self_fd, fd)
     }
 
     /// The connect's proc-direct: `/proc/self/fd/<the socket's directory's

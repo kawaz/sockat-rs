@@ -2469,6 +2469,108 @@ fn proc_direct_comes_first_on_linux() {
     ping(&l, c.socket.unwrap());
 }
 
+/// A `/proc` of another PID namespace or mount, standing in for one that
+/// disagrees with this process: `<it>/self/fd/<n>` and `<it>/<pid>/fd/<n>`
+/// for every small `n` are symlinks to `to`, whatever this process's fd `n`
+/// is open on.
+fn disagreeing_proc(at: &Path, to: &Path) -> PathBuf {
+    for who in ["self".to_owned(), sys::process_id().to_string()] {
+        let fds = at.join(who).join("fd");
+        std::fs::create_dir_all(&fds).unwrap();
+        for n in 0..512 {
+            std::os::unix::fs::symlink(to, fds.join(n.to_string())).unwrap();
+        }
+    }
+    at.to_path_buf()
+}
+
+// /proc is used only where `<proc>/self/fd/<fd>` names what the fd is open on
+// (the same (st_dev, st_ino) by stat as by fstat; hub SPEC "用語"): a /proc
+// of another PID namespace or mount may list another process's fds.
+//
+// - every `self/fd/<n>` leading to another directory, holding a socket of the
+//   same name: the check of `/` that chooses the row fails, so the connect
+//   takes the row without /proc, never proc-direct, and reaches the socket at
+//   the path, not the other one
+// - every `self/fd/<n>` leading to `/`: the row's check of `/` passes, and
+//   proc-direct's own check of the socket's directory's fd (each call) fails,
+//   so proc-direct is passed over (/proc unusable) and a later route reaches
+//   the socket at the path
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn proc_direct_is_used_only_where_proc_names_the_fd() {
+    let (t, place) = setup();
+    let p = nest(&t.path().join("real"), 300, "s.sock");
+    let l = listen_at(&p);
+    l.set_nonblocking(true).unwrap();
+
+    let other = t.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    let decoy = UnixListener::bind(other.join("s.sock")).unwrap();
+    decoy.set_nonblocking(true).unwrap();
+    let cfg = Config {
+        proc: disagreeing_proc(&t.path().join("p1"), &other),
+        ..config(&place)
+    };
+    let c = connect(&p, &cfg).unwrap();
+    assert_ne!(c.route, names::PROC_DIRECT);
+    assert!(
+        decoy.accept().is_err(),
+        "the connect reached the other socket"
+    );
+    assert!(l.accept().is_ok());
+
+    let cfg = Config {
+        proc: disagreeing_proc(&t.path().join("p2"), Path::new("/")),
+        ..config(&place)
+    };
+    let c = connect(&p, &cfg).unwrap();
+    assert_ne!(c.route, names::PROC_DIRECT);
+    assert!(
+        c.skipped.contains(&route::Skipped {
+            name: names::PROC_DIRECT,
+            reason: names::PROC_UNUSABLE
+        }),
+        "{:?}",
+        c.skipped
+    );
+    assert!(l.accept().is_ok());
+}
+
+// The estimate of a procB spelling's length, made before B is made, counts
+// on procB only where `<proc>/<pid>/fd/<fd>` of a directory open now names
+// what that fd is open on (hub SPEC-routes "綴りの形"). With a /proc that
+// lists other fds, a file name that only a procB spelling would fit is known
+// not to fit: no B is made in the place (one made would be of no use, its
+// real path too long), and the resolve is ENAMETOOLONG with link-dir passed
+// over as too long.
+#[test]
+fn the_estimate_counts_on_procb_only_where_proc_names_the_fd() {
+    let t = tmp();
+    let place = t.path().join("l".repeat(40));
+    std::fs::create_dir(&place).unwrap();
+    let other = t.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    let cfg = Config {
+        proc: disagreeing_proc(&t.path().join("p"), &other),
+        ..no_link_file(config(&place))
+    };
+    let p = nest(&t.path().join("a"), 250, &name_just_past(&place));
+    let f = route::resolve(route::Use::Bind, &p, &opts(), Some(&cfg))
+        .err()
+        .unwrap();
+    assert_eq!(errno(&f.error), Some(libc::ENAMETOOLONG));
+    assert!(
+        f.skipped.contains(&route::Skipped {
+            name: names::LINK_DIR,
+            reason: names::TOO_LONG
+        }),
+        "{:?}",
+        f.skipped
+    );
+    assert!(entries(&place).is_empty(), "B made where no spelling fits");
+}
+
 // widened (Apple): a connect to a path of up to 253 bytes far from the cwd
 // goes in a widened sockaddr, nothing written. A bind never uses it: the
 // address a bound socket reports fits sun_path.

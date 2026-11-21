@@ -78,6 +78,7 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
   - 使い回す E は `Reached.link` に入れない (誰も片付けない)。`bind_ex` と resolve と link-file の E は呼び出しごとのまま
   - 試験だけの差し替え口は持たない。試験は試験ごとの `Held` で D を分け、E を手で消す・別の所を指す symlink に置き換えて、作り直しを確かめる
 - procB の綴りは `/proc/<getpid()>/fd/<B の fd>`。その stat が B の fd と同じ `(st_dev, st_ino)` の時だけ使う
+- `/proc` を使えるかは、どれも `route::names_fd` (`<proc>/…/fd/<fd>` の stat と fd の fstat の `(st_dev, st_ino)` が同じか) で決める (ハブ SPEC「用語」)。connect の行の選択は `linux::probe` が `/` を開いた fd で `/proc/self/fd` を、proc-direct は呼び出しごとにソケットのディレクトリの fd で `/proc/self/fd` を、procB の綴りの長さの見積もり (`route::proc_prefix_estimate`) は B を開く前に `/` を開いた fd で `/proc/<pid>/fd` を確かめる
 - `sweep`・`sweep_base` が見るのは、B の直下の、名前が D の形 (`base::is_random_name`: ASCII の英数字 10 文字) のディレクトリだけ。他の名前の物には触らない
 
 ### OS ごとの試す順
