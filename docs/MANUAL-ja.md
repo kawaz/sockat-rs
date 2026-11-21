@@ -286,6 +286,7 @@ Rust の口に固有のエラー:
 | `Options::base` の確かめに通った後、B を作れない | 作れなかったエラー |
 | 相対パスの `bind_ex` の途中で cwd が変わった | `Other` |
 | `bind_ex` が bind した直後、そこ (最後の要素が symlink なら辿った先) にソケットでない物がある。`socket_file()` が辿った先がソケットでない | `ENOTSOCK` |
+| `bind_ex` が bind した直後に、覚える所 (仕様の [`remove`](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#remove)) の実パスを引けない (ファイルが消された、元のパスを引き直す経路で途中の symlink が張り替わった先に何も無い等) | 実パスを引けなかったエラー (`ENOENT` 等) |
 | `socket_file()` を bind の前や片付けた後に呼んだ | 綴りを辿れなかったエラー |
 | `cleanup` / `remove` で E を消せない (既に無い時を除く) | `unlink` のエラー |
 

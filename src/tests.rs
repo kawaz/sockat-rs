@@ -3439,6 +3439,218 @@ fn a_bind_ex_that_finds_no_socket_where_it_bound_fails() {
     }
 }
 
+/// A path whose way goes through a symlink switched during a bind:
+/// `<r>/l` is a symlink to `<r>/a`, the path is `<r>/l/<name>`, and the
+/// switch points `l` to `<r>/b`.
+struct Switched {
+    /// `<r>/l/<name>`.
+    path: PathBuf,
+    /// `<r>/l`.
+    link: PathBuf,
+    /// The real path of `<r>/a`.
+    a: PathBuf,
+    /// The real path of `<r>/b`.
+    b: PathBuf,
+}
+
+fn switched(r: &Path, name: &str) -> Switched {
+    std::fs::create_dir_all(r.join("a")).unwrap();
+    std::fs::create_dir_all(r.join("b")).unwrap();
+    let link = r.join("l");
+    std::os::unix::fs::symlink(r.join("a"), &link).unwrap();
+    Switched {
+        path: link.join(name),
+        a: std::fs::canonicalize(r.join("a")).unwrap(),
+        b: std::fs::canonicalize(r.join("b")).unwrap(),
+        link,
+    }
+}
+
+thread_local! {
+    /// The symlink the [`switch_symlink`] hook points elsewhere, and where.
+    // The initializer is `const`; clippy on illumos says otherwise of the
+    // macro's expansion there.
+    #[allow(clippy::missing_const_for_thread_local)]
+    static SWITCH: std::cell::RefCell<Option<(PathBuf, PathBuf)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A hook for the tests ([`route::AFTER_BIND`], `Config::between_cwd_lookups`):
+/// the symlink in [`SWITCH`] is pointed to its new target, once, as another
+/// process could.
+fn switch_symlink() {
+    if let Some((link, to)) = SWITCH.take() {
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&to, &link).unwrap();
+    }
+}
+
+/// The routes a bind of a long path takes on this target, each with a file
+/// name and a config that make it the one taken: link-dir through B's real
+/// path and through procB (Linux), link-file (macOS, NetBSD), and thread-cwd
+/// (Linux, Apple, where it can be used) or at (FreeBSD).
+fn long_bind_routes(place: &Path) -> Vec<(&'static str, String, Config)> {
+    let mut routes = vec![(names::LINK_DIR, "s.sock".to_owned(), real_link_dir(place))];
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if proc_here() {
+        routes.push((names::LINK_DIR, "s.sock".to_owned(), config(place)));
+    }
+    if cfg!(any(target_vendor = "apple", target_os = "netbsd")) {
+        routes.push((names::LINK_FILE, "n".repeat(200), no_proc(config(place))));
+    }
+    if cfg!(target_os = "freebsd") {
+        routes.push((names::AT, name_past_link_dir(), real_link_dir(place)));
+    } else if thread_here() {
+        routes.push((
+            names::THREAD_CWD,
+            name_past_link_dir(),
+            real_link_dir(place),
+        ));
+    }
+    routes
+}
+
+// A symlink on the way of a long path switched after the route is built and
+// before the bind (another thread could do it) does not make bind_ex
+// remember another file than the one the bind made (hub SPEC "remove": where
+// to remember). The switch is made once the real path of the directory has
+// been taken (`between_cwd_lookups`), pointing `l` from `a` to `b`:
+//
+// - link-dir (B's real path, procB) and thread-cwd / at bind through an E
+//   pointing to the real path of `a` taken before, so the socket is made in
+//   `a`. They remember `a/<name>`, the real path E points to, without looking
+//   the path up again, so remove() removes it and leaves a socket of the same
+//   name in `b`, where the path leads now
+// - link-file (macOS, NetBSD) binds through an E pointing to the path as
+//   given, which the kernel follows through `l` as it is at the bind, so the
+//   socket is made in `b`. It looks the path up after the bind and remembers
+//   `b/<name>`, so remove() removes it and leaves a socket of the same name
+//   in `a`, the directory's real path taken before the switch
+//
+// standard is not here: std takes a short path as it is at the bind, and
+// nothing about it is looked up before.
+#[test]
+fn a_bind_ex_remembers_where_it_bound_when_a_symlink_is_switched_before_the_bind() {
+    let (t, place) = setup();
+    for (i, (route, name, mut cfg)) in long_bind_routes(&place).into_iter().enumerate() {
+        let x = switched(&t.path().join(i.to_string()).join("x".repeat(100)), &name);
+        assert!(path::len(&x.path) > DIRECT_MAX, "{route}");
+        let (made, other) = match route == names::LINK_FILE {
+            true => (x.b.join(&name), x.a.join(&name)),
+            false => (x.a.join(&name), x.b.join(&name)),
+        };
+        let decoy = listen_at(&other);
+        let decoy_id = file_id(&other);
+        SWITCH.set(Some((x.link.clone(), x.b.clone())));
+        cfg.between_cwd_lookups = switch_symlink;
+        let got = bind(&x.path, &opts(), &cfg);
+        SWITCH.set(None);
+        let mut got = got.unwrap_or_else(|f| panic!("{route}: {}", f.error));
+        assert_eq!(got.route, route);
+        assert_eq!(
+            std::fs::read_link(&x.link).unwrap(),
+            x.b,
+            "{route}: not switched"
+        );
+        assert!(is_socket(&made), "{route}: no socket where the route bound");
+        let l = listener(&mut got);
+        let file = SocketFile::new(
+            got.file.take().unwrap(),
+            crate::Clean::new(got.link.clone()),
+        );
+        assert_eq!(file.path(), made, "{route}");
+        file.remove().unwrap();
+        assert!(std::fs::symlink_metadata(&made).is_err(), "{route}");
+        assert_eq!(
+            file_id(&other),
+            decoy_id,
+            "{route}: the other socket was removed"
+        );
+        drop((l, decoy));
+    }
+    assert_no_e(&b_of(&place));
+}
+
+// A symlink on the way switched right after the bind, before the socket file
+// is looked up (another thread could do it), pointing `l` from `a` to `b`
+// (hub SPEC "remove": where to remember). The bind made the socket in `a` on
+// every route:
+//
+// - link-dir (B's real path, procB) and thread-cwd / at remember `a/<name>`,
+//   the real path E points to, not the path looked up again, so remove()
+//   removes the socket the bind made and leaves a socket of the same name in
+//   `b`, where the path leads now
+// - standard and link-file (macOS, NetBSD) look the path up after the bind,
+//   and find nothing at `b/<name>`: the call fails as one that cannot
+//   remember (ENOENT, E removed), leaving the socket made in `a`. That they
+//   take what is at the path after the bind, even a socket of the same name,
+//   is the window hub SPEC "remove" does not close
+#[test]
+fn a_bind_ex_remembers_where_it_bound_when_a_symlink_is_switched_after_the_bind() {
+    let (t, place) = setup();
+    let mut cases = vec![(
+        names::STANDARD,
+        t.path().join("st"),
+        "s.sock".to_owned(),
+        config(&place),
+    )];
+    for (i, (route, name, cfg)) in long_bind_routes(&place).into_iter().enumerate() {
+        cases.push((
+            route,
+            t.path().join(i.to_string()).join("x".repeat(100)),
+            name,
+            cfg,
+        ));
+    }
+    for (route, r, name, cfg) in cases {
+        let x = switched(&r, &name);
+        assert_eq!(
+            path::len(&x.path) <= DIRECT_MAX,
+            route == names::STANDARD,
+            "{route}: the premise of the path's length"
+        );
+        let made = x.a.join(&name);
+        let other = x.b.join(&name);
+        let looked_up_again = matches!(route, names::STANDARD | names::LINK_FILE);
+        let decoy = (!looked_up_again).then(|| listen_at(&other));
+        SWITCH.set(Some((x.link.clone(), x.b.clone())));
+        route::AFTER_BIND.set(Some(switch_symlink));
+        let got = bind(&x.path, &opts(), &cfg);
+        route::AFTER_BIND.set(None);
+        SWITCH.set(None);
+        assert_eq!(
+            std::fs::read_link(&x.link).unwrap(),
+            x.b,
+            "{route}: not switched"
+        );
+        assert!(is_socket(&made), "{route}: no socket where the route bound");
+        if looked_up_again {
+            let f = got.err().unwrap_or_else(|| panic!("{route}: bound"));
+            assert_eq!(errno(&f.error), Some(libc::ENOENT), "{route}");
+            assert_eq!(f.route, Some(route));
+            assert!(std::fs::symlink_metadata(&other).is_err(), "{route}");
+            continue;
+        }
+        let decoy_id = file_id(&other);
+        let mut got = got.unwrap_or_else(|f| panic!("{route}: {}", f.error));
+        assert_eq!(got.route, route);
+        let l = listener(&mut got);
+        let file = SocketFile::new(
+            got.file.take().unwrap(),
+            crate::Clean::new(got.link.clone()),
+        );
+        assert_eq!(file.path(), made, "{route}");
+        file.remove().unwrap();
+        assert!(std::fs::symlink_metadata(&made).is_err(), "{route}");
+        assert_eq!(
+            file_id(&other),
+            decoy_id,
+            "{route}: the other socket was removed"
+        );
+        drop((l, decoy));
+    }
+    assert_no_e(&b_of(&place));
+}
+
 /// `f` with every removal of an E on this thread failing (`EPERM`, the E
 /// left), as the system could refuse it ([`base::FAIL_UNLINK_E`]).
 fn with_e_unremovable<T>(f: impl FnOnce() -> T) -> T {

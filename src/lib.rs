@@ -651,6 +651,10 @@ fn connect_with(
 /// symlink (followed by the bind on macOS and NetBSD), those of the socket it
 /// led to, so [`SocketFile::remove`] leaves the symlink. What is found there
 /// must be a socket (`ENOTSOCK` otherwise: it was replaced, and is not taken).
+/// Where it is looked up is hub SPEC "remove"'s: a route that binds through
+/// the real path of the directory taken before the bind looks there, not up
+/// `path` again, so a symlink on its way switched meanwhile does not move it;
+/// the others look up `path` after the bind.
 /// For a relative `path`, the cwd's `(st_dev, st_ino)` must be the same
 /// before the bind and after that look-up (another thread changing it would
 /// make the file looked up another one); otherwise the listener is closed

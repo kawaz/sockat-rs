@@ -249,9 +249,11 @@ pub(crate) struct Config {
         allow(dead_code)
     )]
     pub(crate) open_socket_dir: fn(&Path) -> io::Result<OwnedFd>,
-    /// Called once where a relative path has been resolved against the cwd
-    /// and is yet to be again. Does nothing outside the tests, which change
-    /// the cwd there, as another thread could.
+    /// Called once where the path has been looked up and is yet to be again:
+    /// after the bind / connect of a short path, and after the real path of
+    /// a long path's directory is taken, before any route. Does nothing
+    /// outside the tests, which change the cwd there (a relative path) or
+    /// switch a symlink on the path's way, as another thread could.
     pub(crate) between_cwd_lookups: fn(),
 }
 
@@ -1105,8 +1107,11 @@ fn bind_through(t: &Target<'_>, th: Through, route: &'static str, remember: bool
 }
 
 /// The socket file bound just now through `spelling`: [`remembered_at`] the
-/// real path of the socket's directory joined with the file name (a symlink
-/// there followed, as the bind followed it), which the spelling must reach.
+/// real path of the socket's directory E points to, joined with the file name
+/// (a symlink there followed, as the bind followed it), which the spelling
+/// must reach. The path as given is not looked up again (hub SPEC "remove"):
+/// a symlink on its way switched since the route was built does not move what
+/// is remembered away from where the bind made the socket.
 fn remember_spelled(t: &Target<'_>, spelling: &Path) -> io::Result<Remembered> {
     let r = remembered_at(&t.real_dir.join(t.name))?;
     let by_spelling = std::fs::metadata(spelling)?;
@@ -1128,6 +1133,12 @@ fn remember_spelled(t: &Target<'_>, spelling: &Path) -> io::Result<Remembered> {
 /// be told, means the kernel did not follow the symlink, and the route is
 /// passed over (a real failure fails the next route the same way and is
 /// returned there). E is removed either way.
+///
+/// With `remember`, the socket file is looked up after the bind by the path
+/// E points to (the path as given, made absolute), not in the directory's
+/// real path taken before the bind (hub SPEC "remove"): E goes through the
+/// symlinks on the way as they are at the bind, so a symlink switched before
+/// the bind takes the socket to where it points then.
 fn link_file_bind(t: &Target<'_>, b: Result<&Base, &&'static str>, remember: bool) -> Step {
     let b = match b {
         Ok(b) => b,
@@ -1161,7 +1172,7 @@ fn link_file_bind(t: &Target<'_>, b: Result<&Base, &&'static str>, remember: boo
     after_bind();
     let file = match remember {
         false => None,
-        true => match remembered_at(&t.real_dir.join(t.name)) {
+        true => match remembered_at(&target) {
             Ok(r) => Some(r),
             Err(e) => {
                 drop(socket);
@@ -1209,7 +1220,8 @@ fn d_base(t: &Target<'_>) -> Result<Result<Arc<Base>, &'static str>, io::Error> 
 /// at の手順"): this process's D held by its fd, a random E in it pointing to
 /// the socket's directory's real path, the call with `E/<name>` relative to
 /// D by `call`, and E removed right after, whatever the outcome. The spelling
-/// is `Dangling`.
+/// is `Dangling`. A bind's socket file is remembered in the real path E
+/// points to, not by the path as given looked up again (hub SPEC "remove").
 #[cfg(any(
     target_os = "linux",
     target_os = "android",

@@ -286,6 +286,7 @@ Errors specific to the Rust calls:
 | `Options::base` passes its check, but B cannot be made | the error of making it |
 | The cwd changed during `bind_ex` of a relative path | `Other` |
 | Right after `bind_ex`'s bind, what is there (where a symlink leads, when the last component is one) is not a socket. What `socket_file()` reaches is not a socket | `ENOTSOCK` |
+| Right after `bind_ex`'s bind, the real path of where to remember (the specification's [`remove`](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#remove)) cannot be resolved (the file was removed, or on a route that looks the original path up again a symlink on the way was switched to where nothing is) | the error of resolving the real path (`ENOENT` etc.) |
 | `socket_file()` is called before the bind or after the clean-up | the error of following the spelling |
 | `cleanup` / `remove` cannot remove E (other than it being gone already) | the error of `unlink` |
 
