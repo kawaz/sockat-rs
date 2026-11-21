@@ -40,7 +40,7 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 | 型 | 形 |
 |---|---|
 | `Options` | `pub usable_cross_uid: bool`、`pub base: Option<PathBuf>`。`Default` を持ち、`#[non_exhaustive]` にしない (`Options { base: Some(p), ..Default::default() }` と書けるように) |
-| `Spelling` | `#[non_exhaustive]` の enum。`Original`、`CwdRelative`、`Linked { removable, until: Until, usable_cross_uid, usable_with_private_tmp }`、`Dangling` |
+| `Spelling` | `#[non_exhaustive]` の enum。`Original`、`CwdRelative`、`Linked { removable, until: Until, usable_cross_uid, usable_with_private_tmp }`、`Dangling`。`Linked` の variant も `#[non_exhaustive]` にし、属性を足しても利用者の pattern (`Linked { removable, .. }`) を壊さない (enum の `#[non_exhaustive]` は variant を足す時にしか効かない) |
 | `Until` | `Process`、`Cleanup` |
 | `Bound<S>` | `socket`、`file: SocketFile`、`spelling`、`route: &'static str`、`base: Option<&'static str>`、`skipped: Vec<Skipped>` |
 | `Connected<S>` | `socket`、`route`、`skipped` |

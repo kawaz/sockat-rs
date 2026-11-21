@@ -111,6 +111,7 @@ mod cli {
                 until,
                 usable_cross_uid,
                 usable_with_private_tmp,
+                ..
             } => json!({
                 "kind": "Linked",
                 "removable": removable,

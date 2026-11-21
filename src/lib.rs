@@ -252,6 +252,10 @@ pub enum Spelling {
     CwdRelative,
     /// Through B, D and E, naming the same place as the path while it can be
     /// followed.
+    ///
+    /// `#[non_exhaustive]`: more attributes may come, so match it with `..`
+    /// (`Spelling::Linked { removable, .. }`).
+    #[non_exhaustive]
     Linked {
         /// Whether unlinking the spelling removes the socket file: `true`
         /// through a symlink to the directory (link-dir), `false` through a
