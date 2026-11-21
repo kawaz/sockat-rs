@@ -1,16 +1,9 @@
 //! Bind and connect Unix domain sockets whose path is longer than `sun_path`
-//! allows.
+//! allows (104 bytes on macOS and the BSDs, 108 on Linux and illumos, the
+//! terminating NUL included).
 //!
-//! `struct sockaddr_un` keeps the socket path in a fixed array: 104 bytes on
-//! macOS and the BSDs, 108 on Linux and illumos, the terminating NUL included.
-//! std's [`UnixListener::bind`], [`UnixStream::connect`] and
-//! [`UnixDatagram::bind`](std::os::unix::net::UnixDatagram::bind) refuse anything longer, although the file system has
-//! no such limit. Deep temporary directories (macOS's `$TMPDIR` alone is about
-//! 50 bytes; test harnesses and sandboxes nest further) run into it easily.
-//! The limit is on the argument of `bind(2)` / `connect(2)`, so sockat hands
-//! the kernel a short spelling that names the same place.
-//!
-//! Use [`bind`] and [`connect`] where you would use std's, and
+//! Use [`bind`] and [`connect`] where you would use std's
+//! [`UnixListener::bind`] and [`UnixStream::connect`], and
 //! [`connect_nonblocking`] in async code; [`datagram`] has the same for
 //! `SOCK_DGRAM`. They take a path of any length and return std's own types. A
 //! path std accepts goes to std unchanged, so it behaves exactly as with std:
@@ -19,6 +12,9 @@
 //! |---|---|---|
 //! | Linux, Android, illumos | 108 | up to 107 bytes |
 //! | macOS, iOS, FreeBSD, NetBSD, OpenBSD | 104 | up to 103 bytes |
+//!
+//! A longer path is handed to the kernel by a short spelling that names the
+//! same place.
 //!
 //! ```no_run
 //! use std::io::{Read, Write};
@@ -33,88 +29,36 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 //!
-//! The behaviour is the language-independent
-//! [specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md);
-//! the details, with examples, are in the
-//! [manual](https://github.com/kawaz/sockat-rs/blob/main/docs/MANUAL.md).
+//! The details, with examples, are in the
+//! [manual](https://github.com/kawaz/sockat-rs/blob/main/docs/MANUAL.md); the
+//! language-independent behaviour is the
+//! [specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md),
+//! with how a long path is reached in
+//! [Routes for long paths and their order](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#routes-for-long-paths-and-their-order).
 //!
-//! # How a long path is reached
+//! # Things to know
 //!
-//! A bind's spelling is kept by the kernel for the life of the socket and
-//! reported by `getsockname` / `getpeername`; libraries remove the socket file
-//! by it and a datagram peer replies to it. So a long path is bound by a short
-//! spelling that keeps naming the same place: through a symlink E in a
-//! directory D of this process, in a directory B of this user.
-//!
-//! * **B** is `/tmp/sockat-<uid>` (else `$XDG_RUNTIME_DIR/sockat`, else
-//!   `$TMPDIR/sockat-<uid>`, else `.sockat.<random>` in the socket's
-//!   directory), mode 0711, checked to be this user's and to be reached only
-//!   through directories no other user can change. It is reused across
-//!   processes and never removed by sockat. [`Options::base`] puts it where
-//!   the application says.
-//! * **D** is a directory with a random name in B, one per process and B, on
-//!   which the process holds a shared `flock(2)` for its life.
-//! * **E** is a symlink in D: to the socket's directory (**link-dir**,
-//!   spelling `B/D/E/<file name>`) or to the socket file (**link-file**,
-//!   `B/D/E`, where a bind follows a symlink: macOS, NetBSD).
-//!
-//! B is spelled `/proc/<pid>/fd/<B's fd>` where `/proc` can be used, else by
-//! its real path. When no such spelling fits, a bind goes through
-//! **thread-cwd** (Linux, Apple: a thread of its own moves its own working
-//! directory into D) or **at** (FreeBSD: `bindat(2)`) with a random E that is
-//! removed right away (the spelling then names nothing).
-//!
-//! A connect's spelling is kept nowhere, so a connect leaves nothing: it
-//! tries the routes that need neither writing nor a thread first
-//! (**proc-direct** `/proc/self/fd/<dirfd>/<file name>` on Linux,
-//! **relative** to the cwd, **widened** sockaddr up to 253 bytes on Apple,
-//! **at-direct** `connectat(2)` on FreeBSD), then **thread-cwd-direct**
-//! (Linux, Apple), then **link-file** through an E made directly in B and
-//! removed right after the connect.
-//!
-//! | Platform | bind | connect |
-//! |---|---|---|
-//! | Linux, Android | link-dir, thread-cwd | proc-direct (relative without `/proc`), thread-cwd-direct, link-file |
-//! | macOS, iOS (Apple) | link-dir, link-file, thread-cwd | relative, widened, thread-cwd-direct, link-file |
-//! | FreeBSD | link-dir, at | at-direct, link-file |
-//! | NetBSD | link-dir, link-file | relative, link-file |
-//! | OpenBSD, illumos | link-dir | relative, link-file |
-//!
-//! The first route that can be used makes the call; a real failure there
-//! (`ENOENT`, `EADDRINUSE`, `ECONNREFUSED`, ...) is the result, not a reason
-//! to try the next. No route forks, and none changes the working directory of
-//! the process or of the calling thread.
-//!
-//! # What a bind leaves, and what can be cleaned up
-//!
-//! [`bind`] keeps its E until the process ends; dead processes' D (and their
-//! E) are removed by the system's cleanup of temporary directories, or by
-//! [`sweep`]. [`bind_ex`] returns a [`SocketFile`]: [`SocketFile::remove`]
-//! removes the socket file (only while it is still the one bound) and the E,
-//! [`SocketFile::cleanup`] the E alone. [`resolve_for_bind`] and
-//! [`resolve_for_connect`] return a spelling to hand to std yourself, with
-//! the same clean-up. A connect never leaves anything.
-//!
-//! What a bind's spelling is good for is in [`Spelling`]: whether removing by
-//! it removes the socket file, until when it can be followed, and whether
-//! another uid can follow it.
+//! * A bind at a long path leaves a small directory and a symlink in
+//!   `/tmp/sockat-<uid>` or the like. They go with the OS's cleaning of
+//!   temporary directories, or by [`sweep`] ([`sweep_base`] for a B at
+//!   [`Options::base`]). See
+//!   [What stays in the base](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-stays-in-the-base)
+//!   and [`sweep`](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#sweep).
+//! * For a long path, the address the kernel reports (`local_addr`,
+//!   `peer_addr`, `recv_from`) is the short spelling, not the original path.
+//!   Remove the socket file by the original path or by
+//!   [`SocketFile::remove`]. See
+//!   [What differs from the standard for a long path](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-differs-from-the-standard-for-a-long-path).
+//! * To remove the socket file later, or to know what the spelling is good
+//!   for ([`Spelling`]) and which route was taken, use the `_ex` functions
+//!   ([`bind_ex`], [`connect_ex`], ...). To hand a spelling to std yourself,
+//!   use [`resolve_for_bind`] / [`resolve_for_connect`].
 //!
 //! # Patterns not to use
 //!
-//! * removing or `stat`ing the socket file by the address the kernel reports
-//!   without looking at [`Spelling`]: a link-file spelling removes E, not the
-//!   file, and a `Dangling` one names nothing. Keep the path, or use
-//!   [`SocketFile::remove`];
-//! * using a spelling after its clean-up or after the process ended;
-//! * binding a relative path and removing by it after the cwd changes;
-//! * relying on closing the listener to remove the socket file, or on
-//!   [`SocketFile::remove`] to close the listener;
-//! * calling [`SocketFile::remove`] after the listener is closed (a file made
-//!   again at the path may then not be told apart);
-//! * branching on `route`, `base` or `skipped`: they are diagnostics; branch
-//!   on [`Spelling`].
-//!
-//! What to do instead, run as a test:
+//! The patterns and why they are wrong are in the specification's
+//! [Patterns not to use](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#patterns-not-to-use).
+//! What to do instead in Rust, run as a test:
 //!
 //! ```
 //! use std::io;
@@ -141,25 +85,17 @@
 //!
 //! # Errors
 //!
-//! The errors of `bind(2)`, `listen(2)` and `connect(2)` as
-//! [`std::io::Error`]s: `ENOENT` for a missing directory or socket,
-//! `ENOTDIR`, `EADDRINUSE`, `ECONNREFUSED`, `EAGAIN` for a full backlog on a
-//! nonblocking connect (Linux; macOS answers `ECONNREFUSED`). `ENAMETOOLONG`
-//! when no route reaches the path. `InvalidInput` for an empty path (which
-//! std's bind on Linux would autobind to an unnamed abstract address), for a
-//! path longer than std accepts that does not end with a file name, and for a
-//! path of any length with a NUL byte (on Linux a leading NUL, the abstract
-//! namespace, goes to std as it is). [`Options::base`] that fails its checks is `ENOENT`,
-//! `ENOTDIR` or `EPERM`, never another base (`InvalidInput` when it is
-//! relative or does not end with a name). The `_ex` functions return an
-//! [`ExError`], which converts into the `io::Error` by `?`.
+//! OS errors come as [`std::io::Error`]s with their errno; an argument error
+//! is `InvalidInput`. The `_ex` functions and resolve return an [`ExError`],
+//! which converts into the `io::Error` by `?`. Which error for which
+//! situation is in the specification's
+//! [Errors](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#errors).
 //!
 //! # Async runtimes
 //!
 //! The results are std types, so any runtime that adopts std sockets takes
-//! them. [`connect_nonblocking`] does not wait (a Unix-domain connect
-//! completes or fails within the call, and its clean-up is an `unlink`) and
-//! returns the stream nonblocking:
+//! them. [`connect_nonblocking`] does not wait and returns the stream
+//! nonblocking:
 //!
 //! ```no_run
 //! # async fn demo(path: std::path::PathBuf) -> std::io::Result<()> {
