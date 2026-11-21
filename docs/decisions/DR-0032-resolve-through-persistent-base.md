@@ -55,7 +55,7 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 - `remove` と `cleanup` は `&self` で、内側の印で 1 回だけ働く。1 つの綴りの持ち主 (`ForBind` か `ForConnect`、`bind_ex` の `SocketFile`) と、`ForBind` の `socket_file()` が返す全ての `SocketFile` は、E と 1 つの lock を `Arc<Clean>` で共有し、ファイルと E を消す操作はどれもその lock を持って行う。複数のスレッドから、別々の `SocketFile` や `ForBind` を通して同時に呼ばれても、消す操作は同時に 1 つ (lock が `SocketFile` ごとだと、2 つが同時にファイルを bind した物と確かめて両方が unlink し、後の方がその間に bind された別のソケットを消しうる)。片付けはどこから呼んでも 1 回。E の印 (`base::Link`) も自分の lock を持ち、経路の中の片付けと合わせて E の unlink を同時に 1 つにする
 - 利用者が呼ぶ `cleanup` は E の unlink の失敗 (`ENOENT` 以外) をエラーで返す。印を立てるのは消せた時 (と既に無い時) だけで、失敗した後の呼び出しはもう一度消しに行く
 - `remove` は失敗しても `cleanup` まで行い、ファイルの側のエラーを先に、無ければ `cleanup` のエラーを返す。印を立てるのは両方が通った時だけで、失敗した後の呼び出しはもう一度確かめて消しに行く
-- 呼び出しの中で消す E (bind が失敗した時・ソケットのファイルを覚えられなかった時の E、thread-cwd・at の E、既定の connect の E) は、消すのに失敗しても捨てる (`let _`、`TempLink` の Drop)。呼び出しの成否も元のエラーも変えない
+- 呼び出しの中で消す E (bind が失敗した時・ソケットのファイルを覚えられなかった時の E。既定の bind の link-dir の E は除く。thread-cwd・at の E、既定の connect の E) は、消すのに失敗しても捨てる (`let _`、`TempLink` の Drop)。呼び出しの成否も元のエラーも変えない
 - bind の後に覚えるソケットのファイルは、どの経路も `route::remembered_at` で引く: パスを `realpath` し (最後の要素の symlink も辿る。Apple・NetBSD の bind はそこを辿ってその先にソケットを作る)、その `lstat` を覚える。ソケットでなければ `ENOTSOCK` で覚えない。standard は元のパス、link-dir・link-file・thread-cwd・at はソケットのディレクトリの実パスとファイル名を引き、link-dir は加えて綴りの `stat` が同じ物かを確かめる。`ForBind::socket_file()` は綴りを同じ関数で引く
 - std に渡す前に引数の誤り (`InvalidInput`、`route` は `None`、`skipped` は空) にする物は、先頭以外の NUL (ハブ DR-0006) と空のパス (ハブ SPEC「短いパス」)。どちらも長さによらず、全ての関数の入口 (`route::run`・`route::resolve`) で、abstract の名前の判定より前に断る (`path::refuse_empty`・`path::refuse_nul`)。`Options.base` の形の検査はその前
 - 作らないもの: `datagram::send_to`・`send_to_ex` と `seqpacket` (ハブ SPEC の「未確定」)
@@ -65,12 +65,18 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 - プロセスの中の登録簿 (`Mutex<Vec<Arc<Base>>>`) が、このプロセスの B を持つ。B は fd で掴み、プロセスが終わるまで閉じない (close-on-exec)。使う前に、fd の `fstat` の `st_nlink` が 0 でなく、B の綴りの `lstat` が持っている `(st_dev, st_ino)` と同じかを確かめ、外れたら外して次に作り直す。D も同じ。消したディレクトリの `st_nlink` は Linux では 0 になるが macOS の APFS では 2 のままなので、名前の確かめは省かない
 - 置き場 1〜3 の B は `Held` が、普段の B と `usable_cross_uid` の B の 2 つの枠で持つ (普段の B が他の uid に辿らせる時は同じ B)。一度持ったらプロセスの間それを使い、作れなかった置き場は覚えず次の呼び出しで試し直す。外では `route::Config` がプロセスの 1 つの `Held` を運ぶ
 - 置き場の順に、何も作らずに分かること (置き場が無い、途中の確かめに外れる、`usable_cross_uid` で途中が other に x を持たない) で外れる置き場を飛ばし、最初に残った置き場で綴りの長さを見積もる。収まらなければ B を作らず、次の置き場にも移らない
+- 置き場 1〜3 の既定の名前に、B の確かめ (実ディレクトリ・持ち主が自分・他人が書けない) に外れる物が既にある時 (占拠)、`Base::make` は `Unmade::Occupied` を返し、`base::automatic` はその置き場に何も作らず次の置き場へ進む。どの置き場でも B を持てず、その中に占拠された置き場があった時は `Automatic::Missing { occupied: true }` で、B を使う経路 (link-dir、link-file、thread-cwd・at の D) の `skipped` の `reason` は `"base occupied"` (`route::names::BASE_OCCUPIED`)。`Options.base` の B の占拠は今まで通りそのエラー (`EPERM` / `ENOTDIR`)
 - 他の uid に辿らせるか (other の x) は、B を持った時に、途中の判定 (`Base::way_search`) と B 自身の判定 (`Base::b_search`) に分けて `Base` に覚える。途中の判定は後で見直さない。B 自身が other の x を持たないと覚えた時は、`usable_cross_uid` の呼び出しのたびに B の fd の `fstat` で見直し、持っていればそれを覚える (`Base::others_search`)。`Options.base` の安全の確かめ (途中、持ち主、他人が書けない) は呼び出しのたびに行い、other の x だけは持っている B の判定 (と見直し) を使う
 - D を作れなかった B は、その呼び出しの間 (`route::Target`) 覚え、D を使う経路で作り直さない。mode をそろえられない・開けない時は、作った空の D を消す
 - ソケットのディレクトリの B は procB の綴りでだけ使う (`route::forms` が実パスの綴りを出さない)
 - D は B ごとに 1 つ、`O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` の fd に `flock(LOCK_SH | LOCK_NB)` を掛けて持ち続ける。掛けた後に名前で引き直して同じ D かを確かめ、違えば作り直す
 - 作った B と D は、作った直後に名前で `fchmodat(0711)` してから開いて確かめる
 - resolve の E は D の中のカウンタ (36 進)、thread-cwd・at の E と B 直下の E は乱数 10 文字 (`arc4random_buf` / `getrandom`)
+- 既定の bind (`bind`・`datagram::bind`。中では `route::run` の `remember` が false の bind) の link-dir の E は、D ごとの表 `Dir::shared` (`Mutex<HashMap<PathBuf, OsString>>`: ソケットのディレクトリの realpath → カウンタの E の名前) で (D, realpath) ごとに 1 つにして使い回す (`route::link_dir_shared`)。表は D が持つので、D を作り直すと空から始まる
+  - 使う前に D の fd を基準に `readlinkat` (`sys::read_link_at`) し、失敗するか指す先が realpath と違えば、新しい E を作って表の値を置き換える
+  - 表の lock は E を引く・作って表に入れる間だけ持ち、bind の間は持たない。新しい E は bind の前に表に入れ、bind に失敗しても消さない (その呼び出しで作った物も)。同じディレクトリへの同時の既定の bind は lock の中で同じ E を引くので、E は 1 つのまま
+  - 使い回す E は `Reached.link` に入れない (誰も片付けない)。`bind_ex` と resolve と link-file の E は呼び出しごとのまま
+  - 試験だけの差し替え口は持たない。試験は試験ごとの `Held` で D を分け、E を手で消す・別の所を指す symlink に置き換えて、作り直しを確かめる
 - procB の綴りは `/proc/<getpid()>/fd/<B の fd>`。その stat が B の fd と同じ `(st_dev, st_ino)` の時だけ使う
 - `sweep`・`sweep_base` が見るのは、B の直下の、名前が D の形 (`base::is_random_name`: ASCII の英数字 10 文字) のディレクトリだけ。他の名前の物には触らない
 
@@ -106,6 +112,7 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 - ソケットでない物を覚えないのを、SPEC が求める最後の要素が symlink の時に限らずどの場合にも行うのは、`bind_ex` が bind した直後の名前にソケットでない物があれば置き換わった物で、覚えると `remove` がそれを消すため (`ForBind::socket_file()` と同じ確かめ)
 - B・D はプロセスごとの状態 (ハブ DR-0017) なので、プロセス全体の登録簿に置く。試験は置き場を試験ごとの一時ディレクトリにするので、登録簿を共有しても B は重ならない
 - 置き場 1〜3 の B は置き場によらずプロセスに 1 つなので、置き場で引く登録簿では表せない。プロセスに 1 つの `Held` を `Config` で運ぶと、外の振る舞いはそのままで、試験は試験ごとの `Held` で 1 つのプロセスを模せる
+- 既定の bind の link-dir の E を、失敗した呼び出しで作った物も含めて消さないのは、同時に別の既定の bind がその E を引いて bind しているかもしれないため (ハブ SPEC-routes「経路の失敗の扱い」)。消さないので、bind の間 lock を持って既定の bind どうしを順番にする必要が無い。残った E は次の既定の bind が使う
 - 空のパスを std に渡さないのは、[DR-0002](DR-0002-std-handles-paths-it-accepts.md) の「std が受け付けるパスには何も足さない」の例外 (先頭以外の NUL と同じ)。Linux の std は空のパスの bind を名前の無い abstract のアドレスに autobind し、それは呼び出し側が頼んだソケットのファイルではない (`bind_ex` が覚えるファイルも無い)。macOS の std は `EINVAL` を返すので、errno の無い `InvalidInput` に変わるが `ErrorKind` は同じ
 - B 自身の other の x だけを見直すのは、2 つのプロセスが同時に B を初めて作ると、片方の `mkdirat` (0700) と `fchmodat` (0711) の間にもう片方がその B を開いて 0700 と覚えうるため (ハブ SPEC-routes「実体の置き場」)。見直しは B の fd の `fstat` 1 回で、B を作り直さない。持っていると分かった後は覚えて見直さない (持っていると覚えた B を見直さないのと同じ)
 - 作った直後に名前で mode を変えるのは、Linux の B の fd が `O_PATH` (`fchmod` を受け付けない) で、umask が持ち主の読み・辿る権限を削ると `O_RDONLY` / `O_SEARCH` では開けないため。親は途中の確かめに通っていて、作った物を他人は付け替えられない (sticky な `/tmp` でも、消す・名前を変えるのは持ち主だけ)
@@ -122,7 +129,7 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 ## Consequences
 
 - fork の経路、最終手段 (`LastResort`)、`Loss`・`losses`、`ExListener`・`ExStream`、`SocketFile::discard` は無い
-- 既定の `bind` の E と、死んだプロセスの D は、OS の一時ディレクトリの掃除か `sweep()` まで残る。ソケットのディレクトリの B と、落とした B (`sockat-<uid>.<乱数>`) はどちらでも消えないことがある (MANUAL に書く)
+- 既定の `bind` の E と、死んだプロセスの D は、OS の一時ディレクトリの掃除か `sweep()` まで残る。ソケットのディレクトリの B はどちらでも消えないことがある (MANUAL に書く)
 - 試験は `src/tests.rs` (経路を強制する単体試験) と `tests/` (公開 API) に置く
 
 ## 関連

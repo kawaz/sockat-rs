@@ -28,7 +28,8 @@ use crate::{Bound, ExError, Options, Report};
 
 /// Create a datagram socket bound to `path`, like [`UnixDatagram::bind`] but
 /// for a path of any length. As [`bind`](crate::bind): the socket file is at
-/// `path`, and E stays until the process ends ([`bind_ex`] cleans up).
+/// `path`, and E stays until the process ends, shared with the other default
+/// binds in the same directory ([`bind_ex`] cleans up an E of its own).
 ///
 /// # Errors
 ///

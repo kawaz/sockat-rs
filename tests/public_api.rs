@@ -375,6 +375,31 @@ fn long_path_errors_through_the_public_api() {
     );
 }
 
+// The default binds (`bind`, `datagram::bind`) in one directory go through
+// one E (hub SPEC-routes "link-dir"): the spellings the kernel keeps for them
+// share everything but the file name, so a process binding many sockets in
+// one directory leaves one E there, not one per bind. bind_ex makes an E of
+// its own (its cleanup removes that one alone), so its spelling goes through
+// another. Only the part before the file name is compared: std on OpenBSD
+// before Rust 1.100 cuts the last byte of what it reads.
+#[test]
+fn default_binds_in_one_directory_share_their_e() {
+    let t = tmp();
+    let dir = nest(t.path(), 200, "x").parent().unwrap().to_path_buf();
+    let a = sockat::bind(dir.join("a.sock")).unwrap();
+    let b = sockat::bind(dir.join("b.sock")).unwrap();
+    let d = sockat::datagram::bind(dir.join("d.sock")).unwrap();
+    let through = |p: PathBuf| p.parent().unwrap().to_path_buf();
+    let shared = through(reported(&a));
+    assert_eq!(through(reported(&b)), shared);
+    let dgram = d.local_addr().unwrap().as_pathname().unwrap().to_path_buf();
+    assert_eq!(through(dgram), shared);
+    let ex = sockat::bind_ex(dir.join("e.sock"), Default::default()).unwrap();
+    assert_ne!(through(reported(&ex.socket)), shared);
+    ex.file.remove().unwrap();
+    ping_through_spelling(&a, "default_binds_share_one_link_dir_e_per_directory");
+}
+
 // An empty path is an argument error through every public function (hub
 // SPEC "短いパス"), whatever the OS: InvalidInput with no errno, before std
 // sees it (std's bind on Linux would autobind to an unnamed abstract address,

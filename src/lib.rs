@@ -553,9 +553,11 @@ pub(crate) fn bound<S: From<OwnedFd>>(
 /// A path that std accepts goes to [`UnixListener::bind`] unchanged. A longer
 /// path is bound by the routes of the platform (see the [crate
 /// documentation](crate)); the socket file is created at `path` either way,
-/// and is not removed when the listener is dropped (as with std). Its E stays
-/// until the process ends ([`bind_ex`] returns a [`SocketFile`] that removes
-/// the file and E).
+/// and is not removed when the listener is dropped (as with std). The E its
+/// spelling goes through stays until the process ends; through link-dir it is
+/// one per directory, shared by every `bind` and [`datagram::bind`] there
+/// ([`bind_ex`] returns a [`SocketFile`] that removes the file and an E of
+/// its own).
 ///
 /// # Errors
 ///

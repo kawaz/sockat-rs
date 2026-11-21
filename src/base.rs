@@ -80,8 +80,8 @@ impl Place {
     }
 }
 
-/// Length of every random name sockat draws: B in the socket's directory, a
-/// fallback B, D, the E of thread-cwd / at and the E directly in B (hub
+/// Length of every random name sockat draws: B in the socket's directory, D,
+/// the E of thread-cwd / at and the E directly in B (hub
 /// SPEC-routes "D と E").
 pub(crate) const RANDOM_LEN: usize = 10;
 
@@ -273,15 +273,42 @@ pub(crate) struct Base {
 /// What [`Base::make`] does with a B already there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Existing {
-    /// Use it when it passes the checks; otherwise fall back to
-    /// `<name>.<10 random>` (the places 1-3).
-    UseOrFallBack,
+    /// Use it when it passes the checks; otherwise the name is taken
+    /// ([`Unmade::Occupied`]) and the place cannot be used (the places 1-3).
+    UseOrNext,
     /// Use it when it passes the checks; otherwise `EPERM` (`Options.base`).
     UseOrRefuse,
     /// Never: the name is random and must be new (the socket's directory).
     New,
     /// Make nothing: only find it (`sweep`).
     FindOnly,
+}
+
+/// Why [`Base::make`] gave no B.
+#[derive(Debug)]
+enum Unmade {
+    /// Something already at B's name fails the checks (not a real directory,
+    /// someone else's, writable by group or others): the name is taken
+    /// (hub SPEC-routes "B の作り方" 5). The error is the one the check gives
+    /// (`EPERM`, `ENOTDIR`), which `Options.base` returns.
+    Occupied(io::Error),
+    /// Anything else (the way to B, `mkdirat`, the mode, the open, B not
+    /// letting others search when that is asked).
+    Failed(io::Error),
+}
+
+impl From<io::Error> for Unmade {
+    fn from(e: io::Error) -> Self {
+        Unmade::Failed(e)
+    }
+}
+
+impl From<Unmade> for io::Error {
+    fn from(u: Unmade) -> Self {
+        match u {
+            Unmade::Occupied(e) | Unmade::Failed(e) => e,
+        }
+    }
 }
 
 impl Base {
@@ -338,7 +365,7 @@ impl Base {
     ///    directory of this user, and its mode is set to 0711;
     /// 5. on `EEXIST`, what is there must be a directory of this user that
     ///    group and others cannot write to, and is used with its mode as it
-    ///    is; otherwise `existing` decides.
+    ///    is; otherwise the name is taken ([`Unmade::Occupied`]).
     ///
     /// `others_search` asks for a B another uid can search through: a way
     /// there that does not allow it is `EPERM` before anything is made, and
@@ -349,11 +376,11 @@ impl Base {
         place: Place,
         existing: Existing,
         others_search: bool,
-    ) -> io::Result<Base> {
+    ) -> Result<Base, Unmade> {
         let parent_real = std::fs::canonicalize(parent)?;
         let c = chain(&parent_real)?;
         if !c.safe || (others_search && !c.others_search) {
-            return Err(refused());
+            return Err(Unmade::Failed(refused()));
         }
         let parent_fd = open_dir(&parent_real)?;
         let mut name = name.to_os_string();
@@ -364,32 +391,28 @@ impl Base {
                     Ok(()) => true,
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                         if existing == Existing::New {
-                            name = fallback_name(place)?;
+                            name = socket_dir_name()?;
                             continue;
                         }
                         false
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 },
             };
             let st = sys::stat_at(parent_fd.as_fd(), &name)?;
             // A symlink is not a real directory (EPERM: the check fails);
             // anything else that is not a directory is ENOTDIR.
             if st.is_symlink {
-                return Err(refused());
+                return Err(Unmade::Occupied(refused()));
             }
             if !st.is_dir {
-                return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+                return Err(Unmade::Occupied(io::Error::from_raw_os_error(
+                    libc::ENOTDIR,
+                )));
             }
             let ours = st.uid == sys::effective_uid() && (created || st.mode & 0o022 == 0);
             if !ours {
-                match existing {
-                    Existing::UseOrFallBack => {
-                        name = fallback_name(place)?;
-                        continue;
-                    }
-                    _ => return Err(refused()),
-                }
+                return Err(Unmade::Occupied(refused()));
             }
             // Design rationale: the mode of a B just made is set by its name
             // before it is opened, rather than by `fchmod` on the fd after:
@@ -401,7 +424,7 @@ impl Base {
             let mode = if created {
                 if let Err(e) = sys::chmod_at(parent_fd.as_fd(), &name, 0o711) {
                     let _ = sys::unlink_at(parent_fd.as_fd(), &name, true);
-                    return Err(e);
+                    return Err(e.into());
                 }
                 0o711
             } else {
@@ -413,7 +436,7 @@ impl Base {
                     if created {
                         let _ = sys::unlink_at(parent_fd.as_fd(), &name, true);
                     }
-                    return Err(e);
+                    return Err(e.into());
                 }
             };
             // What was opened must be a directory of this user and still be
@@ -426,12 +449,13 @@ impl Base {
             if !held {
                 if created {
                     let _ = sys::unlink_at(parent_fd.as_fd(), &name, true);
+                    return Err(Unmade::Failed(refused()));
                 }
-                return Err(refused());
+                return Err(Unmade::Occupied(refused()));
             }
             let b_search = mode & 0o001 != 0;
             if others_search && !b_search {
-                return Err(refused());
+                return Err(Unmade::Failed(refused()));
             }
             let path = parent_real.join(&name);
             return Ok(Base {
@@ -446,10 +470,10 @@ impl Base {
                 d: Mutex::new(None),
             });
         }
-        Err(io::Error::new(
+        Err(Unmade::Failed(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "could not find a free name for B",
-        ))
+        )))
     }
 
     /// This process's D in B, made the first time it is asked for (and again
@@ -492,15 +516,13 @@ pub(crate) fn still_named(
     linked && named.is_ok_and(|n| n == id)
 }
 
-/// A random name for B in `place`: `.sockat.<10 random>` in the socket's
-/// directory, `sockat-<uid>.<10 random>` in place of a default name someone
-/// else holds (hub SPEC-routes "B の作り方" 5).
-fn fallback_name(place: Place) -> io::Result<OsString> {
-    let random = random_name()?;
-    Ok(OsString::from(match place {
-        Place::SocketDir => format!("{SOCKDIR_PREFIX}{random}"),
-        _ => format!("sockat-{}.{random}", sys::effective_uid()),
-    }))
+/// A random name for B in the socket's directory: `.sockat.<10 random>`
+/// (hub SPEC-routes "B の作り方").
+fn socket_dir_name() -> io::Result<OsString> {
+    Ok(OsString::from(format!(
+        "{SOCKDIR_PREFIX}{}",
+        random_name()?
+    )))
 }
 
 /// Every B this process holds.
@@ -595,8 +617,10 @@ pub(crate) enum Automatic {
     /// The process's B is (or would be made) where the spelling is known not
     /// to fit: the routes through B are passed over, and nothing is made.
     TooLong,
-    /// B can be made in none of the places.
-    Missing,
+    /// B can be made in none of the places; `occupied` when B's default
+    /// name was taken in one of them (hub SPEC "skipped": the reason of the
+    /// routes through B says so).
+    Missing { occupied: bool },
 }
 
 /// The process's B of the places 1-3 (hub SPEC-routes "実体の置き場"): the
@@ -614,6 +638,10 @@ pub(crate) enum Automatic {
 /// When the spelling through that first place is known not to fit (`fits`
 /// of B's real path there), B is not made, and the next place is not tried
 /// either: the process's B does not depend on the length of a path.
+///
+/// A place whose default name is taken (something there fails the checks of
+/// B) cannot be used: nothing is made in it, and the next place is tried
+/// (hub SPEC-routes "B の作り方" 5).
 pub(crate) fn automatic(
     places: &[(Place, PathBuf)],
     held: &Held,
@@ -630,6 +658,7 @@ pub(crate) fn automatic(
         return found(b);
     }
     let other = held_in(&mut slots, 1 - slot);
+    let mut occupied = false;
     for (place, parent) in places {
         // The B held for the other slot is this place's B when it is here,
         // with what it allows as judged when it was taken (B itself looked
@@ -658,20 +687,18 @@ pub(crate) fn automatic(
             return Automatic::TooLong;
         }
         let name = OsString::from(place.b_name());
-        if let Ok(b) = Base::make(
-            parent,
-            &name,
-            *place,
-            Existing::UseOrFallBack,
-            others_search,
-        ) {
-            let b = Arc::new(b);
-            lock(&REGISTRY).all.push(Arc::clone(&b));
-            slots[slot] = Some(Arc::clone(&b));
-            return Automatic::Base(b);
+        match Base::make(parent, &name, *place, Existing::UseOrNext, others_search) {
+            Ok(b) => {
+                let b = Arc::new(b);
+                lock(&REGISTRY).all.push(Arc::clone(&b));
+                slots[slot] = Some(Arc::clone(&b));
+                return Automatic::Base(b);
+            }
+            Err(Unmade::Occupied(_)) => occupied = true,
+            Err(Unmade::Failed(_)) => {}
         }
     }
-    Automatic::Missing
+    Automatic::Missing { occupied }
 }
 
 /// The B in the socket's directory (`.sockat.<10 random>`), for when no place
@@ -682,7 +709,7 @@ pub(crate) fn in_socket_dir(real_dir: &Path) -> Option<Arc<Base>> {
     if let Some(b) = registry.find(|b| b.place == Place::SocketDir && b.given_parent == real_dir) {
         return Some(b);
     }
-    let name = fallback_name(Place::SocketDir).ok()?;
+    let name = socket_dir_name().ok()?;
     let b = Arc::new(Base::make(real_dir, &name, Place::SocketDir, Existing::New, false).ok()?);
     registry.all.push(Arc::clone(&b));
     Some(b)
@@ -785,6 +812,8 @@ pub(crate) struct Dir {
     id: (u64, u64),
     /// The number of the next counted E ([`counted_name`]).
     next: AtomicU64,
+    /// The E the default binds share ([`Dir::shared`]).
+    shared: Mutex<HashMap<PathBuf, OsString>>,
 }
 
 impl Dir {
@@ -837,6 +866,7 @@ impl Dir {
                 fd,
                 id,
                 next: AtomicU64::new(0),
+                shared: Mutex::new(HashMap::new()),
             });
         }
         Err(io::Error::new(
@@ -857,6 +887,25 @@ impl Dir {
     )]
     pub(crate) fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
+    }
+
+    /// The E the default binds (those that return no `SocketFile`) share in
+    /// D through link-dir: the real path of a socket's directory to the name
+    /// of the counted E pointing to it, one per directory (hub SPEC-routes
+    /// "link-dir"). The caller holds the lock while it looks an E up and
+    /// makes one when there is none, so two binds at once never make two E
+    /// for one directory; it is not held across the bind (a shared E is
+    /// never removed, so no bind has to wait for another). A D made again
+    /// starts with an empty table (the table is D's).
+    pub(crate) fn shared(&self) -> MutexGuard<'_, HashMap<PathBuf, OsString>> {
+        lock(&self.shared)
+    }
+
+    /// Whether the E named `name` in D is still a symlink pointing to
+    /// `target` (`readlinkat` on D's fd): one removed, or replaced by
+    /// something else, is not to be used again (hub SPEC-routes "link-dir").
+    pub(crate) fn points_to(&self, name: &OsStr, target: &Path) -> bool {
+        sys::read_link_at(self.fd.as_fd(), name).is_ok_and(|to| to == target)
     }
 
     /// The length of the name the next counted E gets (it only grows).
@@ -906,6 +955,11 @@ pub(crate) struct Link {
 }
 
 impl Link {
+    /// E's name in D.
+    pub(crate) fn name(&self) -> &OsStr {
+        &self.name
+    }
+
     /// `D/E`: the part of the spelling below B.
     pub(crate) fn below_b(&self) -> PathBuf {
         Path::new(&self.dir.name).join(&self.name)
@@ -1004,7 +1058,7 @@ pub(crate) fn proc_spelling(proc: &Path, b: &Base) -> Option<PathBuf> {
 
 /// Remove the D whose owner is gone (no `flock` held on it) in each B of the
 /// places 1-3 by its default name that is there (hub SPEC "`sweep`"): none is
-/// made, and fallback or socket-directory Bs are left alone.
+/// made, and the Bs in sockets' directories are left alone.
 pub(crate) fn sweep(places: &[(Place, PathBuf)]) -> io::Result<()> {
     for (place, parent) in places {
         let name = OsString::from(place.b_name());
@@ -1027,7 +1081,8 @@ pub(crate) fn sweep(places: &[(Place, PathBuf)]) -> io::Result<()> {
 /// there, and of listing it.
 pub(crate) fn sweep_base(base: &Path) -> io::Result<()> {
     let (parent, name) = split_given(base)?;
-    match Base::make(parent, name, Place::Given, Existing::FindOnly, false) {
+    match Base::make(parent, name, Place::Given, Existing::FindOnly, false).map_err(io::Error::from)
+    {
         Ok(b) => sweep_in(&b),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),

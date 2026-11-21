@@ -637,6 +637,217 @@ fn a_failed_bind_through_link_dir_removes_its_e_and_is_not_retried() {
     assert_no_e(&b_of(&place));
 }
 
+/// A default bind (one that returns no `SocketFile`, as `bind` and
+/// `datagram::bind` do): `route::run` without remembering the file.
+fn bind_default(p: &Path, cfg: &Config) -> Result<Reached, route::Failed> {
+    route::run(BIND, p, &opts(), false, Some(cfg))
+}
+
+/// The E in the only D of `b`, as `(name, what it points to)`, sorted.
+fn links_in(b: &Path) -> Vec<(String, PathBuf)> {
+    let ds = entries(b);
+    assert_eq!(ds.len(), 1, "{ds:?}");
+    let d = b.join(&ds[0]);
+    entries(&d)
+        .into_iter()
+        .map(|e| {
+            let to = std::fs::read_link(d.join(&e)).unwrap();
+            (e, to)
+        })
+        .collect()
+}
+
+// The default binds share one link-dir E per (D, socket's directory) (hub
+// SPEC-routes "link-dir", RV-Q2): a long-lived process binding many sockets
+// in one directory keeps one E for it, not one per bind, since nothing ever
+// cleans the default bind's E up. So:
+//
+// - three default binds (stream and datagram) in one directory leave one E,
+//   pointing to that directory's real path, and each socket is at its path
+//   and reached through the spelling the kernel keeps (`<B>/<D>/<E>/<name>`)
+// - a default bind in another directory makes its own E (one per directory)
+// - bind_ex and resolve_for_bind still make an E per call (their cleanup()
+//   removes theirs alone), and cleaning one up leaves the shared E
+#[test]
+fn default_binds_share_one_link_dir_e_per_directory() {
+    let (t, place) = setup();
+    let cfg = real_link_dir(&place);
+    let b = b_of(&place);
+    let dir = nest(t.path(), 200, "x").parent().unwrap().to_path_buf();
+    let real = std::fs::canonicalize(&dir).unwrap();
+    let mut listeners = Vec::new();
+    for name in ["s1.sock", "s2.sock"] {
+        let mut r = bind_default(&dir.join(name), &cfg).unwrap();
+        assert_eq!(r.route, names::LINK_DIR);
+        listeners.push((dir.join(name), listener(&mut r)));
+    }
+    let dgram = Request::Bind(SockType::Datagram);
+    let r = route::run(dgram, &dir.join("d.sock"), &opts(), false, Some(&cfg)).unwrap();
+    assert_eq!(r.route, names::LINK_DIR);
+    let _dgram = UnixDatagram::from(r.socket.unwrap());
+    assert!(is_socket(&dir.join("d.sock")));
+    assert_eq!(links_in(&b), vec![("0".to_owned(), real.clone())]);
+    for (p, l) in &listeners {
+        assert!(is_socket(p));
+        let spelling = reported(l);
+        assert_eq!(spelling.parent().unwrap().file_name().unwrap(), "0");
+        ping(l, UnixStream::connect(&spelling).unwrap().into());
+    }
+
+    let other = nest(&t.path().join("o"), 200, "s.sock");
+    let _o = listener(&mut bind_default(&other, &cfg).unwrap());
+    assert_eq!(links_in(&b).len(), 2);
+
+    let mut ex = bind(&dir.join("e.sock"), &opts(), &cfg).unwrap();
+    let _ex = listener(&mut ex);
+    let resolved =
+        route::resolve(route::Use::Bind, &dir.join("r.sock"), &opts(), Some(&cfg)).unwrap();
+    assert_eq!(links_in(&b).len(), 4);
+    ex.link.as_ref().unwrap().cleanup().unwrap();
+    resolved.link.as_ref().unwrap().cleanup().unwrap();
+    let left = links_in(&b);
+    assert_eq!(left.len(), 2, "{left:?}");
+    assert!(left.contains(&("0".to_owned(), real)));
+}
+
+// The shared E is used again only while it is still the symlink to the
+// directory (hub SPEC-routes "link-dir": readlinkat on D's fd, and what it
+// points to compared with the directory's real path). One removed by hand,
+// or put back pointing elsewhere, is let go: the next default bind makes a
+// new E and binds there, the socket ends up at its own path (never in the
+// directory the replaced E points to), and the new E is shared from then on.
+#[test]
+fn a_shared_e_removed_or_pointing_elsewhere_is_made_again() {
+    let (t, place) = setup();
+    let cfg = real_link_dir(&place);
+    let b = b_of(&place);
+    let dir = nest(t.path(), 200, "x").parent().unwrap().to_path_buf();
+    let real = std::fs::canonicalize(&dir).unwrap();
+    let elsewhere = tmp();
+    let _first = listener(&mut bind_default(&dir.join("s1.sock"), &cfg).unwrap());
+    let d = b.join(entries(&b).pop().unwrap());
+
+    std::fs::remove_file(d.join("0")).unwrap();
+    let mut r = bind_default(&dir.join("s2.sock"), &cfg).unwrap();
+    let l = listener(&mut r);
+    assert!(is_socket(&dir.join("s2.sock")));
+    assert_eq!(links_in(&b), vec![("1".to_owned(), real.clone())]);
+    ping(&l, UnixStream::connect(reported(&l)).unwrap().into());
+
+    std::fs::remove_file(d.join("1")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), d.join("1")).unwrap();
+    let mut r = bind_default(&dir.join("s3.sock"), &cfg).unwrap();
+    let l = listener(&mut r);
+    assert!(is_socket(&dir.join("s3.sock")));
+    assert!(
+        entries(elsewhere.path()).is_empty(),
+        "bound through the replaced E"
+    );
+    let spelling = reported(&l);
+    assert_eq!(spelling.parent().unwrap().file_name().unwrap(), "2");
+    let mut r = bind_default(&dir.join("s4.sock"), &cfg).unwrap();
+    assert_eq!(reported(&listener(&mut r)).parent(), spelling.parent());
+}
+
+// A default bind that fails for real on link-dir (a file at the path: the
+// errno std's bind gives a short path in the same situation on this OS,
+// compared rather than fixed) leaves the shared E, the one an earlier call
+// made (a connect through that call's spelling still works) and the one it
+// made itself when it was the first in its directory: another default bind
+// may be going through it at the same moment, and the next default bind
+// there uses it (hub SPEC-routes "経路の失敗の扱い"). The E of bind_ex
+// (link-dir) and of the default bind's link-file (macOS, NetBSD: an E per
+// bind) are still removed when their bind fails.
+#[test]
+fn a_failed_default_bind_leaves_the_shared_e_for_the_next() {
+    let (t, place) = setup();
+    let cfg = real_link_dir(&place);
+    let b = b_of(&place);
+    let dir = nest(t.path(), 200, "x").parent().unwrap().to_path_buf();
+    let l = listener(&mut bind_default(&dir.join("s1.sock"), &cfg).unwrap());
+    std::fs::write(dir.join("f.sock"), b"").unwrap();
+    let f = bind_default(&dir.join("f.sock"), &cfg).err().unwrap();
+    assert_eq!(errno(&f.error), Some(std_errno(Short::BindOntoAFile)));
+    assert_eq!(f.route, Some(names::LINK_DIR));
+    assert_eq!(links_in(&b).len(), 1);
+    ping(&l, UnixStream::connect(reported(&l)).unwrap().into());
+
+    let fresh = nest(&t.path().join("n"), 200, "f.sock");
+    let fresh_real = std::fs::canonicalize(fresh.parent().unwrap()).unwrap();
+    std::fs::write(&fresh, b"").unwrap();
+    let f = bind_default(&fresh, &cfg).err().unwrap();
+    assert_eq!(errno(&f.error), Some(std_errno(Short::BindOntoAFile)));
+    let left = links_in(&b);
+    assert_eq!(left.len(), 2, "the failed bind's own E was removed");
+    let made = left
+        .iter()
+        .find(|(_, to)| *to == fresh_real)
+        .unwrap()
+        .0
+        .clone();
+    std::fs::remove_file(&fresh).unwrap();
+    let l = listener(&mut bind_default(&fresh, &cfg).unwrap());
+    assert_eq!(
+        links_in(&b).len(),
+        2,
+        "the next bind did not use the E left"
+    );
+    assert_eq!(
+        reported(&l).parent().unwrap().file_name().unwrap(),
+        made.as_str()
+    );
+
+    let ex = nest(&t.path().join("x"), 200, "f.sock");
+    std::fs::write(&ex, b"").unwrap();
+    let f = bind(&ex, &opts(), &cfg).err().unwrap();
+    assert_eq!(f.route, Some(names::LINK_DIR));
+    assert_eq!(links_in(&b).len(), 2, "bind_ex left its E");
+
+    if cfg!(any(target_vendor = "apple", target_os = "netbsd")) {
+        // The same B and D as above (clones of a config share its B).
+        let lf = Config {
+            follows: Follows::Yes,
+            ..cfg.clone()
+        };
+        let p = nest(&t.path().join("lf"), 400, &"n".repeat(200));
+        std::fs::write(&p, b"").unwrap();
+        let f = bind_default(&p, &lf).err().unwrap();
+        assert_eq!(f.route, Some(names::LINK_FILE));
+        assert_eq!(
+            links_in(&b).len(),
+            2,
+            "the default bind's link-file left its E"
+        );
+    }
+}
+
+// Many default binds at once in one directory, on many threads, all
+// succeed with one D and one E for that directory between them (hub SPEC
+// "実装が確かめる試験の観点": the sharing of the default bind's E does not
+// race), and every socket is at its own path and answers.
+#[test]
+fn concurrent_default_binds_share_one_e() {
+    let (t, place) = setup();
+    let cfg = real_link_dir(&place);
+    let dir = nest(t.path(), 200, "x").parent().unwrap().to_path_buf();
+    std::thread::scope(|s| {
+        for i in 0..16 {
+            let (cfg, p) = (&cfg, dir.join(format!("s{i:02}.sock")));
+            s.spawn(move || {
+                let mut r = bind_default(&p, cfg).unwrap();
+                assert_eq!(r.route, names::LINK_DIR);
+                let l = listener(&mut r);
+                ping(&l, connect(&p, cfg).unwrap().socket.unwrap());
+            });
+        }
+    });
+    let real = std::fs::canonicalize(&dir).unwrap();
+    assert_eq!(links_in(&b_of(&place)), vec![("0".to_owned(), real)]);
+    for i in 0..16 {
+        assert!(is_socket(&dir.join(format!("s{i:02}.sock"))));
+    }
+}
+
 // link-dir through /proc/<pid>/fd/<B's fd> (Linux with /proc), tried before
 // B's real path: the spelling goes through this process's fd of B by this
 // process's pid (not `self`, which another process would read as its own).
@@ -1038,30 +1249,93 @@ fn a_place_another_user_could_change_is_passed_over() {
     assert!(b_of(&good).is_dir());
 }
 
-// A B already at the default name that is not fit to use (writable by its
-// group) is left as it is, and B is made under `sockat-<uid>.<10 random>`
-// instead. A B already there that is fit is used with its mode as it is
-// (0700 here).
+// Something already at B's default name in one of the places 1-3 that fails
+// the checks of B (here: a directory writable by its group, a symlink, a
+// regular file) means the name is taken (占拠, hub SPEC-routes "B の作り方"
+// 5): the place cannot be used, nothing is made in it (no other B beside the
+// one there), what is there is left as it is, and B is made in the next
+// place. With no next place, the routes through B cannot be used, and their
+// reason says the name is taken (hub SPEC "skipped"), for a bind (link-dir)
+// and for a connect (link-file) alike, so the user can tell it from a place
+// that is just missing. Another uid's B is not made here (it needs root).
 #[test]
-fn an_existing_b_is_used_as_it_is_or_replaced_by_a_random_name() {
-    let (t, place) = setup();
-    let cfg = real_link_dir(&place);
-    let b = b_of(&place);
-    std::fs::create_dir(&b).unwrap();
-    std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o770)).unwrap();
-    let p = nest(t.path(), 200, "s.sock");
-    let r = bind(&p, &opts(), &cfg).unwrap();
-    assert_eq!(r.route, names::LINK_DIR);
-    assert!(entries(&b).is_empty(), "the unfit B was used");
-    assert_eq!(std::fs::metadata(&b).unwrap().mode() & 0o777, 0o770);
-    let prefix = format!("sockat-{}.", sys::effective_uid());
-    let fallback: Vec<_> = entries(&place)
-        .into_iter()
-        .filter(|n| n.starts_with(&prefix))
-        .collect();
-    assert_eq!(fallback.len(), 1);
-    assert_eq!(fallback[0].len(), prefix.len() + base::RANDOM_LEN);
+fn an_occupied_b_is_passed_over_for_the_next_place() {
+    /// How to put something at B's name.
+    type Put = fn(&Path);
+    let occupy: [(&str, Put); 3] = [
+        ("group-writable", |b| {
+            std::fs::create_dir(b).unwrap();
+            std::fs::set_permissions(b, std::fs::Permissions::from_mode(0o770)).unwrap();
+        }),
+        ("symlink", |b| {
+            std::os::unix::fs::symlink("/", b).unwrap();
+        }),
+        ("file", |b| std::fs::write(b, b"").unwrap()),
+    ];
+    for (kind, put) in occupy {
+        let t = tmp();
+        let taken = t.path().join("taken");
+        let next = t.path().join("next");
+        std::fs::create_dir(&taken).unwrap();
+        std::fs::create_dir(&next).unwrap();
+        let b = b_of(&taken);
+        put(&b);
+        let before = std::fs::symlink_metadata(&b).unwrap();
+        let cfg = with_places(
+            real_link_dir(&taken),
+            &[(Place::Tmp, &taken), (Place::Tmpdir, &next)],
+        );
+        let r = bind(&nest(&t.path().join("a"), 200, "s.sock"), &opts(), &cfg).unwrap();
+        assert_eq!(
+            (r.route, r.base),
+            (names::LINK_DIR, Some("tmpdir")),
+            "{kind}"
+        );
+        assert_eq!(
+            entries(&taken),
+            vec![format!("sockat-{}", sys::effective_uid())],
+            "{kind}"
+        );
+        let after = std::fs::symlink_metadata(&b).unwrap();
+        assert_eq!(
+            (after.ino(), after.mode(), after.file_type().is_dir()),
+            (before.ino(), before.mode(), before.file_type().is_dir()),
+            "{kind}: what was there was changed"
+        );
+        if after.file_type().is_dir() {
+            assert!(entries(&b).is_empty(), "{kind}: something made in it");
+        }
 
+        let alone = no_thread(with_places(real_link_dir(&taken), &[(Place::Tmp, &taken)]));
+        let q = nest(&t.path().join("q"), 200, "s.sock");
+        let r = bind(&q, &opts(), &alone);
+        assert!(
+            skipped_of(&r).contains(&(names::LINK_DIR, names::BASE_OCCUPIED)),
+            "{kind}: {:?}",
+            skipped_of(&r)
+        );
+        let c = nest(&t.path().join("c"), 300, &"n".repeat(100));
+        let _l = listen_at(&c);
+        let only_link_file = no_thread(no_direct(no_proc(config(&taken))));
+        let c = connect(&c, &only_link_file);
+        assert!(
+            skipped_of(&c).contains(&(names::LINK_FILE, names::BASE_OCCUPIED)),
+            "{kind}: {:?}",
+            skipped_of(&c)
+        );
+        assert_eq!(
+            entries(&taken),
+            vec![format!("sockat-{}", sys::effective_uid())],
+            "{kind}"
+        );
+    }
+}
+
+// A B already at the default name that passes the checks is used with its
+// mode as it is (0700 here: sockat does not change the mode of a B it did not
+// make).
+#[test]
+fn an_existing_b_that_passes_the_checks_is_used_as_it_is() {
     let (t2, place2) = setup();
     let b2 = b_of(&place2);
     std::fs::create_dir(&b2).unwrap();

@@ -28,7 +28,7 @@
 use std::ffi::{CString, OsStr};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 /// What to do with a socket and an address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -659,6 +659,36 @@ pub(crate) fn symlink_at(
     // SAFETY: both strings are NUL-terminated and live for the call; `dir` is
     // a borrowed, live fd.
     cvt(unsafe { libc::symlinkat(target.as_ptr(), dir.as_raw_fd(), name.as_ptr()) }).map(drop)
+}
+
+/// `readlinkat(2)`: what the symlink `name` inside the directory `dir`
+/// points to. `EINVAL` when `name` is not a symlink. A target that fills the
+/// buffer is read again with a larger one, so it is never cut short.
+pub(crate) fn read_link_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<std::path::PathBuf> {
+    let name = c_name(name)?;
+    let mut buf: Vec<u8> = vec![0; 256];
+    loop {
+        // SAFETY: `name` is NUL-terminated and lives for the call; the kernel
+        // writes at most `buf.len()` bytes into `buf`; `dir` is a borrowed,
+        // live fd.
+        let n = unsafe {
+            libc::readlinkat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let n = n as usize;
+        if n < buf.len() {
+            buf.truncate(n);
+            return Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(buf)));
+        }
+        buf.resize(buf.len() * 2, 0);
+    }
 }
 
 /// `unlinkat(2)`: remove `name` inside the directory `dir`, a directory

@@ -63,6 +63,10 @@ pub(crate) mod names {
     pub(crate) const NO_BASE: &str = "no base";
     /// `usable_cross_uid`: no place lets another uid search the way to B.
     pub(crate) const NO_CROSS_UID_BASE: &str = "no base usable across uids";
+    /// No B could be had, and B's default name was taken in a place by
+    /// something that fails the checks (another user's, writable by others,
+    /// not a real directory).
+    pub(crate) const BASE_OCCUPIED: &str = "base occupied";
     /// D could not be made in B.
     pub(crate) const NO_D: &str = "D not made";
     /// E could not be made.
@@ -788,7 +792,8 @@ fn forms(
 /// uid) one in the socket's directory when `/proc` can spell it. `link_file`
 /// says whether a link-file spelling may be tried after link-dir. Without a
 /// B, why: no spelling would fit through the process's B (nothing is made
-/// then), or none could be had.
+/// then), or none could be had (because B's default name was taken, when it
+/// was: [`missing`]).
 fn spelled_base(
     t: &Target<'_>,
     link_file: bool,
@@ -806,16 +811,24 @@ fn spelled_base(
         let real = path::len(b);
         fits_through(real, 1, Some(t.name)) || by_proc || (link_file && fits_through(real, 1, None))
     };
-    let none = if cross {
-        names::NO_CROSS_UID_BASE
-    } else {
-        names::NO_BASE
-    };
     match base::automatic(&t.cfg.places, &t.cfg.held, cross, fits) {
         Automatic::Base(b) => Ok(Ok(b)),
         Automatic::TooLong => Ok(Err(names::TOO_LONG)),
-        Automatic::Missing if !cross && by_proc => Ok(base::in_socket_dir(&t.real_dir).ok_or(none)),
-        Automatic::Missing => Ok(Err(none)),
+        Automatic::Missing { occupied } if !cross && by_proc => {
+            Ok(base::in_socket_dir(&t.real_dir).ok_or(missing(occupied, cross)))
+        }
+        Automatic::Missing { occupied } => Ok(Err(missing(occupied, cross))),
+    }
+}
+
+/// Why no B could be had (hub SPEC "skipped"): B's default name taken in a
+/// place, when it was; else none lets another uid search the way to it (for
+/// `usable_cross_uid`), or none at all.
+fn missing(occupied: bool, cross: bool) -> &'static str {
+    match (occupied, cross) {
+        (true, _) => names::BASE_OCCUPIED,
+        (false, true) => names::NO_CROSS_UID_BASE,
+        (false, false) => names::NO_BASE,
     }
 }
 
@@ -893,6 +906,10 @@ fn bind_order(t: &Target<'_>, remember: bool) -> Step {
     };
     match &b {
         Err(why) => t.skip(names::LINK_DIR, why),
+        Ok(b) if !remember => match link_dir_shared(t, b) {
+            Ok(step) => return step,
+            Err(why) => t.skip(names::LINK_DIR, why),
+        },
         Ok(b) => match through(t, b, None) {
             Ok(th) => return bind_through(t, th, names::LINK_DIR, remember),
             Err(why) => t.skip(names::LINK_DIR, why),
@@ -914,6 +931,76 @@ fn bind_order(t: &Target<'_>, remember: bool) -> Step {
         target_os = "freebsd"
     )))]
     Step::Next
+}
+
+/// The default bind's link-dir (a bind that returns no `SocketFile`; hub
+/// SPEC-routes "link-dir"): the E pointing to the socket's directory's real
+/// path is one per (D, directory) and shared by every default bind there
+/// ([`base::Dir::shared`]), so a long-lived process binding many sockets in
+/// one directory keeps one E for it, not one per bind. Nothing cleans it up
+/// (the default bind hands back no `SocketFile`), so no count of its users
+/// is kept.
+///
+/// The E in the table is used again only while `readlinkat` on D's fd still
+/// finds it pointing to the directory; otherwise a new one is made and takes
+/// its place. A new E goes into the table as soon as it is made, before the
+/// bind, and a failed bind leaves it, as it leaves one an earlier call made
+/// (hub SPEC-routes "経路の失敗の扱い"): another default bind may be going
+/// through it at the same moment, and one left is used by the next. So the
+/// table is locked only to look up or make E, never across a bind. `Err`
+/// with why when no form of B fits or D or E cannot be made (noted by the
+/// caller).
+fn link_dir_shared(t: &Target<'_>, b: &Base) -> Result<Step, &'static str> {
+    let forms = forms(t.cfg, b, t.cross_uid());
+    let mut why = match forms.is_empty() {
+        true => names::PROC_UNUSABLE,
+        false => names::TOO_LONG,
+    };
+    for (prefix, diag, until, others, private_tmp) in forms {
+        if !fits_through(path::len(&prefix), 1, Some(t.name)) {
+            why = names::TOO_LONG;
+            continue;
+        }
+        let d = t.dir(b).ok_or(names::NO_D)?;
+        let e = {
+            let mut shared = d.shared();
+            match shared
+                .get(&t.real_dir)
+                .filter(|e| d.points_to(e, &t.real_dir))
+            {
+                Some(e) => e.clone(),
+                None => {
+                    if !fits_through(path::len(&prefix), d.next_e_len(), Some(t.name)) {
+                        why = names::TOO_LONG;
+                        continue;
+                    }
+                    let link = d.link(&t.real_dir).map_err(|_| names::NO_E)?;
+                    let e = link.name().to_os_string();
+                    shared.insert(t.real_dir.clone(), e.clone());
+                    e
+                }
+            }
+        };
+        let spelling = prefix.join(&d.name).join(&e).join(t.name);
+        if path::len(&spelling) > DIRECT_MAX {
+            why = names::TOO_LONG;
+            continue;
+        }
+        let hit = plain(t.req, &spelling).map(|socket| Hit {
+            socket,
+            base: Some(diag),
+            spelling: Some(Spelling::Linked {
+                removable: true,
+                until,
+                usable_cross_uid: others,
+                usable_with_private_tmp: private_tmp,
+            }),
+            link: None,
+            file: None,
+        });
+        return Ok(Step::done(names::LINK_DIR, hit));
+    }
+    Err(why)
 }
 
 /// Bind by the spelling of `th`. On success the E stays (the kernel keeps the
@@ -1041,16 +1128,18 @@ fn link_file_bind(t: &Target<'_>, b: Result<&Base, &&'static str>, remember: boo
     target_vendor = "apple",
     target_os = "freebsd"
 ))]
-fn d_base(t: &Target<'_>) -> Result<Option<Arc<Base>>, io::Error> {
+fn d_base(t: &Target<'_>) -> Result<Result<Arc<Base>, &'static str>, io::Error> {
     if let Some(given) = &t.options.base {
-        return base::given(given, t.cross_uid()).map(Some);
+        return base::given(given, t.cross_uid()).map(Ok);
     }
     // Nothing is spelled through B here, so any B fits (never TooLong).
     Ok(
         match base::automatic(&t.cfg.places, &t.cfg.held, false, |_| true) {
-            Automatic::Base(b) => Some(b),
-            Automatic::TooLong => None,
-            Automatic::Missing => base::in_socket_dir(&t.real_dir),
+            Automatic::Base(b) => Ok(b),
+            Automatic::TooLong => Err(names::TOO_LONG),
+            Automatic::Missing { occupied } => {
+                base::in_socket_dir(&t.real_dir).ok_or(missing(occupied, false))
+            }
         },
     )
 }
@@ -1078,9 +1167,9 @@ fn in_d(
         return Step::Next;
     }
     let b = match d_base(t) {
-        Ok(Some(b)) => b,
-        Ok(None) => {
-            t.skip(route, names::NO_BASE);
+        Ok(Ok(b)) => b,
+        Ok(Err(why)) => {
+            t.skip(route, why);
             return Step::Next;
         }
         Err(e) => return Step::base_error(e),
@@ -1280,7 +1369,7 @@ fn link_file_connect(t: &Target<'_>) -> Step {
         None => match base::automatic(&t.cfg.places, &t.cfg.held, false, fits) {
             Automatic::Base(b) => b,
             Automatic::TooLong => return skip(names::TOO_LONG),
-            Automatic::Missing => return skip(names::NO_BASE),
+            Automatic::Missing { occupied } => return skip(missing(occupied, false)),
         },
     };
     if !fits(&b.path) {
