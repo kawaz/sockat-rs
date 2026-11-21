@@ -175,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "sockat"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "libc",
  "serde_json",
