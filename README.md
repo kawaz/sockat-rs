@@ -25,33 +25,12 @@ Use sockat's functions where you would use std's.
 - The results are std's own types
 - A path of a length std accepts goes to std unchanged, so it behaves exactly as with std
 - Even for a long path, the socket file is created at the path given
-- A bind at a long path leaves D and E outside the app's own directories (`/tmp/sockat-<uid>` etc.). They go with the OS's cleaning of temporary directories or `sockat::sweep()`. Removing a live process's D by hand only makes the spelling unreachable; the socket at the original path keeps working. Where tests run over and over, one call of `sweep()` keeps dead D from piling up (`sweep_base` for a B put at `Options::base`). See [What differs from std for a long path](#what-differs-from-std-for-a-long-path)
-- Nothing forks, and neither the cwd of the process nor that of the calling thread is changed
+- A bind at a long path leaves small directories and symlinks outside the app's own directories (`/tmp/sockat-<uid>` etc.). What stays and how it goes are in the specification's [What stays in the base](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-stays-in-the-base) and [`sweep`](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#sweep); how to call it from Rust (`sockat::sweep()`, `sockat::sweep_base(path)`) is in the [manual](docs/MANUAL.md#sweep-and-sweep_base)
 - To remove the socket file later, or to know whether the spelling can be used later and how the path was reached, use the `_ex` functions (`bind_ex`, ...). To hand a spelling to std yourself, use `resolve_for_bind` / `resolve_for_connect`
-
-## Why
-
-std's `bind` / `connect` refuse a path that does not fit `sun_path`. The file system has no such limit, but deep temporary directories hit it quickly (macOS's `$TMPDIR` alone is about 50 bytes, and test harnesses and sandboxes nest further). The limit applies to the argument passed to `bind(2)` / `connect(2)`, so sockat hands the kernel a short spelling that names the same place.
 
 ## How a long path is reached
 
-The kernel keeps a bind's spelling for the life of the socket and reports it by `getsockname`. Libraries above remove the socket file by that spelling, and a DGRAM receiver replies to it. So a bind's spelling must keep naming the same place when it is followed later.
-
-- **B**: this user's directory in a base. `/tmp/sockat-<uid>` (failing that `$XDG_RUNTIME_DIR/sockat`, `$TMPDIR/sockat-<uid>`, the socket's directory). Mode 0711, reused, never removed by sockat
-- **D**: a directory per process in B. The process keeps a `flock` on it; a dead process's D is removed by the OS's cleaning of temporary directories or by `sockat::sweep()`
-- **E**: a symlink in D. It points to the socket's directory (link-dir, spelling `B/D/E/<file name>`) or to the socket file (link-file, spelling `B/D/E`; macOS and NetBSD, where a bind follows a symlink)
-
-B is spelled `/proc/<pid>/fd/<B's fd>` (Linux) or by its real path. A bind that still does not fit is made by a sockat thread that alone moves its cwd into D (Linux, Apple OSes), and on FreeBSD by `bindat(2)`. A connect's spelling stays nowhere on the peer, so a connect tries first the routes that need neither writing nor a thread (`/proc/self/fd`, a path relative to the cwd, macOS's widened sockaddr, FreeBSD's `connectat(2)`), then the thread cwd, then a symlink made directly in B and removed at once, and leaves nothing.
-
-| OS | bind | connect |
-|---|---|---|
-| Linux, Android | link-dir, thread-cwd | proc-direct (relative without `/proc`), thread-cwd-direct, link-file |
-| macOS, iOS (Apple) | link-dir, link-file, thread-cwd | relative, widened, thread-cwd-direct, link-file |
-| FreeBSD | link-dir, at | at-direct, link-file |
-| NetBSD | link-dir, link-file | relative, link-file |
-| OpenBSD, illumos | link-dir | relative, link-file |
-
-The routes and how far they reach are in the [manual](docs/MANUAL.md#how-a-long-path-is-reached).
+A long path is handed to the kernel by a short spelling that names the same place as the original path. B, D and E, the routes and the order tried on each OS are in the specification's [Routes for long paths and their order](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#routes-for-long-paths-and-their-order); how far they reach is in the [reach table](https://github.com/kawaz/sockat/blob/main/pages/reach/README.md). sockat-rs makes every route of the specification and tries them in the specification's order on every OS.
 
 ## The _ex functions: clean-up and diagnostics
 
@@ -73,13 +52,12 @@ drop(bound.socket);
 
 ## What differs from std for a long path
 
-- **The address the kernel reports is not the original path.** `local_addr()`, `peer_addr()`, `ss -x` and the like report the bind's spelling. Whether it can be used later is told by `Spelling`. Remove the socket file by the original path or by `SocketFile::remove()`
-- **State grows outside the application's own place.** B and D stay in `/tmp` and the like. The default `bind`'s E and a dead process's D stay until the OS's cleaning of temporary directories or `sweep()`. A B in the socket's directory and a B made after the checks failed (`sockat-<uid>.<random>`) may be removed neither by `sweep()` nor by the OS's cleaning
-- **Do not use a spelling after its clean-up.** Once B in `/tmp` is gone, someone else may make it again under the same name. A spelling through `/proc` cannot be followed after the process ends
-- **There are environments where a live D can be removed.** Linux with systemd older than v242, and B in macOS's `$TMPDIR` (the spelling just cannot be followed any more)
-- **A peer with `PrivateTmp`** cannot follow a spelling through `/tmp` (`Spelling`'s `usable_with_private_tmp`)
+What differs regardless of the language, and the patterns not to use, are in the specification's [What differs from the standard for a long path](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-differs-from-the-standard-for-a-long-path) and [Patterns not to use](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#patterns-not-to-use). In Rust:
 
-Details in the [manual](docs/MANUAL.md#what-differs-from-std-for-a-long-path) and [Patterns not to use](docs/MANUAL.md#patterns-not-to-use).
+- For a long path, the address from `local_addr()`, `peer_addr()` and `recv_from()` is the bind's spelling, not the original path. Remove the socket file by the original path or by `SocketFile::remove()`
+- On OpenBSD, std in Rust 1.99 and earlier drops the last byte of those addresses. Replying to a datagram at the address from `recv_from` needs Rust 1.100 or later
+
+The forms in Rust and the recommended code are in the manual's ["What differs from std for a long path"](docs/MANUAL.md#what-differs-from-std-for-a-long-path), ["Patterns not to use"](docs/MANUAL.md#patterns-not-to-use) and ["Caveats specific to Rust"](docs/MANUAL.md#caveats-specific-to-rust).
 
 ## Async runtimes
 
@@ -98,8 +76,9 @@ let stream = tokio::net::UnixStream::from_std(stream)?;
 
 ## Documentation
 
-- [Manual](docs/MANUAL.md): usage, routes, clean-up, what differs from std, errors
+- [Manual](docs/MANUAL.md): the functions and types in Rust, the clean-up calls, the patterns not to use in Rust, the error types, the caveats specific to Rust
 - [sockat specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md): the language-independent behaviour
+- [Per-language caveats](https://github.com/kawaz/sockat/blob/main/pages/langs.md): the caveats specific to each language's implementation
 - [Design decisions (DR)](docs/decisions/INDEX.md), in Japanese
 
 ## License
