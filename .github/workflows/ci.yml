@@ -46,7 +46,7 @@ jobs:
         with:
           usesh: true
           prepare: pkg install -y rust
-          run: cargo test
+          run: rustc -V && cargo test --no-fail-fast
 
   # The Unix systems without a thread cwd or a dirfd-relative bind / connect.
   # They run the whole suite in a VM so the routes through B and those they
@@ -70,7 +70,7 @@ jobs:
               export PKG_PATH
               /usr/sbin/pkg_add rust
             }
-          run: cargo test
+          run: rustc -V && cargo test --no-fail-fast
 
   openbsd:
     name: Test (OpenBSD VM)
@@ -82,7 +82,7 @@ jobs:
         with:
           usesh: true
           prepare: pkg_add rust
-          run: cargo test
+          run: rustc -V && cargo test --no-fail-fast
 
   illumos:
     name: Test (illumos / OmniOS VM)
@@ -94,7 +94,7 @@ jobs:
         with:
           usesh: true
           prepare: pkg install ooce/developer/rust build-essential
-          run: cargo test
+          run: rustc -V && cargo test --no-fail-fast
 
   cross-check:
     name: Cross check (${{ matrix.target }})
