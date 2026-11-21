@@ -51,7 +51,7 @@ fn std_max() -> usize {
 
 fn tmp() -> tempfile::TempDir {
     tempfile::Builder::new()
-        .prefix("sockat-")
+        .prefix("srt-")
         .tempdir_in("/tmp")
         .unwrap()
 }

@@ -48,7 +48,7 @@ use crate::{Options, SocketFile, Spelling, Until};
 /// (not).
 fn tmp() -> tempfile::TempDir {
     let t = tempfile::Builder::new()
-        .prefix("sockat-")
+        .prefix("srt-")
         .tempdir_in("/tmp")
         .unwrap();
     std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o700)).unwrap();

@@ -131,7 +131,7 @@
 //!     drop(bound.socket);
 //!     Ok(())
 //! }
-//! # let dir = tempfile::Builder::new().prefix("sockat-").tempdir_in("/tmp")?;
+//! # let dir = tempfile::Builder::new().prefix("srt-").tempdir_in("/tmp")?;
 //! # let deep = dir.path().join("d".repeat(150));
 //! # std::fs::create_dir(&deep)?;
 //! # serve(&deep.join("s.sock"))?;

@@ -30,7 +30,7 @@ fn long_path(base: &Path, total: usize) -> PathBuf {
 #[tokio::test]
 async fn std_sockets_from_sockat_are_adopted_by_tokio() {
     let t = tempfile::Builder::new()
-        .prefix("sockat-")
+        .prefix("srt-")
         .tempdir_in("/tmp")
         .unwrap();
     let path = long_path(t.path(), 400);
@@ -62,7 +62,7 @@ async fn std_sockets_from_sockat_are_adopted_by_tokio() {
 #[tokio::test]
 async fn bind_ex_removes_after_the_listener_went_to_tokio() {
     let t = tempfile::Builder::new()
-        .prefix("sockat-")
+        .prefix("srt-")
         .tempdir_in("/tmp")
         .unwrap();
     let path = long_path(t.path(), 400);
