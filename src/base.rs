@@ -594,7 +594,9 @@ impl Registry {
 
 /// The places 1-3 (hub SPEC-routes "実体の置き場"), in order: `/tmp`, then
 /// `$XDG_RUNTIME_DIR` and `$TMPDIR`, each only when set to an absolute path.
-/// A path already listed is not listed again.
+/// A place already listed is not listed again: the same path, or a path
+/// whose real path is the same directory (the same `(st_dev, st_ino)`, hub
+/// SPEC-routes "実体の置き場"; macOS's `TMPDIR=/private/tmp` and `/tmp`).
 pub(crate) fn places_from(
     tmpdir: Option<OsString>,
     runtime_dir: Option<OsString>,
@@ -606,7 +608,11 @@ pub(crate) fn places_from(
         (Place::Tmpdir, set(tmpdir)),
     ] {
         if let Some(p) = p {
-            let same = |q: &PathBuf| q.components().eq(p.components());
+            let id = |q: &Path| std::fs::metadata(q).ok().map(|m| (m.dev(), m.ino()));
+            let p_id = id(&p);
+            let same = |q: &PathBuf| {
+                q.components().eq(p.components()) || (p_id.is_some() && id(q) == p_id)
+            };
             if !out.iter().any(|(_, q)| same(q)) {
                 out.push((place, p));
             }

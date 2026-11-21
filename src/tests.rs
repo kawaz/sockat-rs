@@ -3953,4 +3953,22 @@ fn the_places_come_from_the_environment() {
     );
     assert_eq!(p(Some(""), Some("rel")), v(&["/tmp"]));
     assert_eq!(p(Some("/tmp/"), None), v(&["/tmp"]));
+
+    // A place whose real path is a place already listed is not listed
+    // again (hub SPEC-routes "実体の置き場": places are told apart by the
+    // (st_dev, st_ino) of their real path): here $TMPDIR is a symlink to
+    // $XDG_RUNTIME_DIR, as macOS's TMPDIR=/private/tmp is to /tmp. A place
+    // that is not there is told apart by its path alone.
+    let t = tmp();
+    let runtime = t.path().join("run");
+    std::fs::create_dir(&runtime).unwrap();
+    let link = t.path().join("tmpdir");
+    std::os::unix::fs::symlink(&runtime, &link).unwrap();
+    let (link, runtime) = (link.to_str().unwrap(), runtime.to_str().unwrap());
+    assert_eq!(p(Some(link), Some(runtime)), v(&["/tmp", runtime]));
+    let real_tmp = std::fs::canonicalize("/tmp").unwrap();
+    assert_eq!(p(real_tmp.to_str(), None), v(&["/tmp"]));
+    let gone = t.path().join("none");
+    let gone = gone.to_str().unwrap();
+    assert_eq!(p(Some(gone), Some(runtime)), v(&["/tmp", runtime, gone]));
 }
