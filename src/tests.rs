@@ -1395,9 +1395,10 @@ fn an_existing_b_that_passes_the_checks_is_used_as_it_is() {
     assert_eq!(entries(&b2).len(), 1);
 }
 
-// An Options.base of the wrong form (relative, or not ending with a name) is
-// an argument error whatever the length of the path, a short one included,
-// like a NUL in the path: no route, nothing skipped, nothing made.
+// An Options.base of the wrong form (relative, holding a NUL, or not ending
+// with a name; hub SPEC "エラー") is an argument error whatever the length of
+// the path, a short one included, like a NUL in the path: no route, nothing
+// skipped, nothing made.
 #[test]
 fn an_options_base_of_the_wrong_form_is_invalid_input_at_any_length() {
     let (t, place) = setup();
@@ -1409,6 +1410,10 @@ fn an_options_base_of_the_wrong_form_is_invalid_input_at_any_length() {
         PathBuf::from(format!("{}/", t.path().join("b").display())),
         t.path().join(".."),
         PathBuf::from("/"),
+        // A NUL anywhere: the kernel would stop reading the path at it.
+        PathBuf::from(OsStr::from_bytes(
+            &[t.path().as_os_str().as_bytes(), b"/b\0x"].concat(),
+        )),
     ] {
         let options = Options {
             base: Some(base.clone()),

@@ -762,17 +762,17 @@ pub(crate) fn in_socket_dir(real_dir: &Path) -> Option<Arc<Base>> {
     Some(b)
 }
 
-/// `Options.base` split into its parent and B's name: it must be absolute and
-/// end with a name (not `dir/`, `.`, `..` or `/`), else it is an argument
-/// error (hub SPEC "エラー").
+/// `Options.base` split into its parent and B's name: it must be absolute,
+/// hold no NUL and end with a name (not `dir/`, `.`, `..` or `/`), else it is
+/// an argument error (hub SPEC "エラー").
 pub(crate) fn split_given(base: &Path) -> io::Result<(&Path, &OsStr)> {
     let refuse = || {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Options.base must be an absolute path ending with a name",
+            "Options.base must be an absolute path without NUL, ending with a name",
         )
     };
-    if !base.is_absolute() {
+    if !base.is_absolute() || crate::path::refuse_nul(base).is_err() {
         return Err(refuse());
     }
     crate::path::split(base).map_err(|_| refuse())

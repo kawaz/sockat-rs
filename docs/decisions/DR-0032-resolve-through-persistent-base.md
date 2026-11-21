@@ -57,7 +57,7 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 - `remove` は失敗しても `cleanup` まで行い、ファイルの側のエラーを先に、無ければ `cleanup` のエラーを返す。印を立てるのは両方が通った時だけで、失敗した後の呼び出しはもう一度確かめて消しに行く
 - 呼び出しの中で消す E (bind が失敗した時・ソケットのファイルを覚えられなかった時の E。既定の bind の link-dir の E は除く。thread-cwd・at の E、既定の connect の E) は、消すのに失敗しても捨てる (`let _`、`TempLink` の Drop)。呼び出しの成否も元のエラーも変えない
 - bind の後に覚えるソケットのファイルは、どの経路も `route::remembered_at` で引く: パスを `realpath` し (最後の要素の symlink も辿る。Apple・NetBSD の bind はそこを辿ってその先にソケットを作る)、その `lstat` を覚える。ソケットでなければ `ENOTSOCK` で覚えない。standard は元のパス、link-dir・link-file・thread-cwd・at はソケットのディレクトリの実パスとファイル名を引き、link-dir は加えて綴りの `stat` が同じ物かを確かめる。`ForBind::socket_file()` は綴りを同じ関数で引く。abstract の名前 (Linux / Android) はファイルでないので引かず、`route::Kept::Abstract` (ファイルを持たない `SocketFile`、`remove` はファイルを消さず E の片付けだけ) にする (ハブ SPEC「remove」)。std はパスで渡した abstract の名前を bind しないので、`bind_ex` は std の `InvalidInput` を返し、ファイルを持たない `SocketFile` を返すのは `ForBind::socket_file()` (利用者が std の `bind_addr` で bind した後) だけ
-- std に渡す前に引数の誤り (`InvalidInput`、`route` は `None`、`skipped` は空) にする物は、先頭以外の NUL (ハブ DR-0006) と空のパス (ハブ SPEC「短いパス」)。どちらも長さによらず、全ての関数の入口 (`route::run`・`route::resolve`) で、abstract の名前の判定より前に断る (`path::refuse_empty`・`path::refuse_nul`)。`Options.base` の形の検査はその前
+- std に渡す前に引数の誤り (`InvalidInput`、`route` は `None`、`skipped` は空) にする物は、先頭以外の NUL (ハブ DR-0006) と空のパス (ハブ SPEC「短いパス」)。どちらも長さによらず、全ての関数の入口 (`route::run`・`route::resolve`) で、abstract の名前の判定より前に断る (`path::refuse_empty`・`path::refuse_nul`)。`Options.base` の形の検査 (相対パス、NUL を含む、名前で終わらない。`base::split_given`) はその前
 - 作らないもの: `datagram::send_to`・`send_to_ex` と `seqpacket` (ハブ SPEC の「未確定」)
 
 ### B・D・E の持ち方 (`src/base.rs`)
