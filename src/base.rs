@@ -284,6 +284,9 @@ pub(crate) struct Base {
     pub(crate) through_tmp: bool,
     /// This process's D in B, made when first needed.
     d: Mutex<Option<Arc<Dir>>>,
+    /// The Ds of B let go because they were removed, kept with their fd and
+    /// lock for the rest of the process ([`Base::dir`]).
+    retired_d: Mutex<Vec<Arc<Dir>>>,
 }
 
 /// What [`Base::make`] does with a B already there.
@@ -488,6 +491,7 @@ impl Base {
                 way_search: c.others_search,
                 b_search: AtomicBool::new(b_search),
                 d: Mutex::new(None),
+                retired_d: Mutex::new(Vec::new()),
             });
         }
         Err(Unmade::Failed(io::Error::new(
@@ -497,7 +501,9 @@ impl Base {
     }
 
     /// This process's D in B, made the first time it is asked for (and again
-    /// when the one held is no longer at its name in B).
+    /// when the one held is no longer at its name in B: the one let go is
+    /// kept, fd and lock held, for the rest of the process, as a B let go
+    /// is, [`retire`]).
     pub(crate) fn dir(&self) -> io::Result<Arc<Dir>> {
         let mut slot = lock(&self.d);
         if let Some(d) = slot.as_ref() {
@@ -506,7 +512,9 @@ impl Base {
             }
         }
         let d = Arc::new(Dir::make(self.fd.as_fd())?);
-        *slot = Some(Arc::clone(&d));
+        if let Some(old) = slot.replace(Arc::clone(&d)) {
+            lock(&self.retired_d).push(old);
+        }
         Ok(d)
     }
 
@@ -552,15 +560,27 @@ struct Registry {
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry { all: Vec::new() });
 
+/// The Bs let go because they were removed (hub SPEC-routes "実体の置き場"):
+/// kept, fd open, for the rest of the process. Closing the fd would let its
+/// number go to another directory, and a live socket whose spelling goes
+/// through `/proc/<pid>/fd/<that number>` (procB) would then name a place in
+/// that directory.
+static RETIRED: Mutex<Vec<Arc<Base>>> = Mutex::new(Vec::new());
+
+/// Keep `b`, removed and let go, for the rest of the process ([`RETIRED`]).
+fn retire(b: Arc<Base>) {
+    lock(&RETIRED).push(b);
+}
+
 impl Registry {
     /// The B that `pick` chooses and that is still at its spelling; a B no
-    /// longer there is dropped (what still uses it keeps its D held).
+    /// longer there is let go, its fd kept open ([`retire`]).
     fn find(&mut self, pick: impl Fn(&Base) -> bool) -> Option<Arc<Base>> {
         let i = self.all.iter().position(|b| pick(b))?;
         if self.all[i].current() {
             return Some(Arc::clone(&self.all[i]));
         }
-        self.all.remove(i);
+        retire(self.all.remove(i));
         None
     }
 
@@ -619,7 +639,7 @@ impl Held {
 }
 
 /// The B in `slots[slot]` when it is still at its spelling; one no longer
-/// there is let go (what still uses it keeps its D held).
+/// there is let go, its fd kept open ([`retire`]).
 fn held_in(slots: &mut [Option<Arc<Base>>; 2], slot: usize) -> Option<Arc<Base>> {
     let b = slots[slot].clone()?;
     if b.current() {
@@ -627,6 +647,7 @@ fn held_in(slots: &mut [Option<Arc<Base>>; 2], slot: usize) -> Option<Arc<Base>>
     }
     slots[slot] = None;
     lock(&REGISTRY).all.retain(|r| !Arc::ptr_eq(r, &b));
+    retire(b);
     None
 }
 
@@ -1199,4 +1220,13 @@ pub(crate) fn registered_fd(path: &Path) -> Option<std::os::fd::RawFd> {
         .iter()
         .find(|b| b.path == path)
         .map(|b| b.fd.as_raw_fd())
+}
+
+/// The number of the fd this process holds on its D in the registered B at
+/// `path` (test-only).
+#[cfg(test)]
+pub(crate) fn registered_d_fd(path: &Path) -> Option<std::os::fd::RawFd> {
+    let registry = lock(&REGISTRY);
+    let b = registry.all.iter().find(|b| b.path == path)?;
+    lock(&b.d).as_ref().map(|d| d.fd.as_raw_fd())
 }

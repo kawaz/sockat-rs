@@ -62,7 +62,7 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 
 ### B・D・E の持ち方 (`src/base.rs`)
 
-- プロセスの中の登録簿 (`Mutex<Vec<Arc<Base>>>`) が、このプロセスの B を持つ。B は fd で掴み、プロセスが終わるまで閉じない (close-on-exec)。使う前に、fd の `fstat` の `st_nlink` が 0 でなく、B の綴りの `lstat` が持っている `(st_dev, st_ino)` と同じかを確かめ、外れたら外して次に作り直す。D も同じ。消したディレクトリの `st_nlink` は Linux では 0 になるが macOS の APFS では 2 のままなので、名前の確かめは省かない
+- プロセスの中の登録簿 (`Mutex<Vec<Arc<Base>>>`) が、このプロセスの B を持つ。B は fd で掴み、プロセスが終わるまで閉じない (close-on-exec)。使う前に、fd の `fstat` の `st_nlink` が 0 でなく、B の綴りの `lstat` が持っている `(st_dev, st_ino)` と同じかを確かめ、外れたら外して次に作り直す。D も同じ。外した B は fd を開けたまま `base::RETIRED` に、外した D は fd と flock を持ったまま B の `retired_d` に、プロセスの間持ち続ける (閉じると番号が別のディレクトリに使い回され、procB の綴りでその番号を通る生きているソケットの綴りが別のディレクトリに当たる。ハブ SPEC-routes「実体の置き場」)。消したディレクトリの `st_nlink` は Linux では 0 になるが macOS の APFS では 2 のままなので、名前の確かめは省かない
 - 置き場 1〜3 の B は `Held` が、普段の B と `usable_cross_uid` の B の 2 つの枠で持つ (普段の B が他の uid に辿らせる時は同じ B)。一度持ったらプロセスの間それを使い、作れなかった置き場は覚えず次の呼び出しで試し直す。外では `route::Config` がプロセスの 1 つの `Held` を運ぶ
 - 置き場の順に、何も作らずに分かること (置き場が無い、途中の確かめに外れる、`usable_cross_uid` で途中が other に x を持たない) で外れる置き場を飛ばし、最初に残った置き場で綴りの長さを見積もる。収まらなければ B を作らず、次の置き場にも移らない
 - 置き場 1〜3 の既定の名前に、B の確かめ (実ディレクトリ・持ち主が自分・他人が書けない) に外れる物が既にある時 (占拠)、`Base::make` は `Unmade::Occupied` を返し、`base::automatic` はその置き場に何も作らず次の置き場へ進む。どの置き場でも B を持てず、その中に占拠された置き場があった時は `Automatic::Missing { occupied: true }` で、B を使う経路 (link-dir、link-file、thread-cwd・at の D) の `skipped` の `reason` は `"base occupied"` (`route::names::BASE_OCCUPIED`)。`Options.base` の B の占拠は今まで通りそのエラー (`EPERM` / `ENOTDIR`)

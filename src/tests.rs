@@ -1838,6 +1838,47 @@ fn the_way_to_an_options_base_is_checked_on_every_call() {
     base::sweep_base(&way.join("b")).unwrap();
 }
 
+// A B or D removed from under the process (by the OS's clean-up or by hand)
+// is let go and made again by the next call, and the one let go is kept with
+// its fd open for the rest of the process (hub SPEC-routes "実体の置き場").
+// Closed, its fd number would go to the next directory opened, and a live
+// socket bound through `/proc/<pid>/fd/<that number>/...` (procB) would then
+// name a place in that directory. So after D and then B are removed and the
+// next binds make new ones, the fds held on the old D and the old B are
+// still open on them (looked at through /dev/fd, which shows what an fd is
+// open on).
+#[test]
+fn a_removed_b_or_d_is_let_go_with_its_fd_kept_open() {
+    let (t, place) = setup();
+    let cfg = real_link_dir(&place);
+    let id = |fd: std::os::fd::RawFd| {
+        let m = std::fs::metadata(format!("/dev/fd/{fd}")).unwrap();
+        (m.dev(), m.ino())
+    };
+    // A default bind: its E holds nothing of D, so only the process holds it.
+    let _a = bind_default(&nest(&t.path().join("a"), 200, "s.sock"), &cfg).unwrap();
+    let b = b_of(&place);
+    let (b_fd, d_fd) = (
+        base::registered_fd(&b).unwrap(),
+        base::registered_d_fd(&b).unwrap(),
+    );
+    let (b_id, d_id) = (id(b_fd), id(d_fd));
+
+    std::fs::remove_dir_all(b.join(entries(&b).pop().unwrap())).unwrap();
+    let _b = bind(&nest(&t.path().join("b"), 200, "s.sock"), &opts(), &cfg).unwrap();
+    assert_ne!(
+        base::registered_d_fd(&b),
+        Some(d_fd),
+        "the D let go is used"
+    );
+    assert_eq!(id(d_fd), d_id, "the fd of the D let go was closed");
+
+    std::fs::remove_dir_all(&b).unwrap();
+    let _c = bind(&nest(&t.path().join("c"), 200, "s.sock"), &opts(), &cfg).unwrap();
+    assert!(b.is_dir());
+    assert_eq!(id(b_fd), b_id, "the fd of the B let go was closed");
+}
+
 // When D cannot be made ready in B (made, but its mode cannot be set or it
 // cannot be opened), the empty D is removed again, the routes that use D
 // cannot be used in that call (link-dir, link-file, thread-cwd / at: each "D
