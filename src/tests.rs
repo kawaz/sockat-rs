@@ -1331,6 +1331,54 @@ fn an_occupied_b_is_passed_over_for_the_next_place() {
     }
 }
 
+// A call that passes over a place whose B's default name is taken (hub
+// SPEC "skipped") adds that to the reason of a route through B that cannot be
+// used for another reason too: here the next place's real path is too long
+// for the file name, so link-dir is passed over as too long with the taken
+// place added, and no B is made in either place (the spelling is known not
+// to fit, hub SPEC-routes "実体の置き場"). Once a call has made the next
+// place's B the process's B, later calls do not look at the taken place, and
+// their reason does not mention it.
+#[test]
+fn a_reason_says_the_call_passed_over_an_occupied_place() {
+    let t = tmp();
+    let taken = t.path().join("taken");
+    let next = t.path().join("n".repeat(40));
+    std::fs::create_dir(&taken).unwrap();
+    std::fs::create_dir(&next).unwrap();
+    std::fs::write(b_of(&taken), b"").unwrap();
+    let cfg = with_places(
+        real_link_dir(&next),
+        &[(Place::Tmp, &taken), (Place::Tmpdir, &next)],
+    );
+    let long = name_just_past(&next);
+    // resolve tries the routes through B alone (no thread-cwd / at, which
+    // would make a B to work in).
+    let reasons = |p: &Path| {
+        let f = route::resolve(route::Use::Bind, p, &opts(), Some(&cfg))
+            .err()
+            .unwrap();
+        f.skipped
+            .iter()
+            .map(|s| (s.name, s.reason))
+            .collect::<Vec<_>>()
+    };
+    let first = reasons(&nest(&t.path().join("a"), 250, &long));
+    assert!(
+        first.contains(&(names::LINK_DIR, names::TOO_LONG_OCCUPIED)),
+        "{first:?}"
+    );
+    assert!(entries(&next).is_empty(), "B made where no spelling fits");
+
+    let r = bind(&nest(&t.path().join("b"), 200, "s.sock"), &opts(), &cfg).unwrap();
+    assert_eq!(r.base, Some("tmpdir"));
+    let later = reasons(&nest(&t.path().join("c"), 250, &long));
+    assert!(
+        later.contains(&(names::LINK_DIR, names::TOO_LONG)),
+        "{later:?}"
+    );
+}
+
 // A B already at the default name that passes the checks is used with its
 // mode as it is (0700 here: sockat does not change the mode of a B it did not
 // make).

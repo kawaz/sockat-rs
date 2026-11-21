@@ -658,10 +658,8 @@ pub(crate) enum Automatic {
     /// The process's B is (or would be made) where the spelling is known not
     /// to fit: the routes through B are passed over, and nothing is made.
     TooLong,
-    /// B can be made in none of the places; `occupied` when B's default
-    /// name was taken in one of them (hub SPEC "skipped": the reason of the
-    /// routes through B says so).
-    Missing { occupied: bool },
+    /// B can be made in none of the places.
+    Missing,
 }
 
 /// The process's B of the places 1-3 (hub SPEC-routes "実体の置き場"): the
@@ -682,12 +680,15 @@ pub(crate) enum Automatic {
 ///
 /// A place whose default name is taken (something there fails the checks of
 /// B) cannot be used: nothing is made in it, and the next place is tried
-/// (hub SPEC-routes "B の作り方" 5).
+/// (hub SPEC-routes "B の作り方" 5). `occupied` is set when that happened,
+/// so the call can add it to the reasons of the routes through B (hub SPEC
+/// "skipped").
 pub(crate) fn automatic(
     places: &[(Place, PathBuf)],
     held: &Held,
     others_search: bool,
     fits: impl Fn(&Path) -> bool,
+    occupied: &std::cell::Cell<bool>,
 ) -> Automatic {
     let mut slots = lock(&held.slots);
     let slot = if others_search { CROSS } else { USUAL };
@@ -699,7 +700,6 @@ pub(crate) fn automatic(
         return found(b);
     }
     let other = held_in(&mut slots, 1 - slot);
-    let mut occupied = false;
     for (place, parent) in places {
         // The B held for the other slot is this place's B when it is here,
         // with what it allows as judged when it was taken (B itself looked
@@ -735,11 +735,11 @@ pub(crate) fn automatic(
                 slots[slot] = Some(Arc::clone(&b));
                 return Automatic::Base(b);
             }
-            Err(Unmade::Occupied(_)) => occupied = true,
+            Err(Unmade::Occupied(_)) => occupied.set(true),
             Err(Unmade::Failed(_)) => {}
         }
     }
-    Automatic::Missing { occupied }
+    Automatic::Missing
 }
 
 /// The B in the socket's directory (`.sockat.<10 random>`), for when no place

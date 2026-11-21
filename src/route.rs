@@ -67,6 +67,29 @@ pub(crate) mod names {
     /// something that fails the checks (another user's, writable by others,
     /// not a real directory).
     pub(crate) const BASE_OCCUPIED: &str = "base occupied";
+    /// [`TOO_LONG`] in a call that passed over a place whose B's default
+    /// name was taken.
+    pub(crate) const TOO_LONG_OCCUPIED: &str = "spelling too long; base occupied";
+    /// [`NO_D`], likewise.
+    pub(crate) const NO_D_OCCUPIED: &str = "D not made; base occupied";
+    /// [`NO_E`], likewise.
+    pub(crate) const NO_E_OCCUPIED: &str = "E not made; base occupied";
+    /// [`PROC_UNUSABLE`], likewise.
+    pub(crate) const PROC_UNUSABLE_OCCUPIED: &str = "/proc unusable; base occupied";
+
+    /// `reason` with the taken place added, for a route through B in a call
+    /// that passed over a place whose B's default name was taken (hub SPEC
+    /// "skipped"). A reason that has nothing to do with B stays as it is.
+    pub(crate) fn with_occupied(reason: &'static str) -> &'static str {
+        match reason {
+            NO_BASE | NO_CROSS_UID_BASE => BASE_OCCUPIED,
+            TOO_LONG => TOO_LONG_OCCUPIED,
+            NO_D => NO_D_OCCUPIED,
+            NO_E => NO_E_OCCUPIED,
+            PROC_UNUSABLE => PROC_UNUSABLE_OCCUPIED,
+            other => other,
+        }
+    }
     /// D could not be made in B.
     pub(crate) const NO_D: &str = "D not made";
     /// E could not be made.
@@ -597,6 +620,10 @@ struct Target<'a> {
     /// The Bs (by `(st_dev, st_ino)`) in which D could not be made during
     /// this call: the routes that use D cannot be used for the rest of it.
     no_d: RefCell<Vec<(u64, u64)>>,
+    /// Whether this call passed over a place whose B's default name was
+    /// taken ([`base::automatic`]): the reasons of the routes through B say
+    /// so ([`Target::skip`]).
+    occupied: Cell<bool>,
     skipped: RefCell<Vec<Skipped>>,
 }
 
@@ -641,6 +668,7 @@ impl<'a> Target<'a> {
             proc_self: OnceCell::new(),
             wide: Cell::new(wide_allowed(cfg)),
             no_d: RefCell::new(Vec::new()),
+            occupied: Cell::new(false),
             skipped: RefCell::new(vec![Skipped {
                 name: names::STANDARD,
                 reason: names::TOO_LONG,
@@ -652,6 +680,14 @@ impl<'a> Target<'a> {
     /// one entry per route name, with the last reason (link-dir tried with
     /// procB and the real path is one entry).
     fn skip(&self, name: &'static str, reason: &'static str) {
+        let through_b = matches!(
+            name,
+            names::LINK_DIR | names::LINK_FILE | names::THREAD_CWD | names::AT
+        );
+        let reason = match through_b && self.occupied.get() {
+            true => names::with_occupied(reason),
+            false => reason,
+        };
         let mut skipped = self.skipped.borrow_mut();
         match skipped.iter_mut().find(|s| s.name == name) {
             Some(s) => s.reason = reason,
@@ -827,24 +863,23 @@ fn spelled_base(
         let real = path::len(b);
         fits_through(real, 1, Some(t.name)) || by_proc || (link_file && fits_through(real, 1, None))
     };
-    match base::automatic(&t.cfg.places, &t.cfg.held, cross, fits) {
+    match base::automatic(&t.cfg.places, &t.cfg.held, cross, fits, &t.occupied) {
         Automatic::Base(b) => Ok(Ok(b)),
         Automatic::TooLong => Ok(Err(names::TOO_LONG)),
-        Automatic::Missing { occupied } if !cross && by_proc => {
-            Ok(base::in_socket_dir(&t.real_dir).ok_or(missing(occupied, cross)))
+        Automatic::Missing if !cross && by_proc => {
+            Ok(base::in_socket_dir(&t.real_dir).ok_or(missing(cross)))
         }
-        Automatic::Missing { occupied } => Ok(Err(missing(occupied, cross))),
+        Automatic::Missing => Ok(Err(missing(cross))),
     }
 }
 
-/// Why no B could be had (hub SPEC "skipped"): B's default name taken in a
-/// place, when it was; else none lets another uid search the way to it (for
-/// `usable_cross_uid`), or none at all.
-fn missing(occupied: bool, cross: bool) -> &'static str {
-    match (occupied, cross) {
-        (true, _) => names::BASE_OCCUPIED,
-        (false, true) => names::NO_CROSS_UID_BASE,
-        (false, false) => names::NO_BASE,
+/// Why no B could be had: none lets another uid search the way to it (for
+/// `usable_cross_uid`), or none at all ([`Target::skip`] adds a taken
+/// place).
+fn missing(cross: bool) -> &'static str {
+    match cross {
+        true => names::NO_CROSS_UID_BASE,
+        false => names::NO_BASE,
     }
 }
 
@@ -1150,12 +1185,10 @@ fn d_base(t: &Target<'_>) -> Result<Result<Arc<Base>, &'static str>, io::Error> 
     }
     // Nothing is spelled through B here, so any B fits (never TooLong).
     Ok(
-        match base::automatic(&t.cfg.places, &t.cfg.held, false, |_| true) {
+        match base::automatic(&t.cfg.places, &t.cfg.held, false, |_| true, &t.occupied) {
             Automatic::Base(b) => Ok(b),
             Automatic::TooLong => Err(names::TOO_LONG),
-            Automatic::Missing { occupied } => {
-                base::in_socket_dir(&t.real_dir).ok_or(missing(occupied, false))
-            }
+            Automatic::Missing => base::in_socket_dir(&t.real_dir).ok_or(missing(false)),
         },
     )
 }
@@ -1382,10 +1415,10 @@ fn link_file_connect(t: &Target<'_>) -> Step {
             Ok(b) => b,
             Err(e) => return Step::base_error(e),
         },
-        None => match base::automatic(&t.cfg.places, &t.cfg.held, false, fits) {
+        None => match base::automatic(&t.cfg.places, &t.cfg.held, false, fits, &t.occupied) {
             Automatic::Base(b) => b,
             Automatic::TooLong => return skip(names::TOO_LONG),
-            Automatic::Missing { occupied } => return skip(missing(occupied, false)),
+            Automatic::Missing => return skip(missing(false)),
         },
     };
     if !fits(&b.path) {
