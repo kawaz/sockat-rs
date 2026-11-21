@@ -263,7 +263,7 @@ drop(bound.socket);
 
 ### What stays in the base
 
-- The default `bind` returns no `SocketFile`, so its E stays until the process ends and is removed together with D by the OS's cleaning of temporary directories or by `sweep`. If clean-up matters, use `bind_ex` or resolve
+- The default `bind` returns no `SocketFile`, so its E stays until the process ends and is removed together with D by the OS's cleaning of temporary directories or by `sweep`. If clean-up matters, use `bind_ex` or resolve. A long-lived process that binds at long paths again and again (a daemon making a socket per session, and the like) piles up E until it ends with the default `bind`, so it cleans each up with `remove()` / `cleanup()` of `bind_ex`
 - A connect leaves nothing (when it made B for the first time, that B goes on being used as the process's B)
 - sockat never removes B. A B in the socket's directory (`.sockat.<random>`) and a B made after the checks failed (`sockat-<uid>.<random>`) are not covered by `sweep`, and may not be removed by the OS's cleaning either. A B in the socket's directory stays in the user's directory
 
@@ -285,7 +285,7 @@ When a live D is removed (by hand included), the spelling just cannot be followe
 - `sockat::sweep_base(path)` does the same for a B passed as `Options::base`. The application that manages that B calls it. When B or its parent is not there it does nothing and succeeds. A path of the wrong form is `InvalidInput`, a symlink `EPERM`, something not a directory `ENOTDIR`, and a B owned by someone else, writable by group or others, or reached through a directory others can write to `EPERM`
 - They look only at the directories right under B whose name has the form of a D (10 ASCII letters and digits). B is sockat's own; what has another name is left alone
 - The D of a live process (this process's included) is not removed. E directly under B, and a D holding anything that is not a symlink, are left alone
-- Neither is called automatically (resolve and bind do not list B each time)
+- Neither is called automatically (B is listed neither at each resolve or bind, nor when the process starts, nor when it exits). A dead D goes only by a `sweep` the application calls or by the OS's cleaning
 - Where tests run over and over (CI, repeated checks), one call of `sweep()` (`sweep_base` for a B at `Options::base`) keeps dead D from piling up
 
 ## resolve
