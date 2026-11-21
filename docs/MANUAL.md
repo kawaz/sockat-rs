@@ -321,7 +321,7 @@ to.cleanup()?;
 
 ## datagram
 
-`sockat::datagram` mirrors the functions of std's `UnixDatagram` that take a path, and `unbound`. The routes and their order are those of stream. To a sender bound to a long path, the receiver can reply to the address from `recv_from` while the spelling can be followed (`Spelling::Linked`).
+`sockat::datagram` mirrors the functions of std's `UnixDatagram` that take a path, and `unbound`. The routes and their order are those of stream. To a sender bound to a long path, the receiver can reply to the address from `recv_from` while the spelling can be followed (`Spelling::Linked`). On OpenBSD this needs Rust 1.100 or later ("The address the kernel reports" in [What differs from std for a long path](#what-differs-from-std-for-a-long-path)).
 
 ```rust
 let server = sockat::datagram::bind(server_path)?;
@@ -336,7 +336,7 @@ client.send(b"ping")?;
 
 | Point | Detail |
 |---|---|
-| The address the kernel reports | `local_addr()` of the listener and of accepted streams, and `peer_addr()` of the connecting side, report the bind's spelling, not the original path. Whether it can be used later is told by `Spelling`. On illumos, the connecting side's `peer_addr()` reports the spelling passed to connect |
+| The address the kernel reports | `local_addr()` of the listener and of accepted streams, and `peer_addr()` of the connecting side, report the bind's spelling, not the original path. Whether it can be used later is told by `Spelling`. On illumos, the connecting side's `peer_addr()` reports the spelling passed to connect.<br>On OpenBSD, the `local_addr()`, `peer_addr()` and `recv_from()` of std in Rust 1.99 and earlier drop the last byte of the path (a bug in std, the same for a short path and without sockat; [rust-lang/rust#118925](https://github.com/rust-lang/rust/issues/118925), fixed in Rust 1.100.0). The address the kernel reports is whole. Replying to a datagram at the address from std's `recv_from` needs Rust 1.100 or later there |
 | How operational tools show it | the addresses `ss -x`, `lsof` and `/proc/net/unix` show are the bind's spelling too. For link-dir, thread-cwd and at the file name stays at the end; a link-file spelling does not show it |
 | When the listener is closed | as with std, the socket file is not removed when the listener is closed |
 | The directory is resolved first | the E of link-dir, thread-cwd and at points to the real path of the socket's directory, and proc-direct, at-direct and thread-cwd-direct open the directory first and then pass the file name. A rename or a repointed symlink in between is not reflected |

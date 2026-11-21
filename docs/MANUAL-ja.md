@@ -321,7 +321,7 @@ to.cleanup()?;
 
 ## datagram
 
-`sockat::datagram` は std の `UnixDatagram` の、パスを取る関数と `unbound` を写す。経路と順は stream と同じ。長いパスに bind した送り手には、綴りが辿れる間は受け手が `recv_from` のアドレスへ返信できる (`Spelling::Linked`)。
+`sockat::datagram` は std の `UnixDatagram` の、パスを取る関数と `unbound` を写す。経路と順は stream と同じ。長いパスに bind した送り手には、綴りが辿れる間は受け手が `recv_from` のアドレスへ返信できる (`Spelling::Linked`)。OpenBSD では Rust 1.100 以上が要る ([長いパスで std と違う点](#長いパスで-std-と違う点) の「カーネルが返すアドレス」)。
 
 ```rust
 let server = sockat::datagram::bind(server_path)?;
@@ -336,7 +336,7 @@ client.send(b"ping")?;
 
 | 点 | 内容 |
 |---|---|
-| カーネルが返すアドレス | listener と accept したストリームの `local_addr()`、connect した側の `peer_addr()` は、元のパスでなく bind の綴りを返す。後で使えるかは `Spelling` で分かる。illumos では connect した側の `peer_addr()` が、connect に渡した綴りを返す |
+| カーネルが返すアドレス | listener と accept したストリームの `local_addr()`、connect した側の `peer_addr()` は、元のパスでなく bind の綴りを返す。後で使えるかは `Spelling` で分かる。illumos では connect した側の `peer_addr()` が、connect に渡した綴りを返す。<br>OpenBSD では、Rust 1.99 以前の std の `local_addr()`・`peer_addr()`・`recv_from()` がパスの最後の 1 バイトを落とす (std の不具合で、sockat に関係なく短いパスでも同じ。[rust-lang/rust#118925](https://github.com/rust-lang/rust/issues/118925)、Rust 1.100.0 で修正)。カーネルが返すアドレスは欠けていない。std の `recv_from` のアドレスへ DGRAM を返信するには Rust 1.100 以上が要る |
 | 運用の道具での見え方 | `ss -x`・`lsof`・`/proc/net/unix` に出るアドレスも bind の綴り。link-dir と thread-cwd・at はファイル名が最後に残り、link-file の綴りには出ない |
 | listener を閉じた時 | std と同じく、閉じてもソケットのファイルは消えない |
 | ディレクトリを先に引く | link-dir・thread-cwd・at の E はソケットのディレクトリの実パスを指し、proc-direct・at-direct・thread-cwd-direct はディレクトリを開いてからファイル名で渡す。その間の rename や symlink の張り替えは反映されない |
