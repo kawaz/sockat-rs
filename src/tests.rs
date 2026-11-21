@@ -290,7 +290,10 @@ fn std_errno(case: Short) -> i32 {
         }
         Short::ConnectToNothing => UnixStream::connect(&p).map(drop),
         Short::ConnectToNobodyListening => {
-            drop(UnixListener::bind(&p).unwrap());
+            // Bound by a child that has exited: a listener dropped here
+            // could still be held, and listen, in a child another test is
+            // starting meanwhile (between its fork and its exec).
+            bind_in_child(&p, t.path());
             UnixStream::connect(&p).map(drop)
         }
         Short::RemoveFromAnUnwritableDirectory => {
@@ -2593,8 +2596,15 @@ fn a_failed_removal_of_e_inside_a_call_changes_nothing() {
     assert_eq!(c.route, names::LINK_FILE);
     ping(&l, c.socket.unwrap());
     assert_eq!(e_left(&b), 1);
-    drop(l);
-    let f = with_e_unremovable(|| connect(&p, &cfg)).err().unwrap();
+    // The socket nobody listens on is bound by a child that has exited (its
+    // B in a place of its own): a listener dropped here could still be held,
+    // and listen, in a child another test is starting meanwhile (between its
+    // fork and its exec).
+    let other = t.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    let gone = nest(&t.path().join("g"), 200, "s.sock");
+    bind_in_child(&gone, &other);
+    let f = with_e_unremovable(|| connect(&gone, &cfg)).err().unwrap();
     assert_eq!(
         errno(&f.error),
         Some(std_errno(Short::ConnectToNobodyListening))
