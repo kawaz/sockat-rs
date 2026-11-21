@@ -1799,6 +1799,45 @@ fn usable_cross_uid_is_judged_when_b_is_taken() {
     assert!(crossing(&r), "{:?}", r.spelling);
 }
 
+// The way to an Options.base (the directories from the root down to its
+// parent) is checked on every call (hub SPEC-routes "実体の置き場": the safety
+// check of Options.base is made on every call; sweep_base checks its path as
+// Options.base is). One that passed once and then became changeable by
+// another user (a directory on the way made group-writable, not sticky) is
+// EPERM for the next bind, before any route (no route, nothing skipped), and
+// for sweep_base; once it is safe again, the next bind goes through it. A
+// check kept from the first call would let another user swap the way, and B
+// with it.
+#[test]
+fn the_way_to_an_options_base_is_checked_on_every_call() {
+    let (t, auto) = setup();
+    let cfg = real_link_dir(&auto);
+    let way = t.path().join("way");
+    std::fs::create_dir(&way).unwrap();
+    let given = Options {
+        base: Some(way.join("b")),
+        ..opts()
+    };
+    let mode = |m: u32| {
+        std::fs::set_permissions(&way, std::fs::Permissions::from_mode(m)).unwrap();
+    };
+    let r = bind(&nest(&t.path().join("a"), 200, "s.sock"), &given, &cfg).unwrap();
+    assert_eq!(r.base, Some("given"));
+    mode(0o770);
+    let f = bind(&nest(&t.path().join("b"), 200, "s.sock"), &given, &cfg)
+        .err()
+        .unwrap();
+    assert_eq!(errno(&f.error), Some(libc::EPERM));
+    assert_eq!(f.route, None);
+    assert!(f.skipped.is_empty());
+    let e = base::sweep_base(&way.join("b")).unwrap_err();
+    assert_eq!(errno(&e), Some(libc::EPERM));
+    mode(0o700);
+    let r = bind(&nest(&t.path().join("c"), 200, "s.sock"), &given, &cfg).unwrap();
+    assert_eq!(r.base, Some("given"));
+    base::sweep_base(&way.join("b")).unwrap();
+}
+
 // When D cannot be made ready in B (made, but its mode cannot be set or it
 // cannot be opened), the empty D is removed again, the routes that use D
 // cannot be used in that call (link-dir, link-file, thread-cwd / at: each "D

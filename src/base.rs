@@ -194,16 +194,30 @@ pub(crate) struct Chain {
     pub(crate) others_search: bool,
 }
 
+/// How often the way to a B is checked (hub SPEC-routes "B の作り方" 2 and
+/// "実体の置き場").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Check {
+    /// Once per process: the places 1-3 and the socket's directory.
+    Once,
+    /// On every call: `Options.base` (and `sweep_base`, whose path is
+    /// checked as `Options.base` is), whose way may change between calls.
+    EveryCall,
+}
+
 /// The [`Chain`] of every directory from the root down to `real`, a real path
-/// (hub SPEC-routes "B の作り方" 2), looked up once per process.
+/// (hub SPEC-routes "B の作り方" 2): looked up once per process for
+/// [`Check::Once`], on every call for [`Check::EveryCall`].
 ///
 /// # Errors
 ///
 /// `ENOENT` when one is missing, `ENOTDIR` when one is not a directory.
-pub(crate) fn chain(real: &Path) -> io::Result<Chain> {
+pub(crate) fn chain(real: &Path, check: Check) -> io::Result<Chain> {
     static CHECKED: Mutex<Option<HashMap<PathBuf, Chain>>> = Mutex::new(None);
-    if let Some(c) = lock(&CHECKED).as_ref().and_then(|m| m.get(real)) {
-        return Ok(*c);
+    if check == Check::Once {
+        if let Some(c) = lock(&CHECKED).as_ref().and_then(|m| m.get(real)) {
+            return Ok(*c);
+        }
     }
     let mut c = Chain {
         safe: true,
@@ -222,9 +236,11 @@ pub(crate) fn chain(real: &Path) -> io::Result<Chain> {
         c.safe &= owner_ok && (unwritable || sticky);
         c.others_search &= m.mode() & 0o001 != 0;
     }
-    lock(&CHECKED)
-        .get_or_insert_with(HashMap::new)
-        .insert(real.to_path_buf(), c);
+    if check == Check::Once {
+        lock(&CHECKED)
+            .get_or_insert_with(HashMap::new)
+            .insert(real.to_path_buf(), c);
+    }
     Ok(c)
 }
 
@@ -378,7 +394,11 @@ impl Base {
         others_search: bool,
     ) -> Result<Base, Unmade> {
         let parent_real = std::fs::canonicalize(parent)?;
-        let c = chain(&parent_real)?;
+        let check = match place {
+            Place::Given => Check::EveryCall,
+            _ => Check::Once,
+        };
+        let c = chain(&parent_real, check)?;
         if !c.safe || (others_search && !c.others_search) {
             return Err(Unmade::Failed(refused()));
         }
@@ -679,7 +699,7 @@ pub(crate) fn automatic(
         let Ok(real) = std::fs::canonicalize(parent) else {
             continue;
         };
-        match chain(&real) {
+        match chain(&real, Check::Once) {
             Ok(c) if c.safe && (c.others_search || !others_search) => {}
             _ => continue,
         }
@@ -733,7 +753,8 @@ pub(crate) fn split_given(base: &Path) -> io::Result<(&Path, &OsStr)> {
 
 /// Check `Options.base` without making anything (hub SPEC-routes "B の作り方":
 /// made before any route is tried, for a bind and a connect alike): the
-/// directories on the way, and B itself when it is there. `others_search` is
+/// directories on the way (looked at again on every call, "実体の置き場"),
+/// and B itself when it is there. `others_search` is
 /// `Options.usable_cross_uid` of a bind; for a B this process already holds,
 /// whether others can search the way to it is the judgement made when it was
 /// taken, B itself looked at again when judged not to
@@ -742,8 +763,12 @@ pub(crate) fn check_given(base: &Path, others_search: bool) -> io::Result<()> {
     let (parent, name) = split_given(base)?;
     let held = lock(&REGISTRY).given(parent, name);
     let parent_real = std::fs::canonicalize(parent)?;
-    let c = chain(&parent_real)?;
-    if !c.safe || (others_search && !c.others_search) {
+    let c = chain(&parent_real, Check::EveryCall)?;
+    // Whether others can search the way is the judgement made when B was
+    // taken, for a B this process holds; whether the way is safe is checked
+    // now.
+    let way_search = held.as_ref().map_or(c.others_search, |b| b.way_search);
+    if !c.safe || (others_search && !way_search) {
         return Err(refused());
     }
     let m = match std::fs::symlink_metadata(parent_real.join(name)) {
