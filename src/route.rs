@@ -774,7 +774,7 @@ fn forms(
         b.path.clone(),
         b.place.real_name(),
         Until::Cleanup,
-        b.others_search,
+        b.others_search(cross_uid),
         !b.through_tmp,
     ));
     out

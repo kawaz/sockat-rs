@@ -194,7 +194,7 @@ Linux の bind は、ファイル名がおよそ 96 バイトを超えるか、s
 
 | 項目 | 中身 |
 |---|---|
-| `usable_cross_uid: bool` | bind の綴りを別の uid も辿れる物にする。途中と B 自身が other に x を持つ置き場の B だけを使い、procB を使わない。満たせなければ thread-cwd / at (`Dangling`) に進む。B が他の uid に辿らせるかは、プロセスがその B を持った時に判定して覚え、後で見直さない (`Options::base` の B も)。connect 系は見ない |
+| `usable_cross_uid: bool` | bind の綴りを別の uid も辿れる物にする。途中と B 自身が other に x を持つ置き場の B だけを使い、procB を使わない。満たせなければ thread-cwd / at (`Dangling`) に進む。B が他の uid に辿らせるかは、プロセスがその B を持った時に判定して覚え、後で見直さない (`Options::base` の B も)。ただし B 自身が other に x を持たないと覚えた時は、`usable_cross_uid` の呼び出しのたびに B の mode を見直す (2 つのプロセスが同時に B を初めて作ると、片方が mode を 0711 にそろえる前の 0700 の B をもう片方が持ちうるため)。connect 系は見ない |
 | `base: Option<PathBuf>` | B そのものの場所 (例 `/tmp/my-app-1000/sockat`)。無ければ作り (mode 0711)、確かめに外れたら `ENOENT` / `ENOTDIR` / `EPERM` で、自動の置き場に落とさない。相対パスと、名前で終わらないパスは、パスの長さによらず `InvalidInput`。base の場所が symlink なら `EPERM`。確かめは長いパスで呼び出しのたびに経路を試す前に行い、B を作るのは B を使う経路に来た時だけ。bind 系も connect 系も使う。この B は sockat 専用で、他の物を置かない (`sweep_base` は D の形の名前のディレクトリだけを見る) |
 
 ```rust

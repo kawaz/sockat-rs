@@ -1408,13 +1408,23 @@ fn the_usual_b_and_the_b_for_another_uid_are_held_apart() {
 }
 
 // Whether another uid can search the way to a B (the directories on the way
-// and B itself) is judged when the process first takes B, and kept: a B
-// that was 0700 then is not taken for usable_cross_uid after it is made 0711
-// (link-dir passes it over, no second D is made in it), and a B that was 0711
-// then still gives a spelling marked usable_cross_uid after it is made 0700.
-// The same holds for an Options.base: one taken while 0700 is EPERM for
-// usable_cross_uid before any route even once it is 0711 (hub SPEC-routes
-// "実体の置き場").
+// and B itself) is judged when the process first takes B, and kept, except
+// that B itself, judged not to let others search, is looked at again (fstat
+// of B's fd) by each call for usable_cross_uid (hub SPEC-routes
+// "実体の置き場"). Two processes making B at once can take it between the
+// other's mkdirat (0700) and its mode set to 0711; kept as judged then, that
+// B would never serve usable_cross_uid in that process although it is 0711.
+//
+// - B 0700 when taken: usable_cross_uid passes it over while it is 0700, and
+//   once it is 0711 the next usable_cross_uid call goes through it (through
+//   the D already in it: no second D)
+// - B 0711 when taken: still gives a spelling marked usable_cross_uid after
+//   it is made 0700 (what lets others search is not looked at again)
+// - a way to B that was 0700 when B was taken: B is not taken for
+//   usable_cross_uid after the way is made 0711 (the way is not looked at
+//   again)
+// - an Options.base taken while 0700: EPERM for usable_cross_uid before any
+//   route while it is 0700, and gone through once it is 0711
 #[test]
 fn usable_cross_uid_is_judged_when_b_is_taken() {
     let t = tmp();
@@ -1426,6 +1436,15 @@ fn usable_cross_uid_is_judged_when_b_is_taken() {
     let mode = |p: &Path, m: u32| {
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
     };
+    let crossing = |r: &Reached| {
+        matches!(
+            r.spelling,
+            Some(Spelling::Linked {
+                usable_cross_uid: true,
+                ..
+            })
+        )
+    };
 
     let shut = t.path().join("shut");
     std::fs::create_dir(&shut).unwrap();
@@ -1436,14 +1455,30 @@ fn usable_cross_uid_is_judged_when_b_is_taken() {
     let cfg = no_link_file(no_proc(config(&shut)));
     let r = bind(&nest(&t.path().join("a"), 200, "s"), &opts(), &cfg).unwrap();
     assert_eq!(r.base, Some("tmp"));
-    mode(&b, 0o711);
     let r = bind(&nest(&t.path().join("b"), 200, "s"), &cross, &cfg);
     assert!(
         skipped_of(&r).contains(&(names::LINK_DIR, names::NO_CROSS_UID_BASE)),
         "{:?}",
         r.as_ref().map(|r| (r.route, r.spelling))
     );
+    mode(&b, 0o711);
+    let r = bind(&nest(&t.path().join("b2"), 200, "s"), &cross, &cfg).unwrap();
+    assert_eq!((r.route, r.base), (names::LINK_DIR, Some("tmp")));
+    assert!(crossing(&r), "{:?}", r.spelling);
     assert_eq!(entries(&b).len(), 1, "a second D in B");
+
+    let way = t.path().join("way");
+    std::fs::create_dir(&way).unwrap();
+    mode(&way, 0o700);
+    let cfg = no_link_file(no_proc(config(&way)));
+    bind(&nest(&t.path().join("w"), 200, "s"), &opts(), &cfg).unwrap();
+    mode(&way, 0o711);
+    let r = bind(&nest(&t.path().join("w2"), 200, "s"), &cross, &cfg);
+    assert!(
+        skipped_of(&r).contains(&(names::LINK_DIR, names::NO_CROSS_UID_BASE)),
+        "{:?}",
+        r.as_ref().map(|r| (r.route, r.spelling))
+    );
 
     let open = t.path().join("open");
     std::fs::create_dir(&open).unwrap();
@@ -1452,13 +1487,7 @@ fn usable_cross_uid_is_judged_when_b_is_taken() {
     bind(&nest(&t.path().join("c"), 200, "s"), &opts(), &cfg).unwrap();
     mode(&b_of(&open), 0o700);
     let r = bind(&nest(&t.path().join("d"), 200, "s"), &cross, &cfg).unwrap();
-    assert!(matches!(
-        r.spelling,
-        Some(Spelling::Linked {
-            usable_cross_uid: true,
-            ..
-        })
-    ));
+    assert!(crossing(&r), "{:?}", r.spelling);
 
     let given = t.path().join("given");
     std::fs::create_dir(&given).unwrap();
@@ -1469,13 +1498,16 @@ fn usable_cross_uid_is_judged_when_b_is_taken() {
     };
     let r = bind(&nest(&t.path().join("e"), 200, "s"), &at(false), &cfg).unwrap();
     assert_eq!(r.base, Some("given"));
-    mode(&given, 0o711);
     let f = bind(&nest(&t.path().join("f"), 200, "s"), &at(true), &cfg)
         .err()
         .unwrap();
     assert_eq!(errno(&f.error), Some(libc::EPERM));
     assert_eq!(f.route, None);
     assert!(f.skipped.is_empty());
+    mode(&given, 0o711);
+    let r = bind(&nest(&t.path().join("f2"), 200, "s"), &at(true), &cfg).unwrap();
+    assert_eq!((r.route, r.base), (names::LINK_DIR, Some("given")));
+    assert!(crossing(&r), "{:?}", r.spelling);
     assert_eq!(entries(&given).len(), 1, "a second D in the given B");
 
     let made = t.path().join("made");
@@ -1487,13 +1519,7 @@ fn usable_cross_uid_is_judged_when_b_is_taken() {
     mode(&made, 0o700);
     let r = bind(&nest(&t.path().join("h"), 200, "s"), &at_made(true), &cfg).unwrap();
     assert_eq!(r.base, Some("given"));
-    assert!(matches!(
-        r.spelling,
-        Some(Spelling::Linked {
-            usable_cross_uid: true,
-            ..
-        })
-    ));
+    assert!(crossing(&r), "{:?}", r.spelling);
 }
 
 // When D cannot be made ready in B (made, but its mode cannot be set or it

@@ -26,7 +26,7 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::sys;
@@ -256,10 +256,12 @@ pub(crate) struct Base {
     fd: OwnedFd,
     /// `(st_dev, st_ino)` of B.
     pub(crate) id: (u64, u64),
-    /// Whether another uid can follow a spelling through B's real path:
-    /// every directory on the way and B itself let others search (D is
-    /// always 0711).
-    pub(crate) others_search: bool,
+    /// Whether every directory on the way to B lets others search, as judged
+    /// when B was taken.
+    way_search: bool,
+    /// Whether B itself lets others search: judged when B was taken, and
+    /// looked at again while it is `false` ([`Base::others_search`]).
+    b_search: AtomicBool,
     /// Whether the place as given or B's real path goes through `/tmp` or
     /// `/var/tmp` (hub SPEC "綴りの性質": then `usable_with_private_tmp` is
     /// false).
@@ -286,6 +288,37 @@ impl Base {
     /// B's fd.
     pub(crate) fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
+    }
+
+    /// Whether another uid can follow a spelling through B's real path: every
+    /// directory on the way and B itself let others search (D is always
+    /// 0711), as judged when B was taken (hub SPEC-routes "実体の置き場").
+    ///
+    /// When B itself was judged not to, a call for `usable_cross_uid`
+    /// (`recheck`) looks at B's mode again by `fstat` of its fd, and keeps
+    /// what it finds once B lets others search: two processes making B for
+    /// the first time at once may take it between the other's `mkdirat`
+    /// (0700) and its mode set to 0711, and that judgement must not stay.
+    /// The way to B is not looked at again.
+    pub(crate) fn others_search(&self, recheck: bool) -> bool {
+        if !self.way_search {
+            return false;
+        }
+        if self.b_search.load(Ordering::Relaxed) {
+            return true;
+        }
+        if !recheck {
+            return false;
+        }
+        let now = self
+            .fd
+            .try_clone()
+            .and_then(|fd| std::fs::File::from(fd).metadata())
+            .is_ok_and(|m| m.mode() & 0o001 != 0);
+        if now {
+            self.b_search.store(true, Ordering::Relaxed);
+        }
+        now
     }
 
     /// Whether B's spelling still names the directory held.
@@ -408,7 +441,8 @@ impl Base {
                 given_parent: parent.to_path_buf(),
                 fd,
                 id,
-                others_search: c.others_search && b_search,
+                way_search: c.others_search,
+                b_search: AtomicBool::new(b_search),
                 d: Mutex::new(None),
             });
         }
@@ -574,7 +608,8 @@ pub(crate) enum Automatic {
 /// directory on the way and B itself let others search ("別の uid と
 /// PrivateTmp"); that B is held apart from the usual one, and is the usual one
 /// when that allows it. Whether a B allows it is judged when the process
-/// takes it and kept.
+/// takes it and kept, except that B itself found not to is looked at again
+/// ([`Base::others_search`]).
 ///
 /// When the spelling through that first place is known not to fit (`fits`
 /// of B's real path there), B is not made, and the next place is not tried
@@ -597,12 +632,13 @@ pub(crate) fn automatic(
     let other = held_in(&mut slots, 1 - slot);
     for (place, parent) in places {
         // The B held for the other slot is this place's B when it is here,
-        // with what it allows as judged when it was taken.
+        // with what it allows as judged when it was taken (B itself looked
+        // at again when judged not to).
         if let Some(b) = other
             .as_ref()
             .filter(|b| b.place == *place && b.given_parent == *parent)
         {
-            if others_search && !b.others_search {
+            if others_search && !b.others_search(true) {
                 continue;
             }
             slots[slot] = Some(Arc::clone(b));
@@ -673,7 +709,8 @@ pub(crate) fn split_given(base: &Path) -> io::Result<(&Path, &OsStr)> {
 /// directories on the way, and B itself when it is there. `others_search` is
 /// `Options.usable_cross_uid` of a bind; for a B this process already holds,
 /// whether others can search the way to it is the judgement made when it was
-/// taken ([`automatic`]). The errors are those of [`given`].
+/// taken, B itself looked at again when judged not to
+/// ([`Base::others_search`]). The errors are those of [`given`].
 pub(crate) fn check_given(base: &Path, others_search: bool) -> io::Result<()> {
     let (parent, name) = split_given(base)?;
     let held = lock(&REGISTRY).given(parent, name);
@@ -695,7 +732,7 @@ pub(crate) fn check_given(base: &Path, others_search: bool) -> io::Result<()> {
     }
     let ours = m.uid() == sys::effective_uid() && m.mode() & 0o022 == 0;
     let searchable = match &held {
-        Some(b) => b.others_search,
+        Some(b) => b.others_search(others_search),
         None => m.mode() & 0o001 != 0,
     };
     if !ours || (others_search && !searchable) {
@@ -713,13 +750,14 @@ pub(crate) fn check_given(base: &Path, others_search: bool) -> io::Result<()> {
 /// on the way is not a directory, `EPERM` when a check fails (a directory on
 /// the way another user can change, B someone else's or writable by group or
 /// others; with `others_search`, a directory on the way or B others cannot
-/// search; for a B this process holds, as judged when it was taken). Never
+/// search; for a B this process holds, as judged when it was taken, B itself
+/// looked at again when judged not to). Never
 /// another place instead.
 pub(crate) fn given(base: &Path, others_search: bool) -> io::Result<Arc<Base>> {
     let (parent, name) = split_given(base)?;
     let mut registry = lock(&REGISTRY);
     if let Some(b) = registry.given(parent, name) {
-        if others_search && !b.others_search {
+        if others_search && !b.others_search(true) {
             return Err(refused());
         }
         return Ok(b);
