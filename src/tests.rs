@@ -2296,6 +2296,59 @@ fn socket_file_of_what_is_not_a_socket_is_an_error() {
 // sweep
 // ---------------------------------------------------------------------------
 
+// sweep() passes over a B it cannot read (no permission to list it) without
+// an error, as it passes over a place or B that fails the checks (hub SPEC
+// "sweep"); what is in it is left. Not as root, whom the mode does not stop.
+#[test]
+fn sweep_passes_over_a_b_it_cannot_read() {
+    if sys::effective_uid() == 0 {
+        eprintln!("the mode does not stop root");
+        return;
+    }
+    let (t, place) = setup();
+    bind_in_child(&nest(t.path(), 200, "s.sock"), &place);
+    let b = b_of(&place);
+    let before = entries(&b);
+    std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o111)).unwrap();
+    let swept = base::sweep(&[(Place::Tmp, place.clone())]);
+    std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o711)).unwrap();
+    swept.unwrap();
+    assert_eq!(entries(&b), before);
+}
+
+/// [`base::AFTER_SWEEP_LOCK`] for the tests: the D just locked is moved aside
+/// (`<name>.moved`) and a new empty directory takes its name, as another
+/// process's sweep and a new D of the same name could.
+fn replace_d_after_lock(b: &Path, name: &OsStr) {
+    let mut moved = name.to_os_string();
+    moved.push(".moved");
+    std::fs::rename(b.join(name), b.join(moved)).unwrap();
+    std::fs::create_dir(b.join(name)).unwrap();
+}
+
+// sweep removes a dead D only while its name in B is still the directory it
+// locked (hub SPEC-routes "D と E": B and D are listed through their fds, and
+// the name's (st_dev, st_ino) is compared with the locked fd after the lock).
+// A D replaced between the lock and the removal (here: moved aside and a new
+// empty directory put at its name) is left: the new directory stays, and so
+// does the D moved aside with its E.
+#[test]
+fn sweep_removes_a_d_only_while_its_name_is_the_one_locked() {
+    let (t, place) = setup();
+    bind_in_child(&nest(t.path(), 200, "s.sock"), &place);
+    let b = b_of(&place);
+    let d = entries(&b).pop().unwrap();
+    base::AFTER_SWEEP_LOCK.set(Some(replace_d_after_lock));
+    let swept = base::sweep(&[(Place::Tmp, place.clone())]);
+    base::AFTER_SWEEP_LOCK.set(None);
+    swept.unwrap();
+    assert!(
+        b.join(&d).is_dir(),
+        "the directory put at D's name was removed"
+    );
+    assert_eq!(entries(&b.join(format!("{d}.moved"))).len(), 1);
+}
+
 // sweep removes the D of a process that ended (no lock held on it), with its
 // E, and leaves: a live process's D (a child that binds and waits), this
 // process's own D (the spelling the kernel keeps for its bind, read from

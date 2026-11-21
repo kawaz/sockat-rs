@@ -661,6 +661,87 @@ pub(crate) fn symlink_at(
     cvt(unsafe { libc::symlinkat(target.as_ptr(), dir.as_raw_fd(), name.as_ptr()) }).map(drop)
 }
 
+/// Set this thread's `errno` to 0. Where the way to reach it is not known,
+/// nothing is done (a stale `errno` may then be taken for an error).
+fn clear_errno() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: returns this thread's errno, valid for the thread's life.
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+    #[cfg(target_os = "android")]
+    // SAFETY: as above.
+    unsafe {
+        *libc::__errno() = 0;
+    }
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    // SAFETY: as above.
+    unsafe {
+        *libc::__error() = 0;
+    }
+    #[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+    // SAFETY: as above.
+    unsafe {
+        *libc::__errno() = 0;
+    }
+    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
+    // SAFETY: as above.
+    unsafe {
+        *libc::___errno() = 0;
+    }
+}
+
+/// The names in the directory `dir` (but `.` and `..`), listed through the
+/// fd: `openat(dir, ".")` opens it again for reading (`dir` may be `O_PATH`
+/// or `O_SEARCH`, which cannot be read), and `fdopendir` / `readdir` list
+/// it. `EACCES` when it cannot be read.
+pub(crate) fn read_dir_at(dir: BorrowedFd<'_>) -> io::Result<Vec<std::ffi::OsString>> {
+    let dot = c_name(OsStr::new("."))?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    // SAFETY: `dot` is NUL-terminated and lives for the call; `dir` is a
+    // borrowed, live fd. No mode is passed: O_CREAT is not among the flags.
+    let fd = cvt(unsafe { libc::openat(dir.as_raw_fd(), dot.as_ptr(), flags) })?;
+    // SAFETY: `fd` is a fresh fd of a directory opened for reading; on
+    // success the stream owns it (closedir closes it), on failure it is
+    // closed here.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let e = io::Error::last_os_error();
+        // SAFETY: `fd` is ours and not owned by any stream.
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    let mut names = Vec::new();
+    let result = loop {
+        // errno is thread-local; 0 tells the end of the stream (NULL, errno
+        // 0) from an error (NULL, errno set).
+        clear_errno();
+        // SAFETY: `stream` is a live directory stream used by this thread
+        // alone.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break match io::Error::last_os_error().raw_os_error() {
+                None | Some(0) => Ok(()),
+                Some(e) => Err(io::Error::from_raw_os_error(e)),
+            };
+        }
+        // SAFETY: `entry` points to a dirent valid until the next readdir on
+        // this stream; `d_name` is NUL-terminated within it.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let name = name.to_bytes();
+        if name != b"." && name != b".." {
+            names.push(std::ffi::OsString::from_vec(name.to_vec()));
+        }
+    };
+    // SAFETY: `stream` is live and closed once here (it closes `fd`).
+    unsafe { libc::closedir(stream) };
+    result.map(|()| names)
+}
+
 /// `readlinkat(2)`: what the symlink `name` inside the directory `dir`
 /// points to. `EINVAL` when `name` is not a symlink. A target that fills the
 /// buffer is read again with a larger one, so it is never cut short.

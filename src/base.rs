@@ -1109,9 +1109,14 @@ pub(crate) fn sweep(places: &[(Place, PathBuf)]) -> io::Result<()> {
     for (place, parent) in places {
         let name = OsString::from(place.b_name());
         // A place without B, or whose B fails the checks, has nothing of
-        // this user's to sweep.
+        // this user's to sweep; neither has a B that cannot be read (no
+        // permission to list it), which is passed over as well (hub SPEC
+        // "sweep").
         if let Ok(b) = Base::make(parent, &name, *place, Existing::FindOnly, false) {
-            sweep_in(&b)?;
+            match sweep_in(&b) {
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {}
+                swept => swept?,
+            }
         }
     }
     Ok(())
@@ -1149,11 +1154,14 @@ fn own_d_at(b: &Base) -> Option<OsString> {
 /// entries and then itself removed. Another process's live D keeps its
 /// shared lock and is skipped. B is sockat's own, yet anything else in it is
 /// left alone: only what has the form of a D is sockat's (hub SPEC "`sweep`").
+///
+/// B and D are listed through their fds, and D is removed only while its
+/// name in B is still the directory locked (the same `(st_dev, st_ino)`,
+/// looked at after the lock is taken; hub SPEC-routes "D と E"): another
+/// process may have removed it and made a new D of the same name meanwhile.
 fn sweep_in(b: &Base) -> io::Result<()> {
     let own = own_d_at(b);
-    for entry in std::fs::read_dir(&b.path)? {
-        let Ok(entry) = entry else { continue };
-        let name = entry.file_name();
+    for name in sys::read_dir_at(b.fd.as_fd())? {
         if !is_random_name(&name) || own.as_deref() == Some(name.as_os_str()) {
             continue;
         }
@@ -1169,10 +1177,19 @@ fn sweep_in(b: &Base) -> io::Result<()> {
         if !sys::lock(d.as_fd(), sys::Lock::Exclusive).unwrap_or(false) {
             continue;
         }
-        let Ok(inside) = std::fs::read_dir(b.path.join(&name)) else {
+        #[cfg(test)]
+        if let Some(f) = AFTER_SWEEP_LOCK.get() {
+            f(&b.path, &name);
+        }
+        let locked = std::fs::File::from(d.try_clone()?)
+            .metadata()
+            .map(|m| (m.dev(), m.ino()));
+        if sys::id_at(b.fd.as_fd(), &name).ok() != locked.ok() {
+            continue;
+        }
+        let Ok(inside) = sys::read_dir_at(d.as_fd()) else {
             continue;
         };
-        let inside: Vec<OsString> = inside.flatten().map(|e| e.file_name()).collect();
         // A D with anything but symlinks (E) in it is not one sockat left:
         // leave it.
         let only_links = inside
@@ -1187,6 +1204,23 @@ fn sweep_in(b: &Base) -> io::Result<()> {
         let _ = sys::unlink_at(b.fd.as_fd(), &name, true);
     }
     Ok(())
+}
+
+/// What [`AFTER_SWEEP_LOCK`] calls: B's path and D's name (test-only).
+#[cfg(test)]
+pub(crate) type AfterSweepLock = fn(&Path, &OsStr);
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: called by [`sweep_in`] on this thread with B's path and
+    /// D's name right after the exclusive lock on D is taken, before D's name
+    /// is looked at again. The tests replace D there, as another process
+    /// could.
+    // The initializer is `const`; clippy on illumos says otherwise of the
+    // macro's expansion there.
+    #[allow(clippy::missing_const_for_thread_local)]
+    pub(crate) static AFTER_SWEEP_LOCK: std::cell::Cell<Option<AfterSweepLock>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Open D (named `name` in the B held by `b`) to hold it.
