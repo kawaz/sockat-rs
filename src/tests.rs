@@ -2458,6 +2458,277 @@ fn socket_file_through_a_symlink_at_the_path_remembers_where_it_led() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// a path is not folded lexically
+// ---------------------------------------------------------------------------
+
+/// A path through a symlink and `..` under `r`: `<r>/a/sym` is a symlink to
+/// `<r>/b/t`, so the kernel takes `<r>/a/sym/../<name>` to be `<r>/b/<name>`
+/// (it follows `sym`, then climbs out of `b/t`), while folding `sym/..` on the
+/// string would make it `<r>/a/<name>`. A listening socket (the decoy) is put
+/// at `<r>/a/<name>`: what a folded path would hit.
+struct AcrossSymlink {
+    /// `<r>/a/sym/../<name>`.
+    path: PathBuf,
+    /// The real path of `<r>/b`.
+    real_dir: PathBuf,
+    /// The real path of `<r>/b/<name>`, where the socket must be.
+    real: PathBuf,
+    decoy_path: PathBuf,
+    decoy_id: (u64, u64),
+    decoy: UnixListener,
+}
+
+fn across_symlink(r: &Path, name: &str) -> AcrossSymlink {
+    let target = r.join("b").join("t");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(r.join("a")).unwrap();
+    let sym = r.join("a").join("sym");
+    if std::fs::symlink_metadata(&sym).is_err() {
+        std::os::unix::fs::symlink(&target, &sym).unwrap();
+    }
+    let decoy_path = r.join("a").join(name);
+    let decoy = listen_at(&decoy_path);
+    let real_dir = std::fs::canonicalize(r.join("b")).unwrap();
+    AcrossSymlink {
+        path: sym.join("..").join(name),
+        real: real_dir.join(name),
+        real_dir,
+        decoy_id: file_id(&decoy_path),
+        decoy_path,
+        decoy,
+    }
+}
+
+impl AcrossSymlink {
+    /// The decoy is still the socket put there, and nothing connected to it.
+    fn untouched(&self, route: &str) {
+        assert_eq!(
+            std::fs::symlink_metadata(&self.decoy_path)
+                .ok()
+                .map(|m| (m.dev(), m.ino())),
+            Some(self.decoy_id),
+            "{route}: the socket at a/<name> was removed or replaced"
+        );
+        self.decoy.set_nonblocking(true).unwrap();
+        assert_eq!(
+            self.decoy.accept().err().map(|e| e.kind()),
+            Some(io::ErrorKind::WouldBlock),
+            "{route}: a connect reached the socket at a/<name>"
+        );
+    }
+}
+
+fn file_id(p: &Path) -> (u64, u64) {
+    let m = std::fs::symlink_metadata(p).unwrap();
+    (m.dev(), m.ino())
+}
+
+// A path is never folded lexically (hub SPEC "長いパスの経路と試す順番": the
+// directory is looked up by the OS). With `a/sym` a symlink to `b/t`, the
+// kernel takes `a/sym/../<name>` to be `b/<name>`, and folding `sym/..` on the
+// string makes it `a/<name>`, another file. On every route a bind takes here
+// (standard for a short path; link-dir through B's real path and through
+// procB; link-file; thread-cwd / at):
+//
+// - the socket is made in `b`
+// - the E the spelling keeps leads to `b` (link-dir: E is the real path of
+//   `b`; link-file: E resolves to `b/<name>`)
+// - the socket file remembered for remove() is `b/<name>`, so remove()
+//   removes it and leaves the socket at `a/<name>` (a remove that folded the
+//   path removed another server's socket in another implementation)
+// - a connect by the same path reaches the socket in `b`, not the one at
+//   `a/<name>`
+#[test]
+fn a_bind_through_a_symlink_and_dot_dot_is_not_folded() {
+    let (t, place) = setup();
+    let long = |k: &str| t.path().join(k).join("x".repeat(100));
+    let s = || "s.sock".to_owned();
+    let mut cases = vec![
+        (names::STANDARD, t.path().join("st"), s(), config(&place)),
+        (names::LINK_DIR, long("ld"), s(), real_link_dir(&place)),
+    ];
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if proc_here() {
+        cases.push((names::LINK_DIR, long("lp"), s(), config(&place)));
+    }
+    if cfg!(any(target_vendor = "apple", target_os = "netbsd")) {
+        let cfg = no_proc(config(&place));
+        cases.push((names::LINK_FILE, long("lf"), "n".repeat(200), cfg));
+    }
+    let in_d = if cfg!(target_os = "freebsd") {
+        Some(names::AT)
+    } else if thread_here() {
+        Some(names::THREAD_CWD)
+    } else {
+        None
+    };
+    if let Some(route) = in_d {
+        let cfg = real_link_dir(&place);
+        cases.push((route, long("tc"), name_past_link_dir(), cfg));
+    }
+    for (route, r, name, cfg) in cases {
+        let x = across_symlink(&r, &name);
+        assert_eq!(
+            path::len(&x.path) <= DIRECT_MAX,
+            route == names::STANDARD,
+            "{route}: the premise of the path's length"
+        );
+        let mut got =
+            bind(&x.path, &opts(), &cfg).unwrap_or_else(|f| panic!("{route}: {}", f.error));
+        assert_eq!(got.route, route);
+        assert!(is_socket(&x.real), "{route}: no socket in b");
+        let l = listener(&mut got);
+        let spelling = reported(&l);
+        if route == names::LINK_DIR {
+            let e = spelling.parent().unwrap();
+            assert_eq!(std::fs::read_link(e).unwrap(), x.real_dir, "{route}");
+        }
+        if route == names::LINK_FILE {
+            let to = std::fs::read_link(&spelling).unwrap();
+            assert_eq!(std::fs::canonicalize(to).unwrap(), x.real, "{route}");
+        }
+        let c = connect(&x.path, &cfg).unwrap();
+        x.untouched(route);
+        ping(&l, c.socket.unwrap());
+        let file = SocketFile::new(
+            got.file.take().unwrap(),
+            crate::Clean::new(got.link.clone()),
+        );
+        assert_eq!(file.path, x.real, "{route}");
+        file.remove().unwrap();
+        assert!(std::fs::symlink_metadata(&x.real).is_err(), "{route}");
+        x.untouched(route);
+    }
+}
+
+// The same for a connect (hub SPEC "長いパスの経路と試す順番"): every connect
+// route forced here (proc-direct, thread-cwd-direct, widened, at-direct,
+// link-file, and the spelling of resolve_for_connect handed to std) opens or
+// spells the socket's directory as the kernel resolves `a/sym/..`, so it
+// reaches the socket at `b/<name>`, not the one at `a/<name>`. relative is
+// checked in a child (it needs the cwd near the path).
+#[test]
+fn a_connect_through_a_symlink_and_dot_dot_is_not_folded() {
+    let (t, place) = setup();
+    let x = across_symlink(&t.path().join("x".repeat(100)), "s.sock");
+    assert!(path::len(&x.path) > DIRECT_MAX);
+    let l = listen_at(&x.real);
+    // link-file on every target, the others where the target has them (none
+    // is pushed on NetBSD, OpenBSD and illumos).
+    #[allow(unused_mut)]
+    let mut cases = vec![(
+        names::LINK_FILE,
+        no_thread(no_direct(no_proc(config(&place)))),
+    )];
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if proc_here() {
+        cases.push((names::PROC_DIRECT, config(&place)));
+    }
+    #[cfg(target_vendor = "apple")]
+    cases.push((names::WIDENED, config(&place)));
+    #[cfg(target_os = "freebsd")]
+    cases.push((names::AT_DIRECT, config(&place)));
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    if thread_here() {
+        #[allow(unused_mut)]
+        let mut cfg = no_proc(config(&place));
+        #[cfg(target_vendor = "apple")]
+        {
+            cfg.wide = false;
+        }
+        cases.push((names::THREAD_CWD_DIRECT, cfg));
+    }
+    for (route, cfg) in cases {
+        let c = connect(&x.path, &cfg).unwrap_or_else(|f| panic!("{route}: {}", f.error));
+        assert_eq!(c.route, route);
+        x.untouched(route);
+        ping(&l, c.socket.unwrap());
+    }
+    let rc = route::resolve(route::Use::Connect, &x.path, &opts(), Some(&config(&place))).unwrap();
+    assert_eq!(rc.route, names::LINK_FILE);
+    let c = UnixStream::connect(&rc.path).unwrap();
+    x.untouched("resolve_for_connect");
+    ping(&l, c.into());
+}
+
+// A relative path through a symlink and `..` is not folded either (hub SPEC
+// "長いパスの経路と試す順番"), with the cwd at `<r>`:
+//
+// - a short `a/sym/../s.sock` goes to std as it is (standard, CwdRelative):
+//   the socket is made in `b`, and remove() removes `b/s.sock` and leaves the
+//   socket at `a/s.sock` (a short relative remove that folded the path
+//   removed another server's socket in another implementation)
+// - resolve_for_bind hands a short one back as it is, and its socket_file()
+//   remembers the socket in `b`
+// - relative (not on FreeBSD) spells a long absolute path below the cwd as
+//   `a/sym/../c.sock`, which reaches the socket in `b`
+//
+// Run in a child: the cwd is process-wide.
+#[test]
+fn a_relative_path_through_a_symlink_and_dot_dot_is_not_folded() {
+    let t = tmp();
+    let place = t.path().join("p");
+    std::fs::create_dir(&place).unwrap();
+    let r = t.path().join("x".repeat(100));
+    std::fs::create_dir(&r).unwrap();
+    run_child(
+        "tests::child_relative_path_through_a_symlink_and_dot_dot",
+        &[
+            ("SOCKAT_CHILD_PATH", r.as_os_str()),
+            ("SOCKAT_CHILD_PLACE", place.as_os_str()),
+        ],
+    );
+}
+
+#[test]
+fn child_relative_path_through_a_symlink_and_dot_dot() {
+    if !in_child() {
+        return;
+    }
+    let r = std::fs::canonicalize(env_path("SOCKAT_CHILD_PATH")).unwrap();
+    let place = env_path("SOCKAT_CHILD_PLACE");
+    std::env::set_current_dir(&r).unwrap();
+
+    let x = across_symlink(&r, "s.sock");
+    let rel = Path::new("a/sym/../s.sock");
+    let mut got = bind(rel, &opts(), &config(&place)).unwrap();
+    assert_eq!(got.route, names::STANDARD);
+    assert_eq!(got.spelling, Some(Spelling::CwdRelative));
+    assert!(is_socket(&x.real));
+    let l = listener(&mut got);
+    let file = SocketFile::new(
+        got.file.take().unwrap(),
+        crate::Clean::new(got.link.clone()),
+    );
+    assert_eq!(file.path, x.real);
+    file.remove().unwrap();
+    assert!(std::fs::symlink_metadata(&x.real).is_err());
+    x.untouched("standard");
+    drop(l);
+
+    let y = across_symlink(&r, "s2.sock");
+    let rel = Path::new("a/sym/../s2.sock");
+    let resolved = route::resolve(route::Use::Bind, rel, &opts(), Some(&config(&place))).unwrap();
+    assert_eq!(resolved.path, rel);
+    let _l = UnixListener::bind(&resolved.path).unwrap();
+    let remembered = route::remember_resolved(&resolved.path, resolved.cwd).unwrap();
+    assert_eq!(remembered.path, y.real);
+    y.untouched("resolve_for_bind");
+
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        let z = across_symlink(&r, "c.sock");
+        assert!(path::len(&z.path) > DIRECT_MAX);
+        let l = listen_at(&z.real);
+        let cfg = no_proc(config(&place));
+        let c = connect(&z.path, &cfg).unwrap();
+        assert_eq!(c.route, names::RELATIVE);
+        z.untouched(names::RELATIVE);
+        ping(&l, c.socket.unwrap());
+    }
+}
+
 thread_local! {
     /// The file the [`replace_after_bind`] hook puts in the socket's place.
     // The initializer is `const`; clippy on illumos says otherwise of the
