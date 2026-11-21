@@ -18,7 +18,7 @@
   - Apple の OS で広げた sockaddr を試すか (`wide`)
   - bind が symlink を辿るか (`follows`。辿らない OS で実行時の見分けを通す)
   - ソケットのディレクトリの開き方 (`open_socket_dir`。開けないディレクトリの代わり)
-  - 相対パスの bind で cwd を引き直す間 (`between_cwd_lookups`。他のスレッドの `chdir` の代わり)
+  - 相対パスの bind で cwd を引き直す間 (`between_lookups`。他のスレッドの `chdir` の代わり)
 - プロセス全体に効く設定 (cwd、umask) と、終わったプロセスの D が要る試験は、試験のバイナリを子プロセスで起こして中で行う
 - feature も cfg(test) 専用の公開口も作らない。ハブの適合試験の CLI も公開の `_ex` を使う ([DR-0030](DR-0030-conformance-cli.md))
 

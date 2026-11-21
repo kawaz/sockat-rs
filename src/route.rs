@@ -254,7 +254,7 @@ pub(crate) struct Config {
     /// a long path's directory is taken, before any route. Does nothing
     /// outside the tests, which change the cwd there (a relative path) or
     /// switch a symlink on the path's way, as another thread could.
-    pub(crate) between_cwd_lookups: fn(),
+    pub(crate) between_lookups: fn(),
 }
 
 impl Config {
@@ -278,7 +278,7 @@ impl Config {
             wide: true,
             follows: FOLLOWS,
             open_socket_dir,
-            between_cwd_lookups: || {},
+            between_lookups: || {},
         }
     }
 }
@@ -456,7 +456,7 @@ fn run_unchecked(
         };
         let socket = plain(req, path).map_err(failed)?;
         if let Some(cfg) = cfg {
-            (cfg.between_cwd_lookups)();
+            (cfg.between_lookups)();
         }
         if req.is_bind() {
             after_bind();
@@ -669,7 +669,7 @@ impl<'a> Target<'a> {
             let cross = matches!(req, Request::Bind(_)) && options.usable_cross_uid;
             base::check_given(given, cross).map_err(before)?;
         }
-        (cfg.between_cwd_lookups)();
+        (cfg.between_lookups)();
         Ok(Self {
             req,
             path,

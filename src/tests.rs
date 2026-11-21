@@ -3474,7 +3474,7 @@ thread_local! {
     static SWITCH: std::cell::RefCell<Option<(PathBuf, PathBuf)>> = const { std::cell::RefCell::new(None) };
 }
 
-/// A hook for the tests ([`route::AFTER_BIND`], `Config::between_cwd_lookups`):
+/// A hook for the tests ([`route::AFTER_BIND`], `Config::between_lookups`):
 /// the symlink in [`SWITCH`] is pointed to its new target, once, as another
 /// process could.
 fn switch_symlink() {
@@ -3513,7 +3513,7 @@ fn long_bind_routes(place: &Path) -> Vec<(&'static str, String, Config)> {
 // before the bind (another thread could do it) does not make bind_ex
 // remember another file than the one the bind made (hub SPEC "remove": where
 // to remember). The switch is made once the real path of the directory has
-// been taken (`between_cwd_lookups`), pointing `l` from `a` to `b`:
+// been taken (`between_lookups`), pointing `l` from `a` to `b`:
 //
 // - link-dir (B's real path, procB) and thread-cwd / at bind through an E
 //   pointing to the real path of `a` taken before, so the socket is made in
@@ -3541,7 +3541,7 @@ fn a_bind_ex_remembers_where_it_bound_when_a_symlink_is_switched_before_the_bind
         let decoy = listen_at(&other);
         let decoy_id = file_id(&other);
         SWITCH.set(Some((x.link.clone(), x.b.clone())));
-        cfg.between_cwd_lookups = switch_symlink;
+        cfg.between_lookups = switch_symlink;
         let got = bind(&x.path, &opts(), &cfg);
         SWITCH.set(None);
         let mut got = got.unwrap_or_else(|f| panic!("{route}: {}", f.error));
@@ -3976,7 +3976,7 @@ fn child_cwd_changes() {
     let root = env_path("SOCKAT_CHILD_PATH");
     std::env::set_current_dir(root.join("a")).unwrap();
     let mut cfg = config(&root);
-    cfg.between_cwd_lookups = || {
+    cfg.between_lookups = || {
         std::env::set_current_dir(env_path("SOCKAT_CHILD_PATH").join("b")).unwrap();
     };
     let f = route::run(BIND, Path::new("s.sock"), &opts(), true, Some(&cfg))
@@ -4027,7 +4027,7 @@ fn child_cwd_changes_through_link_dir() {
     let root = env_path("SOCKAT_CHILD_PATH");
     std::env::set_current_dir(root.join("a")).unwrap();
     let mut cfg = real_link_dir(&root.join("p"));
-    cfg.between_cwd_lookups = || {
+    cfg.between_lookups = || {
         std::env::set_current_dir(env_path("SOCKAT_CHILD_PATH").join("b")).unwrap();
     };
     let f = route::run(BIND, &long_relative(), &opts(), true, Some(&cfg))
