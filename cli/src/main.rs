@@ -75,7 +75,7 @@ fn subcommand(name: &'static str, args: impl IntoIterator<Item = Arg>) -> Comman
 fn command() -> Command {
     Command::new("sockat")
         .version(env!("CARGO_PKG_VERSION"))
-        .about("Print a path for a Unix domain socket that fits the socket address limit (sun_path), for a path that does not")
+        .about("Print a path to the same Unix domain socket that fits the socket address limit (sun_path)")
         .override_usage("sockat [OPTIONS] <PATH>    (= sockat resolve [OPTIONS] <PATH>)\n       sockat <COMMAND>")
         .disable_help_flag(true)
         .disable_version_flag(true)
@@ -94,7 +94,7 @@ fn command() -> Command {
         )
         .subcommand(
             subcommand("resolve", resolve_args())
-                .about("Print a path for the socket that fits the socket address limit"),
+                .about("Print a path to the same Unix domain socket that fits the socket address limit (sun_path)"),
         )
         .subcommand(subcommand("sweep", []).about(
             "Remove what ended processes left in the bases in /tmp, $XDG_RUNTIME_DIR and $TMPDIR",
@@ -110,7 +110,7 @@ fn command() -> Command {
             )
             .about("Print the completion script for a shell"),
         )
-        .after_help("Environment: TMPDIR and XDG_RUNTIME_DIR name the places for the base after /tmp.")
+        .after_help("Environment: https://github.com/kawaz/sockat/blob/main/pages/cli.md#environment")
 }
 
 fn main() -> ExitCode {
