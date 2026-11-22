@@ -173,7 +173,10 @@ fn run_resolve(m: &ArgMatches) -> ExitCode {
         _ => None,
     };
     let base = m.get_one::<PathBuf>("base");
-    let env = Env { places: places() };
+    let env = Env {
+        places: places(),
+        pwd: std::env::var_os("PWD"),
+    };
     let resolved = match resolve::resolve(path, for_, base.map(PathBuf::as_path), &env) {
         Ok(r) => r,
         Err(f) => return fail(&f),

@@ -7,10 +7,11 @@
 //! It gives only what the command needs to have the same B as the library
 //! (hub DR-0018 "resolve の既定の綴り" 3: B is made and checked as the
 //! library does): the places, the process's B of the places 1-3, B at a
-//! given path, `sweep` over the places, and the few constants and the random
-//! names the command spells and names with. No way to choose a route.
+//! given path, `sweep` over the places, and the few constants, the split of
+//! a path and the random names the command spells and names with, so they
+//! are the library's own. No way to choose a route.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -93,6 +94,17 @@ pub fn automatic(places: &Places, fits: impl Fn(&Path) -> bool) -> Found {
             occupied: occupied.get(),
         },
     }
+}
+
+/// A socket path split into its directory and file name, as the library
+/// splits it (at the last `/`; `s.sock` is in `.`).
+///
+/// # Errors
+///
+/// `InvalidInput` when it does not end with a name (`dir/`, `dir/.`,
+/// `dir/..`, `..`, `/`), which the library refuses whatever the length.
+pub fn split(path: &Path) -> io::Result<(&Path, &OsStr)> {
+    crate::path::split(path)
 }
 
 /// The form of a B the caller names (as `Options.base`): absolute, without

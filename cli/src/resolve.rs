@@ -1,8 +1,11 @@
 //! `resolve`: the path to print for a socket path (hub DR-0018 "resolve の既
 //! 定の綴り", docs/design/cli.md).
 //!
-//! 1. A path that fits the socket address limit (once made absolute) is the
-//!    path itself.
+//! 1. An absolute path that fits the socket address limit is the path
+//!    itself. A relative path is made absolute first (hub DR-0019 "絶対パスの
+//!    作り方と、その後"): its real path, else its spelling from `$PWD` with
+//!    `.` and `..` folded (when that names the same directory), whichever
+//!    fits first; nothing is made for it.
 //! 2. Otherwise the socket's directory is looked up (`ENOENT`, `ENOTDIR`).
 //! 3. B is the process's B of the places 1-3 or the one at `--base`, made
 //!    and checked by the library (`sockat::__cli`).
@@ -14,9 +17,11 @@
 //!    symlink.
 //! 7. Else nothing fits.
 
-use std::ffi::OsStr;
+use std::cell::RefCell;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -32,7 +37,8 @@ pub(crate) enum Use {
 /// How the path printed was made (the JSON's `route`; diagnostics only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Route {
-    /// The path given (made absolute).
+    /// The path given, or for a relative path an absolute path to the same
+    /// place (no E).
     Standard,
     /// Through an E pointing to the socket's directory.
     LinkDir,
@@ -96,9 +102,12 @@ const ATTEMPTS: usize = 16;
 /// What [`resolve`] reads from where it runs.
 pub(crate) struct Env {
     pub(crate) places: entry::Places,
+    /// `$PWD`.
+    pub(crate) pwd: Option<OsString>,
 }
 
-/// The path to print for `path` (hub DR-0018 "resolve の既定の綴り").
+/// The path to print for `path` (hub DR-0018 "resolve の既定の綴り", DR-0019
+/// for a relative path).
 pub(crate) fn resolve(
     path: &Path,
     for_: Option<Use>,
@@ -118,59 +127,121 @@ pub(crate) fn resolve(
             ))
         })?;
     }
-    let absolute = absolute(path)?;
-    if len(&absolute) <= entry::LIMIT {
-        return Ok(Resolved {
-            path: absolute,
-            route: Route::Standard,
-            link: None,
-            bind: true,
-        });
+    // Whatever its length, as the library does (hub SPEC "エラー").
+    let (dir, name) = entry::split(path).map_err(|_| {
+        Failure::usage(format!(
+            "the path must end with a file name (not '/', '.' or '..'): {}\n  give the socket file's path",
+            path.display()
+        ))
+    })?;
+    let standard = |p: PathBuf| Resolved {
+        path: p,
+        route: Route::Standard,
+        link: None,
+        bind: true,
+    };
+    if path.is_absolute() && len(path) <= entry::LIMIT {
+        return Ok(standard(path.to_path_buf()));
     }
-    let (dir, name) = split(&absolute)?;
     let real_dir = socket_dir(dir)?;
+    if !path.is_absolute() {
+        // The candidates of an absolute path naming the same place, the real
+        // path first (hub DR-0019 2-3).
+        let real = real_dir.join(name);
+        if len(&real) <= entry::LIMIT {
+            return Ok(standard(real));
+        }
+        if let Some(p) = from_pwd(path, dir, env.pwd.as_deref()) {
+            if len(&p) <= entry::LIMIT {
+                return Ok(standard(p));
+            }
+        }
+    }
+    through_base(&real_dir, name, for_, base, env)
+}
+
+/// The spelling of the relative `path` from `$PWD` (`pwd`), `.` and `..`
+/// folded by their letters (hub DR-0019 2): only when `$PWD` is absolute and
+/// is the cwd (the same `(st_dev, st_ino)` as `.`), and the folded directory
+/// is the directory of `path` (`dir`) to the kernel. A `..` after a symlink
+/// is the parent of the symlink's target to the kernel, which the folding
+/// does not know, and then the folded spelling names another place.
+fn from_pwd(path: &Path, dir: &Path, pwd: Option<&OsStr>) -> Option<PathBuf> {
+    let pwd = Path::new(pwd?);
+    if !pwd.is_absolute() {
+        return None;
+    }
+    let id = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+    if id(pwd)? != id(Path::new("."))? {
+        return None;
+    }
+    let mut parts: Vec<&[u8]> = Vec::new();
+    let joined = [pwd.as_os_str().as_bytes(), path.as_os_str().as_bytes()];
+    for part in joined.iter().flat_map(|b| b.split(|&c| c == b'/')) {
+        match part {
+            b"" | b"." => {}
+            b".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    let mut folded = Vec::new();
+    for part in &parts {
+        folded.push(b'/');
+        folded.extend_from_slice(part);
+    }
+    let folded = PathBuf::from(OsStr::from_bytes(&folded));
+    (id(folded.parent()?)? == id(dir)?).then_some(folded)
+}
+
+/// The path through an E right in B to the socket's directory (`real_dir`,
+/// its real path), else to the socket file for the use asked for (hub
+/// DR-0018 3-7).
+fn through_base(
+    real_dir: &Path,
+    name: &OsStr,
+    for_: Option<Use>,
+    base: Option<&Path>,
+    env: &Env,
+) -> Result<Resolved, Failure> {
     let name_len = name.len();
-    let through_dir = |b: &Path| len(b) + 1 + HASH_LEN + 1 + name_len;
-    let through_file = |b: &Path| len(b) + 1 + HASH_LEN;
-    // The E pointing to the socket file is counted whatever the use, so B is
-    // chosen the same way for every use, and a path that only it would fit
-    // gets the error that says why it cannot be had for that use (no
-    // `--for`, or a bind where a bind does not follow a symlink) rather than
-    // that nothing fits.
-    let fits = |b: &Path| through_dir(b) <= entry::LIMIT || through_file(b) <= entry::LIMIT;
-    let b = choose_base(base, &env.places, fits, name_len)?;
+    // The E pointing to the socket file is for a connect anywhere, and for a
+    // bind only where a bind follows a symlink; without `--for` it is for
+    // nothing. B is made only when a path for this use can fit through it,
+    // so an error for a use the E to the file cannot serve is told before
+    // anything is made.
+    let file_usable = match for_ {
+        Some(Use::Connect) => true,
+        Some(Use::Bind) => entry::BIND_FOLLOWS_SYMLINK,
+        None => false,
+    };
+    let usable = |b: &Path| {
+        through_dir(b, name_len) <= entry::LIMIT || (file_usable && through_file(b) <= entry::LIMIT)
+    };
+    // The B (made or to be made) the library measured last: the one the
+    // error is about when no path fits through it.
+    let offered = RefCell::new(None::<PathBuf>);
+    let fits = |b: &Path| {
+        *offered.borrow_mut() = Some(b.to_path_buf());
+        usable(b)
+    };
+    let b = choose_base(base, &env.places, fits)?;
+    let Some(b) = b.filter(|b| usable(b.path())) else {
+        return Err(match offered.take() {
+            Some(b) => not_for_this_use(&b, name_len, for_),
+            None => too_long(name_len, None),
+        });
+    };
     let b = b.path();
-    if through_dir(b) <= entry::LIMIT {
-        let e = link(b, &hash(&real_dir), &real_dir)?;
+    if through_dir(b, name_len) <= entry::LIMIT {
+        let e = link(b, &hash(real_dir), real_dir)?;
         return Ok(Resolved {
             path: e.join(name),
             route: Route::LinkDir,
-            link: Some((e, real_dir)),
+            link: Some((e, real_dir.to_path_buf())),
             bind: true,
         });
-    }
-    let room = entry::LIMIT.saturating_sub(len(b) + 1 + HASH_LEN + 1);
-    if through_file(b) > entry::LIMIT {
-        return Err(too_long(name_len, Some(room)));
-    }
-    let bind = entry::BIND_FOLLOWS_SYMLINK;
-    match for_ {
-        None if bind => {
-            return Err(Failure::new(format!(
-                "the file name is too long for a path that works for both bind and connect ({name_len} bytes; up to {room} here)\n  pass --for connect or --for bind to get a path for that use"
-            )));
-        }
-        None => {
-            return Err(Failure::new(format!(
-                "the file name is too long for a path that works for both bind and connect ({name_len} bytes; up to {room} here)\n  pass --for connect to get a path to connect to (a bind does not follow a symlink on this system)"
-            )));
-        }
-        Some(Use::Bind) if !bind => {
-            return Err(Failure::new(format!(
-                "the file name is too long for a path to bind on this system ({name_len} bytes; up to {room} here; a bind does not follow a symlink)\n  use a shorter file name, or a --base with a shorter path"
-            )));
-        }
-        Some(_) => {}
     }
     let file = real_dir.join(name);
     let e = link(b, &hash(&file), &file)?;
@@ -178,23 +249,54 @@ pub(crate) fn resolve(
         path: e.clone(),
         route: Route::LinkFile,
         link: Some((e, file)),
-        bind,
+        bind: entry::BIND_FOLLOWS_SYMLINK,
     })
 }
 
+/// `B/<hash>/<file name>`'s length through B at `b`.
+fn through_dir(b: &Path, name_len: usize) -> usize {
+    len(b) + 1 + HASH_LEN + 1 + name_len
+}
+
+/// `B/<hash>`'s length through B at `b`.
+fn through_file(b: &Path) -> usize {
+    len(b) + 1 + HASH_LEN
+}
+
+/// No path for this use fits through B at `b`: the E to the socket file
+/// would fit but cannot serve it (no `--for`, or a bind where a bind does
+/// not follow a symlink), or nothing fits at all.
+fn not_for_this_use(b: &Path, name_len: usize, for_: Option<Use>) -> Failure {
+    let room = entry::LIMIT.saturating_sub(through_dir(b, 0));
+    if through_file(b) > entry::LIMIT {
+        return too_long(name_len, Some(room));
+    }
+    let message = match (for_, entry::BIND_FOLLOWS_SYMLINK) {
+        (None, true) => format!(
+            "the file name is too long for a path that works for both bind and connect ({name_len} bytes; up to {room} here)\n  pass --for connect or --for bind to get a path for that use"
+        ),
+        (None, false) => format!(
+            "the file name is too long for a path that works for both bind and connect ({name_len} bytes; up to {room} here)\n  pass --for connect to get a path to connect to (a bind does not follow a symlink on this system)"
+        ),
+        _ => format!(
+            "the file name is too long for a path to bind on this system ({name_len} bytes; up to {room} here; a bind does not follow a symlink)\n  use a shorter file name, or a --base with a shorter path"
+        ),
+    };
+    Failure::new(message)
+}
+
 /// B: the one at `--base` (checked before anything is made, and made only
-/// when a spelling through it can fit), else the process's B of the places
-/// 1-3.
+/// when `fits` holds for it), else the process's B of the places 1-3.
+/// `None` when `fits` does not hold for the B (nothing is made then).
 fn choose_base(
     base: Option<&Path>,
     places: &entry::Places,
     fits: impl Fn(&Path) -> bool,
-    name_len: usize,
-) -> Result<entry::Base, Failure> {
+) -> Result<Option<entry::Base>, Failure> {
     let Some(base) = base else {
         return match entry::automatic(places, fits) {
-            entry::Found::Base(b) => Ok(b),
-            entry::Found::TooLong => Err(too_long(name_len, None)),
+            entry::Found::Base(b) => Ok(Some(b)),
+            entry::Found::TooLong => Ok(None),
             entry::Found::Missing { occupied } => Err(Failure::new(format!(
                 "no base directory could be made in /tmp, $XDG_RUNTIME_DIR or $TMPDIR{}\n  pass --base with a directory to make it in",
                 match occupied {
@@ -217,10 +319,9 @@ fn choose_base(
         .map_err(refused)?
         .join(base.file_name().unwrap_or_default());
     if !fits(&real) {
-        let room = entry::LIMIT.saturating_sub(real.as_os_str().len() + 1 + HASH_LEN + 1);
-        return Err(too_long(name_len, Some(room)));
+        return Ok(None);
     }
-    entry::given(base).map_err(refused)
+    entry::given(base).map(Some).map_err(refused)
 }
 
 /// Nothing through B fits. `room`: how long a file name could be through B.
@@ -233,40 +334,6 @@ fn too_long(name_len: usize, room: Option<usize>) -> Failure {
         "no path through the base fits the socket address limit ({} bytes) for this file name ({name_len} bytes{room})\n  use a --base with a shorter path, or a shorter file name",
         entry::LIMIT
     ))
-}
-
-/// `path` made absolute by the current directory put in front of it, as
-/// written: `.` and `..` are not folded (hub SPEC: a path is not folded by
-/// its letters; a `..` after a symlink goes to the symlink's target's parent).
-fn absolute(path: &Path) -> Result<PathBuf, Failure> {
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-    let cwd = std::env::current_dir().map_err(|e| {
-        Failure::new(format!(
-            "cannot read the current directory: {e}\n  give an absolute path"
-        ))
-    })?;
-    // `join` puts one `/` between them and changes nothing else.
-    Ok(cwd.join(path))
-}
-
-/// The directory and the file name of an absolute path, split at its last
-/// `/` (the library's split): it must end with a name, not `/`, `.` or `..`.
-fn split(path: &Path) -> Result<(&Path, &OsStr), Failure> {
-    let bytes = path.as_os_str().as_bytes();
-    let (dir, name) = match bytes.iter().rposition(|&b| b == b'/') {
-        Some(0) => (&b"/"[..], &bytes[1..]),
-        Some(i) => (&bytes[..i], &bytes[i + 1..]),
-        None => (&b"."[..], bytes),
-    };
-    if name.is_empty() || name == b"." || name == b".." {
-        return Err(Failure::usage(format!(
-            "the path must end with a file name (not '/', '.' or '..'): {}\n  give the socket file's path",
-            path.display()
-        )));
-    }
-    Ok((Path::new(OsStr::from_bytes(dir)), OsStr::from_bytes(name)))
 }
 
 /// The real path of the socket's directory `dir`, which must be there and be
