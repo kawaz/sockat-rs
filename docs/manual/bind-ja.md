@@ -4,7 +4,7 @@
 
 ## 待ち受ける
 
-std の `UnixListener::bind` の代わりに `sockat::bind` を使う。返るのは listen 済みの std の `UnixListener`。
+標準ライブラリの `UnixListener::bind` の代わりに `sockat::bind` を使う。返るのは listen 済みの標準ライブラリの `UnixListener`。
 
 ```rust
 use std::io::{self, BufRead, BufReader, Write};
@@ -60,7 +60,7 @@ async fn start(path: &Path) -> io::Result<()> {
 
 ## 終わる時にソケットのファイルを消す
 
-listener を閉じてもソケットのファイルは消えない (std と同じ) ので、`bind_ex` が返す `file` の `remove()` で、listener を閉じる前に消す。
+listener を閉じてもソケットのファイルは消えない (標準ライブラリと同じ) ので、`bind_ex` が返す `file` の `remove()` で、listener を閉じる前に消す。
 
 ```rust
 use std::io;

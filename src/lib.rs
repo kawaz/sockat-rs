@@ -52,7 +52,7 @@
 //!   for a relative path bound, an absolute one.
 //!   Remove the socket file by the original path or by
 //!   [`SocketFile::remove`]. See
-//!   [What differs from the standard for a long path](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-differs-from-the-standard-for-a-long-path).
+//!   [What differs from the standard library for a long path](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-differs-from-the-standard-library-for-a-long-path).
 //! * To remove the socket file later, or to know what the spelling is good
 //!   for ([`Spelling`]) and which route was taken, use the `_ex` functions
 //!   ([`bind_ex`], [`connect_ex`], ...). To hand a spelling to std yourself,

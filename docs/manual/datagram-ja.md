@@ -4,7 +4,7 @@
 
 ## 受ける
 
-std の `UnixDatagram::bind` の代わりに `sockat::datagram::bind` を使う。
+標準ライブラリの `UnixDatagram::bind` の代わりに `sockat::datagram::bind` を使う。
 
 ```rust
 use std::io;

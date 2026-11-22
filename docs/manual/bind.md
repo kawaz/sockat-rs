@@ -4,7 +4,7 @@
 
 ## Listen
 
-Use `sockat::bind` where you would use std's `UnixListener::bind`. It returns std's `UnixListener`, already listening.
+Use `sockat::bind` where you would use the standard library's `UnixListener::bind`. It returns the standard library's `UnixListener`, already listening.
 
 ```rust
 use std::io::{self, BufRead, BufReader, Write};
@@ -60,7 +60,7 @@ async fn start(path: &Path) -> io::Result<()> {
 
 ## Remove the socket file when done
 
-Closing the listener does not remove the socket file (as with std), so remove it with `remove()` on the `file` that `bind_ex` returns, before the listener is closed.
+Closing the listener does not remove the socket file (as with the standard library), so remove it with `remove()` on the `file` that `bind_ex` returns, before the listener is closed.
 
 ```rust
 use std::io;

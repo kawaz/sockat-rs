@@ -4,13 +4,13 @@
 
 Unix domain socket のパスが長すぎて bind / connect できない。sockat は、それを無くす Rust のライブラリです。
 
-Rust の std は、パスが長いと bind / connect を `io::ErrorKind::InvalidInput` の次のエラーで断ります。
+Rust の標準ライブラリは、パスが長いと bind / connect を `io::ErrorKind::InvalidInput` の次のエラーで断ります。
 
 ```
 path must be shorter than SUN_LEN
 ```
 
-std の関数を sockat の関数に置き換えるだけで、長いパスでもそのまま動きます。
+標準ライブラリの関数を sockat の関数に置き換えるだけで、長いパスでもそのまま動きます。
 
 ```rust
 use std::io;
@@ -29,7 +29,7 @@ fn main() -> io::Result<()> {
 }
 ```
 
-返ってくるのは std と同じ型で、短いパスは今までどおり std にそのまま渡します。長いパスの時だけ、sockat が同じ場所を指す短い道を裏で用意してつなぎます。パスを短くする工夫も、OS ごとの上限も、気にしなくて構いません。std の型なので、tokio 等の async ランタイムにも std のソケットと同じ手順で渡せます。
+返ってくるのは標準ライブラリと同じ型で、短いパスは今までどおり標準ライブラリにそのまま渡します。長いパスの時だけ、sockat が同じ場所を指す短い道を裏で用意してつなぎます。パスを短くする工夫も、OS ごとの上限も、気にしなくて構いません。標準ライブラリの型なので、tokio 等の async ランタイムにも標準ライブラリのソケットと同じ手順で渡せます。
 
 ## インストール
 

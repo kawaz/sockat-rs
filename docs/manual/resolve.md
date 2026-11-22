@@ -2,11 +2,11 @@
 
 > English | [日本語](./resolve-ja.md)
 
-Do the bind / connect yourself (with std or another library), and take from sockat only the short path (the spelling) to hand over in place of the long one.
+Do the bind / connect yourself (with the standard library or another library), and take from sockat only the short path (the spelling) to hand over in place of the long one.
 
-## Bind with std
+## Bind with the standard library
 
-Hand the `path` of `resolve_for_bind` to std. Remove the socket file with `remove()` on the `SocketFile` that `socket_file()` gives after the bind, before the listener is closed.
+Hand the `path` of `resolve_for_bind` to the standard library. Remove the socket file with `remove()` on the `SocketFile` that `socket_file()` gives after the bind, before the listener is closed.
 
 ```rust
 use std::io;

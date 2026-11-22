@@ -2,7 +2,7 @@
 
 ## 読み方・調査範囲
 
-- 対象は pathname 型の Unix domain socket の bind / listen / connect。基準は Rust 版の設計 ([DR-0001](../decisions/DR-0001-long-socket-path-routes.md))
+- 対象は pathname 型の Unix domain socket の bind / listen / connect。基準は Rust 版の設計 ([DR-0001](../decisions/archive/DR-0001-long-socket-path-routes.md))
 - 「確」は公開ソース・公式文書・issue 本文・手元の実測で確かめたもの。「見込み」は API の組み合わせからの推論。「未確認」は確かめられなかったもの
 - 表の「○」は言語の標準 API で実現できる、「△」は native extension / FFI / 生のシステムコールに頼る、「×」は標準の返却型を保つ公開 API が見当たらない
 - 需要の件数は GitHub の issue 検索の結果数 (issue と PR を含む、2026-11-18 時点) で、利用者数ではない。調査中に検索 API の回数上限に達したので、取れなかったものを 0 件とはしない

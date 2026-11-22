@@ -4,7 +4,7 @@
 
 ## Connect
 
-Use `sockat::connect` where you would use std's `UnixStream::connect`. It returns std's `UnixStream`.
+Use `sockat::connect` where you would use the standard library's `UnixStream::connect`. It returns the standard library's `UnixStream`.
 
 ```rust
 use std::io::{self, BufRead, BufReader, Write};

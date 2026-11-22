@@ -2,11 +2,11 @@
 
 > [English](./resolve.md) | 日本語
 
-bind / connect は自分で (std や他のライブラリで) して、長いパスの代わりに渡す短いパス (綴り) だけを sockat から受け取る。
+bind / connect は自分で (標準ライブラリや他のライブラリで) して、長いパスの代わりに渡す短いパス (綴り) だけを sockat から受け取る。
 
-## std で bind する
+## 標準ライブラリで bind する
 
-`resolve_for_bind` の `path` を std に渡す。ソケットのファイルは、bind の後に `socket_file()` で受け取った `SocketFile` の `remove()` で、listener を閉じる前に消す。
+`resolve_for_bind` の `path` を標準ライブラリに渡す。ソケットのファイルは、bind の後に `socket_file()` で受け取った `SocketFile` の `remove()` で、listener を閉じる前に消す。
 
 ```rust
 use std::io;

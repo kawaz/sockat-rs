@@ -10,7 +10,7 @@
 
 言語によらない説明は仕様と pages にある:
 
-- [長いパスで標準と違う点](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#長いパスで標準と違う点)
+- [長いパスで標準ライブラリと違う点](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#長いパスで標準ライブラリと違う点)
 - [使ってはいけない書き方](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#使ってはいけない書き方)
 - [置き場に残る物](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#置き場に残る物)
 - [`sweep`](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#sweep)
@@ -20,9 +20,9 @@
 
 ## 関数
 
-std の関数の代わりに sockat の関数を使う。長さによらないパスを取り、std の型を返す。
+標準ライブラリの関数の代わりに sockat の関数を使う。長さによらないパスを取り、標準ライブラリの型を返す。
 
-| 関数 | 対応する std | 戻り値 |
+| 関数 | 対応する標準ライブラリの関数 | 戻り値 |
 |---|---|---|
 | `sockat::bind(path)` | `UnixListener::bind(path)` | `io::Result<UnixListener>` (listen 済み) |
 | `sockat::connect(path)` | `UnixStream::connect(path)` | `io::Result<UnixStream>` |
@@ -31,40 +31,40 @@ std の関数の代わりに sockat の関数を使う。長さによらない�
 | `sockat::datagram::unbound()` | `UnixDatagram::unbound()` | `io::Result<UnixDatagram>` |
 | `sockat::datagram::connect(&sock, path)` | `sock.connect(path)` | `io::Result<()>` |
 
-後始末と診断が要る時は、それぞれの `_ex` を使う ([後始末と診断つきの _ex](#後始末と診断つきの-_ex))。綴りを自分で std や他のライブラリに渡す時は resolve を使う ([resolve](#resolve))。
+後始末と診断が要る時は、それぞれの `_ex` を使う ([後始末と診断つきの _ex](#後始末と診断つきの-_ex))。綴りを自分で標準ライブラリや他のライブラリに渡す時は resolve を使う ([resolve](#resolve))。
 
-- std が受け付ける長さの絶対パスは std の関数をそのまま呼ぶ。何も足さず、環境変数も読まない (`connect_nonblocking` は std に無いので、std と同じアドレスで自前のソケットを connect する)
-- bind (`bind`・`bind_ex`・`datagram::bind`・`datagram::bind_ex`) と resolve は、相対パスを絶対パスにしてから扱う。connect 系 (`connect`・`connect_nonblocking`・`datagram::connect` と各 `_ex`) の相対パスは、今まで通り相対のまま std に渡す。手順は仕様の [相対パスを絶対パスにする](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#相対パスを絶対パスにする)
-- ソケットファイルは渡したパスにできる。listener を閉じても消えない (std と同じ)
-- 自前で作るソケットは std と同じ設定 (close-on-exec、std が付ける OS (macOS / iOS、FreeBSD、NetBSD、DragonFly) では `SO_NOSIGPIPE`、std と同じ listen の backlog)
+- 標準ライブラリが受け付ける長さの絶対パスは標準ライブラリの関数をそのまま呼ぶ。何も足さず、環境変数も読まない (`connect_nonblocking` は標準ライブラリに無いので、標準ライブラリと同じアドレスで自前のソケットを connect する)
+- bind (`bind`・`bind_ex`・`datagram::bind`・`datagram::bind_ex`) と resolve は、相対パスを絶対パスにしてから扱う。connect 系 (`connect`・`connect_nonblocking`・`datagram::connect` と各 `_ex`) の相対パスは、今まで通り相対のまま標準ライブラリに渡す。手順は仕様の [相対パスを絶対パスにする](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#相対パスを絶対パスにする)
+- ソケットファイルは渡したパスにできる。listener を閉じても消えない (標準ライブラリと同じ)
+- 自前で作るソケットは標準ライブラリと同じ設定 (close-on-exec、標準ライブラリが付ける OS (macOS / iOS、FreeBSD、NetBSD、DragonFly) では `SO_NOSIGPIPE`、標準ライブラリと同じ listen の backlog)
 
 ### connect と connect_nonblocking
 
-- **`connect`** は std の `UnixStream::connect` の代わりに使う。ブロックする
+- **`connect`** は標準ライブラリの `UnixStream::connect` の代わりに使う。ブロックする
 - **`connect_nonblocking`** は async ランタイムで使う。ソケットを connect の前に非ブロッキングにし、そのまま返す。tokio の `UnixStream::from_std` にそのまま渡せる。相手の backlog が満杯なら待たずに失敗する (Linux は `EAGAIN`、macOS は `ECONNREFUSED`)。Unix domain の connect は呼び出しの中で終わるか失敗し、sockat の後片付けは unlink だけなので、待つものは無い
 
 ## 長いパスへの届き方
 
-Rust の std が受け付ける長さは `sun_path` − 1 バイト。
+Rust の標準ライブラリが受け付ける長さは `sun_path` − 1 バイト。
 
-| OS | std にそのまま渡す長さ |
+| OS | 標準ライブラリにそのまま渡す長さ |
 |---|---|
 | Linux / Android / illumos | 107 バイトまで |
 | macOS / iOS 等 Apple の OS / FreeBSD / NetBSD / OpenBSD | 103 バイトまで |
 
 それより長いパスは、元のパスと同じ所を指す短い綴りでカーネルに渡す。置き場 B・D・E、経路、試す順番は仕様の [長いパスの経路と試す順番](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#長いパスの経路と試す順番) と [経路の作り方](https://github.com/kawaz/sockat/blob/main/docs/SPEC-routes-ja.md)、どこまで届くかは [届く範囲の表](https://github.com/kawaz/sockat/blob/main/pages/reach/README-ja.md) にある。sockat-rs は仕様のすべての経路を作り、OS ごとに仕様の [bind の順](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#bind-の順) と [connect の順](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#connect-の順) のとおりに試す。
 
-- 長い絶対パスでも、途中の symlink を解いた実パスが std に収まれば、実パスを std に渡し、置き場に何も作らない (`Spelling` は `Original`)。この時 `Options::base` は見ない
+- 長い絶対パスでも、途中の symlink を解いた実パスが標準ライブラリに収まれば、実パスを標準ライブラリに渡し、置き場に何も作らない (`Spelling` は `Original`)。この時 `Options::base` は見ない
 - B の場所をアプリが決める時は [`Options::base`](#options) を渡す
 - 通った経路と飛ばした経路は `_ex` の [診断](#診断) で分かる
 
 ### NUL を含むパス
 
-先頭以外に NUL を含むパスは、長さによらず何も作らずに `InvalidInput` を返す。Linux / Android で先頭が NUL のパス (abstract namespace) は長さによらず std にそのまま渡す (std は `InvalidInput` を返す。abstract の名前は std の `SocketAddr::from_abstract_name` と `bind_addr` / `connect_addr` で扱う)。
+先頭以外に NUL を含むパスは、長さによらず何も作らずに `InvalidInput` を返す。Linux / Android で先頭が NUL のパス (abstract namespace) は長さによらず標準ライブラリにそのまま渡す (標準ライブラリは `InvalidInput` を返す。abstract の名前は標準ライブラリの `SocketAddr::from_abstract_name` と `bind_addr` / `connect_addr` で扱う)。
 
 ### 空のパス
 
-空のパスは、どの関数でも std に渡さず、何も作らずに `InvalidInput` を返す (`ExError` の `route` は `None`、`skipped` は空)。Linux の std は空のパスの bind を名前の無い abstract のアドレスに autobind する (macOS は `EINVAL`) が、それは渡したパスのソケットではないため。
+空のパスは、どの関数でも標準ライブラリに渡さず、何も作らずに `InvalidInput` を返す (`ExError` の `route` は `None`、`skipped` は空)。Linux の標準ライブラリは空のパスの bind を名前の無い abstract のアドレスに autobind する (macOS は `EINVAL`) が、それは渡したパスのソケットではないため。
 
 ## 綴りの性質 Spelling
 
@@ -97,7 +97,7 @@ Rust の std が受け付ける長さは `sun_path` − 1 バイト。
 | 項目 | 中身 |
 |---|---|
 | `usable_cross_uid: bool` | bind の綴りを別の uid も辿れる物にする。満たせなければ thread-cwd / at (`Dangling`) に進む。bind 系だけが見て、connect 系は見ない |
-| `base: Option<PathBuf>` | B そのものの場所 (例 `/tmp/my-app-1000/sockat`)。無ければ作り (mode 0711)、確かめに外れたらエラーを返し ([エラー](#エラー))、自動の置き場に落とさない。bind 系も connect 系も使う。相対パスを絶対にした綴りや長いパスの実パスが std に収まる時は見ない。この B は sockat 専用で、他の物を置かない。中の死んだ D は [`sweep_base`](#sweep-と-sweep_base) で消す |
+| `base: Option<PathBuf>` | B そのものの場所 (例 `/tmp/my-app-1000/sockat`)。無ければ作り (mode 0711)、確かめに外れたらエラーを返し ([エラー](#エラー))、自動の置き場に落とさない。bind 系も connect 系も使う。相対パスを絶対にした綴りや長いパスの実パスが標準ライブラリに収まる時は見ない。この B は sockat 専用で、他の物を置かない。中の死んだ D は [`sweep_base`](#sweep-と-sweep_base) で消す |
 
 ## 後始末と診断つきの _ex
 
@@ -111,7 +111,7 @@ Rust の std が受け付ける長さは `sun_path` − 1 バイト。
 
 | 型 | 中身 |
 |---|---|
-| `Bound<S>` | `socket` (std の型)、`file: SocketFile`、`spelling: Spelling`、`route`、`base`、`skipped` |
+| `Bound<S>` | `socket` (標準ライブラリの型)、`file: SocketFile`、`spelling: Spelling`、`route`、`base`、`skipped` |
 | `Connected<S>` | `socket`、`route`、`skipped` |
 | `Report` | `route`、`skipped` |
 | `ExError` | `error: io::Error`、`route` (実際に bind / connect して失敗した経路。無ければ `None`)、`skipped`。`?` で `io::Error` に戻る |
@@ -157,16 +157,16 @@ Rust の std が受け付ける長さは `sun_path` − 1 バイト。
 
 ## resolve
 
-綴りを自分で std や他のライブラリに渡す人向け。綴りはただのパスなので、ソケットの型と操作を問わず使える。約束は仕様の [resolve](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#resolve)。使い方は利用マニュアルの [パスだけを解決する (resolve)](./manual/resolve-ja.md)。
+綴りを自分で標準ライブラリや他のライブラリに渡す人向け。綴りはただのパスなので、ソケットの型と操作を問わず使える。約束は仕様の [resolve](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#resolve)。使い方は利用マニュアルの [パスだけを解決する (resolve)](./manual/resolve-ja.md)。
 
 | 関数 | 綴り | 戻り値 |
 |---|---|---|
 | `sockat::resolve_for_bind(path, options)` | link-dir の `B/D/E/<ファイル名>`、macOS と NetBSD では link-file の `B/D/E` も | `Result<ForBind, ExError>` (`path`、`spelling`、`route`、`base`、`skipped`、`cleanup()`、`socket_file()`) |
 | `sockat::resolve_for_connect(path, options)` | link-file の `B/D/E` (ファイル名の長さによらない) | `Result<ForConnect, ExError>` (`path`、`spelling`、`route`、`skipped`、`cleanup()`) |
 
-- std が受け付ける長さの絶対パスはそのまま返す (`Original`)
-- 相対パスは絶対の綴りで返す (絶対にしたパスか長いパスの実パスが std に収まれば `Original` で置き場に何も作らない。収まらなければ上の B・D・E の綴り)。どの綴りも使えない時だけ、std が受け付ける長さなら元の相対パスを返す (`CwdRelative`)
-- 長い絶対パスも、実パスが std に収まれば実パスを返す (`Original`、置き場に何も作らない)
+- 標準ライブラリが受け付ける長さの絶対パスはそのまま返す (`Original`)
+- 相対パスは絶対の綴りで返す (絶対にしたパスか長いパスの実パスが標準ライブラリに収まれば `Original` で置き場に何も作らない。収まらなければ上の B・D・E の綴り)。どの綴りも使えない時だけ、標準ライブラリが受け付ける長さなら元の相対パスを返す (`CwdRelative`)
+- 長い絶対パスも、実パスが標準ライブラリに収まれば実パスを返す (`Original`、置き場に何も作らない)
 - 綴りが収まらない時 (thread-cwd・at でしか届かない長さ、B を作れない) は `ENAMETOOLONG`。その長さに届かせたい時は `bind` / `connect` を使う
 - `ForBind::socket_file(&self) -> io::Result<SocketFile>` は、bind した後・listener を閉じる前に呼ぶ。返す `SocketFile` の `remove` はファイルを消して、`ForBind` と同じ E を片付ける。呼ばなければ消す口は無い ([仕様の `ForBind` の `SocketFile`](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#forbind-の-socketfile))
 - `ForConnect` の綴りは何度でも connect に使え、最後に `cleanup()` する
@@ -174,19 +174,19 @@ Rust の std が受け付ける長さは `sun_path` − 1 バイト。
 
 ## datagram
 
-`sockat::datagram` は std の `UnixDatagram` の、パスを取る関数と `unbound` を写す。経路と順は stream と同じ。長いパスに bind した送り手には、綴りが辿れる間は受け手が `recv_from` のアドレスへ返信できる (`Spelling::Linked`)。OpenBSD では Rust 1.100 以上が要る ([Rust に固有の注意](#rust-に固有の注意))。使い方は利用マニュアルの [DGRAM を使う](./manual/datagram-ja.md)。
+`sockat::datagram` は標準ライブラリの `UnixDatagram` の、パスを取る関数と `unbound` を写す。経路と順は stream と同じ。長いパスに bind した送り手には、綴りが辿れる間は受け手が `recv_from` のアドレスへ返信できる (`Spelling::Linked`)。OpenBSD では Rust 1.100 以上が要る ([Rust に固有の注意](#rust-に固有の注意))。使い方は利用マニュアルの [DGRAM を使う](./manual/datagram-ja.md)。
 
-`send_to` と SEQPACKET はまだ無い ([仕様の未確定](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#未確定))。長いパスへ `send_to` したい時は、`resolve_for_connect` の綴りを std の `send_to` に渡す ([長いパスへ send_to する](./manual/datagram-ja.md#長いパスへ-send_to-する))。SEQPACKET は、自分で作ったソケットに resolve の綴りを渡して使う ([SEQPACKET を使う](./manual/seqpacket-ja.md))。
+`send_to` と SEQPACKET はまだ無い ([仕様の未確定](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#未確定))。長いパスへ `send_to` したい時は、`resolve_for_connect` の綴りを標準ライブラリの `send_to` に渡す ([長いパスへ send_to する](./manual/datagram-ja.md#長いパスへ-send_to-する))。SEQPACKET は、自分で作ったソケットに resolve の綴りを渡して使う ([SEQPACKET を使う](./manual/seqpacket-ja.md))。
 
-## 長いパスで std と違う点
+## 長いパスで標準ライブラリと違う点
 
-言語によらない違い (カーネルが返すアドレス、運用の道具での見え方、ディレクトリを先に引くこと、状態がアプリの置き場の外に増えること、生きている D が消されうる環境、`PrivateTmp` の相手) は仕様の [長いパスで標準と違う点](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#長いパスで標準と違う点)。Rust での形:
+言語によらない違い (カーネルが返すアドレス、運用の道具での見え方、ディレクトリを先に引くこと、状態がアプリの置き場の外に増えること、生きている D が消されうる環境、`PrivateTmp` の相手) は仕様の [長いパスで標準ライブラリと違う点](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#長いパスで標準ライブラリと違う点)。Rust での形:
 
-- 相対パスで bind すると、短くても、`local_addr()`・`peer_addr()`・`recv_from()` のアドレスは渡した相対パスでなく絶対パスになる。深い cwd では、短い相対パスでも置き場に B・D・E ができる (仕様の [長いパスで標準と違う点](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#長いパスで標準と違う点) の「相対パス:」の行)
+- 相対パスで bind すると、短くても、`local_addr()`・`peer_addr()`・`recv_from()` のアドレスは渡した相対パスでなく絶対パスになる。深い cwd では、短い相対パスでも置き場に B・D・E ができる (仕様の [長いパスで標準ライブラリと違う点](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#長いパスで標準ライブラリと違う点) の「相対パス:」の行)
 - カーネルが返すアドレスは、listener と accept したストリームの `local_addr()`、connect した側の `peer_addr()`、DGRAM の `recv_from()` のアドレス。長いパスでは元のパスでなく bind の綴りになる。後で使えるかは `Spelling` で分かる
-- listener を閉じた時は、std の `UnixListener` と同じく、`sockat::bind` の listener も `bind_ex` の listener もソケットのファイルを消さない。消すのは元のパスか `SocketFile::remove()`
+- listener を閉じた時は、標準ライブラリの `UnixListener` と同じく、`sockat::bind` の listener も `bind_ex` の listener もソケットのファイルを消さない。消すのは元のパスか `SocketFile::remove()`
 - relative の途中で cwd が変わったままなら `Other` のエラー
-- OpenBSD の Rust 1.99 以前の std は、アドレスの最後の 1 バイトを落とす ([Rust に固有の注意](#rust-に固有の注意))
+- OpenBSD の Rust 1.99 以前の標準ライブラリは、アドレスの最後の 1 バイトを落とす ([Rust に固有の注意](#rust-に固有の注意))
 
 ## 使ってはいけない書き方
 
@@ -251,17 +251,17 @@ Rust の口に固有のエラー:
 
 ## async ランタイム
 
-戻り値は std の型なので、std のソケットを受け取れるランタイムならどれでも使える。tokio の例は利用マニュアルの [tokio で待ち受ける](./manual/bind-ja.md#tokio-で待ち受ける) と [tokio でつなぐ](./manual/connect-ja.md#tokio-でつなぐ)。
+戻り値は標準ライブラリの型なので、標準ライブラリのソケットを受け取れるランタイムならどれでも使える。tokio の例は利用マニュアルの [tokio で待ち受ける](./manual/bind-ja.md#tokio-で待ち受ける) と [tokio でつなぐ](./manual/connect-ja.md#tokio-でつなぐ)。
 
 `connect_nonblocking` は相手を待たず、後片付けも unlink だけなので、runtime の worker から直接呼べる。`bind` も相手を待たない (thread-cwd ではスレッドの終わりを待つが、bind してすぐ終わる)。`bind_ex` の listener も同じく渡せて、`SocketFile` は手元に残る。
 
 ## Rust に固有の注意
 
-- **OpenBSD の Rust 1.99 以前の std はアドレスの最後の 1 バイトを落とす。** `local_addr()`・`peer_addr()`・`recv_from()` が返すパスの最後の 1 バイトが欠ける (std の不具合で、sockat に関係なく短いパスでも同じ。[rust-lang/rust#118925](https://github.com/rust-lang/rust/issues/118925)、Rust 1.100.0 で修正)。カーネルが返すアドレスは欠けていない。std の `recv_from` のアドレスへ DGRAM を返信するには Rust 1.100 以上が要る
-- **Linux の std は空のパスの bind を abstract のアドレスに autobind する。** sockat は空のパスを std に渡さず `InvalidInput` にする ([空のパス](#空のパス))
-- **std はパスで渡した abstract の名前 (先頭が NUL) を受け付けない。** `bind`・`bind_ex` は std に渡し、std の `InvalidInput` を返す。abstract の名前は std の `SocketAddr::from_abstract_name` と `bind_addr` で bind する。`resolve_for_bind` に渡した abstract の名前はそのまま返り、その `socket_file()` はファイルを持たない `SocketFile` を返す (`remove()` はファイルを消さない。仕様の [`remove`](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#remove))
+- **OpenBSD の Rust 1.99 以前の標準ライブラリはアドレスの最後の 1 バイトを落とす。** `local_addr()`・`peer_addr()`・`recv_from()` が返すパスの最後の 1 バイトが欠ける (標準ライブラリの不具合で、sockat に関係なく短いパスでも同じ。[rust-lang/rust#118925](https://github.com/rust-lang/rust/issues/118925)、Rust 1.100.0 で修正)。カーネルが返すアドレスは欠けていない。標準ライブラリの `recv_from` のアドレスへ DGRAM を返信するには Rust 1.100 以上が要る
+- **Linux の標準ライブラリは空のパスの bind を abstract のアドレスに autobind する。** sockat は空のパスを標準ライブラリに渡さず `InvalidInput` にする ([空のパス](#空のパス))
+- **標準ライブラリはパスで渡した abstract の名前 (先頭が NUL) を受け付けない。** `bind`・`bind_ex` は標準ライブラリに渡し、標準ライブラリの `InvalidInput` を返す。abstract の名前は標準ライブラリの `SocketAddr::from_abstract_name` と `bind_addr` で bind する。`resolve_for_bind` に渡した abstract の名前はそのまま返り、その `socket_file()` はファイルを持たない `SocketFile` を返す (`remove()` はファイルを消さない。仕様の [`remove`](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#remove))
 
-- **cwd が PATH_MAX を超えると、相対パスの `bind_ex` は失敗する。** macOS は `ERANGE`、Linux は `ENAMETOOLONG` (`route` は `standard`、listener は閉じる)。ソケットのファイルを絶対の実パスで覚えられないため。既定の `bind` は通る (相対のまま std に渡し、`CwdRelative`)
+- **cwd が PATH_MAX を超えると、相対パスの `bind_ex` は失敗する。** macOS は `ERANGE`、Linux は `ENAMETOOLONG` (`route` は `standard`、listener は閉じる)。ソケットのファイルを絶対の実パスで覚えられないため。既定の `bind` は通る (相対のまま標準ライブラリに渡し、`CwdRelative`)
 
 ## 確かめていないこと
 

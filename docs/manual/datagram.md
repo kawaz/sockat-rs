@@ -4,7 +4,7 @@
 
 ## Receive
 
-Use `sockat::datagram::bind` where you would use std's `UnixDatagram::bind`.
+Use `sockat::datagram::bind` where you would use the standard library's `UnixDatagram::bind`.
 
 ```rust
 use std::io;

@@ -4,13 +4,13 @@
 
 Your Unix domain socket path is too long to bind / connect. sockat is the Rust library that makes that go away.
 
-When the path is long, Rust's std refuses to bind / connect with this error, of kind `io::ErrorKind::InvalidInput`:
+When the path is long, Rust's standard library refuses to bind / connect with this error, of kind `io::ErrorKind::InvalidInput`:
 
 ```
 path must be shorter than SUN_LEN
 ```
 
-Replace the std functions with sockat's, and long paths just work.
+Replace the standard library functions with sockat's, and long paths just work.
 
 ```rust
 use std::io;
@@ -29,7 +29,7 @@ fn main() -> io::Result<()> {
 }
 ```
 
-You get back the same types as std, and a short path goes straight to std as before. Only for a long path does sockat quietly set up a short way to the same place and connect through it. You don't need to shorten paths yourself or care about each OS's limit. Because these are std types, you can hand them to tokio and other async runtimes the same way as any std socket.
+You get back the same types as the standard library, and a short path goes straight to the standard library as before. Only for a long path does sockat quietly set up a short way to the same place and connect through it. You don't need to shorten paths yourself or care about each OS's limit. Because these are standard library types, you can hand them to tokio and other async runtimes the same way as any standard library socket.
 
 ## Installation
 

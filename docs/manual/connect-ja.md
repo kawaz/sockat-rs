@@ -4,7 +4,7 @@
 
 ## つなぐ
 
-std の `UnixStream::connect` の代わりに `sockat::connect` を使う。返るのは std の `UnixStream`。
+標準ライブラリの `UnixStream::connect` の代わりに `sockat::connect` を使う。返るのは標準ライブラリの `UnixStream`。
 
 ```rust
 use std::io::{self, BufRead, BufReader, Write};

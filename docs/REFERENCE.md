@@ -10,7 +10,7 @@ The language-independent behaviour is defined by [the sockat specification](http
 
 What holds regardless of the language is in the specification and the pages:
 
-- [What differs from the standard for a long path](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-differs-from-the-standard-for-a-long-path)
+- [What differs from the standard library for a long path](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-differs-from-the-standard-library-for-a-long-path)
 - [Patterns not to use](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#patterns-not-to-use)
 - [What stays in the base](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-stays-in-the-base)
 - [`sweep`](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#sweep)
@@ -20,9 +20,9 @@ What holds regardless of the language is in the specification and the pages:
 
 ## Functions
 
-Use sockat's functions where you would use std's. They take a path of any length and return std's types.
+Use sockat's functions where you would use the standard library's. They take a path of any length and return the standard library's types.
 
-| Function | std counterpart | Returns |
+| Function | Standard library counterpart | Returns |
 |---|---|---|
 | `sockat::bind(path)` | `UnixListener::bind(path)` | `io::Result<UnixListener>` (listening) |
 | `sockat::connect(path)` | `UnixStream::connect(path)` | `io::Result<UnixStream>` |
@@ -31,40 +31,40 @@ Use sockat's functions where you would use std's. They take a path of any length
 | `sockat::datagram::unbound()` | `UnixDatagram::unbound()` | `io::Result<UnixDatagram>` |
 | `sockat::datagram::connect(&sock, path)` | `sock.connect(path)` | `io::Result<()>` |
 
-When you need clean-up and diagnostics, use the `_ex` of each ([The _ex functions: clean-up and diagnostics](#the-_ex-functions-clean-up-and-diagnostics)). To hand a spelling to std or another library yourself, use resolve ([resolve](#resolve)).
+When you need clean-up and diagnostics, use the `_ex` of each ([The _ex functions: clean-up and diagnostics](#the-_ex-functions-clean-up-and-diagnostics)). To hand a spelling to the standard library or another library yourself, use resolve ([resolve](#resolve)).
 
-- An absolute path of a length std accepts goes to std's function unchanged. Nothing is added, and no environment variable is read (`connect_nonblocking`, which std does not have, connects sockat's own socket with the address std would use)
-- The binds (`bind`, `bind_ex`, `datagram::bind`, `datagram::bind_ex`) and resolve make a relative path absolute first. The connects (`connect`, `connect_nonblocking`, `datagram::connect` and each `_ex`) hand a relative path to std as it is, as before. The steps are in the specification's [Making a relative path absolute](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#making-a-relative-path-absolute)
-- The socket file is created at the path given. It stays when the listener is closed (as with std)
-- sockat's own sockets are set up as std's are (close-on-exec; `SO_NOSIGPIPE` on the OSes where std sets it (macOS / iOS, FreeBSD, NetBSD, DragonFly); the same listen backlog as std)
+- An absolute path of a length the standard library accepts goes to the standard library's function unchanged. Nothing is added, and no environment variable is read (`connect_nonblocking`, which the standard library does not have, connects sockat's own socket with the address the standard library would use)
+- The binds (`bind`, `bind_ex`, `datagram::bind`, `datagram::bind_ex`) and resolve make a relative path absolute first. The connects (`connect`, `connect_nonblocking`, `datagram::connect` and each `_ex`) hand a relative path to the standard library as it is, as before. The steps are in the specification's [Making a relative path absolute](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#making-a-relative-path-absolute)
+- The socket file is created at the path given. It stays when the listener is closed (as with the standard library)
+- sockat's own sockets are set up as the standard library's are (close-on-exec; `SO_NOSIGPIPE` on the OSes where the standard library sets it (macOS / iOS, FreeBSD, NetBSD, DragonFly); the same listen backlog as the standard library)
 
 ### connect and connect_nonblocking
 
-- **`connect`** replaces std's `UnixStream::connect`. It blocks
+- **`connect`** replaces the standard library's `UnixStream::connect`. It blocks
 - **`connect_nonblocking`** is for async runtimes. The socket is made nonblocking before the connect and returned as it is, ready for tokio's `UnixStream::from_std`. When the peer's backlog is full it fails at once (`EAGAIN` on Linux, `ECONNREFUSED` on macOS). A Unix-domain connect completes or fails within the call, and sockat's clean-up afterwards is only an unlink, so there is nothing to wait for
 
 ## How a long path is reached
 
-Rust's std accepts paths of up to `sun_path` − 1 bytes.
+Rust's standard library accepts paths of up to `sun_path` − 1 bytes.
 
-| OS | Handed to std up to |
+| OS | Handed to the standard library up to |
 |---|---|
 | Linux / Android / illumos | 107 bytes |
 | macOS / iOS and other Apple OSes / FreeBSD / NetBSD / OpenBSD | 103 bytes |
 
 A longer path is handed to the kernel by a short spelling that names the same place as the original path. B, D and E, the routes and the order tried are in the specification's [Routes for long paths and their order](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#routes-for-long-paths-and-their-order) and [building the routes](https://github.com/kawaz/sockat/blob/main/docs/SPEC-routes.md); how far they reach is in the [reach table](https://github.com/kawaz/sockat/blob/main/pages/reach/README.md). sockat-rs makes every route of the specification and tries them on each OS as the specification's [Bind order](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#bind-order) and [Connect order](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#connect-order) say.
 
-- Even a long absolute path goes to std by its real path (the symlinks on its way resolved) when that fits std, with nothing made in the bases (`Spelling` is `Original`). `Options::base` is not looked at then
+- Even a long absolute path goes to the standard library by its real path (the symlinks on its way resolved) when that fits the standard library, with nothing made in the bases (`Spelling` is `Original`). `Options::base` is not looked at then
 - When the application decides where B is, pass [`Options::base`](#options)
 - The route taken and the routes passed over are told by the `_ex` functions' [diagnostics](#diagnostics)
 
 ### Paths containing a NUL
 
-A path with a NUL anywhere but at the start is `InvalidInput` at any length, with nothing created. On Linux / Android a path starting with a NUL (the abstract namespace) goes to std as it is at any length (std returns `InvalidInput`; abstract names are handled with std's `SocketAddr::from_abstract_name` and `bind_addr` / `connect_addr`).
+A path with a NUL anywhere but at the start is `InvalidInput` at any length, with nothing created. On Linux / Android a path starting with a NUL (the abstract namespace) goes to the standard library as it is at any length (the standard library returns `InvalidInput`; abstract names are handled with the standard library's `SocketAddr::from_abstract_name` and `bind_addr` / `connect_addr`).
 
 ### The empty path
 
-An empty path is `InvalidInput` from every function, with nothing created and nothing handed to std (`ExError`'s `route` is `None`, `skipped` empty). Linux's std autobinds a bind with an empty path to an unnamed abstract address (macOS answers `EINVAL`), which is not a socket at the path given.
+An empty path is `InvalidInput` from every function, with nothing created and nothing handed to the standard library (`ExError`'s `route` is `None`, `skipped` empty). Linux's standard library autobinds a bind with an empty path to an unnamed abstract address (macOS answers `EINVAL`), which is not a socket at the path given.
 
 ## Spelling properties: Spelling
 
@@ -97,7 +97,7 @@ The `_ex` functions and resolve take `sockat::Options`. `Options::default()` is 
 | Field | Content |
 |---|---|
 | `usable_cross_uid: bool` | make a bind's spelling one another uid can follow too. When that cannot be met, the bind goes on to thread-cwd / at (`Dangling`). Only the binds look at it; the connects do not |
-| `base: Option<PathBuf>` | where B itself is (for example `/tmp/my-app-1000/sockat`). Made when missing (mode 0711); when the checks fail, an error ([Errors](#errors)), never falling back to the automatic bases. Used by both the binds and the connects. Not looked at when a relative path made absolute or a long path's real path fits std. This B is sockat's own: put nothing else in it. The dead D in it go by [`sweep_base`](#sweep-and-sweep_base) |
+| `base: Option<PathBuf>` | where B itself is (for example `/tmp/my-app-1000/sockat`). Made when missing (mode 0711); when the checks fail, an error ([Errors](#errors)), never falling back to the automatic bases. Used by both the binds and the connects. Not looked at when a relative path made absolute or a long path's real path fits the standard library. This B is sockat's own: put nothing else in it. The dead D in it go by [`sweep_base`](#sweep-and-sweep_base) |
 
 ## The _ex functions: clean-up and diagnostics
 
@@ -111,7 +111,7 @@ The `_ex` functions and resolve take `sockat::Options`. `Options::default()` is 
 
 | Type | Content |
 |---|---|
-| `Bound<S>` | `socket` (std's type), `file: SocketFile`, `spelling: Spelling`, `route`, `base`, `skipped` |
+| `Bound<S>` | `socket` (the standard library's type), `file: SocketFile`, `spelling: Spelling`, `route`, `base`, `skipped` |
 | `Connected<S>` | `socket`, `route`, `skipped` |
 | `Report` | `route`, `skipped` |
 | `ExError` | `error: io::Error`, `route` (the route that actually bound / connected and failed; `None` when there is none), `skipped`. Converts back into `io::Error` by `?` |
@@ -157,16 +157,16 @@ What they remove and what they leave is in the specification's [`sweep`](https:/
 
 ## resolve
 
-For those who hand a spelling to std or another library themselves. A spelling is just a path, so it works whatever the socket type and the operation. What it promises is in the specification's [resolve](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#resolve). How to use it is in the user manual's [Resolve only the path](./manual/resolve.md).
+For those who hand a spelling to the standard library or another library themselves. A spelling is just a path, so it works whatever the socket type and the operation. What it promises is in the specification's [resolve](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#resolve). How to use it is in the user manual's [Resolve only the path](./manual/resolve.md).
 
 | Function | Spelling | Returns |
 |---|---|---|
 | `sockat::resolve_for_bind(path, options)` | link-dir's `B/D/E/<file name>`, and on macOS and NetBSD also link-file's `B/D/E` | `Result<ForBind, ExError>` (`path`, `spelling`, `route`, `base`, `skipped`, `cleanup()`, `socket_file()`) |
 | `sockat::resolve_for_connect(path, options)` | link-file's `B/D/E` (any file name length) | `Result<ForConnect, ExError>` (`path`, `spelling`, `route`, `skipped`, `cleanup()`) |
 
-- An absolute path of a length std accepts is returned as it is (`Original`)
-- A relative path comes back as an absolute spelling (the path made absolute, or a long path's real path, when that fits std: `Original`, with nothing made in the bases; otherwise the spelling through B, D and E above). Only when no spelling can be had does a relative path of a length std accepts come back as it is (`CwdRelative`)
-- A long absolute path whose real path fits std comes back as that real path (`Original`, with nothing made in the bases)
+- An absolute path of a length the standard library accepts is returned as it is (`Original`)
+- A relative path comes back as an absolute spelling (the path made absolute, or a long path's real path, when that fits the standard library: `Original`, with nothing made in the bases; otherwise the spelling through B, D and E above). Only when no spelling can be had does a relative path of a length the standard library accepts come back as it is (`CwdRelative`)
+- A long absolute path whose real path fits the standard library comes back as that real path (`Original`, with nothing made in the bases)
 - When no spelling fits (a length only thread-cwd / at reach, or B cannot be made), `ENAMETOOLONG`. To reach such a length, use `bind` / `connect`
 - Call `ForBind::socket_file(&self) -> io::Result<SocketFile>` after the bind and before the listener is closed. The `remove` of the `SocketFile` it returns removes the file and cleans up the same E as the `ForBind`. Without calling it, there is nothing that removes the file ([`SocketFile` of `ForBind` in the specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#socketfile-of-forbind))
 - `ForConnect`'s spelling can be used for any number of connects; call `cleanup()` at the end
@@ -174,19 +174,19 @@ For those who hand a spelling to std or another library themselves. A spelling i
 
 ## datagram
 
-`sockat::datagram` mirrors the functions of std's `UnixDatagram` that take a path, and `unbound`. The routes and their order are those of stream. To a sender bound to a long path, the receiver can reply to the address from `recv_from` while the spelling can be followed (`Spelling::Linked`). On OpenBSD this needs Rust 1.100 or later ([Caveats specific to Rust](#caveats-specific-to-rust)). How to use it is in the user manual's [Use DGRAM](./manual/datagram.md).
+`sockat::datagram` mirrors the functions of the standard library's `UnixDatagram` that take a path, and `unbound`. The routes and their order are those of stream. To a sender bound to a long path, the receiver can reply to the address from `recv_from` while the spelling can be followed (`Spelling::Linked`). On OpenBSD this needs Rust 1.100 or later ([Caveats specific to Rust](#caveats-specific-to-rust)). How to use it is in the user manual's [Use DGRAM](./manual/datagram.md).
 
-`send_to` and SEQPACKET are not there yet ([the specification's open questions](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#open-questions)). To `send_to` a long path, hand the spelling of `resolve_for_connect` to std's `send_to` ([send_to a long path](./manual/datagram.md#send_to-a-long-path)). For SEQPACKET, hand the spelling of resolve to a socket you make yourself ([Use SEQPACKET](./manual/seqpacket.md)).
+`send_to` and SEQPACKET are not there yet ([the specification's open questions](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#open-questions)). To `send_to` a long path, hand the spelling of `resolve_for_connect` to the standard library's `send_to` ([send_to a long path](./manual/datagram.md#send_to-a-long-path)). For SEQPACKET, hand the spelling of resolve to a socket you make yourself ([Use SEQPACKET](./manual/seqpacket.md)).
 
-## What differs from std for a long path
+## What differs from the standard library for a long path
 
-What differs regardless of the language (the address the kernel reports, how operational tools show it, the directory being resolved first, state growing outside the application's own place, environments where a live D can be removed, a peer with `PrivateTmp`) is in the specification's [What differs from the standard for a long path](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-differs-from-the-standard-for-a-long-path). In Rust:
+What differs regardless of the language (the address the kernel reports, how operational tools show it, the directory being resolved first, state growing outside the application's own place, environments where a live D can be removed, a peer with `PrivateTmp`) is in the specification's [What differs from the standard library for a long path](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-differs-from-the-standard-library-for-a-long-path). In Rust:
 
-- After a bind to a relative path, even a short one, the address from `local_addr()`, `peer_addr()` and `recv_from()` is an absolute path, not the relative path given. In a deep cwd, even a short relative path makes B, D and E in the bases (the rows "Relative path:" of the specification's [What differs from the standard for a long path](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-differs-from-the-standard-for-a-long-path))
+- After a bind to a relative path, even a short one, the address from `local_addr()`, `peer_addr()` and `recv_from()` is an absolute path, not the relative path given. In a deep cwd, even a short relative path makes B, D and E in the bases (the rows "Relative path:" of the specification's [What differs from the standard library for a long path](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-differs-from-the-standard-library-for-a-long-path))
 - The address the kernel reports is the address from `local_addr()` of the listener and of accepted streams, `peer_addr()` of the connecting side, and a datagram's `recv_from()`. For a long path it is the bind's spelling, not the original path. Whether it can be used later is told by `Spelling`
-- When a listener is closed, neither the listener of `sockat::bind` nor that of `bind_ex` removes the socket file, as with std's `UnixListener`. Remove it by the original path or by `SocketFile::remove()`
+- When a listener is closed, neither the listener of `sockat::bind` nor that of `bind_ex` removes the socket file, as with the standard library's `UnixListener`. Remove it by the original path or by `SocketFile::remove()`
 - relative returns an `Other` error when the cwd changed in between and stays changed
-- On OpenBSD, std in Rust 1.99 and earlier drops the last byte of the address ([Caveats specific to Rust](#caveats-specific-to-rust))
+- On OpenBSD, the standard library in Rust 1.99 and earlier drops the last byte of the address ([Caveats specific to Rust](#caveats-specific-to-rust))
 
 ## Patterns not to use
 
@@ -251,17 +251,17 @@ Errors specific to the Rust calls:
 
 ## Async runtimes
 
-The results are std types, so any runtime that adopts std sockets can take them. The tokio examples are in the user manual's [Listen with tokio](./manual/bind.md#listen-with-tokio) and [Connect with tokio](./manual/connect.md#connect-with-tokio).
+The results are standard library types, so any runtime that adopts standard library sockets can take them. The tokio examples are in the user manual's [Listen with tokio](./manual/bind.md#listen-with-tokio) and [Connect with tokio](./manual/connect.md#connect-with-tokio).
 
 `connect_nonblocking` does not wait for the peer, and its clean-up is only an unlink, so it can be called on the runtime's worker threads directly. `bind` does not wait for a peer either (thread-cwd waits for its thread to end, but the thread binds and ends at once). `bind_ex`'s listener goes to the runtime the same way, and its `SocketFile` stays with the caller.
 
 ## Caveats specific to Rust
 
-- **On OpenBSD, std in Rust 1.99 and earlier drops the last byte of an address.** The path from `local_addr()`, `peer_addr()` and `recv_from()` lacks its last byte (a bug in std, the same for a short path and without sockat; [rust-lang/rust#118925](https://github.com/rust-lang/rust/issues/118925), fixed in Rust 1.100.0). The address the kernel reports is whole. Replying to a datagram at the address from std's `recv_from` needs Rust 1.100 or later
-- **Linux's std autobinds a bind with an empty path to an abstract address.** sockat does not hand an empty path to std and makes it `InvalidInput` ([The empty path](#the-empty-path))
-- **std does not take an abstract name (a leading NUL) given as a path.** `bind` and `bind_ex` hand it to std and return std's `InvalidInput`. Bind an abstract name with std's `SocketAddr::from_abstract_name` and `bind_addr`. `resolve_for_bind` hands an abstract name back as it is, and its `socket_file()` gives a `SocketFile` with no file (its `remove()` removes no file; the spec's [`remove`](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#remove))
+- **On OpenBSD, the standard library in Rust 1.99 and earlier drops the last byte of an address.** The path from `local_addr()`, `peer_addr()` and `recv_from()` lacks its last byte (a bug in the standard library, the same for a short path and without sockat; [rust-lang/rust#118925](https://github.com/rust-lang/rust/issues/118925), fixed in Rust 1.100.0). The address the kernel reports is whole. Replying to a datagram at the address from the standard library's `recv_from` needs Rust 1.100 or later
+- **Linux's standard library autobinds a bind with an empty path to an abstract address.** sockat does not hand an empty path to the standard library and makes it `InvalidInput` ([The empty path](#the-empty-path))
+- **The standard library does not take an abstract name (a leading NUL) given as a path.** `bind` and `bind_ex` hand it to the standard library and return the standard library's `InvalidInput`. Bind an abstract name with the standard library's `SocketAddr::from_abstract_name` and `bind_addr`. `resolve_for_bind` hands an abstract name back as it is, and its `socket_file()` gives a `SocketFile` with no file (its `remove()` removes no file; the spec's [`remove`](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#remove))
 
-- **With a cwd deeper than PATH_MAX, `bind_ex` of a relative path fails.** `ERANGE` on macOS, `ENAMETOOLONG` on Linux (`route` is `standard`, the listener closed): the socket file cannot be remembered by its absolute real path. The plain `bind` goes through (to std as it is, `CwdRelative`)
+- **With a cwd deeper than PATH_MAX, `bind_ex` of a relative path fails.** `ERANGE` on macOS, `ENAMETOOLONG` on Linux (`route` is `standard`, the listener closed): the socket file cannot be remembered by its absolute real path. The plain `bind` goes through (to the standard library as it is, `CwdRelative`)
 
 ## Not checked
 
