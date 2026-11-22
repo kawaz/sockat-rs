@@ -1,6 +1,6 @@
 # DR-0033: コマンド `sockat` は workspace の別パッケージ sockat-cli に置き、B の作り方は feature の後ろの doc に出さない入口でライブラリから使う
 
-- Status: Proposed (形はハブと合わせ済み。sockat-cli の公開は kawaz の裁定待ち)
+- Status: Accepted (kawaz 2026-11-22: sockat-cli を crates.io に公開してよい (ハブ RL-Q1 = a)。ライブラリ 0.6.0 と一緒に公開する)
 - Date: 2026-11-22
 
 ## Context

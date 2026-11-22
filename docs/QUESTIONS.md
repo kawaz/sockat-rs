@@ -17,27 +17,4 @@
 
 ## 裁定待ち
 
-### VB-Q1 次の版は 0.5.2 か 0.6.0 か
-
-手元の main に積んだ 9 commit (ハブ 80d6eec4・741dde83・be5e0b9a 等の反映) に、Rust の semver で破壊的な変更が入っている。kawaz の裁定 PB-Q2 = a は「破壊的な変更を含む版は kawaz に聞く」。ハブ統括は 0.5.2 (patch) で可と判断した。
-
-- `Spelling::Linked` の variant に `#[non_exhaustive]`: Cargo book の SemVer Compatibility で major (既存の enum の variant に足す)。0.x では 0.5.1 → 0.5.2 は `cargo update` で自動で入るので、`Linked { removable, until, usable_cross_uid, usable_with_private_tmp }` と `..` 無しで分解している利用者は update だけでビルドが壊れる
-- 振る舞いの変更: 空のパスが Linux でも `InvalidInput` (std は abstract に autobind して成功していた)、既定の名前の B が占拠されていたら乱数の B を作らず次の置き場へ
-
-統括推し: b。理由は、cargo が自動で入れる版でビルドを壊さないため (0.5.1 は今日出たばかりで利用者は少なく、0.6.0 にする費用はほぼ無い)。
-
-- [ ] a: 0.5.2 (patch) で出す
-- [ ] b: 0.6.0 (minor = 0.x の major) で出す
-
-
-### VB-Q2 CLI `sockat-cli` を crates.io に新しく公開するか、いつ出すか
-
-ハブ DR-0018 の CLI `sockat` を sockat-rs の workspace の `cli/` (パッケージ `sockat-cli`、`cargo install sockat-cli`) に作った ([DR-0033](decisions/DR-0033-cli-crate-and-internal-entry.md))。今は `publish = false` で、release.yml も publish しない。新しいパッケージの公開なので kawaz の可否が要る。
-
-- ライブラリ `sockat` を `=x.y.z` で固定し、ライブラリの CLI 専用の入口 (既定で無効の feature の後ろ) を使うので、ライブラリと同じ版で一緒に出す
-- 公開したら README (日英) に CLI の節 (`sockat <パス>`、`sockat --json <パス>` の例) を足す (ハブ DR-0018)
-
-統括推し: a。ライブラリの次の版 (VB-Q1) と一緒に出し、release.yml に sockat-cli の publish を足す。
-
-- [ ] a: ライブラリの次の版と一緒に公開する
-- [ ] b: ライブラリだけ先に出し、CLI は後で (後回しの範囲 `--base-fd` 等ができてから) 公開する
+(なし)
