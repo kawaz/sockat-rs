@@ -40,7 +40,7 @@ cargo add sockat
 ## More
 
 - [User manual](https://github.com/kawaz/sockat-rs/blob/main/docs/MANUAL.md)
-- [Reference](https://docs.rs/sockat)
+- [Reference](https://github.com/kawaz/sockat-rs/blob/main/docs/REFERENCE.md)
 - [How it works](https://github.com/kawaz/sockat/blob/main/pages/technical.md)
 
 ## License

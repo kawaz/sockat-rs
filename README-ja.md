@@ -40,7 +40,7 @@ cargo add sockat
 ## もっと詳しく
 
 - [利用マニュアル](./docs/MANUAL-ja.md)
-- [リファレンス](https://docs.rs/sockat)
+- [リファレンス](./docs/REFERENCE-ja.md)
 - [技術説明](https://github.com/kawaz/sockat/blob/main/pages/technical-ja.md)
 
 ## ライセンス
