@@ -164,6 +164,44 @@ fn one_byte_over_the_limit_goes_through_b() {
     assert_eq!(printed(&c.run(&[&over])), expected);
 }
 
+/// A long absolute path whose real path fits (it looks long only through a
+/// symlink on the way) is printed as its real path, nothing made in the
+/// places (route `standard`, no E); one whose real path does not fit either
+/// goes through E (hub's answer on DR-0019 for the command: the real path is
+/// tried for an absolute path too, `$PWD` only for a relative one).
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "the places for B can be moved only in a debug build"
+)]
+fn a_long_absolute_path_is_its_real_path_when_that_fits() {
+    let c = Case::new();
+    let real_dir = c.path().join("r");
+    fs::create_dir(&real_dir).unwrap();
+    let long_link = c.path().join("l".repeat(120));
+    std::os::unix::fs::symlink(&real_dir, &long_link).unwrap();
+    let original = long_link.join("s.sock");
+    assert!(len(&original) > LIMIT);
+    let out = c.run(&[OsStr::new("--json"), original.as_os_str()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let real = fs::canonicalize(&real_dir).unwrap().join("s.sock");
+    assert_eq!(v["path"], real.to_str().unwrap());
+    assert_eq!(v["route"], "standard");
+    assert!(v.get("link").is_none() && v.get("target").is_none(), "{v}");
+    assert!(!c.b().exists(), "nothing is made in the places");
+
+    // The real path too long as well: through E.
+    let long = c.long_dir('d');
+    let out = c.run(&[long.join("s.sock")]);
+    let real_long = fs::canonicalize(&long).unwrap();
+    assert_eq!(printed(&out), c.b().join(hash(&real_long)).join("s.sock"));
+}
+
 /// The command run in `cwd` with `$PWD` set to `pwd`.
 fn in_cwd<S: AsRef<OsStr>>(c: &Case, cwd: &Path, pwd: &Path, args: &[S]) -> Output {
     c.sockat()

@@ -2,10 +2,11 @@
 //! 定の綴り", docs/design/cli.md).
 //!
 //! 1. An absolute path that fits the socket address limit is the path
-//!    itself. A relative path is made absolute first (hub DR-0019 "絶対パスの
-//!    作り方と、その後"): its real path, else its spelling from `$PWD` with
-//!    `.` and `..` folded (when that names the same directory), whichever
-//!    fits first; nothing is made for it.
+//!    itself. Otherwise (and for any relative path) an absolute path to the
+//!    same place is tried (hub DR-0019 "絶対パスの作り方と、その後"): its
+//!    real path, else for a relative path its spelling from `$PWD` with `.`
+//!    and `..` folded (when that names the same directory), whichever fits
+//!    first; nothing is made for it.
 //! 2. Otherwise the socket's directory is looked up (`ENOENT`, `ENOTDIR`).
 //! 3. B is the process's B of the places 1-3 or the one at `--base`, made
 //!    and checked by the library (`sockat::__cli`).
@@ -144,13 +145,15 @@ pub(crate) fn resolve(
         return Ok(standard(path.to_path_buf()));
     }
     let real_dir = socket_dir(dir)?;
+    // The candidates of an absolute path naming the same place, the real path
+    // first (hub DR-0019 2-3): the real path for any path too long as given
+    // (an absolute one may look long only through a symlink on the way),
+    // `$PWD`'s spelling for a relative one only.
+    let real = real_dir.join(name);
+    if len(&real) <= entry::LIMIT {
+        return Ok(standard(real));
+    }
     if !path.is_absolute() {
-        // The candidates of an absolute path naming the same place, the real
-        // path first (hub DR-0019 2-3).
-        let real = real_dir.join(name);
-        if len(&real) <= entry::LIMIT {
-            return Ok(standard(real));
-        }
         if let Some(p) = from_pwd(path, dir, env.pwd.as_deref()) {
             if len(&p) <= entry::LIMIT {
                 return Ok(standard(p));
