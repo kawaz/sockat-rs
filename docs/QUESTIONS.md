@@ -29,3 +29,15 @@
 - [ ] a: 0.5.2 (patch) で出す
 - [ ] b: 0.6.0 (minor = 0.x の major) で出す
 
+
+### VB-Q2 CLI `sockat-cli` を crates.io に新しく公開するか、いつ出すか
+
+ハブ DR-0018 の CLI `sockat` を sockat-rs の workspace の `cli/` (パッケージ `sockat-cli`、`cargo install sockat-cli`) に作った ([DR-0033](decisions/DR-0033-cli-crate-and-internal-entry.md))。今は `publish = false` で、release.yml も publish しない。新しいパッケージの公開なので kawaz の可否が要る。
+
+- ライブラリ `sockat` を `=x.y.z` で固定し、ライブラリの CLI 専用の入口 (既定で無効の feature の後ろ) を使うので、ライブラリと同じ版で一緒に出す
+- 公開したら README (日英) に CLI の節 (`sockat <パス>`、`sockat --json <パス>` の例) を足す (ハブ DR-0018)
+
+統括推し: a。ライブラリの次の版 (VB-Q1) と一緒に出し、release.yml に sockat-cli の publish を足す。
+
+- [ ] a: ライブラリの次の版と一緒に公開する
+- [ ] b: ライブラリだけ先に出し、CLI は後で (後回しの範囲 `--base-fd` 等ができてから) 公開する
