@@ -37,9 +37,9 @@ You get back the same types as std, and a short path goes straight to std as bef
 cargo add sockat
 ```
 
-## The sockat command
+## There is a CLI too
 
-There is a command too. It is handy for trying sockat out before building it into an application, and for making a path to hand to a program that cannot use sockat. Given a long path, it prints a path to the same socket that fits the limit.
+It is handy for trying sockat out before building it into an application, and for making a path to hand to a program that cannot use sockat. Given a long path, it prints a path to the same socket that fits the limit.
 
 ```sh
 cargo install sockat-cli
