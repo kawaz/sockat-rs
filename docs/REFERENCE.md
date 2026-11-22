@@ -33,7 +33,8 @@ Use sockat's functions where you would use std's. They take a path of any length
 
 When you need clean-up and diagnostics, use the `_ex` of each ([The _ex functions: clean-up and diagnostics](#the-_ex-functions-clean-up-and-diagnostics)). To hand a spelling to std or another library yourself, use resolve ([resolve](#resolve)).
 
-- A path of a length std accepts goes to std's function unchanged. Nothing is added, and no environment variable is read (`connect_nonblocking`, which std does not have, connects sockat's own socket with the address std would use)
+- An absolute path of a length std accepts goes to std's function unchanged. Nothing is added, and no environment variable is read (`connect_nonblocking`, which std does not have, connects sockat's own socket with the address std would use)
+- The binds (`bind`, `bind_ex`, `datagram::bind`, `datagram::bind_ex`) and resolve make a relative path absolute first. The connects (`connect`, `connect_nonblocking`, `datagram::connect` and each `_ex`) hand a relative path to std as it is, as before. The steps are in the specification's [Making a relative path absolute](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#making-a-relative-path-absolute)
 - The socket file is created at the path given. It stays when the listener is closed (as with std)
 - sockat's own sockets are set up as std's are (close-on-exec; `SO_NOSIGPIPE` on the OSes where std sets it (macOS / iOS, FreeBSD, NetBSD, DragonFly); the same listen backlog as std)
 
@@ -53,6 +54,7 @@ Rust's std accepts paths of up to `sun_path` − 1 bytes.
 
 A longer path is handed to the kernel by a short spelling that names the same place as the original path. B, D and E, the routes and the order tried are in the specification's [Routes for long paths and their order](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#routes-for-long-paths-and-their-order) and [building the routes](https://github.com/kawaz/sockat/blob/main/docs/SPEC-routes.md); how far they reach is in the [reach table](https://github.com/kawaz/sockat/blob/main/pages/reach/README.md). sockat-rs makes every route of the specification and tries them on each OS as the specification's [Bind order](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#bind-order) and [Connect order](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#connect-order) say.
 
+- Even a long absolute path goes to std by its real path (the symlinks on its way resolved) when that fits std, with nothing made in the bases (`Spelling` is `Original`). `Options::base` is not looked at then
 - When the application decides where B is, pass [`Options::base`](#options)
 - The route taken and the routes passed over are told by the `_ex` functions' [diagnostics](#diagnostics)
 
@@ -66,12 +68,12 @@ An empty path is `InvalidInput` from every function, with nothing created and no
 
 ## Spelling properties: Spelling
 
-`bind_ex` and `resolve_for_bind` tell by `Spelling` whether a bind's spelling can be used later. Branch on it. What the values and the fields mean is in the specification's [Spelling properties: `Spelling`](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#spelling-properties-spelling).
+`bind_ex`, `resolve_for_bind` and `resolve_for_connect` tell by `Spelling` whether the spelling can be used later. Branch on it. What the values and the fields mean is in the specification's [Spelling properties: `Spelling`](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#spelling-properties-spelling).
 
 | Value | Spelling | Route |
 |---|---|---|
-| `Original` | the original absolute path | standard |
-| `CwdRelative` | the original relative path. Names another place after the cwd changes | standard |
+| `Original` | the original absolute path, a relative path made absolute, or a long path's real path | standard |
+| `CwdRelative` | the original relative path. Names another place after the cwd changes. Only when, the relative path made absolute, no route can be used (step 5 of [the specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#making-a-relative-path-absolute)) | standard |
 | `Linked { .. }` | goes through B, D and E and names the same place as the original path | link-dir, link-file |
 | `Dangling` | contains an E already cleaned up. Names nothing | thread-cwd, at |
 
@@ -84,6 +86,8 @@ The fields of `Linked`:
 | `usable_cross_uid` | `bool` | whether a process of another uid can follow it |
 | `usable_with_private_tmp` | `bool` | whether the peer can follow it even when this process or the peer has its `/tmp` isolated (systemd's `PrivateTmp`, ...) |
 
+`ForConnect`'s `spelling` is `Original`, `CwdRelative` or `Linked`. `Linked` is link-file's spelling, with `removable` false; a procB spelling has `until` `Until::Process`.
+
 `Spelling` and `Spelling::Linked` are `#[non_exhaustive]`. A match needs a `_` arm for values it does not know, and `..` in `Linked { removable, .. }`. Read a value you do not know as "do not rely on the spelling".
 
 ## Options
@@ -93,7 +97,7 @@ The `_ex` functions and resolve take `sockat::Options`. `Options::default()` is 
 | Field | Content |
 |---|---|
 | `usable_cross_uid: bool` | make a bind's spelling one another uid can follow too. When that cannot be met, the bind goes on to thread-cwd / at (`Dangling`). Only the binds look at it; the connects do not |
-| `base: Option<PathBuf>` | where B itself is (for example `/tmp/my-app-1000/sockat`). Made when missing (mode 0711); when the checks fail, an error ([Errors](#errors)), never falling back to the automatic bases. Used by both the binds and the connects. This B is sockat's own: put nothing else in it. The dead D in it go by [`sweep_base`](#sweep-and-sweep_base) |
+| `base: Option<PathBuf>` | where B itself is (for example `/tmp/my-app-1000/sockat`). Made when missing (mode 0711); when the checks fail, an error ([Errors](#errors)), never falling back to the automatic bases. Used by both the binds and the connects. Not looked at when a relative path made absolute or a long path's real path fits std. This B is sockat's own: put nothing else in it. The dead D in it go by [`sweep_base`](#sweep-and-sweep_base) |
 
 ## The _ex functions: clean-up and diagnostics
 
@@ -138,6 +142,7 @@ What stays in the bases and when it goes (B, D and E, the OS's cleaning of tempo
 | `cleanup(&self) -> io::Result<()>` | removes the E the spelling goes through, the first time only. The socket file and the socket stay |
 
 - Both do nothing once they have succeeded. A call after a failure tries again. Called from several threads at once, they remove one at a time (also between a `ForBind` and the `SocketFile`s got by calling its `socket_file()` more than once)
+- After the bind, `remove()` removes the file bound even when the cwd has changed (the `SocketFile` of `bind_ex` and that of `ForBind::socket_file()` alike). The cwd is checked (that it is the same before and after the bind) only when `Spelling` is `CwdRelative`
 - Dropping does nothing
 - `remove` does not close the listener. Call `remove` before closing the listener, then close it
 
@@ -157,9 +162,11 @@ For those who hand a spelling to std or another library themselves. A spelling i
 | Function | Spelling | Returns |
 |---|---|---|
 | `sockat::resolve_for_bind(path, options)` | link-dir's `B/D/E/<file name>`, and on macOS and NetBSD also link-file's `B/D/E` | `Result<ForBind, ExError>` (`path`, `spelling`, `route`, `base`, `skipped`, `cleanup()`, `socket_file()`) |
-| `sockat::resolve_for_connect(path, options)` | link-file's `B/D/E` (any file name length) | `Result<ForConnect, ExError>` (`path`, `route`, `skipped`, `cleanup()`) |
+| `sockat::resolve_for_connect(path, options)` | link-file's `B/D/E` (any file name length) | `Result<ForConnect, ExError>` (`path`, `spelling`, `route`, `skipped`, `cleanup()`) |
 
-- A path of a length std accepts is returned as it is (`Original` / `CwdRelative`)
+- An absolute path of a length std accepts is returned as it is (`Original`)
+- A relative path comes back as an absolute spelling (the path made absolute, or a long path's real path, when that fits std: `Original`, with nothing made in the bases; otherwise the spelling through B, D and E above). Only when no spelling can be had does a relative path of a length std accepts come back as it is (`CwdRelative`)
+- A long absolute path whose real path fits std comes back as that real path (`Original`, with nothing made in the bases)
 - When no spelling fits (a length only thread-cwd / at reach, or B cannot be made), `ENAMETOOLONG`. To reach such a length, use `bind` / `connect`
 - Call `ForBind::socket_file(&self) -> io::Result<SocketFile>` after the bind and before the listener is closed. The `remove` of the `SocketFile` it returns removes the file and cleans up the same E as the `ForBind`. Without calling it, there is nothing that removes the file ([`SocketFile` of `ForBind` in the specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#socketfile-of-forbind))
 - `ForConnect`'s spelling can be used for any number of connects; call `cleanup()` at the end
@@ -175,6 +182,7 @@ For those who hand a spelling to std or another library themselves. A spelling i
 
 What differs regardless of the language (the address the kernel reports, how operational tools show it, the directory being resolved first, state growing outside the application's own place, environments where a live D can be removed, a peer with `PrivateTmp`) is in the specification's [What differs from the standard for a long path](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-differs-from-the-standard-for-a-long-path). In Rust:
 
+- After a bind to a relative path, even a short one, the address from `local_addr()`, `peer_addr()` and `recv_from()` is an absolute path, not the relative path given. In a deep cwd, even a short relative path makes B, D and E in the bases (the rows "Relative path:" of the specification's [What differs from the standard for a long path](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-differs-from-the-standard-for-a-long-path))
 - The address the kernel reports is the address from `local_addr()` of the listener and of accepted streams, `peer_addr()` of the connecting side, and a datagram's `recv_from()`. For a long path it is the bind's spelling, not the original path. Whether it can be used later is told by `Spelling`
 - When a listener is closed, neither the listener of `sockat::bind` nor that of `bind_ex` removes the socket file, as with std's `UnixListener`. Remove it by the original path or by `SocketFile::remove()`
 - relative returns an `Other` error when the cwd changed in between and stays changed
@@ -188,7 +196,7 @@ The list and why each is wrong are in the specification's [Patterns not to use](
 |---|---|---|
 | removing or `stat`ing the socket file by the spelling the kernel reports, without looking at `Spelling` | `std::fs::remove_file(listener.local_addr()?.as_pathname().unwrap())` | `std::fs::remove_file(path)` with the original path<br>`SocketFile::remove()` |
 | using an old spelling after its clean-up or after the process ended | connecting by the spelling after `cleanup()` | use a spelling only within its `until` |
-| binding with a relative path and removing by that relative path after the cwd changes | `sockat::bind("app.sock")` followed by<br>`std::env::set_current_dir(..)` and<br>`std::fs::remove_file("app.sock")` | make the path absolute with `std::path::absolute` before the bind<br>`SocketFile::remove()` |
+| binding with a relative path and removing by the relative string given after the cwd changes | `sockat::bind("app.sock")` followed by<br>`std::env::set_current_dir(..)` and<br>`std::fs::remove_file("app.sock")` | `SocketFile::remove()`<br>to make the path absolute yourself, `std::path::absolute` (it does not fold `..`) |
 | relying on closing the listener to remove the socket file | `drop(listener)` alone | `SocketFile::remove()`<br>remove by the original path |
 | relying on `remove()` to close the listener too | `bound.file.remove()` alone | close the listener yourself |
 | calling `remove()` after the listener is closed | `drop(bound.socket); bound.file.remove()` | call it before closing |
@@ -228,7 +236,7 @@ Errors specific to the Rust calls:
 |---|---|
 | For a long path, the real path of the socket's directory cannot be resolved | that error |
 | `Options::base` passes its check, but B cannot be made | the error of making it |
-| The cwd changed during `bind_ex` of a relative path | `Other` |
+| The cwd changed during a `bind_ex` that binds `CwdRelative` | `Other` |
 | Right after `bind_ex`'s bind, what is there (where a symlink leads, when the last component is one) is not a socket. What `socket_file()` reaches is not a socket | `ENOTSOCK` |
 | Right after `bind_ex`'s bind, the real path of where to remember (the specification's [`remove`](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#remove)) cannot be resolved (the file was removed, or on a route that looks the original path up again a symlink on the way was switched to where nothing is) | the error of resolving the real path (`ENOENT` etc.) |
 | `socket_file()` is called before the bind or after the clean-up | the error of following the spelling |
@@ -237,6 +245,7 @@ Errors specific to the Rust calls:
 `route` and `skipped` of `ExError`:
 
 - The directory is looked up first, so `ENOENT` and `ENOTDIR` are settled before any route is tried (`route` is `None`, `skipped` empty)
+- A bind / resolve of a relative path whose socket's directory is missing is `ENOENT` even when short, with `route` `None`
 - `Options::base` is checked before the routes; when it fails, `route` is `None` and `skipped` empty. When B cannot be made after the check passed, `route` is `None` and `skipped` holds the routes passed over until then
 - The route that actually bound / connected and failed goes in `route`
 
@@ -251,6 +260,8 @@ The results are std types, so any runtime that adopts std sockets can take them.
 - **On OpenBSD, std in Rust 1.99 and earlier drops the last byte of an address.** The path from `local_addr()`, `peer_addr()` and `recv_from()` lacks its last byte (a bug in std, the same for a short path and without sockat; [rust-lang/rust#118925](https://github.com/rust-lang/rust/issues/118925), fixed in Rust 1.100.0). The address the kernel reports is whole. Replying to a datagram at the address from std's `recv_from` needs Rust 1.100 or later
 - **Linux's std autobinds a bind with an empty path to an abstract address.** sockat does not hand an empty path to std and makes it `InvalidInput` ([The empty path](#the-empty-path))
 - **std does not take an abstract name (a leading NUL) given as a path.** `bind` and `bind_ex` hand it to std and return std's `InvalidInput`. Bind an abstract name with std's `SocketAddr::from_abstract_name` and `bind_addr`. `resolve_for_bind` hands an abstract name back as it is, and its `socket_file()` gives a `SocketFile` with no file (its `remove()` removes no file; the spec's [`remove`](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#remove))
+
+- **With a cwd deeper than PATH_MAX, `bind_ex` of a relative path fails.** `ERANGE` on macOS, `ENAMETOOLONG` on Linux (`route` is `standard`, the listener closed): the socket file cannot be remembered by its absolute real path. The plain `bind` goes through (to std as it is, `CwdRelative`)
 
 ## Not checked
 
