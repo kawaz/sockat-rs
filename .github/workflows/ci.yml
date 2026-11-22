@@ -46,7 +46,7 @@ jobs:
         with:
           usesh: true
           prepare: pkg install -y rust
-          run: rustc -V && cargo test --no-fail-fast
+          run: rustc -V && cargo test --workspace --no-fail-fast
 
   # The Unix systems without a thread cwd or a dirfd-relative bind / connect.
   # They run the whole suite in a VM so the routes through B and those they
@@ -70,7 +70,7 @@ jobs:
               export PKG_PATH
               /usr/sbin/pkg_add rust
             }
-          run: rustc -V && cargo test --no-fail-fast
+          run: rustc -V && cargo test --workspace --no-fail-fast
 
   openbsd:
     name: Test (OpenBSD VM)
@@ -82,7 +82,7 @@ jobs:
         with:
           usesh: true
           prepare: pkg_add rust
-          run: rustc -V && cargo test --no-fail-fast
+          run: rustc -V && cargo test --workspace --no-fail-fast
 
   illumos:
     name: Test (illumos / OmniOS VM)
@@ -94,7 +94,7 @@ jobs:
         with:
           usesh: true
           prepare: pkg install ooce/developer/rust build-essential
-          run: rustc -V && cargo test --no-fail-fast
+          run: rustc -V && cargo test --workspace --no-fail-fast
 
   cross-check:
     name: Cross check (${{ matrix.target }})
@@ -111,7 +111,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
           components: clippy
-      - run: cargo clippy --target ${{ matrix.target }} --all-targets -- -D warnings
+      # The workspace (the library with the feature the command turns on, and
+      # the command), then the library alone as its users build it.
+      - run: cargo clippy --workspace --target ${{ matrix.target }} --all-targets -- -D warnings
+      - run: cargo clippy -p sockat --target ${{ matrix.target }} --all-targets -- -D warnings
 
   msrv:
     name: MSRV check (rust-version = 1.85)
@@ -121,7 +124,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.85"
-      - run: cargo check
+      # The command's dependencies must keep the MSRV as well.
+      - run: cargo check --workspace
 
   audit:
     name: cargo-audit (RUSTSEC advisories)

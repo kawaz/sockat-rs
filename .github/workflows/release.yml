@@ -148,4 +148,6 @@ jobs:
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
-        run: cargo publish
+        # The library only: the command (sockat-cli) is not published until
+        # kawaz decides to (DR-0033; it also says publish = false).
+        run: cargo publish -p sockat

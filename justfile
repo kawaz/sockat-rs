@@ -23,20 +23,25 @@ list:
 # ---------- lint / test ----------
 
 # cargo fmt --check + clippy (-D warnings) + unsafe 封じ込め
+#
+# workspace (ライブラリ sockat と CLI sockat-cli) を見る。workspace の build は
+# sockat-cli がライブラリの feature __cli-internal を入れるので、利用者が使う
+# feature なしのライブラリも別に clippy に掛ける。
 check: lint-unsafe
-    cargo fmt --check
-    cargo clippy --all-targets -- -D warnings
+    cargo fmt --all --check
+    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy -p sockat --all-targets -- -D warnings
 
 # cargo fmt (書き換える)
 fmt:
-    cargo fmt
+    cargo fmt --all
 
-# unsafe は src/sys.rs にだけ置く。他のファイルに漏れたら fail
+# unsafe は src/sys.rs にだけ置く。他のファイル (CLI の cli/ も) に漏れたら fail
 # (grep が何も拾わないのが成功)。
 [private]
 [script]
 lint-unsafe:
-    leaked=$(grep -rnE '\bunsafe[[:space:]]+(fn|impl|trait|extern|\{)' src tests --include='*.rs' \
+    leaked=$(grep -rnE '\bunsafe[[:space:]]+(fn|impl|trait|extern|\{)' src tests examples cli --include='*.rs' \
       | grep -v '^src/sys.rs:' || true)
     if [ -n "$leaked" ]; then
       echo "ERROR: unsafe leaked outside src/sys.rs:" >&2
@@ -53,13 +58,13 @@ lint-unsafe:
 [script]
 test *ARGS: check
     if cargo nextest --version >/dev/null 2>&1; then
-        cargo nextest run --no-fail-fast "$@"
-        cargo test --doc
+        cargo nextest run --workspace --no-fail-fast "$@"
+        cargo test --doc --workspace
     elif [ -n "${CI:-}" ]; then
         echo "error: cargo-nextest が CI に無い (ハング打ち切りが効かない)" >&2
         exit 1
     else
-        cargo test --no-fail-fast "$@"
+        cargo test --workspace --no-fail-fast "$@"
     fi
 
 # Linux の試験を docker で回す (macOS の手元から Linux の経路を確かめる)
@@ -70,21 +75,21 @@ test *ARGS: check
 [doc("Linux の試験を docker (rust:1、既定の seccomp) で回す")]
 test-linux *ARGS:
     docker run --rm -v "$PWD":/work -w /work -e CARGO_TARGET_DIR=/work/target-linux/docker \
-      -v sockat-cargo-registry:/usr/local/cargo/registry rust:1 cargo test "$@"
+      -v sockat-cargo-registry:/usr/local/cargo/registry rust:1 cargo test --workspace "$@"
 
 # seccomp の filter を外した Linux (スレッド cwd の経路を通す)
 [doc("Linux の試験を docker (seccomp=unconfined) で回す")]
 test-linux-unconfined *ARGS:
     docker run --rm --security-opt seccomp=unconfined -v "$PWD":/work -w /work \
       -e CARGO_TARGET_DIR=/work/target-linux/docker \
-      -v sockat-cargo-registry:/usr/local/cargo/registry rust:1 cargo test "$@"
+      -v sockat-cargo-registry:/usr/local/cargo/registry rust:1 cargo test --workspace "$@"
 
 # root でない uid 1000 の Linux (置き場と B の持ち主の確かめを root 以外で通す)。
 # リポは読み取り専用で mount し、target と cargo の置き場はコンテナの中に置く。
 [doc("Linux の試験を docker (uid 1000) で回す")]
 test-linux-user *ARGS:
     docker run --rm --user 1000:1000 -e HOME=/tmp/home -e CARGO_HOME=/tmp/cargo \
-      -e CARGO_TARGET_DIR=/tmp/target -v "$PWD":/work:ro -w /work rust:1 cargo test "$@"
+      -e CARGO_TARGET_DIR=/tmp/target -v "$PWD":/work:ro -w /work rust:1 cargo test --workspace "$@"
 
 # ---------- 適合試験 (ハブの conformance) ----------
 
@@ -160,12 +165,20 @@ check-version-bumped:
 # ---------- release flow ----------
 
 # Cargo.toml の version を上げて (既定 patch)、Cargo.lock と一緒に Release commit を作る
+#
+# sockat-cli (cli/Cargo.toml) はライブラリを version = "=x.y.z" で固定している
+# (DR-0033) ので、同じ commit でその固定も新しい version に動かす。
 [doc("version を上げて Release commit を作る")]
 [script]
 bump-version level="patch": ensure-clean
     new_version=$(bump-semver "$1" Cargo.toml --write --no-hint)
-    cargo check --offline >/dev/null 2>&1 || cargo check >/dev/null
-    bump-semver vcs commit -m "Release v${new_version}" Cargo.toml Cargo.lock
+    perl -pi -e 's/^(sockat = \{ path = "\.\.", version = "=)[^"]*(")/${1}'"$new_version"'${2}/' cli/Cargo.toml
+    if ! grep -qF "version = \"=${new_version}\"" cli/Cargo.toml; then
+      echo "ERROR: cli/Cargo.toml の sockat の固定を ${new_version} に動かせなかった" >&2
+      exit 1
+    fi
+    cargo check --workspace --offline >/dev/null 2>&1 || cargo check --workspace >/dev/null
+    bump-semver vcs commit -m "Release v${new_version}" Cargo.toml Cargo.lock cli/Cargo.toml
     echo "Version: -> ${new_version}"
 
 # 現在の version を表示
