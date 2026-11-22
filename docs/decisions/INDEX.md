@@ -29,5 +29,6 @@ Status は各 DR ファイルの `Status:` 行が正本。
 | [DR-0021](DR-0021-nul-is-invalid-at-any-length.md) | ✅ 実装済 | NUL を含むパスは長さによらず InvalidInput で何も作らない。Linux の先頭の NUL は std にそのまま渡す |
 | [DR-0030](DR-0030-conformance-cli.md) | ✅ 実装済 | 適合試験の CLI は `examples/conformance.rs`。公開の `bind_ex` / `connect_ex` に入力の `Options` を渡して呼び、経路・B・綴りの性質を出す。`just conformance` で起こす |
 | [DR-0032](DR-0032-resolve-through-persistent-base.md) | ✅ 実装済 | ハブ DR-0017 の Rust の形: 公開 API (stream・`datagram`・resolve・`sweep`、`Options`・`Spelling`・`Bound`・`SocketFile`)、B・D・E をプロセスの登録簿と flock で持つ、OS ごとの試す順。fork・最終手段・losses は無い |
+| [DR-0033](DR-0033-cli-crate-and-internal-entry.md) | 💭 提案 | コマンド `sockat` は workspace の別パッケージ sockat-cli (`cli/`、未公開)。B の作り方は feature `__cli-internal` の後ろの doc に出さない `sockat::__cli` から使い、ライブラリの依存と API は増やさない。ライブラリは `=x.y.z` で固定 |
 
 退避した DR は [archive/INDEX.md](archive/INDEX.md)。
