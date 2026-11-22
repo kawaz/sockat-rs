@@ -649,3 +649,56 @@ mod datagram_remove {
         assert!(!path.exists());
     }
 }
+
+// Every ```rust block of the manual's pages is in this file, as consecutive
+// lines, so the code a reader copies is the code the tests above run. The
+// manual and this file are written by hand, and nothing else ties them
+// together: a sample changed on one side only would otherwise go unnoticed.
+// Leading whitespace is ignored (a block sits one level deep in its module
+// here) and so are blank lines.
+#[test]
+fn every_sample_of_the_manual_is_here() {
+    const PAGES: [(&str, &str); 8] = [
+        ("bind-ja.md", include_str!("../docs/manual/bind-ja.md")),
+        ("bind.md", include_str!("../docs/manual/bind.md")),
+        (
+            "connect-ja.md",
+            include_str!("../docs/manual/connect-ja.md"),
+        ),
+        ("connect.md", include_str!("../docs/manual/connect.md")),
+        (
+            "resolve-ja.md",
+            include_str!("../docs/manual/resolve-ja.md"),
+        ),
+        ("resolve.md", include_str!("../docs/manual/resolve.md")),
+        (
+            "datagram-ja.md",
+            include_str!("../docs/manual/datagram-ja.md"),
+        ),
+        ("datagram.md", include_str!("../docs/manual/datagram.md")),
+    ];
+    fn lines(text: &str) -> Vec<&str> {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+    let here = lines(include_str!("manual_samples.rs"));
+    let mut blocks = 0;
+    for (page, text) in PAGES {
+        let mut rest = text;
+        while let Some(start) = rest.find("```rust\n") {
+            let body = &rest[start + "```rust\n".len()..];
+            let end = body.find("```").expect("an unclosed code block");
+            let block = lines(&body[..end]);
+            assert!(
+                here.windows(block.len()).any(|w| w == block.as_slice()),
+                "a sample of docs/manual/{page} is not in tests/manual_samples.rs:\n{}",
+                block.join("\n")
+            );
+            blocks += 1;
+            rest = &body[end + 3..];
+        }
+    }
+    assert!(blocks > 0);
+}
