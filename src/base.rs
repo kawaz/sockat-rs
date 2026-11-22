@@ -601,8 +601,18 @@ pub(crate) fn places_from(
     tmpdir: Option<OsString>,
     runtime_dir: Option<OsString>,
 ) -> Vec<(Place, PathBuf)> {
+    places_with_tmp(PathBuf::from("/tmp"), tmpdir, runtime_dir)
+}
+
+/// [`places_from`] with `tmp` in place of `/tmp` (the command's tests put
+/// the places in a directory of their own, `crate::__cli::Places::with_tmp`).
+pub(crate) fn places_with_tmp(
+    tmp: PathBuf,
+    tmpdir: Option<OsString>,
+    runtime_dir: Option<OsString>,
+) -> Vec<(Place, PathBuf)> {
     let set = |v: Option<OsString>| v.map(PathBuf::from).filter(|p| p.is_absolute());
-    let mut out = vec![(Place::Tmp, PathBuf::from("/tmp"))];
+    let mut out = vec![(Place::Tmp, tmp)];
     for (place, p) in [
         (Place::Runtime, set(runtime_dir)),
         (Place::Tmpdir, set(tmpdir)),

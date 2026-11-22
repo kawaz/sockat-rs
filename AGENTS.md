@@ -21,6 +21,8 @@ sockat は、`sun_path` の上限を超えるパスでも Unix domain socket を
 | `src/tests.rs` | 経路を強制する単体試験 |
 | `tests/` | 公開 API の結合試験、tokio との連携試験 |
 | `examples/conformance.rs` | ハブの適合試験の CLI (DR-0030) |
+| `src/cli_internal.rs` | コマンド専用の入口 `sockat::__cli` (feature `__cli-internal` の後ろ、doc に出さない、API でない。DR-0033) |
+| `cli/` | コマンド `sockat` のパッケージ sockat-cli (`src/main.rs` 引数と出力、`src/resolve.rs` 綴りの作り方、`tests/cli.rs` 結合試験)。未公開 |
 
 ## 守ること
 
@@ -35,7 +37,7 @@ sockat は、`sun_path` の上限を超えるパスでも Unix domain socket を
 ## 試験
 
 - `just test` (macOS)、`just test-linux` (docker、既定の seccomp)、`just test-linux-unconfined` (スレッド cwd を通す)、`just test-linux-user` (uid 1000)。経路は OS と環境で違うので、変更したら全部回す
-- 一時ディレクトリはランダム名で作り、試験の終わりに消す (`tempfile`)。長さを決めたいので、基本は `/tmp` の下に作る。B の置き場は試験ごとの一時ディレクトリにする (`route::Config` の `places`)
+- 一時ディレクトリはランダム名で作り、試験の終わりに消す (`tempfile`)。長さを決めたいので、基本は `/tmp` の下に作る。B の置き場は試験ごとの一時ディレクトリにする (`route::Config` の `places`。コマンドの試験は debug build のコマンドが読む `SOCKAT_CLI_TEST_TMP`)
 - cwd や umask のようにプロセス全体に効く設定が要る試験と、終わったプロセスの D が要る試験は、試験バイナリを子プロセスで起こして中で行う (`run_child`)。試験は並行して走るので、同じプロセスで変えない
 - 各試験の直前に「何を確かめ、なぜそうなるべきか」をコメントで書く。DR の番号だけで済ませない
 - ハブの適合試験 (`just conformance` をハブで) も流す。手元と `--on linux`

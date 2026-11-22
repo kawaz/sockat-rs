@@ -193,7 +193,7 @@ pub(crate) enum Follows {
 
 /// Whether a bind follows a symlink on this target.
 #[cfg(any(target_vendor = "apple", target_os = "netbsd"))]
-const FOLLOWS: Follows = Follows::Yes;
+pub(crate) const FOLLOWS: Follows = Follows::Yes;
 #[cfg(any(
     target_os = "linux",
     target_os = "android",
@@ -201,7 +201,7 @@ const FOLLOWS: Follows = Follows::Yes;
     target_os = "openbsd",
     target_os = "illumos"
 ))]
-const FOLLOWS: Follows = Follows::No;
+pub(crate) const FOLLOWS: Follows = Follows::No;
 #[cfg(not(any(
     target_vendor = "apple",
     target_os = "netbsd",
@@ -211,7 +211,7 @@ const FOLLOWS: Follows = Follows::No;
     target_os = "openbsd",
     target_os = "illumos"
 )))]
-const FOLLOWS: Follows = Follows::Unknown;
+pub(crate) const FOLLOWS: Follows = Follows::Unknown;
 
 /// What the routes read from the environment, made explicit so the tests can
 /// vary it without touching the process environment.

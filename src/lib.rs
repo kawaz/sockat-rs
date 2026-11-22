@@ -134,6 +134,17 @@ mod sys;
 #[cfg(test)]
 mod tests;
 
+// Design rationale: the `sockat` command (another package, `sockat-cli`) makes
+// and checks B as this library does, and a package cannot see `pub(crate)`.
+// Rather than copy B's making and checking into the command, or add it to
+// the API, this entry is public only behind a feature off by default and
+// hidden from the documentation: it is not part of the API and promises
+// nothing (DR-0033).
+#[cfg(feature = "__cli-internal")]
+#[doc(hidden)]
+#[path = "cli_internal.rs"]
+pub mod __cli;
+
 pub use route::Skipped;
 
 /// What the `_ex` functions and resolve take besides the path.

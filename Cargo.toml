@@ -11,9 +11,20 @@ keywords = ["unix", "socket", "sun_path", "uds"]
 categories = ["os::unix-apis", "network-programming"]
 readme = "README.md"
 # What goes into the published crate: the code and what docs.rs / crates.io
-# show. Repository tooling (CI, justfile, agent rules) and the design docs stay
-# in the repository.
+# show. Repository tooling (CI, justfile, agent rules), the design docs and
+# the command (cli/) stay in the repository.
 include = ["src/**", "README.md", "LICENSE", "Cargo.toml"]
+
+# The library stays at the root (where the published package has always
+# been); the command `sockat` is the package sockat-cli in cli/ (DR-0033).
+[workspace]
+members = [".", "cli"]
+
+[features]
+# For the command sockat (sockat-cli) only: makes `sockat::__cli` public, the
+# entry it makes and checks B through. Not part of the API, promises nothing,
+# do not use it (DR-0033). Adds no dependency.
+__cli-internal = []
 
 [dependencies]
 libc = "0.2"
