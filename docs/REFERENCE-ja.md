@@ -176,7 +176,7 @@ Rust の std が受け付ける長さは `sun_path` − 1 バイト。
 
 `sockat::datagram` は std の `UnixDatagram` の、パスを取る関数と `unbound` を写す。経路と順は stream と同じ。長いパスに bind した送り手には、綴りが辿れる間は受け手が `recv_from` のアドレスへ返信できる (`Spelling::Linked`)。OpenBSD では Rust 1.100 以上が要る ([Rust に固有の注意](#rust-に固有の注意))。使い方は利用マニュアルの [DGRAM を使う](./manual/datagram-ja.md)。
 
-`send_to` と SEQPACKET はまだ無い ([仕様の未確定](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#未確定))。長いパスへ `send_to` したい時は、`resolve_for_connect` の綴りを std の `send_to` に渡す ([長いパスへ send_to する](./manual/datagram-ja.md#長いパスへ-send_to-する))。
+`send_to` と SEQPACKET はまだ無い ([仕様の未確定](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md#未確定))。長いパスへ `send_to` したい時は、`resolve_for_connect` の綴りを std の `send_to` に渡す ([長いパスへ send_to する](./manual/datagram-ja.md#長いパスへ-send_to-する))。SEQPACKET は、自分で作ったソケットに resolve の綴りを渡して使う ([SEQPACKET を使う](./manual/seqpacket-ja.md))。
 
 ## 長いパスで std と違う点
 
