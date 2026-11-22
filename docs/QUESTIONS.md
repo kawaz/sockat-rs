@@ -18,3 +18,15 @@
 ## 裁定待ち
 
 (なし)
+
+### VB-Q3 sockat-cli の crates.io への初回の公開を、どう行うか
+
+crates.io の trusted publishing (今の release.yml の publish の仕組み) は、crate が既にある時にしか設定できない ([RFC 3691](https://github.com/rust-lang/rfcs/blob/master/text/3691-trusted-publishing-cratesio.md): "A Trusted Publisher Configuration can only be created after an initial manual publishing of a crate."。RFC は作る前の PENDING の設定を将来の案に挙げている。今の crates.io で作る前の設定ができるかは未確認)。sockat-cli は新しい crate なので、初回は CI から publish できない見込み。
+
+統括推し: a。ライブラリ 0.6.0 を CI で出した後に、kawaz の手元で `cargo publish -p sockat-cli` を 1 回だけ行い、crates.io の sockat-cli の設定に trusted publisher (kawaz/sockat-rs、release.yml、環境 crates-io) を足す。次の版から release.yml が両方を出す。
+
+あわせて sockat-cli の版は、ライブラリと同じ版で動かす形 (0.6.0 から。`just bump-version` が両方を上げる) にしたい。CLI はライブラリを `=x.y.z` で固定するので、ライブラリを出すたびに CLI も出し直しになり、別の版の番号を持つ利点が無い。
+
+- [ ] a: 0.6.0 は CI でライブラリだけ出し、CLI の初回は kawaz の手元で publish して trusted publisher を設定する
+- [ ] b: crates.io で作る前の trusted publisher の設定ができるか kawaz が確かめ、できれば CI で両方を出す
+- [ ] c: CLI の公開は 0.6.0 の後に回す
