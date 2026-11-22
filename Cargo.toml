@@ -31,6 +31,9 @@ libc = "0.2"
 
 [dev-dependencies]
 serde_json = "1"
+# The SEQPACKET samples of the user manual (docs/manual/seqpacket*.md) make
+# their sockets with it; the library itself does not depend on it.
+socket2 = { version = "0.6", features = ["all"] }
 tempfile = "3"
 tokio = { version = "1", features = ["net", "rt", "io-util", "macros"] }
 

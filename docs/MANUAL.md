@@ -4,6 +4,7 @@
 
 - [Bind](./manual/bind.md)
 - [Connect](./manual/connect.md)
+- [Use SEQPACKET](./manual/seqpacket.md)
 - [Use DGRAM](./manual/datagram.md)
 - [Resolve only the path](./manual/resolve.md)
 
