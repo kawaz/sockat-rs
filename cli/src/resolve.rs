@@ -22,7 +22,6 @@ use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -177,48 +176,13 @@ pub(crate) fn resolve(
         return Ok(standard(real));
     }
     if !path.is_absolute() {
-        if let Some(p) = from_pwd(path, dir, env.pwd.as_deref()) {
+        if let Some(p) = entry::pwd_candidate(path, dir, env.pwd.as_deref()) {
             if len(&p) <= entry::LIMIT {
                 return Ok(standard(p));
             }
         }
     }
     through_base(&real_dir, name, for_, base, env)
-}
-
-/// The spelling of the relative `path` from `$PWD` (`pwd`), `.` and `..`
-/// folded by their letters (hub DR-0019 2): only when `$PWD` is absolute and
-/// is the cwd (the same `(st_dev, st_ino)` as `.`), and the folded directory
-/// is the directory of `path` (`dir`) to the kernel. A `..` after a symlink
-/// is the parent of the symlink's target to the kernel, which the folding
-/// does not know, and then the folded spelling names another place.
-fn from_pwd(path: &Path, dir: &Path, pwd: Option<&OsStr>) -> Option<PathBuf> {
-    let pwd = Path::new(pwd?);
-    if !pwd.is_absolute() {
-        return None;
-    }
-    let id = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
-    if id(pwd)? != id(Path::new("."))? {
-        return None;
-    }
-    let mut parts: Vec<&[u8]> = Vec::new();
-    let joined = [pwd.as_os_str().as_bytes(), path.as_os_str().as_bytes()];
-    for part in joined.iter().flat_map(|b| b.split(|&c| c == b'/')) {
-        match part {
-            b"" | b"." => {}
-            b".." => {
-                parts.pop();
-            }
-            _ => parts.push(part),
-        }
-    }
-    let mut folded = Vec::new();
-    for part in &parts {
-        folded.push(b'/');
-        folded.extend_from_slice(part);
-    }
-    let folded = PathBuf::from(OsStr::from_bytes(&folded));
-    (id(folded.parent()?)? == id(dir)?).then_some(folded)
 }
 
 /// The path through an E right in B to the socket's directory (`real_dir`,

@@ -699,6 +699,47 @@ fn base_puts_the_e_in_the_given_b() {
     failed(&out, 1);
 }
 
+/// `--base` is not looked at when an absolute candidate fits (hub SPEC "相対
+/// パスを絶対パスにする": a candidate goes to std without B, as a path that
+/// fits as it is does): a long absolute path whose real path fits, and a
+/// relative path, are printed as their real path with a `--base` whose parent
+/// is missing (an error when it is looked at). Its form is still checked
+/// first (an argument error), as the library checks `Options.base`'s.
+#[test]
+fn base_is_not_looked_at_when_a_candidate_fits() {
+    let c = Case::new();
+    let real_dir = c.path().join("r");
+    fs::create_dir(&real_dir).unwrap();
+    let long_link = c.path().join("l".repeat(120));
+    std::os::unix::fs::symlink(&real_dir, &long_link).unwrap();
+    let real = fs::canonicalize(&real_dir).unwrap().join("s.sock");
+    let missing = c.path().join("no").join("sockat");
+    let with_base = |cwd: &Path, path: &OsStr| {
+        in_cwd(
+            &c,
+            cwd,
+            cwd,
+            &[OsStr::new("--base"), missing.as_os_str(), path],
+        )
+    };
+    let original = long_link.join("s.sock");
+    assert!(len(&original) > LIMIT);
+    assert_eq!(printed(&with_base(c.path(), original.as_os_str())), real);
+    assert_eq!(printed(&with_base(&real_dir, OsStr::new("s.sock"))), real);
+    assert!(!missing.parent().unwrap().exists());
+    let out = in_cwd(
+        &c,
+        &real_dir,
+        &real_dir,
+        &[
+            OsStr::new("--base"),
+            OsStr::new("rel"),
+            OsStr::new("s.sock"),
+        ],
+    );
+    failed(&out, 2);
+}
+
 /// With no arguments the command, and `resolve` and `completion`, print
 /// their help and succeed, as `--help` does; `--help-all` has all of
 /// `--help` (cli.md "呼び方"). `--version` prints the version.

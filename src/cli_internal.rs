@@ -8,8 +8,9 @@
 //! (hub DR-0018 "resolve の既定の綴り" 3: B is made and checked as the
 //! library does): the places, the process's B of the places 1-3, B at a
 //! given path, `sweep` over the places, and the few constants, the split of
-//! a path and the random names the command spells and names with, so they
-//! are the library's own. No way to choose a route.
+//! a path, the `$PWD` candidate of a relative path and the random names the
+//! command spells and names with, so they are the library's own. No way to
+//! choose a route.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -105,6 +106,15 @@ pub fn automatic(places: &Places, fits: impl Fn(&Path) -> bool) -> Found {
 /// `dir/..`, `..`, `/`), which the library refuses whatever the length.
 pub fn split(path: &Path) -> io::Result<(&Path, &OsStr)> {
     crate::path::split(path)
+}
+
+/// The `$PWD` candidate of the relative `path` whose directory is `dir`, as
+/// the library makes it for a bind and a resolve (hub SPEC-routes "絶対パスの
+/// 候補の作り方"): `pwd` and `path` joined and folded by their letters, when
+/// `pwd` is absolute and is the cwd, and the folded directory is `dir` (the
+/// same `(st_dev, st_ino)`). Its length is not looked at.
+pub fn pwd_candidate(path: &Path, dir: &Path, pwd: Option<&OsStr>) -> Option<PathBuf> {
+    route::pwd_candidate(path, dir, pwd)
 }
 
 /// The form of a B the caller names (as `Options.base`): absolute, without

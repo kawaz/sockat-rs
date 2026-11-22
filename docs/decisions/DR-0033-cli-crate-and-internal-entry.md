@@ -41,17 +41,19 @@
   | `Places` | 置き場 1〜3 (`from_env`: `/tmp`・`$XDG_RUNTIME_DIR`・`$TMPDIR`。`with_tmp`: `/tmp` を差し替えた物、試験用) |
   | `automatic(places, fits)` | プロセスの B (ライブラリの `base::automatic`。見積もりの `fits` に外れる置き場では作らず、次の置き場にも移らない) |
   | `split` | パスをディレクトリとファイル名に分ける (`path::split`。名前で終わらなければ `InvalidInput`) |
+  | `pwd_candidate` | 相対パスの `$PWD` の候補 (ライブラリの bind・resolve と同じ `route::pwd_candidate`。長さは見ない) |
   | `check_base_form`・`check_given`・`given` | `Options.base` と同じ形の検査、作らない確かめ、作る (`base::split_given`・`check_given`・`given`) |
   | `sweep(places)` | ライブラリの `sweep()` と同じ (`base::sweep`。`places` を `from_env` にすれば `sweep()` そのもの) |
   | `random_name` | ライブラリの乱数の名前 (英数字 10 文字) |
 
-- ライブラリの側の変更は、この module と、置き場 1 を差し替えられる `base::places_with_tmp` (`places_from` はそれに `/tmp` を渡す)、`route::FOLLOWS` を `pub(crate)` にすることだけ。ライブラリの振る舞いは変えない
+- ライブラリの側の変更は、この module と、置き場 1 を差し替えられる `base::places_with_tmp` (`places_from` はそれに `/tmp` を渡す)、`route::FOLLOWS` を `pub(crate)` にすることだけ。ライブラリの振る舞いは変えない。`$PWD` の候補はライブラリが bind・resolve で作る物 ([DR-0032](DR-0032-resolve-through-persistent-base.md)「相対パスを絶対パスにする」) をそのまま使う
 
 ### `resolve` の作り方 (ハブ DR-0018 の手順 1〜7 を Rust で)
 
 - 相対パスは絶対パスにしてから扱う (出した綴りを別の cwd のプロセスが使う。ハブ [DR-0019](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0019-absolutize-relative-path-on-bind.md)「絶対パスの作り方と、その後」と cli.md「終了コードとエラー」)。同じ所を指す絶対パスの候補を、上限に収まる最初の物が見つかるまで順に見る。収まればそれを出し、置き場には何も作らない
   1. 実パス: ソケットのディレクトリを realpath で実パスにし、ファイル名を付ける
-  2. `$PWD` からの綴り: `$PWD` が絶対パスで、`stat` の `(st_dev, st_ino)` が `.` と同じ時だけ、相対パスを文字列でつなぎ、`.` と `..` を字句で畳む。畳んでできたディレクトリの `(st_dev, st_ino)` が元の相対パスのディレクトリと同じ時だけ候補にする (`sym/..` はカーネルでは symlink の先の親で、字句で畳むと別のディレクトリになりうる)
+  2. `$PWD` からの綴り: `$PWD` が絶対パスで、`stat` の `(st_dev, st_ino)` が `.` と同じ時だけ、相対パスを文字列でつなぎ、`.` と `..` を字句で畳む。畳んでできたディレクトリの `(st_dev, st_ino)` が元の相対パスのディレクトリと同じ時だけ候補にする (`sym/..` はカーネルでは symlink の先の親で、字句で畳むと別のディレクトリになりうる)。作るのは入口の `pwd_candidate` (ライブラリと同じ関数)
+- 候補が収まれば `--base` を確かめない (形の検査だけは引数の誤りとして先に行う。ライブラリが `Options.base` を候補の時に見ないのと同じ、ハブ SPEC「相対パスを絶対パスにする」)
 - どちらも収まらなければ、B の直下のハッシュの E を通す (手順 2〜7)。ライブラリの DR-0019 の 5 (経路が使えない時に相対のまま標準に渡す) は、コマンドでは取らない。コマンドは相対の綴りを出さない (cli.md) ので、E も作れない時はエラー
 - 上限を超える絶対パスにも実パスの候補を試す (途中の symlink で長く見えるだけのパスがある)。収まればそれを出し、置き場に何も作らない (`route` は `standard`、`link`・`target` は無い)。収まらなければ E を通す。`$PWD` の候補は相対パスだけ。上限以下の絶対パスは何も確かめずにそのまま出す
 - 相対パスのソケットのディレクトリが無い時は、長さによらずエラー (終了コード 1、`ENOENT`)。実パスの候補も E も作れないため。絶対パスの短いパスは何も確かめずにそのまま出すので、そこは扱いが分かれる
