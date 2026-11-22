@@ -40,6 +40,7 @@
   | `BIND_FOLLOWS_SYMLINK` | bind が最後の要素の symlink を辿ると分かっている OS か (Apple・NetBSD)。分からない OS は `false` |
   | `Places` | 置き場 1〜3 (`from_env`: `/tmp`・`$XDG_RUNTIME_DIR`・`$TMPDIR`。`with_tmp`: `/tmp` を差し替えた物、試験用) |
   | `automatic(places, fits)` | プロセスの B (ライブラリの `base::automatic`。見積もりの `fits` に外れる置き場では作らず、次の置き場にも移らない) |
+  | `split` | パスをディレクトリとファイル名に分ける (`path::split`。名前で終わらなければ `InvalidInput`) |
   | `check_base_form`・`check_given`・`given` | `Options.base` と同じ形の検査、作らない確かめ、作る (`base::split_given`・`check_given`・`given`) |
   | `sweep(places)` | ライブラリの `sweep()` と同じ (`base::sweep`。`places` を `from_env` にすれば `sweep()` そのもの) |
   | `random_name` | ライブラリの乱数の名前 (英数字 10 文字) |
@@ -48,10 +49,16 @@
 
 ### `resolve` の作り方 (ハブ DR-0018 の手順 1〜7 を Rust で)
 
-- 相対パスは、短くても cwd (`getcwd`) を前に付けて絶対パスにしてから、手順 1 の長さで分ける (出した綴りを別の cwd のプロセスが使う)。前に付ける時に `.` や `..` を字句で畳まない (`PathBuf::join` は間に `/` を 1 つ置くだけ)。`--json` の `original` は渡されたままの文字列
+- 相対パスは絶対パスにしてから扱う (出した綴りを別の cwd のプロセスが使う。ハブ [DR-0019](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0019-absolutize-relative-path-on-bind.md)「絶対パスの作り方と、その後」と cli.md「終了コードとエラー」)。同じ所を指す絶対パスの候補を、上限に収まる最初の物が見つかるまで順に見る。収まればそれを出し、置き場には何も作らない
+  1. 実パス: ソケットのディレクトリを realpath で実パスにし、ファイル名を付ける
+  2. `$PWD` からの綴り: `$PWD` が絶対パスで、`stat` の `(st_dev, st_ino)` が `.` と同じ時だけ、相対パスを文字列でつなぎ、`.` と `..` を字句で畳む。畳んでできたディレクトリの `(st_dev, st_ino)` が元の相対パスのディレクトリと同じ時だけ候補にする (`sym/..` はカーネルでは symlink の先の親で、字句で畳むと別のディレクトリになりうる)
+- どちらも収まらなければ、B の直下のハッシュの E を通す (手順 2〜7)。ライブラリの DR-0019 の 5 (経路が使えない時に相対のまま標準に渡す) は、コマンドでは取らない。コマンドは相対の綴りを出さない (cli.md) ので、E も作れない時はエラー
+- 候補を作るのは相対パスだけ。絶対パスは今までどおり、収まればそのまま出し、収まらなければ E を通す (DR-0019 の「相対パスだけが対象」)
+- 相対パスのソケットのディレクトリが無い時は、長さによらずエラー (終了コード 1、`ENOENT`)。実パスの候補も E も作れないため。絶対パスの短いパスは何も確かめずにそのまま出すので、そこは扱いが分かれる
+- `--json` の `original` は渡されたままの文字列。候補を出した時の `route` は `standard` (ライブラリの DR-0019 の 3 で標準に渡す時の経路の名前と同じ)
 - 手順 1 の長さは `sun_path` − 1 (`LIMIT`)。それ以下のパスは何も作らずにそのまま出す
-- パスの分け方はライブラリの `path::split` と同じ (最後の `/` で分け、名前が空・`.`・`..` なら引数の誤り)
-- 手順 3 の B は、`--base` があればその B (入口の `check_given` で作らずに確かめ、綴りが収まると見積もれた時だけ `given` で作る)、無ければ入口の `automatic`。見積もりは「`B/<ハッシュ>/<名前>` か `B/<ハッシュ>` が収まる」で、用途によらない (B の選び方を用途で変えず、ファイルを指す E だけが収まる時は「収まらない」でなく、その用途で使えない理由 (`--for` が無い、bind が symlink を辿らない OS) をエラーにするため)
+- パスは入口の `split` (ライブラリの `path::split`) で分ける。名前で終わらないパス (`dir/`・`dir/.`・`dir/..`・`..`・`/`) は、短いパスでも長さによらず引数の誤り (終了コード 2)。ライブラリが長さによらず `InvalidInput` にするのと揃える
+- 手順 3 の B は、`--base` があればその B (入口の `check_given` で作らずに確かめ、綴りが収まると見積もれた時だけ `given` で作る)、無ければ入口の `automatic`。見積もりは「`B/<ハッシュ>/<名前>` が収まる、またはファイルを指す E がその用途に使えて `B/<ハッシュ>` が収まる」(ファイルを指す E は、`--for connect` ならどの OS でも、`--for bind` は bind が symlink を辿る OS だけ、`--for` が無ければ使えない)。見積もりに外れると B を作らずに止まる。その時は、入口の `automatic` が最後に見積もりに渡した B のパス (作った B か、作るはずだった B) で、ファイルを指す E なら収まるかを見て、収まるなら「その用途では使えない」(`--for` を求める、または bind が symlink を辿らない) を、収まらないなら「収まらない」をエラーにする
 - 手順 4・6 の E は B の直下。名前は指す先 (ディレクトリの E はソケットのディレクトリの realpath、ファイルの E はその後ろにファイル名を付けた物) のバイト列の SHA-256 の 16 進小文字の先頭 12 文字。`symlink` が `EEXIST` なら `readlink` で指す先を比べ、同じなら使い、違えば `<ハッシュ>.<乱数 10 文字>` に作って `rename` で置き換える (失敗したら作った物を消す)
 - E の名前 (16 進 12 文字) も置き換えの途中の名前 (`.` を含む) も D の形 (英数字 10 文字) でないので、`sweep` は触らない。ライブラリの `sweep` は変えない (ハブが SPEC の「置き場に残る物」「sweep」に CLI の E を足す)
 - 手順 6 は、`--for connect` ならどの OS でも、`--for bind` は `BIND_FOLLOWS_SYMLINK` の OS だけ出す。`--for` が無ければエラーで `--for` を求める (cli.md の CL-Q1)。bind が symlink を辿らない OS では、エラーの文は `--for connect` だけを勧める
@@ -88,9 +95,10 @@
 - feature `__cli-internal` は crates.io の feature の一覧と `cargo add` の表示に出る (実測: `cargo add --dry-run` が `- __cli-internal` を並べた)。名前と注記で「使わない」を示すだけで、使うことは止められない
 - ライブラリの version を上げるたびに `cli/Cargo.toml` の固定も動く。コマンドを公開した後は、ライブラリだけを直したリリースでもコマンドを出し直さないと、公開されたコマンドは古いライブラリのまま
 - 試験の置き場の口は debug build にしか無いので、`cargo test --release` ではそれに頼る試験が `ignore` になる
-- ファイルを指す E だけが収まり、その用途で使えない時 (`--for` が無い、bind が symlink を辿らない OS の `--for bind`) は、エラーにする前に B を作る (B は残す物なので害は無いが、何も出さずに B ができる)
+- エラーの文を選ぶのに、入口の `automatic` が見積もりの関数に渡したパスを覚えて使う (`automatic` は見積もりに外れた B のパスを返さない)。`automatic` が見積もりを呼ぶ回数や順が変わると、エラーの文がずれうる (綴りと終了コードは変わらない)
 - 補完はトップレベルのパスとオプションと、サブコマンドの名前を同じ位置に並べる (パスの補完の候補にサブコマンドの名前が混ざる)
-- 上限に収まる短いパスは何も確かめずにそのまま出す (`/tmp/x/` のような名前で終わらないパスもそのまま。ライブラリが std にそのまま渡すのと同じ)
+- 絶対パスの短いパスは何も確かめずにそのまま出すが、相対パスは短くてもディレクトリを引くので、ディレクトリが無いとエラーになる (相対パスだけ扱いが厳しい)
+- 深い cwd (realpath が PATH_MAX を超える) の相対パスは、候補も E も作れずエラーになる。ライブラリなら DR-0019 の 5 で相対のまま標準に渡せる所
 
 ## Alternatives Considered
 
@@ -117,5 +125,5 @@
 
 ## 関連
 
-- ハブ: [DR-0018](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0018-cli-resolve-with-reused-hashed-link.md)、[cli.md](https://github.com/kawaz/sockat/blob/main/docs/design/cli.md)、[SPEC-routes「B の作り方」](https://github.com/kawaz/sockat/blob/main/docs/SPEC-routes-ja.md#b-の作り方)、[DR-0017](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0017-resolve-through-persistent-base.md)
+- ハブ: [DR-0018](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0018-cli-resolve-with-reused-hashed-link.md)、[DR-0019](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0019-absolutize-relative-path-on-bind.md)、[cli.md](https://github.com/kawaz/sockat/blob/main/docs/design/cli.md)、[SPEC-routes「B の作り方」](https://github.com/kawaz/sockat/blob/main/docs/SPEC-routes-ja.md#b-の作り方)、[DR-0017](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0017-resolve-through-persistent-base.md)
 - [DR-0011](DR-0011-routes-not-exposed.md)、[DR-0016](DR-0016-crate-distribution.md)、[DR-0017](DR-0017-release-flow.md)、[DR-0032](DR-0032-resolve-through-persistent-base.md)
