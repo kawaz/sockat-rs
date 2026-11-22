@@ -164,33 +164,126 @@ fn one_byte_over_the_limit_goes_through_b() {
     assert_eq!(printed(&c.run(&[&over])), expected);
 }
 
-/// A relative path is made absolute by the current directory before it is
-/// measured, since the process the path is handed to may run elsewhere; `.`
-/// and `..` are kept as written (hub SPEC: a path is not folded by its
-/// letters, a `..` after a symlink is the symlink's target's parent).
+/// The command run in `cwd` with `$PWD` set to `pwd`.
+fn in_cwd<S: AsRef<OsStr>>(c: &Case, cwd: &Path, pwd: &Path, args: &[S]) -> Output {
+    c.sockat()
+        .current_dir(cwd)
+        .env("PWD", pwd)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// A relative path is made absolute before it is measured, since the
+/// process the path is handed to may run in another directory (cli.md
+/// "終了コードとエラー", hub DR-0019 "絶対パスの作り方と、その後"). The
+/// first candidate is the real path (the socket's directory by realpath, the
+/// file name after it): when it fits, it is the path, and nothing is made in
+/// the places.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
     ignore = "the places for B can be moved only in a debug build"
 )]
-fn a_relative_path_is_made_absolute_by_the_current_directory() {
+fn a_relative_path_is_its_real_path_when_that_fits() {
     let c = Case::new();
+    fs::create_dir(c.path().join("x")).unwrap();
     let real = fs::canonicalize(c.path()).unwrap();
-    let out = c.run(&["./x/../s.sock"]);
-    let mut expected = real.as_os_str().as_bytes().to_vec();
-    expected.extend_from_slice(b"/./x/../s.sock");
-    assert_eq!(printed(&out).as_os_str().as_bytes(), &expected[..]);
+    let out = in_cwd(&c, c.path(), c.path(), &["./x/../s.sock"]);
+    assert_eq!(printed(&out), real.join("s.sock"));
+    assert!(!c.b().exists(), "nothing is made in the places");
+}
 
-    // Short as given, too long once absolute: through B.
+/// When the real path does not fit, the second candidate is `$PWD` with the
+/// relative path after it, `.` and `..` folded by their letters: used when
+/// `$PWD` is the cwd and the folded directory is the relative path's
+/// directory (hub DR-0019 2-3). Here the cwd is reached through a short
+/// symlink to a long directory, so only `$PWD`'s spelling fits; nothing is
+/// made in the places.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "the places for B can be moved only in a debug build"
+)]
+fn a_relative_path_is_spelled_from_pwd_when_only_that_fits() {
+    let c = Case::new();
     let long = c.long_dir('d');
-    let out = c
-        .sockat()
-        .current_dir(&long)
-        .arg("s.sock")
-        .output()
-        .unwrap();
+    let link = c.path().join("ln");
+    std::os::unix::fs::symlink(&long, &link).unwrap();
+    let out = in_cwd(&c, &link, &link, &["./s.sock"]);
+    assert_eq!(printed(&out), link.join("s.sock"));
+    assert!(!c.b().exists(), "nothing is made in the places");
+}
+
+/// `$PWD` that is not the cwd (another directory's `(st_dev, st_ino)`) is
+/// not used: its spelling would name another place (hub DR-0019 2). With the
+/// real path too long, the path goes through E.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "the places for B can be moved only in a debug build"
+)]
+fn a_pwd_that_is_not_the_cwd_is_not_used() {
+    let c = Case::new();
+    let long = c.long_dir('d');
+    let link = c.path().join("ln");
+    std::os::unix::fs::symlink(&long, &link).unwrap();
+    let elsewhere = c.path().join("e");
+    fs::create_dir(&elsewhere).unwrap();
+    let out = in_cwd(&c, &link, &elsewhere, &["s.sock"]);
     let real_long = fs::canonicalize(&long).unwrap();
     assert_eq!(printed(&out), c.b().join(hash(&real_long)).join("s.sock"));
+}
+
+/// `..` after a symlink is the parent of the symlink's target to the
+/// kernel, so `$PWD`'s spelling folded by its letters names another
+/// directory and is not a candidate (hub DR-0019 2, 案 E): the path goes
+/// through E to the directory the kernel reaches, not to the folded one.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "the places for B can be moved only in a debug build"
+)]
+fn a_folded_dotdot_that_names_another_directory_is_not_used() {
+    let c = Case::new();
+    let long = c.long_dir('d');
+    fs::create_dir(long.join("sub")).unwrap();
+    std::os::unix::fs::symlink(long.join("sub"), c.path().join("sym")).unwrap();
+    let out = in_cwd(&c, c.path(), c.path(), &["sym/../s.sock"]);
+    let real_long = fs::canonicalize(&long).unwrap();
+    assert_eq!(printed(&out), c.b().join(hash(&real_long)).join("s.sock"));
+}
+
+/// When neither candidate fits, a relative path goes through E, as a long
+/// absolute path does (hub DR-0019 4), even when it is short as given.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "the places for B can be moved only in a debug build"
+)]
+fn a_relative_path_neither_candidate_fits_goes_through_e() {
+    let c = Case::new();
+    let long = c.long_dir('d');
+    let out = in_cwd(&c, &long, &long, &["s.sock"]);
+    let real_long = fs::canonicalize(&long).unwrap();
+    assert_eq!(printed(&out), c.b().join(hash(&real_long)).join("s.sock"));
+}
+
+/// A path that does not end with a name (`dir/`, `dir/.`, `dir/..`, `..`)
+/// is an error in the arguments whatever its length, as in the library (hub
+/// SPEC "エラー"): it names no socket file to bind or connect to.
+#[test]
+fn a_path_not_ending_with_a_name_is_an_argument_error() {
+    let c = Case::new();
+    let long = c.long_dir('d');
+    for p in ["/tmp/x/", "/tmp/x/.", "/tmp/x/..", "..", "x/", "/"] {
+        let m = failed(&c.run(&[p]), 2);
+        assert!(
+            m.starts_with("sockat: ") && m.lines().count() == 2,
+            "{p}: {m}"
+        );
+    }
+    failed(&c.run(&[long.join("x").join("..")]), 2);
 }
 
 /// A long path is printed as `B/<hash of the directory's real path>/<file
@@ -285,7 +378,7 @@ fn too_long_for_the_directory(c: &Case) -> usize {
 /// `--for`: the path through an E to the file works for a connect
 /// everywhere, for a bind only where a bind follows a symlink (macOS,
 /// NetBSD); without `--for` it is an error asking for it rather than a path
-/// that may not work (hub DR-0018 6, cli.md CL-Q1).
+/// that may not work, told before B is made (hub DR-0018 6, cli.md CL-Q1).
 #[test]
 #[cfg_attr(
     not(debug_assertions),
@@ -294,18 +387,29 @@ fn too_long_for_the_directory(c: &Case) -> usize {
 fn a_long_file_name_needs_for() {
     let c = Case::new();
     let long = c.long_dir('d');
-    // B is made by the first call.
-    printed(&c.run(&[long.join("s.sock")]));
     let name = "n".repeat(too_long_for_the_directory(&c));
     let original = long.join(&name);
     let real = fs::canonicalize(&long).unwrap().join(&name);
     let e = c.b().join(hash(&real));
 
+    // Told before anything is made: no B for an error.
     let message = failed(&c.run(&[&original]), 1);
     assert!(message.starts_with("sockat: "), "{message}");
     assert!(message.contains("--for connect"), "{message}");
     assert_eq!(message.contains("--for bind"), BIND_FOLLOWS, "{message}");
     assert_eq!(message.lines().count(), 2, "{message}");
+    if !BIND_FOLLOWS {
+        let message = failed(
+            &c.run(&[
+                OsStr::new("--for"),
+                OsStr::new("bind"),
+                original.as_os_str(),
+            ]),
+            1,
+        );
+        assert!(message.contains("bind"), "{message}");
+    }
+    assert!(!c.b().exists(), "no B is made for an error");
 
     // For a connect: the E to the file, to a socket bound at the long path.
     let listener = sockat::bind(&original).unwrap();
