@@ -2,7 +2,7 @@
 
 > [English](./MANUAL.md) | 日本語
 
-sockat-rs (crate `sockat`) の使い方と、Rust での関数・型の対応、Rust での具体的な書き方、Rust に固有の注意のリファレンス。言語によらない振る舞いの正本は [sockat の仕様](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md) で、sockat-rs はその Rust 実装。Rust で決めた所は [DR-0032](./decisions/DR-0032-resolve-through-persistent-base.md) にある。
+sockat-rs (crate `sockat`) の使い方と、Rust での関数・型の対応、Rust での具体的な書き方、Rust に固有の注意のリファレンス。言語によらない振る舞いの正本は [sockat の仕様](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md) で、sockat-rs はその Rust 実装。Rust で決めた所は [DR-0032](./decisions/DR-0032-resolve-through-persistent-base.md) にあり、判断の一覧は [設計の判断 (DR) の索引](./decisions/INDEX.md)。
 
 言語によらない説明は仕様と pages にある:
 

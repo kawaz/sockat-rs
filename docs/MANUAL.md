@@ -2,7 +2,7 @@
 
 > English | [日本語](./MANUAL-ja.md)
 
-A reference for sockat-rs (the crate `sockat`): how to use it, the functions and types in Rust, how to write it in Rust, and the caveats specific to Rust. The language-independent behaviour is defined by [the sockat specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md); sockat-rs is its Rust implementation. What was decided for Rust is in [DR-0032](./decisions/DR-0032-resolve-through-persistent-base.md) (in Japanese).
+A reference for sockat-rs (the crate `sockat`): how to use it, the functions and types in Rust, how to write it in Rust, and the caveats specific to Rust. The language-independent behaviour is defined by [the sockat specification](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md); sockat-rs is its Rust implementation. What was decided for Rust is in [DR-0032](./decisions/DR-0032-resolve-through-persistent-base.md) (in Japanese), and all the decisions are listed in [the index of design decisions (DR)](./decisions/INDEX.md) (in Japanese).
 
 What holds regardless of the language is in the specification and the pages:
 
