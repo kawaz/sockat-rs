@@ -1,6 +1,6 @@
 # DR-0033: コマンド `sockat` は workspace の別パッケージ sockat-cli に置き、B の作り方は feature の後ろの doc に出さない入口でライブラリから使う
 
-- Status: Accepted (kawaz 2026-11-22: sockat-cli を crates.io に公開してよい (ハブ RL-Q1 = a)。ライブラリ 0.6.0 と一緒に公開する)
+- Status: Accepted (kawaz 2026-11-22: sockat-cli を crates.io に公開してよい (ハブ RL-Q1 = a)。ライブラリ 0.6.0 と一緒に公開する。kawaz 指示 2026-11-22: Homebrew (kawaz/tap) でも配り、GitHub release に target ごとの binary とハッシュの検査ファイルを置く)
 - Date: 2026-11-22
 
 ## Context
@@ -26,6 +26,34 @@
 - `sha2` は 0.10 にする (0.11 は Rust 1.88 を求め、MSRV 1.85 を保てない)。他の依存は 1.85 で通る (`cargo +1.85 check --workspace`)
 - `sockat-cli` の version はライブラリと同じ番号で動かす。ライブラリは path 依存に `version = "=x.y.z"` を添えて固定し、`just bump-version` がライブラリの version、`sockat-cli` の version、この固定を同じ commit で動かす
 - release.yml は、ライブラリを出した後に `sockat-cli` を出す (固定の版のライブラリが crates.io に先に要る)。crates.io に `sockat-cli` がまだ無い時は出さずに知らせだけ残す (初回は kawaz の手元で publish し、その後に trusted publisher を設定する。trusted publishing の設定は crate がある時にしか作れない)
+
+### 配り方
+
+- コマンドは 2 つの経路で配る
+  - crates.io: `cargo install sockat-cli` (手元で build する。Rust の動く OS ならどれでも)
+  - Homebrew: `brew install kawaz/tap/sockat` (tap kawaz/homebrew-tap の Formula `sockat`。build 済みの binary を入れる。macOS と Linux)
+- GitHub release に、target ごとの binary の tar.gz とハッシュの検査ファイルを置く
+
+  | target | 作り方 | Formula |
+  |---|---|---|
+  | `aarch64-apple-darwin`<br>`x86_64-apple-darwin` | macos-latest で `cargo build`。Developer ID で署名 (hardened runtime、entitlement なし) し、notarize する | 使う |
+  | `aarch64-unknown-linux-gnu`<br>`x86_64-unknown-linux-gnu` | cross (image は Ubuntu 16.04、glibc 2.23)。要る glibc は 2.18 (実測) | 使う |
+  | `aarch64-unknown-linux-musl`<br>`x86_64-unknown-linux-musl` | cross。static link | 使わない |
+
+- 置く物の名前は `sockat-<version>-<target>.tar.gz` (中身は `sockat`・`LICENSE`・`README.md`) と `SHA256SUMS` (全部の tar.gz の SHA-256、`sha256sum -c` の形)。tar.gz と `SHA256SUMS` に SLSA の build provenance の attestation を付ける
+- Formula の desc は "Print a path to a Unix domain socket that fits the socket address limit"、test は `sockat --version`。補完 (bash・zsh・fish) は `sockat completion <shell>` の出力から入れる
+- macOS の binary を署名しないまま配らない。署名の secrets が無ければ darwin の job が build の前に落ち、GitHub release も Formula も作らない
+
+### release の流れ
+
+```text
+ci - check-version -+- build-release (6 targets) -----------+- release - update-homebrew
+                    +- publish-crate (sockat, sockat-cli) -+
+```
+
+- build-release と publish-crate は並べて走らせる。release (tag と GitHub release) は両方が通った後に、binary と `SHA256SUMS` を付けて 1 度に作る。update-homebrew は release の後に Formula を作り直して tap に push する (deploy key の secret `HOMEBREW_TAP_DEPLOY_KEY`)
+- publish-crate は crates.io に既にある版を出し直さない (その版の API が 200 を返せば飛ばす)。publish の後で build や release が落ちても、手動の起動か `gh run rerun --failed` でやり直して release まで進める
+- update-homebrew だけが落ちた時は `gh run rerun --failed` でやり直す (手動の起動は、release 済みの版を check-version が止める)
 
 ### CLI 専用の入口
 
@@ -97,6 +125,12 @@
 - 版を `=` で固定するのは、入口が semver に縛られず、ライブラリの patch の版で変わりうるため。同じリポの path 依存なので固定は今の版と常に同じで、`just bump-version` が動かす
 - E を B の fd でなくパスで作る (`symlink`・`readlink`・`rename`) のは、コマンドが `unsafe` を持たず std に `*at` の呼び出しが無いため。B はライブラリが確かめた自分のディレクトリ (途中を他人が変えられず、B は自分の物で group と他人が書けない) なので、その間に他人がパスの指す物を差し替えられない
 - 置き場の差し替えを debug build に閉じるのは、release build に文書に無い口を残さないため
+- Linux の gnu の binary を 2 つとも cross で作るのは、要る glibc を低く揃えるため。ubuntu-latest (24.04、glibc 2.39) で直に build すると `__libc_start_main@GLIBC_2.34` 等が入り、glibc 2.34 より古い Linux (Ubuntu 20.04・Debian 11・RHEL 8) で動かない (実測: 24.04 で build した binary の要る版は最大 2.34、cross の image で build した物は最大 2.18)
+- musl の binary を置くのは、static link で glibc の版にも有無にも依らないため (Alpine、2.18 より古い glibc)。Alpine (aarch64、docker の既定の seccomp) で workspace の試験が全部通り、cross で作った binary が glibc の無い busybox の上で動く (aarch64・x86_64) ことを確かめた
+- Formula の Linux は gnu の binary にする (Homebrew の Linux は glibc の環境。kawaz の他の Formula と同じ)
+- build と publish を並べるのは、build が publish に依らないため。Apple の側 (notarize の同意の期限切れ等) で build が落ちても、ライブラリの release は止まらない。tag は両方の後なので、publish が落ちれば tag は残らない
+- publish を出し直さないのは、publish の後の失敗 (build、release) をやり直す時に、出した版の publish で止まらないため
+- FreeBSD・NetBSD・OpenBSD・illumos の binary は置かない。cross 0.2.5 で FreeBSD と illumos (x86_64 だけ) は build できたが、NetBSD は link で落ち (image に `libexecinfo` が無い)、OpenBSD は cross が無い (Rust の tier 3)。CI の VM は試験を回すが、配る binary を動かす所が無い。build の job が 1 つ落ちれば release が止まるので、確かめられない target を増やさない。これらの OS は `cargo install sockat-cli` で入る
 
 悪い面:
 
@@ -107,6 +141,10 @@
 - 補完はトップレベルのパスとオプションと、サブコマンドの名前を同じ位置に並べる (パスの補完の候補にサブコマンドの名前が混ざる)
 - 絶対パスの短いパスは何も確かめずにそのまま出すが、相対パスは短くてもディレクトリを引くので、ディレクトリが無いとエラーになる (相対パスだけ扱いが厳しい)
 - 深い cwd (realpath が PATH_MAX を超える) の相対パスは、候補も E も作れずエラーになる。ライブラリなら DR-0019 の 5 で相対のまま標準に渡せる所
+- Apple の側で build が落ちると、crates.io に出た版に tag と GitHub release が無いまま、直してやり直すまで残る
+- 配る binary は release の前に 1 度も動かさない (build するだけ)。cross の image の toolchain は CI の試験の build と別物
+- cross 0.2.5 の image は古い (Ubuntu 16.04〜20.04)。Rust が要る glibc やリンクする物を増やすと、gnu や musl の build も NetBSD のように落ちうる
+- update-homebrew だけが落ちた時は、同じ run の `gh run rerun --failed` でしかやり直せない
 
 ## Alternatives Considered
 
@@ -124,6 +162,14 @@
   - 不採用理由: `--help` と補完の定義を別に書いて合わせ続けることになる (好みの「実装・`--help`・補完を同時に追従」を手で守る)
 - 案 G: 試験の置き場の差し替えを release build でも読む
   - 不採用理由: 文書に無い口が利用者の手元に残る
+- 案 H: x86_64 の gnu の binary を ubuntu-latest で直に build する (kawaz/hyoui の形)
+  - 不採用理由: glibc 2.34 以上が要り、aarch64 (cross、2.18) と要る版がずれる
+- 案 I: Formula の Linux に musl の binary を使う
+  - 不採用理由: gnu の binary も 2.18 まで動き、Homebrew の Linux の環境で足りる。kawaz の他の Formula と形を揃える
+- 案 J: binary の build を crates.io の publish の後に置く
+  - 不採用理由: 署名・notarize の都合でライブラリの release まで止まる。publish を出し直さないので、並べてもやり直しは効く
+- 案 K: FreeBSD・illumos の binary も cross で作って置く
+  - 不採用理由: 配る binary を動かして確かめる所が無く、落ちれば release 全体を止める (「理由」の BSD の項)
 
 ## Consequences
 

@@ -104,15 +104,284 @@ jobs:
             echo "New version detected: v${CURRENT_VERSION}"
           fi
 
-  # The tag and the GitHub release come after the crate is on crates.io, so a
-  # failed publish leaves no tag behind and can be retried by hand.
+  # The command sockat as a binary per target, for the GitHub release and the
+  # Homebrew formula (DR-0033). It does not depend on the crates.io publish, so
+  # it runs beside publish-crate; the release job waits for both.
+  build-release:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        # Design rationale: every Linux binary is built by cross, x86_64 too
+        # (unlike a native build on ubuntu-latest, whose glibc 2.39 makes the
+        # binary need glibc 2.34). The cross images carry glibc 2.23, so the
+        # gnu binaries need glibc 2.18 and run on older distributions too
+        # (DR-0033). The musl binaries are static and run on any Linux
+        # (Alpine, a glibc older still); they go to the GitHub release only,
+        # the formula takes the gnu ones.
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      # The macOS binary is signed with the Developer ID (hardened runtime)
+      # and notarized before it is packaged. Without the signing secrets the
+      # darwin job fails here, before the build, so no unsigned macOS binary
+      # ships: the release job needs every build, so no GitHub release is
+      # made either. The Linux jobs skip every macOS step.
+      - name: Require signing secrets (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=0
+          # Report only which ones are empty, never a value.
+          for name in APPLE_SIGNING_IDENTITY APPLE_TEAM_ID APPLE_CERTIFICATE_BASE64 \
+                      APPLE_CERTIFICATE_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::secret ${name} is not set; refusing to ship an unsigned macOS binary"
+              missing=1
+            fi
+          done
+          [ "$missing" = "0" ]
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.check-version.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+          CROSS: ${{ matrix.cross }}
+        run: |
+          if [ "$CROSS" = "true" ]; then
+            cross build --release -p sockat-cli --target "$TARGET"
+          else
+            cargo build --release -p sockat-cli --target "$TARGET"
+          fi
+
+      - name: Import signing certificate (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERTIFICATE_PATH="$RUNNER_TEMP/build_certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          echo -n "$APPLE_CERTIFICATE_BASE64" | base64 --decode -o "$CERTIFICATE_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          rm -f "$CERTIFICATE_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" > /dev/null
+
+      # Design rationale: no entitlements (nothing that loosens the hardened
+      # runtime, such as get-task-allow or disable-library-validation). The
+      # command only makes directories and symlinks and prints a path; it
+      # runs under the hardened runtime without any (checked by hand with an
+      # ad-hoc signature and --options runtime: --version, resolve, sweep).
+      #
+      # The identifier stays codesign's default, the file name `sockat`,
+      # replacing the linker's per-build one, so a code requirement can name
+      # `identifier "sockat"`.
+      - name: Sign binary (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          codesign --sign "$APPLE_SIGNING_IDENTITY" \
+            --options runtime \
+            --force \
+            --timestamp \
+            "target/${TARGET}/release/sockat"
+
+      # Check the signature and stop before Package when it is not as
+      # expected: strictly valid, the hardened runtime flag, a Developer ID
+      # Application certificate, the TeamIdentifier, the identifier, no
+      # entitlements, a secure timestamp.
+      - name: Verify signature (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/sockat"
+          codesign --verify --strict --verbose=2 "$BIN"
+          INFO=$(codesign -dvv "$BIN" 2>&1)
+          echo "$INFO"
+          fail=0
+          check() {
+            if ! grep -qE "$1" <<<"$INFO"; then
+              echo "::error::signature check failed: $2"
+              fail=1
+            fi
+          }
+          check '^Identifier=sockat$' 'Identifier is not sockat'
+          check '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime[^)]*\)' 'hardened runtime flag is missing'
+          check '^Authority=Developer ID Application: ' 'not signed with a Developer ID Application certificate'
+          check "^TeamIdentifier=${APPLE_TEAM_ID}\$" 'TeamIdentifier does not match APPLE_TEAM_ID'
+          check '^Timestamp=' 'secure timestamp is missing'
+          if grep -qE '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*adhoc' <<<"$INFO"; then
+            echo "::error::signature check failed: still ad-hoc signed"
+            fail=1
+          fi
+          ENTITLEMENTS=$(codesign -d --entitlements - --xml "$BIN" 2>/dev/null || true)
+          if [ -n "$ENTITLEMENTS" ]; then
+            echo "$ENTITLEMENTS"
+            echo "::error::signature check failed: entitlements are present (this binary ships without any)"
+            fail=1
+          fi
+          [ "$fail" = "0" ]
+
+      # A bare binary cannot carry a stapled ticket, so this only submits;
+      # Gatekeeper checks the notarization online the first time it sees the
+      # binary. The status in the JSON output must be Accepted (the exit code
+      # of `submit --wait` alone is not trusted); otherwise the notarization
+      # log is printed and the job fails.
+      - name: Notarize binary (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          xcrun notarytool store-credentials "notary-profile" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --keychain "$KEYCHAIN_PATH"
+
+          ZIP="$RUNNER_TEMP/sockat-notarize.zip"
+          zip -j -q "$ZIP" "target/${TARGET}/release/sockat"
+
+          RESULT="$RUNNER_TEMP/notarize-result.json"
+          xcrun notarytool submit "$ZIP" \
+            --keychain-profile "notary-profile" \
+            --keychain "$KEYCHAIN_PATH" \
+            --wait \
+            --timeout 10m \
+            --output-format json > "$RESULT" || true
+          cat "$RESULT"
+          rm -f "$ZIP"
+
+          STATUS=$(jq -r '.status // empty' "$RESULT")
+          SUBMISSION_ID=$(jq -r '.id // empty' "$RESULT")
+          if [ "$STATUS" != "Accepted" ]; then
+            if [ -n "$SUBMISSION_ID" ]; then
+              xcrun notarytool log "$SUBMISSION_ID" \
+                --keychain-profile "notary-profile" \
+                --keychain "$KEYCHAIN_PATH" || true
+            fi
+            echo "::error::notarization did not succeed (status: ${STATUS:-unknown})"
+            exit 1
+          fi
+          echo "Notarization accepted: ${SUBMISSION_ID}"
+
+      - name: Clean up keychain (macOS)
+        if: always() && runner.os == 'macOS'
+        run: |
+          if [ -f "$RUNNER_TEMP/app-signing.keychain-db" ]; then
+            security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db"
+          fi
+          rm -f "$RUNNER_TEMP/build_certificate.p12"
+
+      # The archive holds the binary, LICENSE and README.md at its top level,
+      # named one by one: archiving the staging directory as `.` would add a
+      # `./` entry with mktemp's 0700 mode.
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="sockat-${VERSION}-${TARGET}.tar.gz"
+          STAGE=$(mktemp -d)
+          cp "target/${TARGET}/release/sockat" LICENSE README.md "$STAGE/"
+          tar czf "$ARCHIVE" -C "$STAGE" sockat LICENSE README.md
+          rm -rf "$STAGE"
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  # The tag and the GitHub release come after the crates are on crates.io, so
+  # a failed publish leaves no tag behind and can be retried by hand. The
+  # release is created with every binary and SHA256SUMS at once.
   release:
-    needs: [check-version, publish-crate]
+    needs: [check-version, publish-crate, build-release]
     if: needs.check-version.outputs.changed == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write # sigstore signing of the provenance
+      attestations: write # actions/attest-build-provenance
     steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Generate SLSA build provenance attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            *.tar.gz
+            SHA256SUMS
+
       - name: Create release with tag
         env:
           GH_TOKEN: ${{ github.token }}
@@ -121,10 +390,109 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           gh release create "v${VERSION}" \
+            ./*.tar.gz SHA256SUMS \
             --repo "$REPO" \
             --title "v${VERSION}" \
             --target "$COMMIT_SHA" \
             --generate-notes
+
+  # The formula Formula/sockat.rb in kawaz/homebrew-tap, pushed with the
+  # deploy key. It takes the macOS and the gnu Linux binaries.
+  update-homebrew:
+    needs: [check-version, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Calculate checksums
+        id: checksums
+        run: |
+          set -euo pipefail
+          {
+            echo "darwin_arm64=$(sha256sum artifacts/aarch64-apple-darwin/*.tar.gz | cut -d' ' -f1)"
+            echo "darwin_amd64=$(sha256sum artifacts/x86_64-apple-darwin/*.tar.gz | cut -d' ' -f1)"
+            echo "linux_arm64=$(sha256sum artifacts/aarch64-unknown-linux-gnu/*.tar.gz | cut -d' ' -f1)"
+            echo "linux_amd64=$(sha256sum artifacts/x86_64-unknown-linux-gnu/*.tar.gz | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v5
+        with:
+          repository: kawaz/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: homebrew-tap
+
+      - name: Update formula
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+          DARWIN_ARM64: ${{ steps.checksums.outputs.darwin_arm64 }}
+          DARWIN_AMD64: ${{ steps.checksums.outputs.darwin_amd64 }}
+          LINUX_ARM64: ${{ steps.checksums.outputs.linux_arm64 }}
+          LINUX_AMD64: ${{ steps.checksums.outputs.linux_amd64 }}
+        run: |
+          set -euo pipefail
+          for sum in "$DARWIN_ARM64" "$DARWIN_AMD64" "$LINUX_ARM64" "$LINUX_AMD64"; do
+            if ! [[ "$sum" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::not a sha256 checksum: '${sum}'"
+              exit 1
+            fi
+          done
+          cat > homebrew-tap/Formula/sockat.rb <<FORMULA
+          class Sockat < Formula
+            desc "Print a path to a Unix domain socket that fits the socket address limit"
+            homepage "https://github.com/kawaz/sockat-rs"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/kawaz/sockat-rs/releases/download/v#{version}/sockat-#{version}-aarch64-apple-darwin.tar.gz"
+                sha256 "${DARWIN_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/kawaz/sockat-rs/releases/download/v#{version}/sockat-#{version}-x86_64-apple-darwin.tar.gz"
+                sha256 "${DARWIN_AMD64}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/kawaz/sockat-rs/releases/download/v#{version}/sockat-#{version}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${LINUX_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/kawaz/sockat-rs/releases/download/v#{version}/sockat-#{version}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${LINUX_AMD64}"
+              end
+            end
+
+            def install
+              bin.install "sockat"
+              generate_completions_from_executable(bin/"sockat", "completion")
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/sockat --version")
+            end
+          end
+          FORMULA
+
+      - name: Commit and push formula
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/sockat.rb
+          git diff --staged --quiet || git commit -m "Update sockat to ${VERSION}"
+          git push
 
   publish-crate:
     needs: check-version
@@ -145,10 +513,21 @@ jobs:
         id: crates-io-auth
         uses: rust-lang/crates-io-auth-action@v1
 
+      # A version already on crates.io is not published again, so a run that
+      # failed after the publish (a build, the GitHub release) can be run
+      # again and goes on to the release.
       - name: Publish the library to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
-        run: cargo publish -p sockat
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          status=$(curl -s -o /dev/null -w '%{http_code}' -A 'sockat-rs release workflow' "https://crates.io/api/v1/crates/sockat/${VERSION}")
+          if [ "$status" = 200 ]; then
+            echo "::notice::sockat ${VERSION} is already on crates.io; not publishing it again"
+            exit 0
+          fi
+          cargo publish -p sockat
 
       # The command after the library: it pins the library at this version,
       # which must be on crates.io first (DR-0033). Trusted publishing can be
@@ -157,11 +536,17 @@ jobs:
       - name: Publish the command to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+          VERSION: ${{ needs.check-version.outputs.version }}
         run: |
           set -euo pipefail
           status=$(curl -s -o /dev/null -w '%{http_code}' -A 'sockat-rs release workflow' https://crates.io/api/v1/crates/sockat-cli)
           if [ "$status" = 404 ]; then
             echo "::notice::sockat-cli is not on crates.io yet: publish its first release by hand (cargo publish -p sockat-cli), then add the trusted publisher"
+            exit 0
+          fi
+          status=$(curl -s -o /dev/null -w '%{http_code}' -A 'sockat-rs release workflow' "https://crates.io/api/v1/crates/sockat-cli/${VERSION}")
+          if [ "$status" = 200 ]; then
+            echo "::notice::sockat-cli ${VERSION} is already on crates.io; not publishing it again"
             exit 0
           fi
           cargo publish -p sockat-cli

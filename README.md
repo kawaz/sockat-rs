@@ -43,6 +43,8 @@ There is a command too. It is handy for trying sockat out before building it int
 
 ```sh
 cargo install sockat-cli
+# or with Homebrew (macOS, Linux)
+brew install kawaz/tap/sockat
 ```
 
 ```console

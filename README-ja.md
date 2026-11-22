@@ -43,6 +43,8 @@ cargo add sockat
 
 ```sh
 cargo install sockat-cli
+# または Homebrew (macOS・Linux)
+brew install kawaz/tap/sockat
 ```
 
 ```console
