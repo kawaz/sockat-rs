@@ -24,8 +24,8 @@
   | `sockat-cli` | `sockat` (path、feature `__cli-internal`)、`clap`、`clap_complete`、`sha2` 0.10。試験に `serde_json`・`tempfile` |
 
 - `sha2` は 0.10 にする (0.11 は Rust 1.88 を求め、MSRV 1.85 を保てない)。他の依存は 1.85 で通る (`cargo +1.85 check --workspace`)
-- `sockat-cli` は `publish = false`。release.yml は `cargo publish -p sockat` でライブラリだけを出す。公開は kawaz の裁定の後に外す
-- `sockat-cli` の version はライブラリと別に持つ (0.1.0 から)。ライブラリは path 依存に `version = "=x.y.z"` を添えて固定し、`just bump-version` がライブラリの version を上げる同じ commit でこの固定も動かす
+- `sockat-cli` の version はライブラリと同じ番号で動かす。ライブラリは path 依存に `version = "=x.y.z"` を添えて固定し、`just bump-version` がライブラリの version、`sockat-cli` の version、この固定を同じ commit で動かす
+- release.yml は、ライブラリを出した後に `sockat-cli` を出す (固定の版のライブラリが crates.io に先に要る)。crates.io に `sockat-cli` がまだ無い時は出さずに知らせだけ残す (初回は kawaz の手元で publish し、その後に trusted publisher を設定する。trusted publishing の設定は crate がある時にしか作れない)
 
 ### CLI 専用の入口
 
@@ -101,7 +101,7 @@
 悪い面:
 
 - feature `__cli-internal` は crates.io の feature の一覧と `cargo add` の表示に出る (実測: `cargo add --dry-run` が `- __cli-internal` を並べた)。名前と注記で「使わない」を示すだけで、使うことは止められない
-- ライブラリの version を上げるたびに `cli/Cargo.toml` の固定も動く。コマンドを公開した後は、ライブラリだけを直したリリースでもコマンドを出し直さないと、公開されたコマンドは古いライブラリのまま
+- ライブラリだけを直したリリースでも、コマンドの version が上がり出し直しになる (中身はライブラリの差だけ)。固定の版のライブラリを使うので、出し直さないと公開されたコマンドは古いライブラリのまま
 - 試験の置き場の口は debug build にしか無いので、`cargo test --release` ではそれに頼る試験が `ignore` になる
 - エラーの文を選ぶのに、入口の `automatic` が見積もりの関数に渡したパスを覚えて使う (`automatic` は見積もりに外れた B のパスを返さない)。`automatic` が見積もりを呼ぶ回数や順が変わると、エラーの文がずれうる (綴りと終了コードは変わらない)
 - 補完はトップレベルのパスとオプションと、サブコマンドの名前を同じ位置に並べる (パスの補完の候補にサブコマンドの名前が混ざる)
@@ -129,7 +129,6 @@
 
 - コマンドの試験は `cli/tests/cli.rs`。`just test` と `just test-linux*`、CI の各 OS の VM は `--workspace` で回す。clippy と MSRV の check も workspace を見て、clippy は feature なしのライブラリも別に見る。`just lint-unsafe` は `cli/` と `examples/` も見る
 - README (日英) と MANUAL にコマンドの節を足すのは公開の後 (ハブ DR-0018 の Consequences)
-- `sockat-cli` を公開する時は、`publish = false` を外し、release.yml でライブラリの後に出す (固定の版のライブラリが crates.io に先に要る)
 
 ## 関連
 

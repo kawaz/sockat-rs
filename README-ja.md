@@ -37,6 +37,33 @@ fn main() -> io::Result<()> {
 cargo add sockat
 ```
 
+## コマンド sockat
+
+コマンドもあります。アプリに組み込む前のお試しや、sockat を組み込めないプログラムに渡すパスを作るのに便利です。長いパスを渡すと、同じソケットを指して上限に収まるパスを出します。
+
+```sh
+cargo install sockat-cli
+```
+
+```console
+$ sockat /とても/深い/ディレクトリ/.../app.sock
+/tmp/sockat-1000/3f9c2a7b1e04/app.sock
+
+$ sockat --json /とても/深い/ディレクトリ/.../app.sock
+{
+  "path": "/tmp/sockat-1000/3f9c2a7b1e04/app.sock",
+  "bytes": 38,
+  "limit": 107,
+  "original": "/とても/深い/ディレクトリ/.../app.sock",
+  "original_bytes": 214,
+  "route": "link-dir",
+  "link": "/tmp/sockat-1000/3f9c2a7b1e04",
+  "target": "/とても/深い/ディレクトリ/...",
+  "for": ["bind", "connect"],
+  "warnings": []
+}
+```
+
 ## もっと詳しく
 
 - [利用マニュアル](./docs/MANUAL-ja.md)

@@ -145,9 +145,23 @@ jobs:
         id: crates-io-auth
         uses: rust-lang/crates-io-auth-action@v1
 
-      - name: Publish to crates.io
+      - name: Publish the library to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
-        # The library only: the command (sockat-cli) is not published until
-        # kawaz decides to (DR-0033; it also says publish = false).
         run: cargo publish -p sockat
+
+      # The command after the library: it pins the library at this version,
+      # which must be on crates.io first (DR-0033). Trusted publishing can be
+      # set up only for a crate that exists, so the first release of
+      # sockat-cli is published by hand; until then this step only notes it.
+      - name: Publish the command to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          status=$(curl -s -o /dev/null -w '%{http_code}' -A 'sockat-rs release workflow' https://crates.io/api/v1/crates/sockat-cli)
+          if [ "$status" = 404 ]; then
+            echo "::notice::sockat-cli is not on crates.io yet: publish its first release by hand (cargo publish -p sockat-cli), then add the trusted publisher"
+            exit 0
+          fi
+          cargo publish -p sockat-cli

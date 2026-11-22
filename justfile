@@ -172,9 +172,9 @@ check-version-bumped:
 [script]
 bump-version level="patch": ensure-clean
     new_version=$(bump-semver "$1" Cargo.toml --write --no-hint)
-    perl -pi -e 's/^(sockat = \{ path = "\.\.", version = "=)[^"]*(")/${1}'"$new_version"'${2}/' cli/Cargo.toml
-    if ! grep -qF "version = \"=${new_version}\"" cli/Cargo.toml; then
-      echo "ERROR: cli/Cargo.toml の sockat の固定を ${new_version} に動かせなかった" >&2
+    perl -pi -e 's/^(sockat = \{ path = "\.\.", version = "=)[^"]*(")/${1}'"$new_version"'${2}/; s/^(version = ")[^"]*(")/${1}'"$new_version"'${2}/' cli/Cargo.toml
+    if ! grep -qF "version = \"=${new_version}\"" cli/Cargo.toml || ! grep -qx "version = \"${new_version}\"" cli/Cargo.toml; then
+      echo "ERROR: cli/Cargo.toml の version と sockat の固定を ${new_version} に動かせなかった" >&2
       exit 1
     fi
     cargo check --workspace --offline >/dev/null 2>&1 || cargo check --workspace >/dev/null

@@ -37,6 +37,33 @@ You get back the same types as std, and a short path goes straight to std as bef
 cargo add sockat
 ```
 
+## The sockat command
+
+There is a command too. It is handy for trying sockat out before building it into an application, and for making a path to hand to a program that cannot use sockat. Given a long path, it prints a path to the same socket that fits the limit.
+
+```sh
+cargo install sockat-cli
+```
+
+```console
+$ sockat /a/very/long/directory/.../app.sock
+/tmp/sockat-1000/3f9c2a7b1e04/app.sock
+
+$ sockat --json /a/very/long/directory/.../app.sock
+{
+  "path": "/tmp/sockat-1000/3f9c2a7b1e04/app.sock",
+  "bytes": 38,
+  "limit": 107,
+  "original": "/a/very/long/directory/.../app.sock",
+  "original_bytes": 214,
+  "route": "link-dir",
+  "link": "/tmp/sockat-1000/3f9c2a7b1e04",
+  "target": "/a/very/long/directory/...",
+  "for": ["bind", "connect"],
+  "warnings": []
+}
+```
+
 ## More
 
 - [User manual](https://github.com/kawaz/sockat-rs/blob/main/docs/MANUAL.md)
