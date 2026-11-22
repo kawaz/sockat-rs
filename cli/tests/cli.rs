@@ -412,19 +412,49 @@ fn too_long_for_the_directory(c: &Case) -> usize {
     LIMIT - (len(&c.b()) + 1 + 12 + 1) + 1
 }
 
-/// The warning for a path to the socket file given without `--for` where a
-/// bind does not follow a symlink (cli.md "ファイル名が長い時").
-const WARNING: &str = "this path is for connect; not recommended for bind (bind does not follow the symlink on this OS)";
+/// The warning for a path to the socket file given without `--for`: on
+/// every OS it is not recommended for a bind, for the reason of the OS
+/// (cli.md "ファイル名が長い時"). Where a bind does not follow a symlink the
+/// bind fails; where it does, unlinking the path removes the symlink and
+/// leaves the socket file.
+const WARNING: &str = match BIND_FOLLOWS {
+    false => {
+        "this path is for connect; not recommended for bind (bind does not follow the symlink on this OS)"
+    }
+    true => {
+        "this path is for connect; not recommended for bind (unlinking this path removes only the symlink, not the socket file)"
+    }
+};
+
+/// The warning for a path to the socket file given for `--for bind` where a
+/// bind follows a symlink.
+const WARNING_BIND: &str = "unlinking this path removes only the symlink, not the socket file (remove the socket by its original path)";
+
+/// The path printed, with the one line on the standard error.
+fn printed_with_warning(out: &Output, warning: &str) -> PathBuf {
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("sockat: warning: {warning}\n")
+    );
+    let line = out
+        .stdout
+        .strip_suffix(b"\n")
+        .expect("a line ending in a newline");
+    assert!(!line.contains(&b'\n'), "one line only");
+    PathBuf::from(OsStr::from_bytes(line))
+}
 
 /// A file name too long for the path through the directory's E gets the
 /// path through an E to the file (kawaz CL-Q1 = b; hub DR-0018 6, cli.md
 /// "ファイル名が長い時"). It works for a connect everywhere and for a bind
-/// only where a bind follows a symlink (macOS, NetBSD). Without `--for` it
-/// is printed for a connect (exit code 0); where a bind does not follow a
-/// symlink, one line on the standard error says it is not recommended for a
-/// bind, and the standard output holds the path alone. `--for connect` has
-/// no warning; `--for bind` where a bind does not follow a symlink is an
-/// error, told before anything is made.
+/// only where a bind follows a symlink (macOS, NetBSD), and even there its
+/// unlink removes the symlink and leaves the socket file. Without `--for`
+/// it is printed for a connect (exit code 0) with one line on the standard
+/// error saying it is not recommended for a bind and why, the standard
+/// output holding the path alone. `--for connect` has no warning; `--for
+/// bind` gets the path with the warning of the unlink where a bind follows
+/// a symlink, and an error elsewhere, told before anything is made.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
@@ -452,17 +482,8 @@ fn a_long_file_name_gets_the_path_to_the_file() {
         assert!(!c.b().exists(), "no B is made for an error");
     }
 
-    // Without `--for`: the path for a connect.
-    let out = c.run(&[&original]);
-    assert_eq!(out.status.code(), Some(0));
-    let mut line = e.as_os_str().as_bytes().to_vec();
-    line.push(b'\n');
-    assert_eq!(out.stdout, line);
-    let stderr = String::from_utf8(out.stderr).unwrap();
-    match BIND_FOLLOWS {
-        true => assert_eq!(stderr, ""),
-        false => assert_eq!(stderr, format!("sockat: warning: {WARNING}\n")),
-    }
+    // Without `--for`: the path for a connect, with the warning on every OS.
+    assert_eq!(printed_with_warning(&c.run(&[&original]), WARNING), e);
 
     // For a connect: the E to the file, to a socket bound at the long path.
     let listener = sockat::bind(&original).unwrap();
@@ -485,7 +506,7 @@ fn a_long_file_name_gets_the_path_to_the_file() {
         original.as_os_str(),
     ]);
     if BIND_FOLLOWS {
-        assert_eq!(printed(&out), e);
+        assert_eq!(printed_with_warning(&out, WARNING_BIND), e);
         let _listener = UnixListener::bind(&e).unwrap();
         assert!(
             fs::symlink_metadata(&original)
@@ -575,15 +596,11 @@ fn json_has_the_members_of_the_design() {
     assert_eq!(v["warnings"], none);
 
     // link-file without `--for`: the same path, with the warning in
-    // `warnings` where a bind does not follow a symlink.
+    // `warnings` on every OS.
     let v = json(c.run(&[OsStr::new("--json"), long.join(&name).as_os_str()]));
     assert_eq!(v["route"], "link-file");
     assert_eq!(v["for"], uses);
-    let warnings = match BIND_FOLLOWS {
-        true => serde_json::json!([]),
-        false => serde_json::json!([WARNING]),
-    };
-    assert_eq!(v["warnings"], warnings);
+    assert_eq!(v["warnings"], serde_json::json!([WARNING]));
 }
 
 /// Exit codes: 2 for an error in the arguments, 1 for a path that cannot be

@@ -71,9 +71,24 @@ pub(crate) struct Resolved {
     pub(crate) warnings: Vec<&'static str>,
 }
 
-/// The warning for a path to the socket file given without `--for` where a
-/// bind does not follow a symlink (cli.md "ファイル名が長い時").
-const NOT_FOR_BIND: &str = "this path is for connect; not recommended for bind (bind does not follow the symlink on this OS)";
+/// The warning for a path to the socket file given without `--for` (cli.md
+/// "ファイル名が長い時"): on every OS it is not recommended for a bind,
+/// for the reason of the OS. Where a bind does not follow a symlink, the
+/// bind fails; where it does, unlinking the path removes only the symlink
+/// and leaves the socket file (the spelling is not removable).
+const NOT_FOR_BIND: &str = match entry::BIND_FOLLOWS_SYMLINK {
+    false => {
+        "this path is for connect; not recommended for bind (bind does not follow the symlink on this OS)"
+    }
+    true => {
+        "this path is for connect; not recommended for bind (unlinking this path removes only the symlink, not the socket file)"
+    }
+};
+
+/// The warning for a path to the socket file given for `--for bind`, where
+/// a bind follows a symlink: the bind works, its unlink does not remove the
+/// socket file.
+const UNLINK_LEAVES_THE_SOCKET: &str = "unlinking this path removes only the symlink, not the socket file (remove the socket by its original path)";
 
 /// Why no path was printed: the message (the cause, then what to do next)
 /// and whether it is an error in the arguments (exit code 2) rather than a
@@ -262,9 +277,10 @@ fn through_base(
         link: Some((e, file)),
         bind: entry::BIND_FOLLOWS_SYMLINK,
         // Without `--for` the path is for a connect (kawaz CL-Q1 = b).
-        warnings: match (for_, entry::BIND_FOLLOWS_SYMLINK) {
-            (None, false) => vec![NOT_FOR_BIND],
-            _ => Vec::new(),
+        warnings: match for_ {
+            None => vec![NOT_FOR_BIND],
+            Some(Use::Bind) => vec![UNLINK_LEAVES_THE_SOCKET],
+            Some(Use::Connect) => Vec::new(),
         },
     })
 }

@@ -62,8 +62,11 @@
 - 手順 4・6 の E は B の直下。名前は指す先 (ディレクトリの E はソケットのディレクトリの realpath、ファイルの E はその後ろにファイル名を付けた物) のバイト列の SHA-256 の 16 進小文字の先頭 12 文字。`symlink` が `EEXIST` なら `readlink` で指す先を比べ、同じなら使い、違えば `<ハッシュ>.<乱数 10 文字>` に作って `rename` で置き換える (失敗したら作った物を消す)
 - E の名前 (16 進 12 文字) も置き換えの途中の名前 (`.` を含む) も D の形 (英数字 10 文字) でないので、`sweep` は触らない。ライブラリの `sweep` は変えない (ハブが SPEC の「置き場に残る物」「sweep」に CLI の E を足す)
 - 手順 6 は、`--for connect` ならどの OS でも、`--for bind` は `BIND_FOLLOWS_SYMLINK` の OS だけ出す (他の OS の `--for bind` は終了コード 1 のエラー)。`--for` が無ければ connect 用の綴りとして出し、終了コード 0 (kawaz 裁定 CL-Q1 = b、cli.md「ファイル名が長い時」)
-  - bind が symlink を辿らない OS では、標準エラーに警告を 1 行出す (`sockat: warning: this path is for connect; not recommended for bind (bind does not follow the symlink on this OS)`)。標準出力は綴りだけ。`--json` の `for` は `["connect"]`
-  - bind が symlink を辿る OS では警告を出さず、`for` は `["bind", "connect"]`。`--for connect` の時も警告を出さない
+  - ファイルを指す綴りは、どの OS でも bind には勧めない。`--for` 無しの時は、標準エラーに理由つきの警告を 1 行出す。標準出力は綴りだけ
+    - bind が symlink を辿らない OS: `sockat: warning: this path is for connect; not recommended for bind (bind does not follow the symlink on this OS)`。`for` は `["connect"]`
+    - 辿る OS (macOS・NetBSD): bind はできるが、この綴りで unlink しても symlink が消えるだけでソケットのファイルが残る (`removable: false`)。`sockat: warning: this path is for connect; not recommended for bind (unlinking this path removes only the symlink, not the socket file)`。`for` は `["bind", "connect"]`
+  - `--for connect` の時は警告を出さない
+  - `--for bind` で、bind が symlink を辿る OS では綴りを出し、`sockat: warning: unlinking this path removes only the symlink, not the socket file (remove the socket by its original path)` を出す (cli.md に例が無いので決めた文)。辿らない OS では終了コード 1
   - `--json` の時は標準エラーに出さず、`warnings` (文の配列) に `sockat: warning: ` を除いた同じ文を入れる。`warnings` はどの `--json` の出力にも置き、警告が無ければ空の配列 (cli.md の表の「無ければ空」)
 - `--json` の `for` は、ディレクトリを指す綴りと `standard` は `["bind", "connect"]`、ファイルを指す綴りは bind が辿る OS で `["bind", "connect"]`、他で `["connect"]`
 - `--json` のパスが UTF-8 でない時は、JSON に書けないのでエラー (終了コード 1) にし、`--json` 無しを勧める。書き換えた文字列を出さない
