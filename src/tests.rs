@@ -1034,10 +1034,9 @@ fn child_relative_connect() {
 
 // A cwd deeper than PATH_MAX (4096 on Linux, 1024 on macOS): the real path
 // of the socket's directory cannot be taken (macOS's realpath(3) gives
-// ERANGE) or is too long for any E to point to (Linux), so no route can be
-// used, and a short relative path goes to std as it is (CwdRelative, route
-// standard, without standard among the routes passed over: where the real
-// path could not be taken, none at all). bind_ex, which takes the socket
+// ERANGE; glibc's gives a path stat(2) refuses with ENAMETOOLONG), so no
+// route can be used and none is tried, and a short relative path goes to
+// std as it is (CwdRelative, route standard, nothing passed over). bind_ex, which takes the socket
 // file by its absolute real path, fails there. A relative path longer than
 // std accepts is ENAMETOOLONG, with no route.
 #[test]
@@ -1064,16 +1063,12 @@ fn child_deeper_than_path_max() {
         depth += 1 + step.len();
     }
     let cfg = config(&env_path("SOCKAT_CHILD_PLACE"));
-    let real_path_taken = std::fs::canonicalize(".").is_ok();
     let mut got = route::run(BIND, Path::new("s.sock"), &opts(), false, Some(&cfg)).unwrap();
     assert_eq!(
         (got.route, got.spelling),
         (names::STANDARD, Some(Spelling::CwdRelative))
     );
-    assert!(!skipped_names(&got.skipped).contains(&names::STANDARD));
-    if !real_path_taken {
-        assert!(got.skipped.is_empty(), "{:?}", got.skipped);
-    }
+    assert!(got.skipped.is_empty(), "{:?}", got.skipped);
     let _l = listener(&mut got);
     assert!(is_socket(Path::new("s.sock")));
     // bind_ex takes the socket file by its real path, which cannot be
@@ -1094,9 +1089,7 @@ fn child_deeper_than_path_max() {
         .unwrap();
     assert_eq!(errno(&f.error), Some(libc::ENAMETOOLONG));
     assert_eq!(f.route, None);
-    if !real_path_taken {
-        assert!(f.skipped.is_empty(), "{:?}", f.skipped);
-    }
+    assert!(f.skipped.is_empty(), "{:?}", f.skipped);
 }
 
 // ---------------------------------------------------------------------------

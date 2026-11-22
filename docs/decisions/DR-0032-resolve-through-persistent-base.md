@@ -67,7 +67,7 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 - 収まる候補は route `standard`・`Original` で標準に渡し、`Options.base` を確かめない。長い絶対パスは、経路のためにソケットのディレクトリを引いた後 (`route::Target::new`)、`Options.base` を確かめる前に実パスの候補 (`Target::real_candidate`) を見る。`Options.base` の確かめは `Target::check_base` で、経路に進む時だけ行う
 - 名前で終わらない短い相対パスは候補を作らず、相対のまま標準に渡す (resolve はそのまま返して `CwdRelative`)
 - 候補が収まらない相対パスは、長い相対パスと同じに経路に進む。どの経路も使えなければ (`Step::Next`)、標準に渡す長さ以下なら相対のまま標準に渡し (`route::as_relative`、`CwdRelative`、`skipped` から `standard` を除く)、超えれば `ENAMETOOLONG`
-- 相対パスのソケットのディレクトリの realpath が、パスの長さのせいで引けない時 (`ENAMETOOLONG` か `ERANGE`。macOS の realpath(3) は cwd が PATH_MAX を超えると `ERANGE` を返す。実測 2026-11-22) は、`Target::new` が `None` を返し、経路を 1 つも試さずに同じく相対のまま標準に渡す (`skipped` は空)
+- 相対パスのソケットのディレクトリの realpath が、パスの長さのせいで引けない時 (`ENAMETOOLONG` か `ERANGE`。macOS の realpath(3) は cwd が PATH_MAX を超えると `ERANGE` を返す。Linux の glibc は成功して PATH_MAX を超える実パスを返し、その `stat` が `ENAMETOOLONG` になるので、それも引けなかった物とする。実測 2026-11-22) は、`Target::new` が `None` を返し、経路を 1 つも試さずに同じく相対のまま標準に渡す (`skipped` は空)
 - `$PWD` は `route::Config` を通さず、呼び出しのたびに環境変数から読む (connect の relative が cwd の綴りに使う `$PWD` と同じ扱い)。試験は子プロセスに `PWD` を渡して変える
 - `bind_ex` の cwd の見張り (何かを引く前と、ソケットのファイルを覚えた後で cwd の `(st_dev, st_ino)` を比べる) は、結果の綴りが `CwdRelative` の時だけ行う。絶対パスにした綴りは覚える realpath が cwd によらない。`ForBind` は `CwdRelative` の時だけ resolve の初めの cwd を持ち、`socket_file()` は cwd が違うか引けていなければエラーにする
 - 候補で bind して失敗したら、そのエラーを返し、もう 1 つの候補・経路・相対パスで試し直さない

@@ -527,11 +527,12 @@ pub(crate) fn pwd_candidate(path: &Path, dir: &Path, pwd: Option<&OsStr>) -> Opt
     (dir_id(folded_dir)? == dir_id(dir)?).then_some(folded)
 }
 
-/// Whether `realpath(3)` of a relative path's directory failed because the
-/// path is too long (hub SPEC "相対パスを絶対パスにする": `ENAMETOOLONG`, or
-/// `ERANGE`, which macOS's gives for a cwd deeper than `PATH_MAX`, measured
-/// 2026-11-22): no route can be used then, as every E would point to that
-/// real path.
+/// Whether `realpath(3)` of a relative path's directory, or `stat(2)` of the
+/// real path it gave, failed because the path is too long (hub SPEC "相対パス
+/// を絶対パスにする": `ENAMETOOLONG`, or `ERANGE`, which macOS's realpath
+/// gives for a cwd deeper than `PATH_MAX`; glibc's gives the longer path,
+/// which `stat` refuses; measured 2026-11-22): no route can be used then, as
+/// every E would point to that real path.
 fn too_deep(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::ENAMETOOLONG | libc::ERANGE))
 }
@@ -793,8 +794,9 @@ impl<'a> Target<'a> {
     /// file name, as a bind / connect through the path would answer. Its real
     /// path is taken next; when it cannot be resolved that error is returned
     /// as is, except that with `absolutize` (a bind, a resolve) a relative
-    /// path whose directory's real path is too long ([`too_deep`]) gives
-    /// `None`: no route can be used. A failure up to there is one before any
+    /// path whose directory's real path is too long ([`too_deep`]: realpath(3)
+    /// fails so, or gives a path `stat(2)` fails so) gives `None`: no route
+    /// can be used, and none is tried. A failure up to there is one before any
     /// route, with nothing passed over: the length is judged only once the
     /// directory is looked up, so `standard` is passed over only from then on.
     ///
@@ -812,11 +814,21 @@ impl<'a> Target<'a> {
         if !std::fs::metadata(dir).map_err(before)?.is_dir() {
             return Err(before(io::Error::from_raw_os_error(libc::ENOTDIR)));
         }
+        let deep = |e: &io::Error| absolutize && !path.is_absolute() && too_deep(e);
         let real_dir = match std::fs::canonicalize(dir) {
             Ok(real_dir) => real_dir,
-            Err(e) if absolutize && !path.is_absolute() && too_deep(&e) => return Ok(None),
+            Err(e) if deep(&e) => return Ok(None),
             Err(e) => return Err(before(e)),
         };
+        // glibc's realpath(3) gives a real path longer than PATH_MAX, which
+        // the system calls refuse: that is one that could not be taken.
+        if !path.is_absolute() {
+            if let Err(e) = std::fs::metadata(&real_dir) {
+                if deep(&e) {
+                    return Ok(None);
+                }
+            }
+        }
         Ok(Some(Self {
             req,
             path,
