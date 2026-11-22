@@ -579,6 +579,22 @@ pub(crate) fn open_dir_at(
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// `(st_dev, st_ino)` of what the raw fd `fd` is open on (`fstat(2)`), or
+/// `EBADF` when `fd` is not open. Test-only: the tests look at an fd the
+/// crate holds (B's, D's) without taking it, which `/dev/fd` cannot do on
+/// every OS (FreeBSD and NetBSD show only 0 to 2 there without fdescfs).
+#[cfg(test)]
+pub(crate) fn fd_id(fd: std::os::fd::RawFd) -> io::Result<(u64, u64)> {
+    // SAFETY: `stat` is plain old data; zeroed is a valid value.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fstat` reads no memory of ours but `st`, into which the kernel
+    // writes at most one `stat`; a closed or invalid fd is `EBADF`, not
+    // undefined behaviour.
+    cvt(unsafe { libc::fstat(fd, &mut st) })?;
+    #[allow(clippy::unnecessary_cast)]
+    Ok((st.st_dev as u64, st.st_ino as u64))
+}
+
 /// `(st_dev, st_ino)` of `name` inside the directory `dir`, without following
 /// a symlink at `name` (`fstatat(2)` with `AT_SYMLINK_NOFOLLOW`). The values
 /// are widened to `u64` as std's `MetadataExt::dev` / `ino` widen them, so

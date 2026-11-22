@@ -2500,16 +2500,12 @@ fn the_way_to_an_options_base_is_checked_on_every_call() {
 // socket bound through `/proc/<pid>/fd/<that number>/...` (procB) would then
 // name a place in that directory. So after D and then B are removed and the
 // next binds make new ones, the fds held on the old D and the old B are
-// still open on them (looked at through /dev/fd, which shows what an fd is
-// open on).
+// still open on them (looked at by fstat on the fd numbers).
 #[test]
 fn a_removed_b_or_d_is_let_go_with_its_fd_kept_open() {
     let (t, place) = setup();
     let cfg = real_link_dir(&place);
-    let id = |fd: std::os::fd::RawFd| {
-        let m = std::fs::metadata(format!("/dev/fd/{fd}")).unwrap();
-        (m.dev(), m.ino())
-    };
+    let id = |fd: std::os::fd::RawFd| sys::fd_id(fd).unwrap();
     // A default bind: its E holds nothing of D, so only the process holds it.
     let _a = bind_default(&nest(&t.path().join("a"), 200, "s.sock"), &cfg).unwrap();
     let b = b_of(&place);
