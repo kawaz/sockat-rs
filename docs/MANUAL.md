@@ -4,8 +4,8 @@
 
 - [Bind](./manual/bind.md)
 - [Connect](./manual/connect.md)
-- [Use SEQPACKET](./manual/seqpacket.md)
 - [Use DGRAM](./manual/datagram.md)
+- [Use SEQPACKET](./manual/seqpacket.md)
 - [Resolve only the path](./manual/resolve.md)
 
 The functions and types are listed in the [reference](./REFERENCE.md).

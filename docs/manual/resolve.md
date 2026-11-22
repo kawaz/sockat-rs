@@ -15,7 +15,13 @@ use std::path::Path;
 
 fn listen(path: &Path) -> io::Result<(UnixListener, sockat::SocketFile)> {
     let spelled = sockat::resolve_for_bind(path, sockat::Options::default())?;
-    let listener = UnixListener::bind(&spelled.path)?;
+    let listener = match UnixListener::bind(&spelled.path) {
+        Ok(listener) => listener,
+        Err(e) => {
+            spelled.cleanup()?;
+            return Err(e);
+        }
+    };
     let file = spelled.socket_file()?;
     Ok((listener, file))
 }
@@ -63,7 +69,13 @@ use tokio::net::{UnixListener, UnixStream};
 
 async fn listen(path: &Path) -> io::Result<(UnixListener, sockat::SocketFile)> {
     let spelled = sockat::resolve_for_bind(path, sockat::Options::default())?;
-    let listener = UnixListener::bind(&spelled.path)?;
+    let listener = match UnixListener::bind(&spelled.path) {
+        Ok(listener) => listener,
+        Err(e) => {
+            spelled.cleanup()?;
+            return Err(e);
+        }
+    };
     let file = spelled.socket_file()?;
     Ok((listener, file))
 }

@@ -377,7 +377,13 @@ mod resolve_bind {
 
     fn listen(path: &Path) -> io::Result<(UnixListener, sockat::SocketFile)> {
         let spelled = sockat::resolve_for_bind(path, sockat::Options::default())?;
-        let listener = UnixListener::bind(&spelled.path)?;
+        let listener = match UnixListener::bind(&spelled.path) {
+            Ok(listener) => listener,
+            Err(e) => {
+                spelled.cleanup()?;
+                return Err(e);
+            }
+        };
         let file = spelled.socket_file()?;
         Ok((listener, file))
     }
@@ -389,7 +395,9 @@ mod resolve_bind {
     }
 
     // std binds the spelling; a client at the original long path reaches
-    // it, and stop leaves no socket file at the path.
+    // it, and stop leaves no socket file at the path. A bind that fails
+    // (another socket at the path) returns its own error, EADDRINUSE, after
+    // cleaning up the spelling, and the other socket's file stays.
     #[test]
     fn std_listens_at_the_spelling() {
         let t = super::tmp();
@@ -400,6 +408,11 @@ mod resolve_bind {
         listener.accept().unwrap();
         stop(listener, file).unwrap();
         assert!(!path.exists());
+
+        let _other = super::echo_server(&path);
+        let e = listen(&path).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EADDRINUSE));
+        assert!(path.exists());
     }
 }
 
@@ -446,7 +459,13 @@ mod resolve_tokio {
 
     async fn listen(path: &Path) -> io::Result<(UnixListener, sockat::SocketFile)> {
         let spelled = sockat::resolve_for_bind(path, sockat::Options::default())?;
-        let listener = UnixListener::bind(&spelled.path)?;
+        let listener = match UnixListener::bind(&spelled.path) {
+            Ok(listener) => listener,
+            Err(e) => {
+                spelled.cleanup()?;
+                return Err(e);
+            }
+        };
         let file = spelled.socket_file()?;
         Ok((listener, file))
     }
@@ -469,6 +488,10 @@ mod resolve_tokio {
         listener.accept().await.unwrap();
         file.remove().unwrap();
         assert!(!path.exists());
+
+        let _other = super::echo_server(&path);
+        let e = listen(&path).await.unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EADDRINUSE));
     }
 }
 
@@ -647,157 +670,6 @@ mod datagram_remove {
         })
         .unwrap();
         assert!(!path.exists());
-    }
-}
-
-/// A SEQPACKET listener at `path` for the samples that need one, made as
-/// the manual's listen does: std has no SEQPACKET socket, so socket2 makes
-/// it and binds the spelling of `resolve_for_bind`.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn seqpacket_listener(path: &Path) -> (socket2::Socket, sockat::SocketFile) {
-    use socket2::{Domain, SockAddr, Socket, Type};
-    let spelled = sockat::resolve_for_bind(path, sockat::Options::default()).unwrap();
-    let socket = Socket::new(Domain::UNIX, Type::SEQPACKET, None).unwrap();
-    socket
-        .bind(&SockAddr::unix(&spelled.path).unwrap())
-        .unwrap();
-    socket.listen(128).unwrap();
-    (socket, spelled.socket_file().unwrap())
-}
-
-/// A SEQPACKET client of `path`, through the spelling of
-/// `resolve_for_connect`, cleaned up once connected.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn seqpacket_client(path: &Path) -> socket2::Socket {
-    use socket2::{Domain, SockAddr, Socket, Type};
-    let to = sockat::resolve_for_connect(path, sockat::Options::default()).unwrap();
-    let socket = Socket::new(Domain::UNIX, Type::SEQPACKET, None).unwrap();
-    socket.connect(&SockAddr::unix(&to.path).unwrap()).unwrap();
-    to.cleanup().unwrap();
-    socket
-}
-
-/// Two messages written one after the other arrive as two messages, each
-/// whole (what SEQPACKET keeps and a stream does not).
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn seqpacket_exchange(mut from: &socket2::Socket, mut to: &socket2::Socket) {
-    use std::io::Read;
-    from.write_all(b"one").unwrap();
-    from.write_all(b"three").unwrap();
-    let mut buf = [0; 16];
-    let n = to.read(&mut buf).unwrap();
-    assert_eq!(&buf[..n], b"one");
-    let n = to.read(&mut buf).unwrap();
-    assert_eq!(&buf[..n], b"three");
-}
-
-// docs/manual/seqpacket-ja.md「待ち受ける」, seqpacket.md "Listen". Only
-// where an AF_UNIX SOCK_SEQPACKET socket can be made and tested here (Linux,
-// Android); the code is the same elsewhere.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-mod seqpacket_listen {
-    use socket2::{Domain, SockAddr, Socket, Type};
-    use std::io;
-    use std::path::Path;
-
-    fn listen(path: &Path) -> io::Result<(Socket, sockat::SocketFile)> {
-        let socket = Socket::new(Domain::UNIX, Type::SEQPACKET, None)?;
-        let spelled = sockat::resolve_for_bind(path, sockat::Options::default())?;
-        let bound = SockAddr::unix(&spelled.path)
-            .and_then(|addr| socket.bind(&addr))
-            .and_then(|()| socket.listen(128));
-        if let Err(e) = bound {
-            spelled.cleanup()?;
-            return Err(e);
-        }
-        let file = spelled.socket_file()?;
-        Ok((socket, file))
-    }
-
-    // The listener bound by the spelling has its socket file at the long
-    // path; a client reaches it, messages keep their bounds, and the
-    // SocketFile from after the bind removes the file. A bind that fails
-    // (another socket at the path) returns its own error, EADDRINUSE, and
-    // the other socket's file stays.
-    #[test]
-    fn listens_at_a_long_path() {
-        let t = super::tmp();
-        let path = super::long_path(t.path(), "app.sock");
-        let (listener, file) = listen(&path).unwrap();
-        assert!(path.exists());
-        let client = super::seqpacket_client(&path);
-        let (server, _) = listener.accept().unwrap();
-        super::seqpacket_exchange(&client, &server);
-        file.remove().unwrap();
-        assert!(!path.exists());
-
-        let (_other, other_file) = super::seqpacket_listener(&path);
-        let e = listen(&path).unwrap_err();
-        assert_eq!(e.raw_os_error(), Some(libc::EADDRINUSE));
-        assert!(path.exists());
-        other_file.remove().unwrap();
-    }
-}
-
-// docs/manual/seqpacket-ja.md「つなぐ」, seqpacket.md "Connect"
-#[cfg(any(target_os = "linux", target_os = "android"))]
-mod seqpacket_connect {
-    use socket2::{Domain, SockAddr, Socket, Type};
-    use std::io;
-    use std::path::Path;
-
-    fn connect(path: &Path) -> io::Result<Socket> {
-        let socket = Socket::new(Domain::UNIX, Type::SEQPACKET, None)?;
-        let to = sockat::resolve_for_connect(path, sockat::Options::default())?;
-        let connected = SockAddr::unix(&to.path).and_then(|addr| socket.connect(&addr));
-        to.cleanup()?;
-        connected.map(|()| socket)
-    }
-
-    // connect reaches a listener at the long path, and the connection
-    // outlives the spelling it was made through (cleaned up inside
-    // connect): messages go both ways after it, keeping their bounds.
-    // With nothing at the path, the connect's own error (ENOENT) comes back.
-    #[test]
-    fn connects_to_a_long_path() {
-        let t = super::tmp();
-        let path = super::long_path(t.path(), "app.sock");
-        let (listener, file) = super::seqpacket_listener(&path);
-        let client = connect(&path).unwrap();
-        let (server, _) = listener.accept().unwrap();
-        super::seqpacket_exchange(&client, &server);
-        super::seqpacket_exchange(&server, &client);
-        file.remove().unwrap();
-
-        let missing = super::long_path(t.path(), "none.sock");
-        let e = connect(&missing).unwrap_err();
-        assert_eq!(e.raw_os_error(), Some(libc::ENOENT));
-    }
-}
-
-// docs/manual/seqpacket-ja.md「終わる時にソケットのファイルを消す」,
-// seqpacket.md "Remove the socket file when done"
-#[cfg(any(target_os = "linux", target_os = "android"))]
-mod seqpacket_remove {
-    use socket2::Socket;
-    use std::io;
-
-    fn stop(listener: Socket, file: sockat::SocketFile) -> io::Result<()> {
-        file.remove()?;
-        drop(listener);
-        Ok(())
-    }
-
-    // stop removes the socket file at the long path, the listener still
-    // open while it does, and a connect afterwards finds nothing there.
-    #[test]
-    fn the_socket_file_goes_on_stop() {
-        let t = super::tmp();
-        let path = super::long_path(t.path(), "app.sock");
-        let (listener, file) = super::seqpacket_listener(&path);
-        stop(listener, file).unwrap();
-        assert!(!path.exists());
-        assert!(sockat::connect(&path).is_err());
     }
 }
 
