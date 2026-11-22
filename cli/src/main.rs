@@ -36,7 +36,7 @@ fn resolve_args() -> [Arg; 4] {
             .long("for")
             .value_name("USE")
             .value_parser(["bind", "connect"])
-            .help("What the path is for; needed only when the file name is too long for a path that works for both"),
+            .help("What the path is for; matters only when the file name is too long for a path through the directory, where the path to the file is given for connect unless --for bind"),
         Arg::new("base")
             .long("base")
             .value_name("DIR")
@@ -187,6 +187,9 @@ fn run_resolve(m: &ArgMatches) -> ExitCode {
             Err(f) => return fail(&f),
         },
         false => {
+            for w in &resolved.warnings {
+                let _ = writeln!(io::stderr(), "sockat: warning: {w}");
+            }
             let mut line = resolved.path.as_os_str().as_bytes().to_vec();
             line.push(b'\n');
             line

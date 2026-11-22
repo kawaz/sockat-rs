@@ -58,10 +58,13 @@
 - `--json` の `original` は渡されたままの文字列。候補を出した時の `route` は `standard` (ライブラリの DR-0019 の 3 で標準に渡す時の経路の名前と同じ)
 - 手順 1 の長さは `sun_path` − 1 (`LIMIT`)。それ以下のパスは何も作らずにそのまま出す
 - パスは入口の `split` (ライブラリの `path::split`) で分ける。名前で終わらないパス (`dir/`・`dir/.`・`dir/..`・`..`・`/`) は、短いパスでも長さによらず引数の誤り (終了コード 2)。ライブラリが長さによらず `InvalidInput` にするのと揃える
-- 手順 3 の B は、`--base` があればその B (入口の `check_given` で作らずに確かめ、綴りが収まると見積もれた時だけ `given` で作る)、無ければ入口の `automatic`。見積もりは「`B/<ハッシュ>/<名前>` が収まる、またはファイルを指す E がその用途に使えて `B/<ハッシュ>` が収まる」(ファイルを指す E は、`--for connect` ならどの OS でも、`--for bind` は bind が symlink を辿る OS だけ、`--for` が無ければ使えない)。見積もりに外れると B を作らずに止まる。その時は、入口の `automatic` が最後に見積もりに渡した B のパス (作った B か、作るはずだった B) で、ファイルを指す E なら収まるかを見て、収まるなら「その用途では使えない」(`--for` を求める、または bind が symlink を辿らない) を、収まらないなら「収まらない」をエラーにする
+- 手順 3 の B は、`--base` があればその B (入口の `check_given` で作らずに確かめ、綴りが収まると見積もれた時だけ `given` で作る)、無ければ入口の `automatic`。見積もりは「`B/<ハッシュ>/<名前>` が収まる、またはファイルを指す E がその用途に使えて `B/<ハッシュ>` が収まる」(ファイルを指す E は、`--for connect` と `--for` 無しならどの OS でも、`--for bind` は bind が symlink を辿る OS だけ使える)。見積もりに外れると B を作らずに止まる。その時は、入口の `automatic` が最後に見積もりに渡した B のパス (作った B か、作るはずだった B) で、ファイルを指す E なら収まるかを見て、収まるなら (`--for bind` で bind が symlink を辿らない OS) 「この OS では bind に使える綴りを作れない」を、収まらないなら「収まらない」をエラーにする
 - 手順 4・6 の E は B の直下。名前は指す先 (ディレクトリの E はソケットのディレクトリの realpath、ファイルの E はその後ろにファイル名を付けた物) のバイト列の SHA-256 の 16 進小文字の先頭 12 文字。`symlink` が `EEXIST` なら `readlink` で指す先を比べ、同じなら使い、違えば `<ハッシュ>.<乱数 10 文字>` に作って `rename` で置き換える (失敗したら作った物を消す)
 - E の名前 (16 進 12 文字) も置き換えの途中の名前 (`.` を含む) も D の形 (英数字 10 文字) でないので、`sweep` は触らない。ライブラリの `sweep` は変えない (ハブが SPEC の「置き場に残る物」「sweep」に CLI の E を足す)
-- 手順 6 は、`--for connect` ならどの OS でも、`--for bind` は `BIND_FOLLOWS_SYMLINK` の OS だけ出す。`--for` が無ければエラーで `--for` を求める (cli.md の CL-Q1)。bind が symlink を辿らない OS では、エラーの文は `--for connect` だけを勧める
+- 手順 6 は、`--for connect` ならどの OS でも、`--for bind` は `BIND_FOLLOWS_SYMLINK` の OS だけ出す (他の OS の `--for bind` は終了コード 1 のエラー)。`--for` が無ければ connect 用の綴りとして出し、終了コード 0 (kawaz 裁定 CL-Q1 = b、cli.md「ファイル名が長い時」)
+  - bind が symlink を辿らない OS では、標準エラーに警告を 1 行出す (`sockat: warning: this path is for connect; not recommended for bind (bind does not follow the symlink on this OS)`)。標準出力は綴りだけ。`--json` の `for` は `["connect"]`
+  - bind が symlink を辿る OS では警告を出さず、`for` は `["bind", "connect"]`。`--for connect` の時も警告を出さない
+  - `--json` の時は標準エラーに出さず、`warnings` (文の配列) に `sockat: warning: ` を除いた同じ文を入れる。`warnings` はどの `--json` の出力にも置き、警告が無ければ空の配列 (cli.md の表の「無ければ空」)
 - `--json` の `for` は、ディレクトリを指す綴りと `standard` は `["bind", "connect"]`、ファイルを指す綴りは bind が辿る OS で `["bind", "connect"]`、他で `["connect"]`
 - `--json` のパスが UTF-8 でない時は、JSON に書けないのでエラー (終了コード 1) にし、`--json` 無しを勧める。書き換えた文字列を出さない
 - JSON は依存を足さずに手で書く (メンバーの順を cli.md の例どおりにし、文字列は `"`・`\`・制御文字を escape する)。試験は `serde_json` で読んで確かめる

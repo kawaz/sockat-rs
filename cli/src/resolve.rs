@@ -66,7 +66,14 @@ pub(crate) struct Resolved {
     pub(crate) link: Option<(PathBuf, PathBuf)>,
     /// Whether the path works for a bind (it always works for a connect).
     pub(crate) bind: bool,
+    /// What to warn of (cli.md "ファイル名が長い時"): on the standard error,
+    /// or in the JSON's `warnings`.
+    pub(crate) warnings: Vec<&'static str>,
 }
+
+/// The warning for a path to the socket file given without `--for` where a
+/// bind does not follow a symlink (cli.md "ファイル名が長い時").
+const NOT_FOR_BIND: &str = "this path is for connect; not recommended for bind (bind does not follow the symlink on this OS)";
 
 /// Why no path was printed: the message (the cause, then what to do next)
 /// and whether it is an error in the arguments (exit code 2) rather than a
@@ -140,6 +147,7 @@ pub(crate) fn resolve(
         route: Route::Standard,
         link: None,
         bind: true,
+        warnings: Vec::new(),
     };
     if path.is_absolute() && len(path) <= entry::LIMIT {
         return Ok(standard(path.to_path_buf()));
@@ -210,14 +218,13 @@ fn through_base(
 ) -> Result<Resolved, Failure> {
     let name_len = name.len();
     // The E pointing to the socket file is for a connect anywhere, and for a
-    // bind only where a bind follows a symlink; without `--for` it is for
-    // nothing. B is made only when a path for this use can fit through it,
-    // so an error for a use the E to the file cannot serve is told before
-    // anything is made.
+    // bind only where a bind follows a symlink; without `--for` it is given
+    // for a connect (kawaz CL-Q1 = b). B is made only when a path for this
+    // use can fit through it, so the error of a bind the E to the file cannot
+    // serve is told before anything is made.
     let file_usable = match for_ {
-        Some(Use::Connect) => true,
+        Some(Use::Connect) | None => true,
         Some(Use::Bind) => entry::BIND_FOLLOWS_SYMLINK,
-        None => false,
     };
     let usable = |b: &Path| {
         through_dir(b, name_len) <= entry::LIMIT || (file_usable && through_file(b) <= entry::LIMIT)
@@ -244,6 +251,7 @@ fn through_base(
             route: Route::LinkDir,
             link: Some((e, real_dir.to_path_buf())),
             bind: true,
+            warnings: Vec::new(),
         });
     }
     let file = real_dir.join(name);
@@ -253,6 +261,11 @@ fn through_base(
         route: Route::LinkFile,
         link: Some((e, file)),
         bind: entry::BIND_FOLLOWS_SYMLINK,
+        // Without `--for` the path is for a connect (kawaz CL-Q1 = b).
+        warnings: match (for_, entry::BIND_FOLLOWS_SYMLINK) {
+            (None, false) => vec![NOT_FOR_BIND],
+            _ => Vec::new(),
+        },
     })
 }
 
@@ -267,25 +280,16 @@ fn through_file(b: &Path) -> usize {
 }
 
 /// No path for this use fits through B at `b`: the E to the socket file
-/// would fit but cannot serve it (no `--for`, or a bind where a bind does
-/// not follow a symlink), or nothing fits at all.
+/// would fit but cannot serve a bind here (`--for bind` where a bind does not
+/// follow a symlink), or nothing fits at all.
 fn not_for_this_use(b: &Path, name_len: usize, for_: Option<Use>) -> Failure {
     let room = entry::LIMIT.saturating_sub(through_dir(b, 0));
-    if through_file(b) > entry::LIMIT {
+    if through_file(b) > entry::LIMIT || for_ != Some(Use::Bind) {
         return too_long(name_len, Some(room));
     }
-    let message = match (for_, entry::BIND_FOLLOWS_SYMLINK) {
-        (None, true) => format!(
-            "the file name is too long for a path that works for both bind and connect ({name_len} bytes; up to {room} here)\n  pass --for connect or --for bind to get a path for that use"
-        ),
-        (None, false) => format!(
-            "the file name is too long for a path that works for both bind and connect ({name_len} bytes; up to {room} here)\n  pass --for connect to get a path to connect to (a bind does not follow a symlink on this system)"
-        ),
-        _ => format!(
-            "the file name is too long for a path to bind on this system ({name_len} bytes; up to {room} here; a bind does not follow a symlink)\n  use a shorter file name, or a --base with a shorter path"
-        ),
-    };
-    Failure::new(message)
+    Failure::new(format!(
+        "the file name is too long for a path to bind on this system ({name_len} bytes; up to {room} here; a bind does not follow a symlink)\n  use a shorter file name, or a --base with a shorter path"
+    ))
 }
 
 /// B: the one at `--base` (checked before anything is made, and made only

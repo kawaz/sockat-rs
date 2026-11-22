@@ -32,6 +32,9 @@ pub(crate) fn resolved(original: &Path, resolved: &Resolved) -> Result<String, F
         false => "[\"connect\"]",
     };
     members.push(("for", uses.to_owned()));
+    // Always there, empty when there is nothing to warn of (cli.md "出力").
+    let warnings: Vec<String> = resolved.warnings.iter().map(|w| quote(w)).collect();
+    members.push(("warnings", format!("[{}]", warnings.join(", "))));
     let mut out = String::from("{\n");
     for (i, (key, value)) in members.iter().enumerate() {
         let comma = if i + 1 < members.len() { "," } else { "" };

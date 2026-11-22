@@ -412,17 +412,25 @@ fn too_long_for_the_directory(c: &Case) -> usize {
     LIMIT - (len(&c.b()) + 1 + 12 + 1) + 1
 }
 
-/// A file name too long for the path through the directory's E needs
-/// `--for`: the path through an E to the file works for a connect
-/// everywhere, for a bind only where a bind follows a symlink (macOS,
-/// NetBSD); without `--for` it is an error asking for it rather than a path
-/// that may not work, told before B is made (hub DR-0018 6, cli.md CL-Q1).
+/// The warning for a path to the socket file given without `--for` where a
+/// bind does not follow a symlink (cli.md "ファイル名が長い時").
+const WARNING: &str = "this path is for connect; not recommended for bind (bind does not follow the symlink on this OS)";
+
+/// A file name too long for the path through the directory's E gets the
+/// path through an E to the file (kawaz CL-Q1 = b; hub DR-0018 6, cli.md
+/// "ファイル名が長い時"). It works for a connect everywhere and for a bind
+/// only where a bind follows a symlink (macOS, NetBSD). Without `--for` it
+/// is printed for a connect (exit code 0); where a bind does not follow a
+/// symlink, one line on the standard error says it is not recommended for a
+/// bind, and the standard output holds the path alone. `--for connect` has
+/// no warning; `--for bind` where a bind does not follow a symlink is an
+/// error, told before anything is made.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
     ignore = "the places for B can be moved only in a debug build"
 )]
-fn a_long_file_name_needs_for() {
+fn a_long_file_name_gets_the_path_to_the_file() {
     let c = Case::new();
     let long = c.long_dir('d');
     let name = "n".repeat(too_long_for_the_directory(&c));
@@ -430,12 +438,6 @@ fn a_long_file_name_needs_for() {
     let real = fs::canonicalize(&long).unwrap().join(&name);
     let e = c.b().join(hash(&real));
 
-    // Told before anything is made: no B for an error.
-    let message = failed(&c.run(&[&original]), 1);
-    assert!(message.starts_with("sockat: "), "{message}");
-    assert!(message.contains("--for connect"), "{message}");
-    assert_eq!(message.contains("--for bind"), BIND_FOLLOWS, "{message}");
-    assert_eq!(message.lines().count(), 2, "{message}");
     if !BIND_FOLLOWS {
         let message = failed(
             &c.run(&[
@@ -445,9 +447,22 @@ fn a_long_file_name_needs_for() {
             ]),
             1,
         );
+        assert!(message.starts_with("sockat: "), "{message}");
         assert!(message.contains("bind"), "{message}");
+        assert!(!c.b().exists(), "no B is made for an error");
     }
-    assert!(!c.b().exists(), "no B is made for an error");
+
+    // Without `--for`: the path for a connect.
+    let out = c.run(&[&original]);
+    assert_eq!(out.status.code(), Some(0));
+    let mut line = e.as_os_str().as_bytes().to_vec();
+    line.push(b'\n');
+    assert_eq!(out.stdout, line);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    match BIND_FOLLOWS {
+        true => assert_eq!(stderr, ""),
+        false => assert_eq!(stderr, format!("sockat: warning: {WARNING}\n")),
+    }
 
     // For a connect: the E to the file, to a socket bound at the long path.
     let listener = sockat::bind(&original).unwrap();
@@ -500,8 +515,15 @@ fn json_has_the_members_of_the_design() {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+        // A warning goes into `warnings`, never to the standard error.
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         serde_json::from_slice(&out.stdout).unwrap()
     };
+    let none = serde_json::json!([]);
     let long = c.long_dir('d');
     let real = fs::canonicalize(&long).unwrap();
 
@@ -524,6 +546,7 @@ fn json_has_the_members_of_the_design() {
     assert_eq!(v["link"], e.to_str().unwrap());
     assert_eq!(v["target"], real.to_str().unwrap());
     assert_eq!(v["for"], serde_json::json!(["bind", "connect"]));
+    assert_eq!(v["warnings"], none, "`warnings` is there even when empty");
 
     // standard: no E.
     let short = c.path().join("s.sock");
@@ -532,6 +555,7 @@ fn json_has_the_members_of_the_design() {
     assert_eq!(v["route"], "standard");
     assert!(v.get("link").is_none() && v.get("target").is_none(), "{v}");
     assert_eq!(v["for"], serde_json::json!(["bind", "connect"]));
+    assert_eq!(v["warnings"], none);
 
     // link-file: for a connect, and for a bind where a bind follows it.
     let name = "n".repeat(too_long_for_the_directory(&c));
@@ -548,6 +572,18 @@ fn json_has_the_members_of_the_design() {
         false => serde_json::json!(["connect"]),
     };
     assert_eq!(v["for"], uses);
+    assert_eq!(v["warnings"], none);
+
+    // link-file without `--for`: the same path, with the warning in
+    // `warnings` where a bind does not follow a symlink.
+    let v = json(c.run(&[OsStr::new("--json"), long.join(&name).as_os_str()]));
+    assert_eq!(v["route"], "link-file");
+    assert_eq!(v["for"], uses);
+    let warnings = match BIND_FOLLOWS {
+        true => serde_json::json!([]),
+        false => serde_json::json!([WARNING]),
+    };
+    assert_eq!(v["warnings"], warnings);
 }
 
 /// Exit codes: 2 for an error in the arguments, 1 for a path that cannot be
