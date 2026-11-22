@@ -461,25 +461,173 @@ fn the_longest_path_std_accepts_goes_to_std_and_one_byte_more_does_not() {
     assert!(is_socket(&over));
 }
 
-// A relative path std accepts goes to std as it is: its spelling is
-// CwdRelative (after the cwd changes it names another place, a hazard std
-// has on its own, reported all the same), an absolute one Original; a
+// An absolute path std accepts goes to std as it is (Original), and a
 // failure there is std's own, from the route standard: the errno std's bind
 // gives for a missing directory on this OS, not a constant (the OS's errno is
 // passed on unchanged, and OSes may differ).
 #[test]
-fn a_short_path_is_original_or_cwd_relative() {
-    let rel = route::resolve(route::Use::Bind, Path::new("s.sock"), &opts(), None).unwrap();
-    assert_eq!(rel.spelling, Spelling::CwdRelative);
-    assert_eq!(rel.path, Path::new("s.sock"));
+fn a_short_absolute_path_is_original_and_its_failure_is_stds() {
+    let t = tmp();
     let abs = route::resolve(route::Use::Bind, Path::new("/x/s.sock"), &opts(), None).unwrap();
     assert_eq!(abs.spelling, Spelling::Original);
-    let f = route::run(
-        BIND,
-        Path::new("target/sockat-no-such-directory/s.sock"),
+    assert_eq!(abs.path, Path::new("/x/s.sock"));
+    let f = route::run(BIND, &t.path().join("none/s.sock"), &opts(), true, None)
+        .err()
+        .unwrap();
+    assert_eq!(
+        errno(&f.error),
+        Some(std_errno(Short::BindInAMissingDirectory))
+    );
+    assert_eq!(f.route, Some(names::STANDARD));
+}
+
+// ---------------------------------------------------------------------------
+// relative paths (hub SPEC "相対パスを絶対パスにする")
+// ---------------------------------------------------------------------------
+//
+// A bind and a resolve make a relative path absolute, so the spelling the
+// kernel keeps does not name another place once the cwd changes (a library
+// that unlinks the listener's address on close, a datagram reply). The cwd is
+// process-wide, so these run in a child process each.
+
+/// Run the child test `test` with its cwd to be `cwd` (`SOCKAT_CHILD_CWD`,
+/// which the child moves to), `$PWD` set to `pwd`, and `env` added.
+fn run_in_cwd(test: &str, cwd: &Path, pwd: &Path, env: &[(&str, &OsStr)]) {
+    let mut all = vec![
+        ("SOCKAT_CHILD_CWD", cwd.as_os_str()),
+        ("PWD", pwd.as_os_str()),
+    ];
+    all.extend_from_slice(env);
+    run_child(test, &all);
+}
+
+/// In a child: move to `SOCKAT_CHILD_CWD`.
+fn enter_cwd() -> PathBuf {
+    let cwd = env_path("SOCKAT_CHILD_CWD");
+    std::env::set_current_dir(&cwd).unwrap();
+    cwd
+}
+
+/// A directory under `base` whose path is about `len` bytes, so a file in it
+/// is longer than std accepts.
+fn deep_dir(base: &Path, len: usize) -> PathBuf {
+    let d = nest(base, len, "c");
+    std::fs::create_dir(&d).unwrap();
+    d
+}
+
+/// The socket file a bind with `remember` took.
+fn kept(r: &Reached) -> &Path {
+    match &r.file {
+        Some(route::Kept::File(f)) => &f.path,
+        other => panic!("no file taken: {other:?}"),
+    }
+}
+
+// A short relative path in a cwd of a short real path goes to std by its
+// real path, the directory's realpath(3) with the name after it (the
+// real-path candidate, looked at first): route standard, Original, nothing
+// passed over, nothing made in the place. The kernel keeps the absolute
+// spelling (a stream and a datagram bind alike), and bind_ex takes the
+// socket file there. resolve gives the same spelling for a bind and for a
+// connect (a resolved spelling may be used after the cwd changes). Also:
+// - Options.base is not looked at when a candidate goes to std, as for a
+//   short absolute path (here a base whose parent is missing, which fails its
+//   check when it is looked at)
+// - a relative path whose directory is missing has no candidate, and fails
+//   where the routes look the directory up: ENOENT (std's errno for a bind
+//   in a missing directory) with no route and nothing passed over
+// - a short relative path that does not end with a name has no candidate:
+//   resolve gives it back as it is (CwdRelative), and the bind hands it to
+//   std, whose error it returns (route standard)
+#[test]
+fn a_short_relative_path_goes_to_std_by_its_real_path() {
+    let (t, place) = setup();
+    let r = t.path().join("r");
+    std::fs::create_dir_all(r.join("sub")).unwrap();
+    run_in_cwd(
+        "tests::child_short_relative_path",
+        &r,
+        &r,
+        &[
+            ("SOCKAT_CHILD_PLACE", place.as_os_str()),
+            ("SOCKAT_CHILD_PATH", t.path().as_os_str()),
+        ],
+    );
+    assert!(
+        entries(&place).is_empty(),
+        "something was made in the place"
+    );
+}
+
+#[test]
+fn child_short_relative_path() {
+    if !in_child() {
+        return;
+    }
+    let cwd = enter_cwd();
+    let real = std::fs::canonicalize(&cwd).unwrap();
+    let cfg = config(&env_path("SOCKAT_CHILD_PLACE"));
+    let mut got = bind(Path::new("s.sock"), &opts(), &cfg).unwrap();
+    assert_eq!(
+        (got.route, got.base, got.spelling),
+        (names::STANDARD, None, Some(Spelling::Original))
+    );
+    assert!(got.skipped.is_empty());
+    assert_eq!(kept(&got), real.join("s.sock"));
+    assert_eq!(reported(&listener(&mut got)), real.join("s.sock"));
+
+    let mut dgram = route::run(
+        Request::Bind(SockType::Datagram),
+        Path::new("d.sock"),
         &opts(),
-        true,
-        None,
+        false,
+        Some(&cfg),
+    )
+    .unwrap();
+    assert_eq!(dgram.spelling, Some(Spelling::Original));
+    let dgram = dgram.socket.take().unwrap();
+    assert_eq!(
+        sys::local_address(dgram.as_fd()).unwrap().1,
+        real.join("d.sock")
+    );
+
+    for for_ in [route::Use::Bind, route::Use::Connect] {
+        let r = route::resolve(for_, Path::new("r.sock"), &opts(), Some(&cfg)).unwrap();
+        assert_eq!(r.path, real.join("r.sock"), "{for_:?}");
+        assert_eq!((r.spelling, r.route), (Spelling::Original, names::STANDARD));
+        assert!(r.link.is_none() && r.cwd.is_none() && r.skipped.is_empty());
+    }
+
+    let bad_base = Options {
+        base: Some(env_path("SOCKAT_CHILD_PATH").join("none/b")),
+        ..opts()
+    };
+    let got = bind(Path::new("b.sock"), &bad_base, &cfg).unwrap();
+    assert_eq!(
+        (got.route, got.spelling),
+        (names::STANDARD, Some(Spelling::Original))
+    );
+    let r = route::resolve(
+        route::Use::Connect,
+        Path::new("b.sock"),
+        &bad_base,
+        Some(&cfg),
+    )
+    .unwrap();
+    assert_eq!(r.spelling, Spelling::Original);
+
+    let f = bind(Path::new("none/s.sock"), &opts(), &cfg).err().unwrap();
+    assert_eq!(
+        errno(&f.error),
+        Some(std_errno(Short::BindInAMissingDirectory))
+    );
+    assert_eq!((f.route, f.skipped.len()), (None, 0));
+    let f = route::resolve(
+        route::Use::Bind,
+        Path::new("none/s.sock"),
+        &opts(),
+        Some(&cfg),
     )
     .err()
     .unwrap();
@@ -487,7 +635,468 @@ fn a_short_path_is_original_or_cwd_relative() {
         errno(&f.error),
         Some(std_errno(Short::BindInAMissingDirectory))
     );
+
+    for no_name in ["sub/", ".."] {
+        let r = route::resolve(route::Use::Bind, Path::new(no_name), &opts(), Some(&cfg)).unwrap();
+        assert_eq!(r.path, Path::new(no_name));
+        assert_eq!(
+            (r.spelling, r.route),
+            (Spelling::CwdRelative, names::STANDARD)
+        );
+        assert!(r.cwd.is_some());
+    }
+    let f = bind(Path::new("sub/"), &opts(), &cfg).err().unwrap();
     assert_eq!(f.route, Some(names::STANDARD));
+    assert!(f.skipped.is_empty());
+}
+
+// Through a cwd reached by a symlink, a short relative path goes to std by
+// whichever absolute candidate fits (hub SPEC-routes "絶対パスの候補の作り
+// 方"), the real path looked at first:
+// - the real path is long and `$PWD` (a short symlink to it, and the cwd) is
+//   short: `$PWD`'s spelling, `..` folded where it names the same directory
+// - the real path is short and `$PWD` (a long symlink) is long: the real path
+// Each goes to std (standard, Original), and the socket is in the cwd.
+#[test]
+fn a_relative_path_takes_the_absolute_candidate_that_fits() {
+    let (t, place) = setup();
+    let deep = deep_dir(t.path(), 150);
+    std::fs::create_dir(deep.join("x")).unwrap();
+    let short_link = t.path().join("l");
+    std::os::unix::fs::symlink(&deep, &short_link).unwrap();
+    let real = t.path().join("r");
+    std::fs::create_dir(&real).unwrap();
+    let long_link = t.path().join("L".repeat(120));
+    std::os::unix::fs::symlink(&real, &long_link).unwrap();
+    let real_real = std::fs::canonicalize(&real).unwrap();
+    let cases = [
+        (
+            &short_link,
+            "s.sock",
+            short_link.join("s.sock"),
+            deep.join("s.sock"),
+        ),
+        (
+            &short_link,
+            "x/../t.sock",
+            short_link.join("t.sock"),
+            deep.join("t.sock"),
+        ),
+        (
+            &long_link,
+            "s.sock",
+            real_real.join("s.sock"),
+            real.join("s.sock"),
+        ),
+    ];
+    for (cwd, rel, want, at) in cases {
+        assert!(
+            path::len(&std::fs::canonicalize(cwd).unwrap().join(rel)) > DIRECT_MAX
+                || path::len(cwd) > DIRECT_MAX
+        );
+        run_in_cwd(
+            "tests::child_bind_by_a_candidate",
+            cwd,
+            cwd,
+            &[
+                ("SOCKAT_CHILD_PLACE", place.as_os_str()),
+                ("SOCKAT_CHILD_REL", OsStr::new(rel)),
+                ("SOCKAT_CHILD_WANT", want.as_os_str()),
+            ],
+        );
+        assert!(is_socket(&at), "{rel}: no socket at {at:?}");
+    }
+    assert!(
+        entries(&place).is_empty(),
+        "something was made in the place"
+    );
+}
+
+#[test]
+fn child_bind_by_a_candidate() {
+    if !in_child() {
+        return;
+    }
+    enter_cwd();
+    let rel = env_path("SOCKAT_CHILD_REL");
+    let want = env_path("SOCKAT_CHILD_WANT");
+    let cfg = config(&env_path("SOCKAT_CHILD_PLACE"));
+    let mut got = bind(&rel, &opts(), &cfg).unwrap();
+    assert_eq!(
+        (got.route, got.spelling),
+        (names::STANDARD, Some(Spelling::Original))
+    );
+    assert_eq!(reported(&listener(&mut got)), want);
+    assert_eq!(kept(&got), std::fs::canonicalize(&want).unwrap());
+}
+
+// A short relative path in a deep cwd, which no candidate makes short
+// enough, goes through the routes as a long path does (here link-dir through
+// B's real path), and the socket is in the cwd:
+// - `$PWD` is the cwd (long)
+// - `$PWD` is not the cwd (a short directory elsewhere, stale as after a
+//   chdir that did not update it): its spelling is not used, so nothing is
+//   bound in that directory
+#[test]
+fn a_short_relative_path_no_candidate_fits_goes_through_the_routes() {
+    let (t, place) = setup();
+    let deep = deep_dir(t.path(), 150);
+    let elsewhere = t.path().join("e");
+    std::fs::create_dir(&elsewhere).unwrap();
+    for (i, pwd) in [&deep, &elsewhere].into_iter().enumerate() {
+        let name = format!("{i}.sock");
+        run_in_cwd(
+            "tests::child_bind_through_the_routes",
+            &deep,
+            pwd,
+            &[
+                ("SOCKAT_CHILD_PLACE", place.as_os_str()),
+                ("SOCKAT_CHILD_REL", OsStr::new(&name)),
+            ],
+        );
+        assert!(is_socket(&deep.join(&name)), "{pwd:?}");
+        assert!(!elsewhere.join(&name).exists(), "{pwd:?}");
+    }
+}
+
+#[test]
+fn child_bind_through_the_routes() {
+    if !in_child() {
+        return;
+    }
+    enter_cwd();
+    let rel = env_path("SOCKAT_CHILD_REL");
+    let got = bind(
+        &rel,
+        &opts(),
+        &real_link_dir(&env_path("SOCKAT_CHILD_PLACE")),
+    )
+    .unwrap();
+    assert_eq!(got.route, names::LINK_DIR);
+    assert_eq!(skipped_names(&got.skipped), vec![names::STANDARD]);
+    assert!(matches!(got.spelling, Some(Spelling::Linked { .. })));
+}
+
+// When no route can be used (here: D cannot be made, so link-dir, link-file,
+// thread-cwd and at cannot), a short relative path goes to std as it is
+// (hub SPEC "相対パスを絶対パスにする" 5): route standard, CwdRelative, the
+// routes passed over without standard (the route it went by), the socket in
+// the cwd. Then:
+// - with the cwd changed between the look-up of the directory and the bind
+//   (as another thread could), bind_ex fails (the cwd is compared before
+//   anything and after the file is taken), the listener closed and the
+//   socket file left where the relative bind put it
+// - resolve gives the relative path as it is (CwdRelative, for a bind and a
+//   connect), and ForBind's socket_file() fails once the cwd has changed
+// - a bad Options.base is the call's error once the routes are reached,
+//   not a reason to hand the relative path to std
+// - a relative path longer than std accepts is ENAMETOOLONG
+#[test]
+fn with_no_route_a_short_relative_path_goes_to_std_as_it_is() {
+    let (t, place) = setup();
+    let deep = deep_dir(t.path(), 150);
+    let other = t.path().join("o");
+    std::fs::create_dir(&other).unwrap();
+    run_in_cwd(
+        "tests::child_no_route",
+        &deep,
+        &deep,
+        &[
+            ("SOCKAT_CHILD_PLACE", place.as_os_str()),
+            ("SOCKAT_CHILD_PATH", t.path().as_os_str()),
+        ],
+    );
+    assert!(is_socket(&deep.join("s.sock")));
+    // Bound in the cwd it was changed to, then closed: nobody listens.
+    assert!(is_socket(&other.join("c.sock")));
+    let e = UnixStream::connect(other.join("c.sock")).unwrap_err();
+    assert_eq!(errno(&e), Some(std_errno(Short::ConnectToNobodyListening)));
+}
+
+#[test]
+fn child_no_route() {
+    if !in_child() {
+        return;
+    }
+    let cwd = enter_cwd();
+    let t = env_path("SOCKAT_CHILD_PATH");
+    let cfg = config(&env_path("SOCKAT_CHILD_PLACE"));
+    base::FAIL_D.set(Some(0));
+
+    let mut got = bind(Path::new("s.sock"), &opts(), &cfg).unwrap();
+    assert_eq!(
+        (got.route, got.base, got.spelling),
+        (names::STANDARD, None, Some(Spelling::CwdRelative))
+    );
+    let passed = skipped_names(&got.skipped);
+    assert_eq!(passed.first(), Some(&names::LINK_DIR));
+    assert!(!passed.contains(&names::STANDARD), "{passed:?}");
+    assert_eq!(
+        kept(&got),
+        std::fs::canonicalize(&cwd).unwrap().join("s.sock")
+    );
+    assert_eq!(reported(&listener(&mut got)), Path::new("s.sock"));
+
+    let mut moving = cfg.clone();
+    moving.between_lookups = || {
+        std::env::set_current_dir(env_path("SOCKAT_CHILD_PATH").join("o")).unwrap();
+    };
+    let f = bind(Path::new("c.sock"), &opts(), &moving).err().unwrap();
+    assert_eq!(f.error.kind(), io::ErrorKind::Other);
+    assert_eq!(f.route, Some(names::STANDARD));
+    std::env::set_current_dir(&cwd).unwrap();
+
+    for for_ in [route::Use::Bind, route::Use::Connect] {
+        let r = route::resolve(for_, Path::new("r.sock"), &opts(), Some(&cfg)).unwrap();
+        assert_eq!(r.path, Path::new("r.sock"));
+        assert_eq!(
+            (r.spelling, r.route),
+            (Spelling::CwdRelative, names::STANDARD)
+        );
+        assert!(!skipped_names(&r.skipped).contains(&names::STANDARD));
+    }
+    let r = route::resolve(route::Use::Bind, Path::new("r.sock"), &opts(), Some(&cfg)).unwrap();
+    let _l = UnixListener::bind(&r.path).unwrap();
+    route::remember_resolved(&r.path, r.spelling, r.cwd).unwrap();
+    std::env::set_current_dir(&t).unwrap();
+    assert!(route::remember_resolved(&r.path, r.spelling, r.cwd).is_err());
+    std::env::set_current_dir(&cwd).unwrap();
+
+    let bad_base = Options {
+        base: Some(t.join("none/b")),
+        ..opts()
+    };
+    let f = bind(Path::new("b.sock"), &bad_base, &cfg).err().unwrap();
+    assert_eq!(errno(&f.error), Some(libc::ENOENT));
+    assert_eq!(f.route, None);
+    assert!(!Path::new("b.sock").exists());
+
+    let long = "n".repeat(DIRECT_MAX + 1);
+    let f = bind(Path::new(&long), &opts(), &cfg).err().unwrap();
+    assert_eq!(errno(&f.error), Some(libc::ENAMETOOLONG));
+    assert_eq!(f.route, None);
+    assert_eq!(f.skipped.first().map(|s| s.name), Some(names::STANDARD));
+    base::FAIL_D.set(None);
+}
+
+// A bind by an absolute candidate that fails returns that failure and tries
+// neither the other candidate nor the relative path (hub SPEC "相対パスを絶
+// 対パスにする": nothing is tried twice or made elsewhere). Here the cwd's
+// directory is renamed between the making of the candidate and the bind:
+// the candidate names nothing (ENOENT, std's errno for a bind in a missing
+// directory), while the relative path would still bind in the renamed
+// directory. The socket is made where the candidate was made, so a cwd
+// changed after that does not move it, and remove() removes the file bound
+// once the cwd has changed (not the file of the same name in the new cwd).
+#[test]
+fn a_bind_by_an_absolute_candidate_is_not_tried_again() {
+    let (t, place) = setup();
+    std::fs::create_dir(t.path().join("a")).unwrap();
+    std::fs::create_dir(t.path().join("b")).unwrap();
+    std::fs::write(t.path().join("b/s.sock"), b"another file").unwrap();
+    run_in_cwd(
+        "tests::child_candidate_moves",
+        &t.path().join("a"),
+        &t.path().join("a"),
+        &[
+            ("SOCKAT_CHILD_PLACE", place.as_os_str()),
+            ("SOCKAT_CHILD_PATH", t.path().as_os_str()),
+        ],
+    );
+    assert!(!t.path().join("a2/s.sock").exists());
+    assert_eq!(
+        std::fs::read(t.path().join("b/s.sock")).unwrap(),
+        b"another file"
+    );
+    assert!(
+        entries(&place).is_empty(),
+        "something was made in the place"
+    );
+}
+
+#[test]
+fn child_candidate_moves() {
+    if !in_child() {
+        return;
+    }
+    enter_cwd();
+    let t = env_path("SOCKAT_CHILD_PATH");
+    let mut cfg = config(&env_path("SOCKAT_CHILD_PLACE"));
+    cfg.between_lookups = || {
+        let t = env_path("SOCKAT_CHILD_PATH");
+        std::fs::rename(t.join("a"), t.join("a2")).unwrap();
+    };
+    let f = bind(Path::new("s.sock"), &opts(), &cfg).err().unwrap();
+    assert_eq!(
+        errno(&f.error),
+        Some(std_errno(Short::BindInAMissingDirectory))
+    );
+    assert_eq!(f.route, Some(names::STANDARD));
+    assert!(f.skipped.is_empty());
+    assert!(!t.join("a2/s.sock").exists(), "the relative path was tried");
+
+    cfg.between_lookups = || {
+        std::env::set_current_dir(env_path("SOCKAT_CHILD_PATH").join("b")).unwrap();
+    };
+    let mut got = bind(Path::new("s.sock"), &opts(), &cfg).unwrap();
+    let real_a2 = std::fs::canonicalize(t.join("a2")).unwrap();
+    assert_eq!(kept(&got), real_a2.join("s.sock"));
+    assert!(is_socket(&t.join("a2/s.sock")));
+    let _l = listener(&mut got);
+    let file = SocketFile::new(got.file.take().unwrap(), crate::Clean::new(None));
+    file.remove().unwrap();
+    assert!(!t.join("a2/s.sock").exists());
+}
+
+// A long absolute path through a symlink whose real path fits goes to std
+// by the real path, before any route (hub SPEC "相対パスを絶対パスにする"):
+// route standard, Original, nothing passed over, nothing made in the place,
+// and the socket file taken there. resolve gives the real path for a bind
+// and a connect. Options.base is not looked at then (a base whose parent is
+// missing). A connect does not do this (it hands the path to its routes).
+#[test]
+fn a_long_absolute_path_whose_real_path_fits_goes_to_std() {
+    let (t, place) = setup();
+    let real = t.path().join("r");
+    std::fs::create_dir(&real).unwrap();
+    let long = t.path().join("l".repeat(150));
+    std::os::unix::fs::symlink(&real, &long).unwrap();
+    let p = long.join("s.sock");
+    assert!(path::len(&p) > DIRECT_MAX);
+    let want = std::fs::canonicalize(&real).unwrap().join("s.sock");
+    let bad_base = Options {
+        base: Some(t.path().join("none/b")),
+        ..opts()
+    };
+    for (options, cfg) in [(opts(), config(&place)), (bad_base, real_link_dir(&place))] {
+        let mut got = bind(&p, &options, &cfg).unwrap();
+        assert_eq!(
+            (got.route, got.base, got.spelling),
+            (names::STANDARD, None, Some(Spelling::Original))
+        );
+        assert!(got.skipped.is_empty());
+        assert_eq!(kept(&got), want);
+        assert_eq!(reported(&listener(&mut got)), want);
+        for for_ in [route::Use::Bind, route::Use::Connect] {
+            let r = route::resolve(for_, &p, &options, Some(&cfg)).unwrap();
+            assert_eq!(
+                (&*r.path, r.spelling, r.route),
+                (&*want, Spelling::Original, names::STANDARD)
+            );
+            assert!(r.link.is_none() && r.skipped.is_empty());
+        }
+        std::fs::remove_file(&want).unwrap();
+    }
+    assert!(
+        entries(&place).is_empty(),
+        "something was made in the place"
+    );
+    let _l = UnixListener::bind(&want).unwrap();
+    let c = connect(&p, &no_proc(config(&place))).unwrap();
+    assert_ne!(c.route, names::STANDARD);
+}
+
+// A connect does not make a relative path absolute (hub SPEC "相対パスを絶
+// 対パスにする": its spelling is kept nowhere): a short relative path goes to
+// std as it is, even in a deep cwd where it would be long made absolute,
+// with nothing made in the place.
+#[test]
+fn a_relative_connect_goes_to_std_as_it_is() {
+    let (t, place) = setup();
+    let deep = deep_dir(t.path(), 150);
+    let _l = listen_at(&deep.join("s.sock"));
+    run_in_cwd(
+        "tests::child_relative_connect",
+        &deep,
+        &deep,
+        &[("SOCKAT_CHILD_PLACE", place.as_os_str())],
+    );
+    assert!(
+        entries(&place).is_empty(),
+        "something was made in the place"
+    );
+}
+
+#[test]
+fn child_relative_connect() {
+    if !in_child() {
+        return;
+    }
+    enter_cwd();
+    let c = connect(
+        Path::new("s.sock"),
+        &config(&env_path("SOCKAT_CHILD_PLACE")),
+    )
+    .unwrap();
+    assert_eq!(c.route, names::STANDARD);
+    assert!(c.skipped.is_empty());
+}
+
+// A cwd deeper than PATH_MAX (4096 on Linux, 1024 on macOS): the real path
+// of the socket's directory cannot be taken (macOS's realpath(3) gives
+// ERANGE) or is too long for any E to point to (Linux), so no route can be
+// used, and a short relative path goes to std as it is (CwdRelative, route
+// standard, without standard among the routes passed over: where the real
+// path could not be taken, none at all). bind_ex, which takes the socket
+// file by its absolute real path, fails there. A relative path longer than
+// std accepts is ENAMETOOLONG, with no route.
+#[test]
+fn in_a_cwd_deeper_than_path_max_a_relative_path_goes_to_std_as_it_is() {
+    let (t, place) = setup();
+    run_in_cwd(
+        "tests::child_deeper_than_path_max",
+        t.path(),
+        t.path(),
+        &[("SOCKAT_CHILD_PLACE", place.as_os_str())],
+    );
+}
+
+#[test]
+fn child_deeper_than_path_max() {
+    if !in_child() {
+        return;
+    }
+    let mut depth = path::len(&enter_cwd());
+    let step = "d".repeat(200);
+    while depth <= 4200 {
+        std::fs::create_dir(&step).unwrap();
+        std::env::set_current_dir(&step).unwrap();
+        depth += 1 + step.len();
+    }
+    let cfg = config(&env_path("SOCKAT_CHILD_PLACE"));
+    let real_path_taken = std::fs::canonicalize(".").is_ok();
+    let mut got = route::run(BIND, Path::new("s.sock"), &opts(), false, Some(&cfg)).unwrap();
+    assert_eq!(
+        (got.route, got.spelling),
+        (names::STANDARD, Some(Spelling::CwdRelative))
+    );
+    assert!(!skipped_names(&got.skipped).contains(&names::STANDARD));
+    if !real_path_taken {
+        assert!(got.skipped.is_empty(), "{:?}", got.skipped);
+    }
+    let _l = listener(&mut got);
+    assert!(is_socket(Path::new("s.sock")));
+    // bind_ex takes the socket file by its real path, which cannot be
+    // looked up here (macOS's realpath(3) gives ERANGE; Linux's gives a path
+    // lstat(2) refuses with ENAMETOOLONG): it fails with that error, from
+    // standard (the listener closed), rather than hand out a SocketFile that
+    // could not remove the file.
+    let f = bind(Path::new("x.sock"), &opts(), &cfg).err().unwrap();
+    assert!(
+        matches!(errno(&f.error), Some(libc::ERANGE | libc::ENAMETOOLONG)),
+        "{}",
+        f.error
+    );
+    assert_eq!(f.route, Some(names::STANDARD));
+
+    let f = bind(Path::new(&"n".repeat(DIRECT_MAX + 1)), &opts(), &cfg)
+        .err()
+        .unwrap();
+    assert_eq!(errno(&f.error), Some(libc::ENAMETOOLONG));
+    assert_eq!(f.route, None);
+    if !real_path_taken {
+        assert!(f.skipped.is_empty(), "{:?}", f.skipped);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2070,42 +2679,27 @@ fn an_options_base_that_cannot_be_made_after_its_check_is_that_error() {
 // only through the procB spelling: its real path is the socket's directory
 // and more, so the spelling through it reaches a socket file only as far as
 // the path does, and a B made in the user's own directory for a spelling is
-// what the procB form is for. Here /proc is stood in for by a directory with
-// `self/fd` (so /proc looks usable) where the procB form of B names nothing,
-// and the socket's directory is reached by a long symlink to a short real
-// one (so B's real path would fit): the bind takes no Linked spelling
-// through that B (thread-cwd / at with Dangling, or ENAMETOOLONG).
+// what the procB form is for. A bind or a resolve never comes to it with a
+// path whose real path fits (the real path goes to std first, hub SPEC "相対
+// パスを絶対パスにする"), so the forms of B's spelling are checked directly:
+// with /proc stood in for by a directory with `self/fd` where the procB form
+// of B names nothing, that B has no form at all (no real-path form), while a
+// B of a place has its real path.
 #[test]
 fn a_b_in_the_socket_directory_is_spelled_only_through_proc() {
-    let t = tmp();
+    let (t, place) = setup();
     let real = t.path().join("x");
     std::fs::create_dir(&real).unwrap();
-    let long = t.path().join("l".repeat(150));
-    std::os::unix::fs::symlink(&real, &long).unwrap();
     let fake = t.path().join("proc");
     std::fs::create_dir_all(fake.join("self/fd")).unwrap();
-    let mut cfg = config(&t.path().join("none"));
+    let mut cfg = config(&place);
     cfg.proc = fake;
-    let p = long.join("s.sock");
-    assert!(path::len(&p) > DIRECT_MAX);
-    match bind(&p, &opts(), &cfg) {
-        Ok(r) => {
-            assert_eq!(
-                (r.route, r.base, r.spelling),
-                (
-                    if cfg!(target_os = "freebsd") {
-                        names::AT
-                    } else {
-                        names::THREAD_CWD
-                    },
-                    None,
-                    Some(Spelling::Dangling)
-                )
-            );
-            assert!(is_socket(&real.join("s.sock")));
-        }
-        Err(f) => assert_eq!(errno(&f.error), Some(libc::ENAMETOOLONG)),
-    }
+    let in_sockdir = base::in_socket_dir(&std::fs::canonicalize(&real).unwrap()).unwrap();
+    assert!(route::forms(&cfg, &in_sockdir, false).is_empty());
+    let b = base::given(&t.path().join("given"), false).unwrap();
+    let forms = route::forms(&cfg, &b, false);
+    assert_eq!(forms.len(), 1);
+    assert_eq!(forms[0].0, b.path);
 }
 
 // A B or D the process holds that has been removed (by the OS's clean-up of
@@ -2292,7 +2886,7 @@ fn socket_file_of_what_is_not_a_socket_is_an_error() {
     let p = nest(t.path(), 200, "s.sock");
     let r = route::resolve(route::Use::Bind, &p, &opts(), Some(&cfg)).unwrap();
     std::fs::write(&p, b"not a socket").unwrap();
-    let e = route::remember_resolved(&r.path, r.cwd).unwrap_err();
+    let e = route::remember_resolved(&r.path, r.spelling, r.cwd).unwrap_err();
     assert_eq!(errno(&e), Some(libc::ENOTSOCK));
     assert_eq!(std::fs::read(&p).unwrap(), b"not a socket");
 }
@@ -2918,11 +3512,11 @@ fn resolved_spellings_are_used_by_std() {
     let p = nest(t.path(), 200, "s.sock");
     let r = route::resolve(route::Use::Bind, &p, &opts(), Some(&cfg)).unwrap();
     assert_eq!(r.route, names::LINK_DIR);
-    assert!(route::remember_resolved(&r.path, r.cwd).is_err());
+    assert!(route::remember_resolved(&r.path, r.spelling, r.cwd).is_err());
     let l = UnixListener::bind(&r.path).unwrap();
     assert!(is_socket(&p));
     let file = SocketFile::new(
-        route::remember_resolved(&r.path, r.cwd).unwrap(),
+        route::remember_resolved(&r.path, r.spelling, r.cwd).unwrap(),
         crate::Clean::new(r.link.clone()),
     );
 
@@ -2938,6 +3532,47 @@ fn resolved_spellings_are_used_by_std() {
     file.remove().unwrap();
     assert!(!p.exists());
     assert_no_e(&b_of(&place));
+}
+
+// resolve_for_connect tells what its spelling is (hub SPEC "綴りの性質", a
+// resolved spelling may be kept and used later): through E to the socket
+// file it is Linked, not removable (unlinking it removes E), with the
+// attributes of the spelling itself: through B's real path, followed until
+// cleanup, not by another uid here (the temporary place is 0700) and not by
+// a peer with a /tmp of its own (B is under /tmp); through procB (Linux with
+// /proc), followed while this process lives.
+#[test]
+fn resolve_for_connect_tells_what_its_spelling_is() {
+    let (t, place) = setup();
+    let p = nest(t.path(), 200, "s.sock");
+    let r = route::resolve(
+        route::Use::Connect,
+        &p,
+        &opts(),
+        Some(&real_link_dir(&place)),
+    )
+    .unwrap();
+    assert_eq!(
+        r.spelling,
+        Spelling::Linked {
+            removable: false,
+            until: Until::Cleanup,
+            usable_cross_uid: false,
+            usable_with_private_tmp: false,
+        }
+    );
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if proc_here() {
+        let r = route::resolve(route::Use::Connect, &p, &opts(), Some(&config(&place))).unwrap();
+        assert!(matches!(
+            r.spelling,
+            Spelling::Linked {
+                removable: false,
+                until: Until::Process,
+                ..
+            }
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3054,7 +3689,7 @@ fn socket_file_through_a_symlink_at_the_path_remembers_where_it_led() {
         let _l = UnixListener::bind(&r.path).unwrap();
         assert!(is_socket(&target));
         let file = SocketFile::new(
-            route::remember_resolved(&r.path, r.cwd).unwrap(),
+            route::remember_resolved(&r.path, r.spelling, r.cwd).unwrap(),
             crate::Clean::new(r.link),
         );
         assert_eq!(file.path(), std::fs::canonicalize(&target).unwrap());
@@ -3067,7 +3702,7 @@ fn socket_file_through_a_symlink_at_the_path_remembers_where_it_led() {
         std::fs::write(&not_socket, b"not a socket").unwrap();
         std::os::unix::fs::symlink(&not_socket, &q).unwrap();
         let r = route::resolve(route::Use::Bind, &q, &opts(), Some(&cfg)).unwrap();
-        let e = route::remember_resolved(&r.path, r.cwd).unwrap_err();
+        let e = route::remember_resolved(&r.path, r.spelling, r.cwd).unwrap_err();
         assert_eq!(errno(&e), Some(libc::ENOTSOCK), "{q:?}");
     }
 }
@@ -3267,14 +3902,18 @@ fn a_connect_through_a_symlink_and_dot_dot_is_not_folded() {
 }
 
 // A relative path through a symlink and `..` is not folded either (hub SPEC
-// "長いパスの経路と試す順番"), with the cwd at `<r>`:
+// "長いパスの経路と試す順番", SPEC-routes "絶対パスの候補の作り方"), with the
+// cwd at `<r>` (long) and `$PWD` a short symlink to it, so the real-path
+// candidate (`<r>/b/<name>`) is long and `$PWD`'s spelling folded by its
+// letters (`$PWD/a/<name>`) would be short but names `a`, not `b`:
 //
-// - a short `a/sym/../s.sock` goes to std as it is (standard, CwdRelative):
-//   the socket is made in `b`, and remove() removes `b/s.sock` and leaves the
-//   socket at `a/s.sock` (a short relative remove that folded the path
-//   removed another server's socket in another implementation)
-// - resolve_for_bind hands a short one back as it is, and its socket_file()
-//   remembers the socket in `b`
+// - a short `a/sym/../s.sock` does not take `$PWD`'s spelling (it would
+//   bind where the decoy listens) and goes through link-dir: the socket is
+//   made in `b`, and remove() removes `b/s.sock` and leaves the socket at
+//   `a/s.sock` (a short relative remove that folded the path removed another
+//   server's socket in another implementation)
+// - resolve_for_bind gives a spelling through link-dir, and its
+//   socket_file() remembers the socket in `b`
 // - relative (not on FreeBSD) spells a long absolute path below the cwd as
 //   `a/sym/../c.sock`, which reaches the socket in `b`
 //
@@ -3286,11 +3925,14 @@ fn a_relative_path_through_a_symlink_and_dot_dot_is_not_folded() {
     std::fs::create_dir(&place).unwrap();
     let r = t.path().join("x".repeat(100));
     std::fs::create_dir(&r).unwrap();
+    let pwd = t.path().join("l");
+    std::os::unix::fs::symlink(&r, &pwd).unwrap();
     run_child(
         "tests::child_relative_path_through_a_symlink_and_dot_dot",
         &[
             ("SOCKAT_CHILD_PATH", r.as_os_str()),
             ("SOCKAT_CHILD_PLACE", place.as_os_str()),
+            ("PWD", pwd.as_os_str()),
         ],
     );
 }
@@ -3305,10 +3947,11 @@ fn child_relative_path_through_a_symlink_and_dot_dot() {
     std::env::set_current_dir(&r).unwrap();
 
     let x = across_symlink(&r, "s.sock");
+    assert!(path::len(&x.real) > DIRECT_MAX);
     let rel = Path::new("a/sym/../s.sock");
-    let mut got = bind(rel, &opts(), &config(&place)).unwrap();
-    assert_eq!(got.route, names::STANDARD);
-    assert_eq!(got.spelling, Some(Spelling::CwdRelative));
+    assert!(path::len(&env_path("PWD").join("a/s.sock")) <= DIRECT_MAX);
+    let mut got = bind(rel, &opts(), &real_link_dir(&place)).unwrap();
+    assert_eq!(got.route, names::LINK_DIR);
     assert!(is_socket(&x.real));
     let l = listener(&mut got);
     let file = SocketFile::new(
@@ -3318,16 +3961,17 @@ fn child_relative_path_through_a_symlink_and_dot_dot() {
     assert_eq!(file.path(), x.real);
     file.remove().unwrap();
     assert!(std::fs::symlink_metadata(&x.real).is_err());
-    x.untouched("standard");
+    x.untouched("link-dir");
     drop(l);
 
     let y = across_symlink(&r, "s2.sock");
     let rel = Path::new("a/sym/../s2.sock");
-    let resolved = route::resolve(route::Use::Bind, rel, &opts(), Some(&config(&place))).unwrap();
-    assert_eq!(resolved.path, rel);
+    let resolved =
+        route::resolve(route::Use::Bind, rel, &opts(), Some(&real_link_dir(&place))).unwrap();
+    assert_eq!(resolved.route, names::LINK_DIR);
     let _l = UnixListener::bind(&resolved.path).unwrap();
     let route::Kept::File(remembered) =
-        route::remember_resolved(&resolved.path, resolved.cwd).unwrap()
+        route::remember_resolved(&resolved.path, resolved.spelling, resolved.cwd).unwrap()
     else {
         panic!("no file remembered")
     };
@@ -3792,6 +4436,7 @@ fn a_cleanup_the_user_calls_returns_the_failure_to_remove_e() {
     let unlinks = || link.unlinks.load(std::sync::atomic::Ordering::Relaxed);
     let for_connect = crate::ForConnect {
         path: r.path,
+        spelling: r.spelling,
         route: r.route,
         skipped: r.skipped,
         clean: crate::Clean::new(r.link),
@@ -3873,7 +4518,7 @@ fn concurrent_cleanups_unlink_e_once() {
         let link = r.link.unwrap();
         let _l = UnixListener::bind(&r.path).unwrap();
         let file = SocketFile::new(
-            route::remember_resolved(&r.path, None).unwrap(),
+            route::remember_resolved(&r.path, r.spelling, None).unwrap(),
             crate::Clean::new(Some(link.clone())),
         );
         let barrier = std::sync::Barrier::new(threads);
@@ -3948,65 +4593,30 @@ fn removals_through_one_for_bind_are_one_at_a_time() {
     }
 }
 
-// A relative path bound with the socket file taken, while the cwd changes
-// between the bind and the look-up of the file, would take a file of the
-// same name in another directory: the cwd is compared around both, and a
-// change fails the call (the socket closed, the file left). Run in a child:
-// the cwd is process-wide.
+// A long relative path goes through the routes against the cwd as it is
+// when the socket's directory is looked up (its real path, which link-dir's
+// E points to): a cwd changed after that (as another thread could) does not
+// move the bind, and the socket file taken is the one bound, so remove()
+// removes it although the cwd has changed, and leaves the file of the same
+// name in the new cwd (hub SPEC "相対パスを絶対パスにする": only a
+// CwdRelative spelling has the cwd compared, the bind's failure when it
+// changes being in with_no_route_a_short_relative_path_goes_to_std_as_it_is).
+// Run in a child: the cwd is process-wide.
 #[test]
-fn a_relative_bind_ex_fails_when_the_cwd_changes_in_between() {
-    let t = tmp();
-    std::fs::create_dir(t.path().join("a")).unwrap();
-    std::fs::create_dir(t.path().join("b")).unwrap();
-    // A socket of the same name in the other directory: what the look-up
-    // would take if the change went unseen.
-    let _other = UnixListener::bind(t.path().join("b/s.sock")).unwrap();
-    run_child(
-        "tests::child_cwd_changes",
-        &[("SOCKAT_CHILD_PATH", t.path().as_os_str())],
-    );
-    assert!(is_socket(&t.path().join("a/s.sock")));
-}
-
-#[test]
-fn child_cwd_changes() {
-    if !in_child() {
-        return;
-    }
-    let root = env_path("SOCKAT_CHILD_PATH");
-    std::env::set_current_dir(root.join("a")).unwrap();
-    let mut cfg = config(&root);
-    cfg.between_lookups = || {
-        std::env::set_current_dir(env_path("SOCKAT_CHILD_PATH").join("b")).unwrap();
-    };
-    let f = route::run(BIND, Path::new("s.sock"), &opts(), true, Some(&cfg))
-        .err()
-        .unwrap();
-    assert_eq!(f.error.kind(), io::ErrorKind::Other);
-    assert_eq!(f.route, Some(names::STANDARD));
-}
-
-// When bind_ex cannot remember the socket file (here: a long relative path,
-// the cwd changed between the bind and the look-up), the listener is closed,
-// the E of the spelling (link-dir) is removed, and the socket file is left
-// where it is: it could not be told to be the one bound, so removing it might
-// remove what replaced it (hub SPEC "SocketFile"). Run in a child: the cwd is
-// process-wide.
-#[test]
-fn a_bind_ex_that_cannot_remember_closes_cleans_e_and_keeps_the_file() {
+fn a_long_relative_bind_ex_binds_where_its_directory_was_looked_up() {
     let t = tmp();
     std::fs::create_dir(t.path().join("p")).unwrap();
-    std::fs::create_dir(t.path().join("b")).unwrap();
-    std::fs::create_dir_all(t.path().join("a").join(long_relative().parent().unwrap())).unwrap();
+    for d in ["a", "b"] {
+        std::fs::create_dir_all(t.path().join(d).join(long_relative().parent().unwrap())).unwrap();
+    }
+    let other = t.path().join("b").join(long_relative());
+    std::fs::write(&other, b"another file").unwrap();
     run_child(
         "tests::child_cwd_changes_through_link_dir",
         &[("SOCKAT_CHILD_PATH", t.path().as_os_str())],
     );
-    let file = t.path().join("a").join(long_relative());
-    assert!(is_socket(&file));
-    let b = b_of(&t.path().join("p"));
-    assert_eq!(entries(&b).len(), 1);
-    assert_no_e(&b);
+    assert!(!t.path().join("a").join(long_relative()).exists());
+    assert_eq!(std::fs::read(&other).unwrap(), b"another file");
 }
 
 /// A relative path longer than std accepts.
@@ -4030,23 +4640,20 @@ fn child_cwd_changes_through_link_dir() {
     cfg.between_lookups = || {
         std::env::set_current_dir(env_path("SOCKAT_CHILD_PATH").join("b")).unwrap();
     };
-    let f = route::run(BIND, &long_relative(), &opts(), true, Some(&cfg))
-        .err()
-        .unwrap();
-    assert_eq!(f.error.kind(), io::ErrorKind::Other);
-    assert_eq!(f.route, Some(names::LINK_DIR));
-    let abs = root.join("a").join(long_relative());
-    let e = connect(&abs, &real_link_dir(&root.join("p")))
-        .err()
-        .unwrap();
-    // The listener was closed: the connect meets a socket file nobody listens
-    // on, and fails with what std's connect gives a short path in that
-    // situation on this OS (the OS's errno, passed on unchanged).
-    assert_eq!(
-        errno(&e.error),
-        Some(std_errno(Short::ConnectToNobodyListening)),
-        "the listener is open"
+    let mut got = route::run(BIND, &long_relative(), &opts(), true, Some(&cfg)).unwrap();
+    assert_eq!(got.route, names::LINK_DIR);
+    let bound = std::fs::canonicalize(root.join("a"))
+        .unwrap()
+        .join(long_relative());
+    assert_eq!(kept(&got), bound);
+    assert!(is_socket(&bound));
+    let _l = listener(&mut got);
+    let file = SocketFile::new(
+        got.file.take().unwrap(),
+        crate::Clean::new(got.link.clone()),
     );
+    file.remove().unwrap();
+    assert!(!bound.exists());
 }
 
 // An Options.base of the wrong form is an argument error before the name in

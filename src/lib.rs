@@ -5,8 +5,9 @@
 //! Use [`bind`] and [`connect`] where you would use std's
 //! [`UnixListener::bind`] and [`UnixStream::connect`], and
 //! [`connect_nonblocking`] in async code; [`datagram`] has the same for
-//! `SOCK_DGRAM`. They take a path of any length and return std's own types. A
-//! path std accepts goes to std unchanged, so it behaves exactly as with std:
+//! `SOCK_DGRAM`. They take a path of any length and return std's own types. An
+//! absolute path std accepts goes to std unchanged, so it behaves exactly as
+//! with std:
 //!
 //! | Platform | `sun_path` (NUL included) | Handed to std |
 //! |---|---|---|
@@ -14,7 +15,9 @@
 //! | macOS, iOS, FreeBSD, NetBSD, OpenBSD | 104 | up to 103 bytes |
 //!
 //! A longer path is handed to the kernel by a short spelling that names the
-//! same place.
+//! same place. A bind (and a resolve) makes a relative path absolute first,
+//! so the address the kernel keeps does not name another place once the cwd
+//! changes; a connect hands a relative path on as it is.
 //!
 //! ```no_run
 //! use std::io::{Read, Write};
@@ -45,7 +48,8 @@
 //!   [What stays in the base](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-stays-in-the-base)
 //!   and [`sweep`](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#sweep).
 //! * For a long path, the address the kernel reports (`local_addr`,
-//!   `peer_addr`, `recv_from`) is the short spelling, not the original path.
+//!   `peer_addr`, `recv_from`) is the short spelling, not the original path;
+//!   for a relative path bound, an absolute one.
 //!   Remove the socket file by the original path or by
 //!   [`SocketFile::remove`]. See
 //!   [What differs from the standard for a long path](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#what-differs-from-the-standard-for-a-long-path).
@@ -184,18 +188,22 @@ pub struct Options {
     pub base: Option<PathBuf>,
 }
 
-/// What a bind's spelling (the address the kernel keeps and reports by
-/// `getsockname` / `getpeername`) is good for.
+/// What the spelling of a bind (the address the kernel keeps and reports by
+/// `getsockname` / `getpeername`) or of a resolve is good for, later.
 ///
 /// `#[non_exhaustive]`: read a kind you do not know as "do not rely on the
 /// spelling".
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Spelling {
-    /// The absolute path itself (std took it).
+    /// The absolute path itself, or an absolute path naming the same place
+    /// (a relative path made absolute, a long path's real path) that std
+    /// takes.
     Original,
-    /// The relative path itself (std took it): after the cwd changes it names
-    /// another place. A hazard std has on its own, reported all the same.
+    /// The relative path itself: after the cwd changes it names another
+    /// place. Only when no absolute spelling could be had (a cwd so deep
+    /// that a relative path made absolute fits nowhere, and no route through
+    /// B can be used).
     CwdRelative,
     /// Through B, D and E, naming the same place as the path while it can be
     /// followed.
@@ -577,9 +585,14 @@ pub(crate) fn bound<S: From<OwnedFd>>(
 /// Create a socket bound to `path` and listening on it, like
 /// [`UnixListener::bind`] but for a path of any length.
 ///
-/// A path that std accepts goes to [`UnixListener::bind`] unchanged. A longer
-/// path is bound by the routes of the platform (see the [crate
-/// documentation](crate)); the socket file is created at `path` either way,
+/// An absolute path that std accepts goes to [`UnixListener::bind`]
+/// unchanged. A relative path is made absolute first: by the real path of its
+/// directory or by `$PWD`, whichever fits std (checked to name the same
+/// directory), else through the routes as a long path; only when none of
+/// those can be used does it go to std as it is. A longer path is bound by
+/// the routes of the platform (see the [crate documentation](crate)), or by
+/// its real path when that fits std; the socket file is created at `path`
+/// either way,
 /// and is not removed when the listener is dropped (as with std). The E its
 /// spelling goes through stays until the process ends; through link-dir it is
 /// one per directory, shared by every `bind` and [`datagram::bind`] there
@@ -600,7 +613,8 @@ pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
 }
 
 /// Connect to the socket at `path`, like [`UnixStream::connect`] but for a
-/// path of any length. Nothing is left behind.
+/// path of any length. Nothing is left behind. A path std accepts, relative
+/// or not, goes to std unchanged.
 ///
 /// The stream blocks, like std's. In async code use [`connect_nonblocking`].
 ///
@@ -666,10 +680,12 @@ fn connect_with(
 /// the real path of the directory taken before the bind looks there, not up
 /// `path` again, so a symlink on its way switched meanwhile does not move it;
 /// the others look up `path` after the bind.
-/// For a relative `path`, the cwd's `(st_dev, st_ino)` must be the same
-/// before the bind and after that look-up (another thread changing it would
-/// make the file looked up another one); otherwise the listener is closed
-/// and an error returned (the socket file stays, and so does nothing else).
+/// A relative `path` is made absolute as by [`bind`], and the file looked up
+/// by that. Only when it goes to std as it is ([`Spelling::CwdRelative`])
+/// must the cwd's `(st_dev, st_ino)` be the same before anything is looked
+/// up and after the file is (another thread changing it would make the file
+/// looked up another one); otherwise the listener is closed and an error
+/// returned (the socket file stays, and so does nothing else).
 /// A listener short of a [`SocketFile`] that could remove the file is never
 /// handed out. Unlike std's and [`bind`]'s, nothing is removed when the
 /// listener is closed even for a short path: remove by
@@ -729,9 +745,10 @@ pub fn connect_nonblocking_ex<P: AsRef<Path>>(
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct ForBind {
-    /// The spelling: the path itself when std accepts it, else one through
-    /// B, D and E that keeps naming the same place until
-    /// [`ForBind::cleanup`].
+    /// The spelling: an absolute path std accepts (the path itself, or one
+    /// naming the same place), else one through B, D and E that keeps naming
+    /// the same place until [`ForBind::cleanup`]; a relative path std
+    /// accepts, as it is, only when none of those can be had.
     pub path: PathBuf,
     /// What the spelling is good for once bound.
     pub spelling: Spelling,
@@ -779,7 +796,7 @@ impl ForBind {
     /// a `CwdRelative` spelling when the cwd is not the one it was resolved
     /// against.
     pub fn socket_file(&self) -> io::Result<SocketFile> {
-        let r = route::remember_resolved(&self.path, self.cwd)?;
+        let r = route::remember_resolved(&self.path, self.spelling, self.cwd)?;
         Ok(SocketFile::new(r, Arc::clone(&self.clean)))
     }
 }
@@ -790,9 +807,16 @@ impl ForBind {
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct ForConnect {
-    /// The spelling: the path itself when std accepts it, else one through B,
-    /// D and E (a symlink to the socket file) until [`ForConnect::cleanup`].
+    /// The spelling: an absolute path std accepts (the path itself, or one
+    /// naming the same place), else one through B, D and E (a symlink to the
+    /// socket file) until [`ForConnect::cleanup`]; a relative path std
+    /// accepts, as it is, only when none of those can be had.
     pub path: PathBuf,
+    /// What the spelling is good for, kept and used later: `Original`,
+    /// `CwdRelative` (it names another place once the cwd changes), or
+    /// `Linked` (`removable` is `false`; spelled through `/proc`, `until` is
+    /// [`Until::Process`]).
+    pub spelling: Spelling,
     /// How it was made (`standard`, `link-file`). Diagnostics only.
     pub route: &'static str,
     /// The routes passed over. Diagnostics only.
@@ -813,12 +837,16 @@ impl ForConnect {
 }
 
 /// A short spelling of `path` for a bind made by std or any other library
-/// (hub SPEC "resolve"): `path` itself when std accepts it, else
-/// `B/D/E/<file name>` through a symlink to the socket's directory
+/// (hub SPEC "resolve"): `path` itself when it is absolute and std accepts
+/// it, an absolute path naming the same place when std accepts that (a
+/// relative path made absolute as by [`bind`], a long path's real path),
+/// else `B/D/E/<file name>` through a symlink to the socket's directory
 /// (link-dir), or on macOS and NetBSD `B/D/E` through a symlink to the socket
 /// file (link-file). The spelling keeps naming the same place until
 /// [`ForBind::cleanup`] (or, spelled through `/proc`, while this process
-/// lives); the socket file is removed by [`ForBind::socket_file`].
+/// lives); the socket file is removed by [`ForBind::socket_file`]. A
+/// relative path std accepts comes back as it is
+/// ([`Spelling::CwdRelative`]) only when none of those can be had.
 ///
 /// ```no_run
 /// let path = "/a/very/long/directory/.../server.sock";
@@ -851,8 +879,12 @@ pub fn resolve_for_bind<P: AsRef<Path>>(path: P, options: Options) -> Result<For
 }
 
 /// A short spelling of `path` to connect to, as many times as needed (hub
-/// SPEC "resolve"): `path` itself when std accepts it, else `B/D/E` through a
-/// symlink to the socket file, whatever the file name's length. Made once
+/// SPEC "resolve"): `path` itself when it is absolute and std accepts it, an
+/// absolute path naming the same place when std accepts that (as for
+/// [`resolve_for_bind`]: the spelling may be used after the cwd changes),
+/// else `B/D/E` through a symlink to the socket file, whatever the file
+/// name's length; a relative path std accepts comes back as it is only when
+/// none of those can be had. [`ForConnect::spelling`] tells which. Made once
 /// and reused, it saves making a spelling on each connect; clean it up by
 /// [`ForConnect::cleanup`]. `usable_cross_uid` is not looked at.
 ///
@@ -869,6 +901,7 @@ pub fn resolve_for_connect<P: AsRef<Path>>(
     let r = route::resolve(Use::Connect, path.as_ref(), &options, None)?;
     Ok(ForConnect {
         path: r.path,
+        spelling: r.spelling,
         route: r.route,
         skipped: r.skipped,
         clean: Clean::new(r.link),

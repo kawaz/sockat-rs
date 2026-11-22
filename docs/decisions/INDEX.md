@@ -14,7 +14,7 @@ Status は各 DR ファイルの `Status:` 行が正本。
 
 | DR | 状態 | 説明 |
 |---|---|---|
-| [DR-0002](DR-0002-std-handles-paths-it-accepts.md) | ✅ 実装済 | std が受け付けるパス (OS ごとの sun_path − 1 バイト以内) は std にそのまま渡す |
+| [DR-0002](DR-0002-std-handles-paths-it-accepts.md) | ✅ 実装済 | std が受け付ける絶対パス (OS ごとの sun_path − 1 バイト以内) は std にそのまま渡す。bind 系と resolve の相対パスはハブ DR-0019 で絶対パスにしてから |
 | [DR-0004](DR-0004-relative-path-from-cwd.md) | ✅ 実装済 | connect 系に cwd からの相対パス (`/proc` の無い Linux・Apple の OS 等で、書き込みもスレッドも要らない経路)。cwd の接頭辞を削る、だめなら実パスに揃えて `..` で上る |
 | [DR-0005](DR-0005-widened-sockaddr-on-macos.md) | ✅ 実装済 | Apple の OS の connect 系は relative の次に広げた sockaddr を 253 バイトまで。bind と FreeBSD では使わない |
 | [DR-0009](DR-0009-windows-out-of-scope.md) | ✅ 実装済 | Windows は対象外 (Unix 以外は compile_error!) |

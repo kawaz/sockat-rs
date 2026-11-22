@@ -46,7 +46,7 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 | `Connected<S>` | `socket`、`route`、`skipped` |
 | `Report` | `route`、`skipped` |
 | `ForBind` | `path`、`spelling`、`route`、`base`、`skipped` と、`cleanup(&self)`・`socket_file(&self) -> io::Result<SocketFile>` |
-| `ForConnect` | `path`、`route`、`skipped` と `cleanup(&self)` |
+| `ForConnect` | `path`、`spelling`、`route`、`skipped` と `cleanup(&self)` |
 | `SocketFile` | `remove(&self)`・`cleanup(&self)`。Drop では何もしない |
 | `ExError` | `error: io::Error`、`route: Option<&'static str>`、`skipped`。`From<ExError> for io::Error`、`Display`・`source` は `io::Error` の物 |
 | `Skipped` | `name`、`reason` (どちらも `&'static str`) |
@@ -56,9 +56,27 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 - 利用者が呼ぶ `cleanup` は E の unlink の失敗 (`ENOENT` 以外) をエラーで返す。印を立てるのは消せた時 (と既に無い時) だけで、失敗した後の呼び出しはもう一度消しに行く
 - `remove` は失敗しても `cleanup` まで行い、ファイルの側のエラーを先に、無ければ `cleanup` のエラーを返す。印を立てるのは両方が通った時だけで、失敗した後の呼び出しはもう一度確かめて消しに行く
 - 呼び出しの中で消す E (bind が失敗した時・ソケットのファイルを覚えられなかった時の E。既定の bind の link-dir の E は除く。thread-cwd・at の E、既定の connect の E) は、消すのに失敗しても捨てる (`let _`、`TempLink` の Drop)。呼び出しの成否も元のエラーも変えない
-- bind の後に覚えるソケットのファイルは、どの経路も `route::remembered_at` で引く: パスを `realpath` し (最後の要素の symlink も辿る。Apple・NetBSD の bind はそこを辿ってその先にソケットを作る)、その `lstat` を覚える。ソケットでなければ `ENOTSOCK` で覚えない。引く場所はハブ SPEC「remove」の覚える場所: standard は bind の後に元のパス、link-file は bind の後に E が指すパス (元のパスを絶対パスにした物、`Target::absolute`)、link-dir・thread-cwd・at は E が指すソケットのディレクトリの実パス (`Target::real_dir`、経路を組む前に引いた物) とファイル名を引き、元のパスを引き直さない。link-dir は加えて綴りの `stat` が同じ物かを確かめる。`ForBind::socket_file()` は綴りを同じ関数で引く。abstract の名前 (Linux / Android) はファイルでないので引かず、`route::Kept::Abstract` (ファイルを持たない `SocketFile`、`remove` はファイルを消さず E の片付けだけ) にする (ハブ SPEC「remove」)。std はパスで渡した abstract の名前を bind しないので、`bind_ex` は std の `InvalidInput` を返し、ファイルを持たない `SocketFile` を返すのは `ForBind::socket_file()` (利用者が std の `bind_addr` で bind した後) だけ
+- bind の後に覚えるソケットのファイルは、どの経路も `route::remembered_at` で引く: パスを `realpath` し (最後の要素の symlink も辿る。Apple・NetBSD の bind はそこを辿ってその先にソケットを作る)、その `lstat` を覚える。ソケットでなければ `ENOTSOCK` で覚えない。引く場所はハブ SPEC「remove」の覚える場所: standard は bind の後に標準に渡した綴り (元のパスか絶対パスの候補)、link-file は bind の後に E が指すパス (元のパスを絶対パスにした物、`Target::absolute`)、link-dir・thread-cwd・at は E が指すソケットのディレクトリの実パス (`Target::real_dir`、経路を組む前に引いた物) とファイル名を引き、元のパスを引き直さない。link-dir は加えて綴りの `stat` が同じ物かを確かめる。`ForBind::socket_file()` は綴りを同じ関数で引く。abstract の名前 (Linux / Android) はファイルでないので引かず、`route::Kept::Abstract` (ファイルを持たない `SocketFile`、`remove` はファイルを消さず E の片付けだけ) にする (ハブ SPEC「remove」)。std はパスで渡した abstract の名前を bind しないので、`bind_ex` は std の `InvalidInput` を返し、ファイルを持たない `SocketFile` を返すのは `ForBind::socket_file()` (利用者が std の `bind_addr` で bind した後) だけ
 - std に渡す前に引数の誤り (`InvalidInput`、`route` は `None`、`skipped` は空) にする物は、先頭以外の NUL (ハブ DR-0006) と空のパス (ハブ SPEC「短いパス」)。どちらも長さによらず、全ての関数の入口 (`route::run`・`route::resolve`) で、abstract の名前の判定より前に断る (`path::refuse_empty`・`path::refuse_nul`)。`Options.base` の形の検査 (相対パス、NUL を含む、名前で終わらない。`base::split_given`) はその前
 - 作らないもの: `datagram::send_to`・`send_to_ex` と `seqpacket` (ハブ SPEC の「未確定」)
+
+### 相対パスを絶対パスにする (ハブ [DR-0019](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0019-absolutize-relative-path-on-bind.md)、SPEC「相対パスを絶対パスにする」)
+
+- bind 系 (`bind`・`bind_ex`・`datagram::bind`・`datagram::bind_ex`) と resolve (`resolve_for_bind`・`resolve_for_connect`) が対象。入口の `route::run` (bind の時) と `route::resolve` が、引数の形の検査の後に `route::before_routes` で決める。connect 系は相対パスをそのまま扱う
+- 相対パスで名前で終わる物は、絶対パスの候補 (`route::absolute_candidate`) を作る: ソケットのディレクトリを `std::fs::canonicalize` (realpath(3)) で引いてファイル名を付けた物を先に、収まらなければ `$PWD` の候補 (`route::pwd_candidate`)。`$PWD` の候補は `$PWD` が絶対パスで `.` と同じ `(st_dev, st_ino)` の時だけ、`path::fold` でバイト列のままつないで畳み、畳んだディレクトリが元のディレクトリと同じ `(st_dev, st_ino)` の時だけ使う。候補を作れないことはエラーにしない (経路に進み、ディレクトリを引いた所でエラーが決まる)
+- 収まる候補は route `standard`・`Original` で標準に渡し、`Options.base` を確かめない。長い絶対パスは、経路のためにソケットのディレクトリを引いた後 (`route::Target::new`)、`Options.base` を確かめる前に実パスの候補 (`Target::real_candidate`) を見る。`Options.base` の確かめは `Target::check_base` で、経路に進む時だけ行う
+- 名前で終わらない短い相対パスは候補を作らず、相対のまま標準に渡す (resolve はそのまま返して `CwdRelative`)
+- 候補が収まらない相対パスは、長い相対パスと同じに経路に進む。どの経路も使えなければ (`Step::Next`)、標準に渡す長さ以下なら相対のまま標準に渡し (`route::as_relative`、`CwdRelative`、`skipped` から `standard` を除く)、超えれば `ENAMETOOLONG`
+- 相対パスのソケットのディレクトリの realpath が、パスの長さのせいで引けない時 (`ENAMETOOLONG` か `ERANGE`。macOS の realpath(3) は cwd が PATH_MAX を超えると `ERANGE` を返す。実測 2026-11-22) は、`Target::new` が `None` を返し、経路を 1 つも試さずに同じく相対のまま標準に渡す (`skipped` は空)
+- `$PWD` は `route::Config` を通さず、呼び出しのたびに環境変数から読む (connect の relative が cwd の綴りに使う `$PWD` と同じ扱い)。試験は子プロセスに `PWD` を渡して変える
+- `bind_ex` の cwd の見張り (何かを引く前と、ソケットのファイルを覚えた後で cwd の `(st_dev, st_ino)` を比べる) は、結果の綴りが `CwdRelative` の時だけ行う。絶対パスにした綴りは覚える realpath が cwd によらない。`ForBind` は `CwdRelative` の時だけ resolve の初めの cwd を持ち、`socket_file()` は cwd が違うか引けていなければエラーにする
+- 候補で bind して失敗したら、そのエラーを返し、もう 1 つの候補・経路・相対パスで試し直さない
+
+理由:
+
+- 候補の 2 つと経路への進み方は SPEC どおり。`$PWD` を `Config` に入れないのは、短い相対パスの入口で `Config` (置き場の環境変数を読む) を作らずに済ませるため。`$PWD` の読み方は connect の relative と同じで、試験の差し替えは子プロセスの環境で足りる
+- `$PWD` の候補の作り方はコマンド `sockat` の `resolve` と同じなので、CLI 専用の入口 (`__cli::pwd_candidate`) からコマンドも同じ関数を使う ([DR-0033](DR-0033-cli-crate-and-internal-entry.md))。実パスの候補はコマンドが自分でディレクトリを引いてエラーの文を選ぶので、写さない
+- `path::fold` は SPEC の手順 (空の要素と `.` を除き、`..` は前の要素と一緒に除く、ルートの `..` はルート) を、`/` で分けたバイト列の上にそのまま書く。`Path::components` に任せると、どの綴りを落とすか (途中の `.`、重なった `/`) が std の解釈になり、SPEC の文言と 1 対 1 で照らせない
 
 ### B・D・E の持ち方 (`src/base.rs`)
 
@@ -98,7 +116,7 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 
 ### 試験の口
 
-- 環境を読む部分は `route::Config` (置き場、持っている置き場 1〜3 の B (`Held`)、`/proc` の場所、thread-cwd、widened、bind が symlink を辿るか、ソケットのディレクトリの開き方、cwd の引き直しの間) にして、試験が差し替える。試験は `Held` を試験ごとに持ち、同じプロセスで並ぶ試験の B が重ならない
+- 環境を読む部分は `route::Config` (置き場、持っている置き場 1〜3 の B (`Held`)、`/proc` の場所、thread-cwd、widened、bind が symlink を辿るか、ソケットのディレクトリの開き方、パスを引いてから次に引くまでの間 `between_lookups`) にして、試験が差し替える。`between_lookups` は 1 回の呼び出しで 1 度、標準にそのまま渡す時は bind / connect の後、絶対パスの候補を作った時はその後・bind の前、経路に進む時はディレクトリを引いて `Options.base` を確かめた後・経路の前に呼ぶ (試験はそこで cwd を変える、ディレクトリの名前を変える、途中の symlink を張り替える)。試験は `Held` を試験ごとに持ち、同じプロセスで並ぶ試験の B が重ならない
 - D を整えられない場面は、試験だけの thread_local (`base::FAIL_D`) で、作った D を開くところを失敗させて作る (本物の失敗をそこで起こす手が無い)
 - E を消せない場面は、試験だけの thread_local (`base::FAIL_UNLINK_E`) で、そのスレッドの E の unlink を `EPERM` にして作る。bind の直後にソケットのファイルが置き換わる場面は、試験だけの thread_local (`route::AFTER_BIND`) で、bind が通ってから覚えるまでの間に置き換えを入れて作る (どちらも呼び出しの途中に他のプロセスが割り込む形で、試験から外の手で起こせない)。元のパスの途中の symlink を経路を組んだ後に張り替える場面は、bind の前を `Config` の cwd の引き直しの間 (ディレクトリの実パスを引いた後、経路の前に呼ばれる) で、bind の後を `route::AFTER_BIND` で作る。E とソケットのファイルを消した回数は試験だけのフィールド (`Link::unlinks`・`Clean::file_unlinks`) で数え、並行の呼び出しで消す操作が 1 回だけかを確かめる
 - プロセス全体に効く設定 (cwd、umask、実効 uid) と、終わったプロセスの D が要る試験は、試験のバイナリを子プロセスで起こす
@@ -136,5 +154,5 @@ pub fn sweep_base<P: AsRef<Path>>(base: P) -> io::Result<()>;
 
 ## 関連
 
-- ハブ: [DR-0017](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0017-resolve-through-persistent-base.md)、[SPEC](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md)、[SPEC-routes](https://github.com/kawaz/sockat/blob/main/docs/SPEC-routes-ja.md)、[適合試験](https://github.com/kawaz/sockat/blob/main/docs/design/conformance.md)
+- ハブ: [DR-0017](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0017-resolve-through-persistent-base.md)、[DR-0019](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0019-absolutize-relative-path-on-bind.md)、[SPEC](https://github.com/kawaz/sockat/blob/main/docs/SPEC-ja.md)、[SPEC-routes](https://github.com/kawaz/sockat/blob/main/docs/SPEC-routes-ja.md)、[適合試験](https://github.com/kawaz/sockat/blob/main/docs/design/conformance.md)
 - [DR-0002](DR-0002-std-handles-paths-it-accepts.md)、[DR-0004](DR-0004-relative-path-from-cwd.md)、[DR-0005](DR-0005-widened-sockaddr-on-macos.md)、[DR-0011](DR-0011-routes-not-exposed.md)、[DR-0012](DR-0012-route-failure-handling.md)、[DR-0015](DR-0015-own-socket-matches-std.md)、[DR-0030](DR-0030-conformance-cli.md)

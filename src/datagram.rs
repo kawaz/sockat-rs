@@ -27,8 +27,9 @@ use crate::sys::SockType;
 use crate::{Bound, ExError, Options, Report};
 
 /// Create a datagram socket bound to `path`, like [`UnixDatagram::bind`] but
-/// for a path of any length. As [`bind`](crate::bind): the socket file is at
-/// `path`, and E stays until the process ends, shared with the other default
+/// for a path of any length. As [`bind`](crate::bind): a relative path is
+/// made absolute first (so a peer replying to the address it reports reaches
+/// this socket from any cwd), the socket file is at `path`, and E stays until the process ends, shared with the other default
 /// binds in the same directory ([`bind_ex`] cleans up an E of its own).
 ///
 /// # Errors

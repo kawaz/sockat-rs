@@ -17,6 +17,13 @@
 //!
 //! The E of link-dir and link-file stays until it is cleaned up (the kernel
 //! keeps the bind's spelling for the life of the socket); D and B stay.
+//!
+//! A bind and a resolve make a relative path absolute first (hub SPEC "相対
+//! パスを絶対パスにする", hub DR-0019): an absolute candidate (the real path,
+//! then `$PWD`'s spelling) that fits goes to std, and a long absolute path's
+//! real path is tried before the routes too. Only when no route can be used
+//! does a short relative path go to std as it is (`CwdRelative`). A connect
+//! hands a relative path on as it is.
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::ffi::{OsStr, OsString};
@@ -34,9 +41,10 @@ use crate::sys::{self, Op, SockAddr, SockType};
 use crate::{Options, Spelling, Until};
 
 /// The longest path std accepts, `sun_path` less the NUL: 107 on Linux,
-/// Android and illumos, 103 on Apple and the BSDs. A path of at most this many
-/// bytes is handed to std as is, so std alone decides what happens to every
-/// path it can take. It is also the limit of every spelling sockat makes.
+/// Android and illumos, 103 on Apple and the BSDs. An absolute path of at most
+/// this many bytes is handed to std as is, so std alone decides what happens
+/// to it (a relative one too, for a connect). It is also the limit of every
+/// spelling sockat makes, absolute candidates included.
 pub(crate) const DIRECT_MAX: usize = sys::SUN_PATH_CAP - 1;
 
 /// The names of the routes in the SPEC ("経路の名前"), and the reasons a
@@ -250,10 +258,12 @@ pub(crate) struct Config {
     )]
     pub(crate) open_socket_dir: fn(&Path) -> io::Result<OwnedFd>,
     /// Called once where the path has been looked up and is yet to be again:
-    /// after the bind / connect of a short path, and after the real path of
-    /// a long path's directory is taken, before any route. Does nothing
-    /// outside the tests, which change the cwd there (a relative path) or
-    /// switch a symlink on the path's way, as another thread could.
+    /// after the bind / connect of a path handed to std as it is; after an
+    /// absolute candidate is made, before std binds it; and after the real
+    /// path of the socket's directory is taken (and `Options.base` checked),
+    /// before any route. Does nothing outside the tests, which change the cwd
+    /// there, move a directory or switch a symlink on the path's way, as
+    /// another thread or process could.
     pub(crate) between_lookups: fn(),
 }
 
@@ -382,20 +392,24 @@ impl Step {
 
 /// Bind or connect `path` by the first route that can be used.
 ///
-/// A path of at most [`DIRECT_MAX`] bytes goes to std as is, before anything
-/// else is looked at (the environment included). An empty path and a NUL
-/// byte are looked at before the length: an empty path is `InvalidInput`
-/// (before the abstract namespace is looked at), and so is a path with a NUL
-/// at any length, except a leading NUL on Linux / Android (a name in the
-/// abstract namespace, which goes to std as is).
+/// An absolute path of at most [`DIRECT_MAX`] bytes goes to std as is, before
+/// anything else is looked at (the environment included); so does a relative
+/// one for a connect. A bind makes a relative path absolute first
+/// ([`before_routes`]). An empty path and a NUL byte are looked at before
+/// the length: an empty path is `InvalidInput` (before the abstract namespace
+/// is looked at), and so is a path with a NUL at any length, except a
+/// leading NUL on Linux / Android (a name in the abstract namespace, which
+/// goes to std as is).
 ///
 /// With `remember` (`bind_ex`), the socket file is looked up right after the
-/// bind ([`Remembered`]). A relative path is resolved against the cwd both by
-/// the bind and by that look-up, at different moments, so the cwd's
-/// `(st_dev, st_ino)` is taken before both and after both; when they differ
-/// the listener is closed and an error returned with the route's name (the
-/// socket file stays), so `remove()` cannot hit an unrelated file. A change
-/// undone before the second look is not seen.
+/// bind ([`Remembered`]). A relative path handed to std as it is
+/// (`CwdRelative`, when no route could be used) is resolved against the cwd
+/// both by the bind and by that look-up, at different moments, so the cwd's
+/// `(st_dev, st_ino)` is taken before anything is looked up and after both;
+/// when they differ the listener is closed and an error returned with the
+/// route's name (the socket file stays), so `remove()` cannot hit an
+/// unrelated file. A change undone before the second look is not seen. A
+/// spelling made absolute needs no such check: the file is looked up by it.
 pub(crate) fn run(
     req: Request<'_>,
     path: &Path,
@@ -403,16 +417,15 @@ pub(crate) fn run(
     remember: bool,
     cfg: Option<&Config>,
 ) -> Result<Reached, Failed> {
-    if !remember || path.is_absolute() || path::is_abstract(path) {
+    if !remember || !req.is_bind() || path.is_absolute() || path::is_abstract(path) {
         return run_unchecked(req, path, options, remember, cfg);
     }
     let before = dir_id(Path::new("."));
     let reached = run_unchecked(req, path, options, remember, cfg)?;
-    if before.is_some() && dir_id(Path::new(".")) == before {
+    if reached.spelling != Some(Spelling::CwdRelative)
+        || (before.is_some() && dir_id(Path::new(".")) == before)
+    {
         return Ok(reached);
-    }
-    if let Some(link) = &reached.link {
-        let _ = link.cleanup();
     }
     Err(Failed {
         error: io::Error::other(
@@ -430,14 +443,139 @@ fn dir_id(dir: &Path) -> Option<(u64, u64)> {
     Some((m.dev(), m.ino()))
 }
 
-/// The spelling of a path handed to std as is: `CwdRelative` for a relative
-/// path (not a name in the abstract namespace), `Original` otherwise.
-fn standard_spelling(path: &Path) -> Spelling {
-    if path.is_absolute() || path::is_abstract(path) {
-        Spelling::Original
-    } else {
-        Spelling::CwdRelative
+/// What an entry hands to std before any route is looked at.
+struct Direct {
+    path: PathBuf,
+    spelling: Spelling,
+    /// An absolute candidate of a relative path: made by looking the cwd
+    /// up, and looked up again by std.
+    candidate: bool,
+}
+
+/// What `path` goes to std as before any route, after the checks of its
+/// form (hub SPEC "短いパス", "相対パスを絶対パスにする" 1-3); `None` to go to
+/// the routes. `absolutize` is for a bind and a resolve:
+///
+/// | path | `absolutize` | to std |
+/// |---|---|---|
+/// | a name in the abstract namespace | either | itself (`Original`) |
+/// | absolute, at most [`DIRECT_MAX`] bytes | either | itself (`Original`) |
+/// | relative, ending with a name | yes | its absolute candidate that fits ([`absolute_candidate`], `Original`); else the routes, however short |
+/// | relative, not ending with a name (`dir/`, `..`), short | yes | itself (`CwdRelative`): std gives its error |
+/// | relative, short | no (a connect) | itself |
+///
+/// Anything longer goes to the routes (which refuse a path that does not
+/// end with a name).
+fn before_routes(path: &Path, absolutize: bool) -> Result<Option<Direct>, Failed> {
+    path::refuse_empty(path).map_err(Failed::before_routes)?;
+    let as_is = |spelling| Direct {
+        path: path.to_path_buf(),
+        spelling,
+        candidate: false,
+    };
+    if path::is_abstract(path) {
+        return Ok(Some(as_is(Spelling::Original)));
     }
+    path::refuse_nul(path).map_err(Failed::before_routes)?;
+    let fits = path::len(path) <= DIRECT_MAX;
+    if path.is_absolute() {
+        return Ok(fits.then(|| as_is(Spelling::Original)));
+    }
+    if absolutize {
+        if let Ok((dir, name)) = path::split(path) {
+            return Ok(absolute_candidate(path, dir, name).map(|c| Direct {
+                path: c,
+                spelling: Spelling::Original,
+                candidate: true,
+            }));
+        }
+    }
+    Ok(fits.then(|| as_is(Spelling::CwdRelative)))
+}
+
+/// An absolute path naming the same place as the relative `path` (whose
+/// directory is `dir` and file name `name`) that std takes, the real path
+/// first (hub SPEC-routes "絶対パスの候補の作り方"): `realpath(3)` of `dir`
+/// with `name` after it, else [`pwd_candidate`]. `None` when neither can be
+/// made or fits: a candidate that cannot be made is no failure, the routes
+/// look the directory up and tell what is wrong.
+fn absolute_candidate(path: &Path, dir: &Path, name: &OsStr) -> Option<PathBuf> {
+    if let Ok(real) = std::fs::canonicalize(dir) {
+        let real = real.join(name);
+        if path::len(&real) <= DIRECT_MAX {
+            return Some(real);
+        }
+    }
+    pwd_candidate(path, dir, std::env::var_os("PWD").as_deref())
+        .filter(|p| path::len(p) <= DIRECT_MAX)
+}
+
+/// The `$PWD` candidate of the relative `path` (whose directory is `dir`):
+/// `pwd` and `path` folded by their letters ([`path::fold`]), when `pwd` is
+/// absolute and is the cwd (the same `(st_dev, st_ino)` as `.`: `$PWD` is
+/// inherited and may be stale), and the folded directory is `dir` to the
+/// kernel (the same `(st_dev, st_ino)`: to the kernel `a/sym/..` is the
+/// parent of the symlink's target, which the folding does not know). `None`
+/// otherwise; the length is the caller's.
+pub(crate) fn pwd_candidate(path: &Path, dir: &Path, pwd: Option<&OsStr>) -> Option<PathBuf> {
+    let pwd = Path::new(pwd?);
+    if !pwd.is_absolute() || dir_id(pwd)? != dir_id(Path::new("."))? {
+        return None;
+    }
+    let folded = path::fold(pwd, path);
+    let (folded_dir, _) = path::split(&folded).ok()?;
+    (dir_id(folded_dir)? == dir_id(dir)?).then_some(folded)
+}
+
+/// Whether `realpath(3)` of a relative path's directory failed because the
+/// path is too long (hub SPEC "相対パスを絶対パスにする": `ENAMETOOLONG`, or
+/// `ERANGE`, which macOS's gives for a cwd deeper than `PATH_MAX`, measured
+/// 2026-11-22): no route can be used then, as every E would point to that
+/// real path.
+fn too_deep(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENAMETOOLONG | libc::ERANGE))
+}
+
+/// Bind or connect by `spelled` handed to std as it is (route `standard`),
+/// with what the call passed over before (`skipped`), and the socket file
+/// looked up by `spelled` with `remember`. `hook` is
+/// [`Config::between_lookups`] when it runs right after the call.
+fn standard(
+    req: Request<'_>,
+    spelled: &Path,
+    spelling: Spelling,
+    remember: bool,
+    hook: Option<fn()>,
+    skipped: Vec<Skipped>,
+) -> Result<Reached, Failed> {
+    let failed = |error| Failed {
+        error,
+        route: Some(names::STANDARD),
+        skipped: skipped.clone(),
+    };
+    let socket = plain(req, spelled).map_err(failed)?;
+    if let Some(hook) = hook {
+        hook();
+    }
+    if req.is_bind() {
+        after_bind();
+    }
+    let file = match remember && req.is_bind() {
+        true => Some(match path::is_abstract(spelled) {
+            true => Kept::Abstract,
+            false => Kept::File(remembered_at(spelled).map_err(failed)?),
+        }),
+        false => None,
+    };
+    Ok(Reached {
+        socket,
+        route: names::STANDARD,
+        base: None,
+        spelling: req.is_bind().then_some(spelling),
+        link: None,
+        file,
+        skipped,
+    })
 }
 
 /// [`run`] without the check of the cwd.
@@ -448,44 +586,17 @@ fn run_unchecked(
     remember: bool,
     cfg: Option<&Config>,
 ) -> Result<Reached, Failed> {
-    let direct = |req: Request<'_>, path: &Path| {
-        let failed = |error| Failed {
-            error,
-            route: Some(names::STANDARD),
-            skipped: Vec::new(),
-        };
-        let socket = plain(req, path).map_err(failed)?;
-        if let Some(cfg) = cfg {
-            (cfg.between_lookups)();
-        }
-        if req.is_bind() {
-            after_bind();
-        }
-        let file = match remember && req.is_bind() {
-            true => Some(match path::is_abstract(path) {
-                true => Kept::Abstract,
-                false => Kept::File(remembered_at(path).map_err(failed)?),
-            }),
-            false => None,
-        };
-        Ok(Reached {
-            socket,
-            route: names::STANDARD,
-            base: None,
-            spelling: req.is_bind().then(|| standard_spelling(path)),
-            link: None,
-            file,
-            skipped: Vec::new(),
-        })
-    };
     refuse_bad_base(options)?;
-    path::refuse_empty(path).map_err(Failed::before_routes)?;
-    if path::is_abstract(path) {
-        return direct(req, path);
-    }
-    path::refuse_nul(path).map_err(Failed::before_routes)?;
-    if path::len(path) <= DIRECT_MAX {
-        return direct(req, path);
+    let absolutize = req.is_bind();
+    if let Some(d) = before_routes(path, absolutize)? {
+        let hook = cfg.map(|c| c.between_lookups);
+        if !d.candidate {
+            return standard(req, &d.path, d.spelling, remember, hook, Vec::new());
+        }
+        if let Some(hook) = hook {
+            hook();
+        }
+        return standard(req, &d.path, d.spelling, remember, None, Vec::new());
     }
     let from_env;
     let cfg = match cfg {
@@ -495,7 +606,20 @@ fn run_unchecked(
             &from_env
         }
     };
-    let t = Target::new(req, path, options, cfg)?;
+    let Some(t) = Target::new(req, path, options, cfg, absolutize)? else {
+        // No route can be used (hub SPEC "相対パスを絶対パスにする" 5), and
+        // none was tried.
+        return as_relative(req, path, remember, Vec::new());
+    };
+    if let Some(real) = t
+        .real_candidate()
+        .filter(|_| absolutize && path.is_absolute())
+    {
+        (cfg.between_lookups)();
+        return standard(req, &real, Spelling::Original, remember, None, Vec::new());
+    }
+    t.check_base()?;
+    (cfg.between_lookups)();
     let step = match req {
         Request::Bind(_) => bind_order(&t, remember),
         Request::Connect(_) => connect_order(&t),
@@ -522,12 +646,34 @@ fn run_unchecked(
             route,
             skipped,
         }),
+        Step::Next if absolutize => as_relative(req, path, remember, skipped),
         Step::Next => Err(Failed {
             error: too_long(),
             route: None,
             skipped,
         }),
     }
+}
+
+/// A bind none of whose routes can be used (hub SPEC "相対パスを絶対パスにす
+/// る" 5): a relative path std takes goes to it as it is (`CwdRelative`),
+/// with the routes passed over but not `standard` (the route it goes by);
+/// anything else is `ENAMETOOLONG`.
+fn as_relative(
+    req: Request<'_>,
+    path: &Path,
+    remember: bool,
+    mut skipped: Vec<Skipped>,
+) -> Result<Reached, Failed> {
+    if path.is_absolute() || path::len(path) > DIRECT_MAX {
+        return Err(Failed {
+            error: too_long(),
+            route: None,
+            skipped,
+        });
+    }
+    skipped.retain(|s| s.name != names::STANDARD);
+    standard(req, path, Spelling::CwdRelative, remember, None, skipped)
 }
 
 /// `InvalidInput` for an `Options.base` that is relative or does not end with
@@ -646,31 +792,32 @@ impl<'a> Target<'a> {
     /// directory is `ENOENT` and a file in its place `ENOTDIR` whatever the
     /// file name, as a bind / connect through the path would answer. Its real
     /// path is taken next; when it cannot be resolved that error is returned
-    /// as is. A failure up to there is one before any route, with nothing
-    /// passed over: the length is judged only once the directory is looked
-    /// up, so `standard` is passed over only from then on.
+    /// as is, except that with `absolutize` (a bind, a resolve) a relative
+    /// path whose directory's real path is too long ([`too_deep`]) gives
+    /// `None`: no route can be used. A failure up to there is one before any
+    /// route, with nothing passed over: the length is judged only once the
+    /// directory is looked up, so `standard` is passed over only from then on.
     ///
-    /// `Options.base` is checked next, before any route, for a bind and a
-    /// connect alike, without making anything ([`base::check_given`]); B is
-    /// made only once a route that uses it is reached.
+    /// `Options.base` is not checked here: an absolute candidate that fits
+    /// goes to std without it ([`Target::check_base`]).
     fn new(
         req: Request<'a>,
         path: &'a Path,
         options: &'a Options,
         cfg: &'a Config,
-    ) -> Result<Self, Failed> {
+        absolutize: bool,
+    ) -> Result<Option<Self>, Failed> {
         let before = Failed::before_routes;
         let (dir, name) = path::split(path).map_err(before)?;
         if !std::fs::metadata(dir).map_err(before)?.is_dir() {
             return Err(before(io::Error::from_raw_os_error(libc::ENOTDIR)));
         }
-        let real_dir = std::fs::canonicalize(dir).map_err(before)?;
-        if let Some(given) = &options.base {
-            let cross = matches!(req, Request::Bind(_)) && options.usable_cross_uid;
-            base::check_given(given, cross).map_err(before)?;
-        }
-        (cfg.between_lookups)();
-        Ok(Self {
+        let real_dir = match std::fs::canonicalize(dir) {
+            Ok(real_dir) => real_dir,
+            Err(e) if absolutize && !path.is_absolute() && too_deep(&e) => return Ok(None),
+            Err(e) => return Err(before(e)),
+        };
+        Ok(Some(Self {
             req,
             path,
             dir,
@@ -687,7 +834,30 @@ impl<'a> Target<'a> {
                 name: names::STANDARD,
                 reason: names::TOO_LONG,
             }]),
-        })
+        }))
+    }
+
+    /// The real-path candidate of a long absolute path (hub SPEC "相対パスを
+    /// 絶対パスにする": a bind and a resolve try it before the routes): the
+    /// directory's real path with the file name after it, when it fits.
+    fn real_candidate(&self) -> Option<PathBuf> {
+        let real = self.real_dir.join(self.name);
+        (path::len(&real) <= DIRECT_MAX).then_some(real)
+    }
+
+    /// `Options.base` checked, before any route, for a bind and a connect
+    /// alike, without making anything ([`base::check_given`]); B is made only
+    /// once a route that uses it is reached. Its error is the call's (a
+    /// relative path does not go to std as it is for it: no route was found
+    /// unusable).
+    fn check_base(&self) -> Result<(), Failed> {
+        match &self.options.base {
+            Some(given) => {
+                base::check_given(given, self.req.is_bind() && self.options.usable_cross_uid)
+                    .map_err(Failed::before_routes)
+            }
+            None => Ok(()),
+        }
     }
 
     /// Note that the route `name` was tried and cannot be used, for `reason`:
@@ -829,7 +999,7 @@ fn fits_through(prefix_len: usize, e_len: usize, name: Option<&OsStr>) -> bool {
 /// for procB (its spelling goes through no `/tmp`), for B's real path when
 /// neither the place as given nor the real path goes through `/tmp` or
 /// `/var/tmp`.
-fn forms(
+pub(crate) fn forms(
     cfg: &Config,
     b: &Base,
     cross_uid: bool,
@@ -1485,11 +1655,16 @@ pub(crate) struct Resolved {
 
 /// Resolve `path` into a spelling to hand to std (hub SPEC "resolve"):
 ///
-/// * a path std accepts: itself (`Original` / `CwdRelative`);
+/// * what [`before_routes`] hands to std (an absolute path std takes, a
+///   relative path's absolute candidate): itself;
+/// * a long absolute path's real path when it fits ([`Target::real_candidate`]);
 /// * for a bind: link-dir (procB, then B's real path), then link-file where
 ///   a bind is measured to follow a symlink;
 /// * for a connect: link-file through an E in this process's D (procB, then
 ///   B's real path);
+/// * when none of those can be used, a relative path std takes, as it is
+///   (`CwdRelative`, with the cwd's `(st_dev, st_ino)` taken before anything
+///   was looked up);
 /// * otherwise `ENAMETOOLONG`.
 pub(crate) fn resolve(
     for_: Use,
@@ -1497,26 +1672,36 @@ pub(crate) fn resolve(
     options: &Options,
     cfg: Option<&Config>,
 ) -> Result<Resolved, Failed> {
-    let short = |path: &Path| Resolved {
-        path: path.to_path_buf(),
-        spelling: standard_spelling(path),
+    refuse_bad_base(options)?;
+    let cwd = match path.is_absolute() || path::is_abstract(path) {
+        true => None,
+        false => dir_id(Path::new(".")),
+    };
+    let standard = |path: PathBuf, spelling: Spelling, skipped: Vec<Skipped>| Resolved {
+        path,
+        spelling,
         route: names::STANDARD,
         base: None,
-        skipped: Vec::new(),
+        skipped,
         link: None,
-        cwd: match standard_spelling(path) {
-            Spelling::CwdRelative => dir_id(Path::new(".")),
-            _ => None,
-        },
+        cwd: cwd.filter(|_| spelling == Spelling::CwdRelative),
     };
-    refuse_bad_base(options)?;
-    path::refuse_empty(path).map_err(Failed::before_routes)?;
-    if path::is_abstract(path) {
-        return Ok(short(path));
-    }
-    path::refuse_nul(path).map_err(Failed::before_routes)?;
-    if path::len(path) <= DIRECT_MAX {
-        return Ok(short(path));
+    // A relative path std takes, as it is, when nothing else can be used
+    // (hub SPEC "相対パスを絶対パスにする" 5): without `standard` among the
+    // routes passed over.
+    let as_relative = |mut skipped: Vec<Skipped>| {
+        if path.is_absolute() || path::len(path) > DIRECT_MAX {
+            return Err(Failed {
+                error: too_long(),
+                route: None,
+                skipped,
+            });
+        }
+        skipped.retain(|s| s.name != names::STANDARD);
+        Ok(standard(path.to_path_buf(), Spelling::CwdRelative, skipped))
+    };
+    if let Some(d) = before_routes(path, true)? {
+        return Ok(standard(d.path, d.spelling, Vec::new()));
     }
     let from_env;
     let cfg = match cfg {
@@ -1530,7 +1715,14 @@ pub(crate) fn resolve(
         Use::Bind => Request::Bind(SockType::Stream),
         Use::Connect => Request::Connect(Connect::Stream { nonblocking: false }),
     };
-    let t = Target::new(req, path, options, cfg)?;
+    let Some(t) = Target::new(req, path, options, cfg, true)? else {
+        return as_relative(Vec::new());
+    };
+    if let Some(real) = t.real_candidate().filter(|_| path.is_absolute()) {
+        return Ok(standard(real, Spelling::Original, Vec::new()));
+    }
+    t.check_base()?;
+    (cfg.between_lookups)();
     let found = match for_ {
         Use::Bind => resolve_bind(&t),
         Use::Connect => resolve_connect(&t),
@@ -1559,11 +1751,7 @@ pub(crate) fn resolve(
             link: Some(th.link),
             cwd: None,
         }),
-        Ok(None) => Err(Failed {
-            error: too_long(),
-            route: None,
-            skipped,
-        }),
+        Ok(None) => as_relative(skipped),
         Err(error) => Err(Failed {
             error,
             route: None,
@@ -1630,17 +1818,22 @@ fn resolve_connect(t: &Target<'_>) -> io::Result<Option<Through>> {
 /// `socket_file()`): [`remembered_at`] the spelling (followed to the end, a
 /// symlink in the last component of the path too), or no file for a name in
 /// the abstract namespace (hub SPEC "remove"). For a `CwdRelative` spelling
-/// the cwd must still be the one it was resolved against.
-pub(crate) fn remember_resolved(spelling: &Path, cwd: Option<(u64, u64)>) -> io::Result<Kept> {
-    if path::is_abstract(spelling) {
+/// the cwd must still be the one it was resolved against (`cwd`, its
+/// `(st_dev, st_ino)` then; `None` when it could not be read).
+pub(crate) fn remember_resolved(
+    spelled: &Path,
+    spelling: Spelling,
+    cwd: Option<(u64, u64)>,
+) -> io::Result<Kept> {
+    if path::is_abstract(spelled) {
         return Ok(Kept::Abstract);
     }
-    if cwd.is_some() && dir_id(Path::new(".")) != cwd {
+    if spelling == Spelling::CwdRelative && (cwd.is_none() || dir_id(Path::new(".")) != cwd) {
         return Err(io::Error::other(
             "the current directory changed since the path relative to it was resolved",
         ));
     }
-    remembered_at(spelling).map(Kept::File)
+    remembered_at(spelled).map(Kept::File)
 }
 
 // ---------------------------------------------------------------------------

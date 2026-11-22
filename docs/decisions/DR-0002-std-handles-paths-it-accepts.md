@@ -9,7 +9,8 @@ std の `UnixListener::bind` / `UnixStream::connect` は `sun_path` に収まる
 
 ## Decision
 
-- パスが `sun_path` − 1 バイト以内なら `UnixListener::bind` / `UnixStream::connect` をそのまま呼ぶ。何も足さない (環境変数も読まない)
+- 絶対パスが `sun_path` − 1 バイト以内なら `UnixListener::bind` / `UnixStream::connect` をそのまま呼ぶ。何も足さない (環境変数も読まない)。connect 系は相対パスも同じ
+- bind 系と resolve の相対パスは、長さによらず絶対パスにしてから扱う (ハブ [DR-0019](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0019-absolutize-relative-path-on-bind.md)。作り方は [DR-0032](DR-0032-resolve-through-persistent-base.md)「相対パスを絶対パスにする」)。標準に渡すのは収まる絶対パスで、相対のまま渡すのはどの経路も使えない時だけ
 - 値は OS ごとに違う。libc の `sockaddr_un` の `sun_path` の配列の長さから求める (`sys::SUN_PATH_CAP`)
 
   | OS | `sun_path` (NUL 込み) | std にそのまま渡す長さ |

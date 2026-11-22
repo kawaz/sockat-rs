@@ -647,7 +647,10 @@ fn an_ex_error_keeps_the_errno_and_the_routes() {
 // The resolved spellings go to std: resolve_for_bind's to std's bind (the
 // socket at the path), its socket_file() after the bind to remove the file
 // and E; resolve_for_connect's to std's connect, many times, then cleanup.
-// A path std accepts resolves to itself.
+// Both tell what the spelling is: resolve_for_connect's through E to the
+// socket file is Linked and not removable (unlinking it removes E). An
+// absolute path std accepts resolves to itself (Original), for a bind and a
+// connect.
 #[test]
 fn resolved_spellings_go_to_std() {
     let t = tmp();
@@ -660,6 +663,13 @@ fn resolved_spellings_go_to_std() {
     let file = for_bind.socket_file().unwrap();
     let for_connect = sockat::resolve_for_connect(&p, own_base(&t)).unwrap();
     assert_eq!(for_connect.route, "link-file");
+    assert!(matches!(
+        for_connect.spelling,
+        Spelling::Linked {
+            removable: false,
+            ..
+        }
+    ));
     for _ in 0..3 {
         let mut c = UnixStream::connect(&for_connect.path).unwrap();
         ping(&listener, &mut c);
@@ -672,6 +682,9 @@ fn resolved_spellings_go_to_std() {
 
     let short = t.path().join("s.sock");
     let r = sockat::resolve_for_bind(&short, own_base(&t)).unwrap();
+    assert_eq!(r.path, short);
+    assert_eq!(r.spelling, Spelling::Original);
+    let r = sockat::resolve_for_connect(&short, own_base(&t)).unwrap();
     assert_eq!(r.path, short);
     assert_eq!(r.spelling, Spelling::Original);
 }

@@ -93,6 +93,46 @@ pub(crate) fn split(path: &Path) -> io::Result<(&Path, &OsStr)> {
     Ok((Path::new(OsStr::from_bytes(dir)), OsStr::from_bytes(name)))
 }
 
+/// `pwd` and the relative path `rel` joined by `/` and folded by their
+/// letters (hub SPEC-routes "絶対パスの候補の作り方", `$PWD` の候補 2): split
+/// into components, the empty ones and `.` dropped, `..` taking the one
+/// before it away (`..` at the root stays at the root). On the bytes, so a
+/// name that is not UTF-8 is kept as it is.
+///
+/// | `pwd` | `rel` | result |
+/// |---|---|---|
+/// | `/w/x` | `s.sock` | `/w/x/s.sock` |
+/// | `/w/x` | `./a//s.sock` | `/w/x/a/s.sock` |
+/// | `/w/x` | `../../s.sock` | `/s.sock` |
+/// | `/` | `../s.sock` | `/s.sock` |
+///
+/// The folding is only arithmetic: to the kernel `a/sym/..` is the parent of
+/// the symlink's target, not `a`, so the caller makes sure the result names
+/// the same directory before using it.
+pub(crate) fn fold(pwd: &Path, rel: &Path) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let mut parts: Vec<&[u8]> = Vec::new();
+    let bytes = [pwd.as_os_str().as_bytes(), rel.as_os_str().as_bytes()];
+    for part in bytes.iter().flat_map(|b| b.split(|&c| c == b'/')) {
+        match part {
+            b"" | b"." => {}
+            b".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    let mut folded = Vec::new();
+    for part in &parts {
+        folded.push(b'/');
+        folded.extend_from_slice(part);
+    }
+    if folded.is_empty() {
+        folded.push(b'/');
+    }
+    std::path::PathBuf::from(std::ffi::OsString::from_vec(folded))
+}
+
 /// The part of `target` below the directory `prefix`, when `target` starts
 /// with `prefix` component by component (`/a/b` is a prefix of `/a/b/c` but
 /// not of `/a/bc`).
@@ -262,6 +302,37 @@ mod tests {
         assert_eq!(below(Path::new("/w"), Path::new("/w")), None);
         // Relative inputs have no defined relation to the cwd here.
         assert_eq!(below(Path::new("w/s"), Path::new("/w")), None);
+    }
+
+    // `fold` makes the `$PWD` candidate of a relative path (hub SPEC-routes
+    // "絶対パスの候補の作り方"): the components of `$PWD` and the path joined,
+    // empty ones and `.` dropped, `..` taking the component before it (none
+    // above the root), on the bytes. Each row pins one of those rules, and a
+    // name that is not UTF-8 must come out byte for byte (the candidate is
+    // handed to the kernel).
+    #[test]
+    fn fold_joins_and_folds_by_the_letters() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("/w/x", "s.sock", "/w/x/s.sock"),
+            ("/w/x/", "./a//s.sock", "/w/x/a/s.sock"),
+            ("/w/x", "a/../s.sock", "/w/x/s.sock"),
+            ("/w/x", "../../s.sock", "/s.sock"),
+            ("/w", "../../../s.sock", "/s.sock"),
+            ("/", "../s.sock", "/s.sock"),
+            ("/w/./x", "s.sock", "/w/x/s.sock"),
+        ];
+        for &(pwd, rel, want) in cases {
+            assert_eq!(
+                fold(Path::new(pwd), Path::new(rel)),
+                Path::new(want),
+                "{pwd} + {rel}"
+            );
+        }
+        let odd = Path::new(OsStr::from_bytes(b"\xff/s.sock"));
+        assert_eq!(
+            fold(Path::new("/w"), odd).as_os_str().as_bytes(),
+            b"/w/\xff/s.sock"
+        );
     }
 
     // `relative` is what lets a long absolute path fit `sun_path` as a short
