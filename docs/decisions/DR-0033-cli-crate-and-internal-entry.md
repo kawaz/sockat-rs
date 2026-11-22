@@ -1,6 +1,6 @@
 # DR-0033: コマンド `sockat` は workspace の別パッケージ sockat-cli に置き、B の作り方は feature の後ろの doc に出さない入口でライブラリから使う
 
-- Status: Accepted (kawaz 2026-11-22: sockat-cli を crates.io に公開してよい (ハブ RL-Q1 = a)。ライブラリ 0.6.0 と一緒に公開する。kawaz 指示 2026-11-22: Homebrew (kawaz/tap) でも配り、GitHub release に target ごとの binary とハッシュの検査ファイルを置く)
+- Status: Accepted (kawaz 2026-11-22: sockat-cli を crates.io に公開してよい (ハブ RL-Q1 = a)。0.6.1 で公開済み (crates.io の初回は手元から publish し、trusted publisher を設定)。kawaz 指示 2026-11-22: Homebrew (kawaz/tap) でも配り、GitHub release に target ごとの binary とハッシュの検査ファイルを置く)
 - Date: 2026-11-22
 
 ## Context
