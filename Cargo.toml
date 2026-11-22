@@ -13,7 +13,7 @@ readme = "README.md"
 # What goes into the published crate: the code and what docs.rs / crates.io
 # show. Repository tooling (CI, justfile, agent rules), the design docs and
 # the command (cli/) stay in the repository.
-include = ["src/**", "README.md", "LICENSE", "Cargo.toml"]
+include = ["/src/**", "/README.md", "/LICENSE", "/Cargo.toml"]
 
 # The library stays at the root (where the published package has always
 # been); the command `sockat` is the package sockat-cli in cli/ (DR-0033).
