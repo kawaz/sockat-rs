@@ -804,3 +804,730 @@ fn a_subcommand_name_is_the_path_unless_first() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["original"], "resolve");
 }
+
+// ---------------------------------------------------------------------------
+// the advanced options and the commands that try the routes (cli.md
+// "進んだオプション", "手法を試すサブコマンド"; DR-0034)
+// ---------------------------------------------------------------------------
+
+/// Every route name of the SPEC ("経路の名前").
+const ALL_ROUTES: [&str; 10] = [
+    "standard",
+    "link-dir",
+    "link-file",
+    "thread-cwd",
+    "at",
+    "proc-direct",
+    "relative",
+    "widened",
+    "at-direct",
+    "thread-cwd-direct",
+];
+
+/// The routes of a bind on this OS (hub SPEC "bind の順": link-file where a
+/// bind may follow a symlink, thread-cwd on Linux and Apple, at on FreeBSD).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const BIND_ROUTES: &[&str] = &["standard", "link-dir", "thread-cwd"];
+#[cfg(target_vendor = "apple")]
+const BIND_ROUTES: &[&str] = &["standard", "link-dir", "link-file", "thread-cwd"];
+#[cfg(target_os = "freebsd")]
+const BIND_ROUTES: &[&str] = &["standard", "link-dir", "at"];
+#[cfg(any(target_os = "openbsd", target_os = "illumos"))]
+const BIND_ROUTES: &[&str] = &["standard", "link-dir"];
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "illumos"
+)))]
+const BIND_ROUTES: &[&str] = &["standard", "link-dir", "link-file"];
+
+/// The routes of a connect on this OS (hub SPEC "connect の順", both rows of
+/// Linux).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const CONNECT_ROUTES: &[&str] = &[
+    "standard",
+    "proc-direct",
+    "relative",
+    "thread-cwd-direct",
+    "link-file",
+];
+#[cfg(target_vendor = "apple")]
+const CONNECT_ROUTES: &[&str] = &[
+    "standard",
+    "relative",
+    "widened",
+    "thread-cwd-direct",
+    "link-file",
+];
+#[cfg(target_os = "freebsd")]
+const CONNECT_ROUTES: &[&str] = &["standard", "at-direct", "link-file"];
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd"
+)))]
+const CONNECT_ROUTES: &[&str] = &["standard", "relative", "link-file"];
+
+/// Why thread-cwd and thread-cwd-direct cannot be used here, if they cannot:
+/// a seccomp filter on Linux (docker's default profile installs one, and the
+/// command inherits it), as the library tells (`seccomp filter`).
+fn thread_cwd_refused() -> Option<&'static str> {
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        return None;
+    }
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let mode = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Seccomp:"))
+        .map(str::trim);
+    (mode != Some("0")).then_some("seccomp filter")
+}
+
+/// A listener at `p` (any length), made by std at a short path in the case
+/// and renamed there, so a connect test does not lean on the bind routes.
+fn listen_at(c: &Case, p: &Path) -> UnixListener {
+    let short = c.path().join("l.sock");
+    let l = UnixListener::bind(&short).unwrap();
+    fs::rename(&short, p).unwrap();
+    l.set_nonblocking(true).unwrap();
+    l
+}
+
+/// The JSON of `bind` / `connect` and the exit code.
+fn trial_json(out: &Output) -> (i32, serde_json::Value) {
+    let v = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "{e}: stdout {}, stderr {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (out.status.code().unwrap(), v)
+}
+
+/// The names in `v`'s `skipped`.
+fn skipped(v: &serde_json::Value) -> Vec<String> {
+    v["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn is_socket(p: &Path) -> bool {
+    fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_socket())
+}
+
+/// The `base` and `until` of a bind's link-dir in the case: B spelled
+/// through `/proc/<pid>/fd/<B's fd>` where `/proc` can be used (hub SPEC "bind
+/// の順" 2), else by its real path (3).
+fn link_dir_base() -> (&'static str, &'static str) {
+    match cfg!(any(target_os = "linux", target_os = "android"))
+        && Path::new("/proc/self/fd").exists()
+    {
+        true => ("proc", "Process"),
+        false => ("tmp", "Cleanup"),
+    }
+}
+
+/// The E of the link-dir spelling `kernel` (`<B's spelling>/<D>/<E>/<name>`),
+/// by B's real path in the case's places: how `left` names it.
+fn e_of(c: &Case, kernel: &Path) -> PathBuf {
+    let e = kernel.parent().unwrap();
+    let d = e.parent().unwrap();
+    c.b()
+        .join(d.file_name().unwrap())
+        .join(e.file_name().unwrap())
+}
+
+/// `bind` without `--route` binds by the library's order (hub SPEC "bind の
+/// 順"): a long path goes past standard (too long) to link-dir, the first
+/// route through B, here in the case's places (spelled through `/proc` where
+/// it can be used). The text shows one item a
+/// line, `left` the E made, with where it points. Without `--keep` the
+/// socket file and that E are removed after they are shown.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "the places for B can be moved only in a debug build"
+)]
+fn bind_by_the_default_order() {
+    let c = Case::new();
+    let long = c.long_dir('d');
+    let original = long.join("s.sock");
+    let out = c.run(&[OsStr::new("bind"), original.as_os_str()]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    let item = |name: &str| -> String {
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}: ")))
+            .unwrap_or_else(|| panic!("no {name} in {text}"))
+            .to_owned()
+    };
+    let (base, until) = link_dir_base();
+    assert_eq!(item("route"), "link-dir");
+    assert_eq!(item("base"), base);
+    assert!(
+        item("spelling").starts_with(&format!(
+            "Linked (removable, until {}",
+            until.to_lowercase()
+        )),
+        "{text}"
+    );
+    assert!(item("skipped").starts_with("standard ("), "{text}");
+    let kernel = PathBuf::from(item("kernel-path"));
+    assert!(len(&kernel) <= LIMIT, "{text}");
+    let real = fs::canonicalize(&long).unwrap();
+    let (e, target) = item("left")
+        .split_once(" -> ")
+        .map(|(e, t)| (PathBuf::from(e), PathBuf::from(t)))
+        .unwrap();
+    assert_eq!(target, real);
+    assert_eq!(e, e_of(&c, &kernel));
+    assert!(!original.exists(), "the socket file is removed");
+    assert!(fs::symlink_metadata(&e).is_err(), "the E is removed");
+}
+
+/// `--keep` leaves the socket file at the path and the E in the base, to be
+/// looked at; without it both are gone (cli.md "手法を試すサブコマンド").
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "the places for B can be moved only in a debug build"
+)]
+fn keep_leaves_the_socket_file_and_the_e() {
+    let c = Case::new();
+    let long = c.long_dir('d');
+    let original = long.join("s.sock");
+    let (code, v) = trial_json(&c.run(&[
+        OsStr::new("bind"),
+        OsStr::new("--json"),
+        OsStr::new("--keep"),
+        original.as_os_str(),
+    ]));
+    assert_eq!(code, 0, "{v}");
+    let e = PathBuf::from(v["left"][0].as_str().unwrap());
+    assert!(is_socket(&original));
+    assert_eq!(fs::read_link(&e).unwrap(), fs::canonicalize(&long).unwrap());
+    fs::remove_file(&original).unwrap();
+
+    let (code, v) = trial_json(&c.run(&[
+        OsStr::new("bind"),
+        OsStr::new("--json"),
+        original.as_os_str(),
+    ]));
+    assert_eq!(code, 0, "{v}");
+    let e = PathBuf::from(v["left"][0].as_str().unwrap());
+    assert!(!original.exists());
+    assert!(fs::symlink_metadata(&e).is_err());
+}
+
+/// `--json` of `bind` and `connect` has the members of the conformance CLI
+/// (`ok`, `error`, `route`, `base`, `spelling`, with its values) and the
+/// command's (`skipped` with the reasons, `kernel_path`, `left`), for a call
+/// that gets through and one that does not (cli.md "出力").
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "the places for B can be moved only in a debug build"
+)]
+fn trial_json_has_the_members_of_the_design() {
+    let c = Case::new();
+    let long = c.long_dir('d');
+    let original = long.join("s.sock");
+    let (code, v) = trial_json(&c.run(&[
+        OsStr::new("bind"),
+        OsStr::new("--json"),
+        OsStr::new("--route"),
+        OsStr::new("standard,link-dir"),
+        original.as_os_str(),
+    ]));
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["error"], serde_json::Value::Null);
+    assert_eq!(v["route"], "link-dir");
+    let (base, until) = link_dir_base();
+    assert_eq!(v["base"], base);
+    assert_eq!(v["spelling"]["kind"], "Linked");
+    assert_eq!(v["spelling"]["removable"], true);
+    assert_eq!(v["spelling"]["until"], until);
+    for attr in ["usable_cross_uid", "usable_with_private_tmp"] {
+        assert!(v["spelling"][attr].is_boolean(), "{v}");
+    }
+    assert_eq!(skipped(&v), ["standard"]);
+    assert!(v["skipped"][0]["reason"].is_string(), "{v}");
+    let kernel = PathBuf::from(v["kernel_path"].as_str().unwrap());
+    assert_eq!(kernel.file_name().unwrap(), "s.sock");
+    assert_eq!(
+        v["left"],
+        serde_json::json!([e_of(&c, &kernel).to_str().unwrap()])
+    );
+
+    // Through to nobody: ok false, the errno's name, and nothing kept.
+    let (code, v) = trial_json(&c.run(&[
+        OsStr::new("connect"),
+        OsStr::new("--json"),
+        original.as_os_str(),
+    ]));
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(v["ok"], false);
+    assert!(
+        matches!(v["error"].as_str(), Some("ENOENT" | "ECONNREFUSED")),
+        "{v}"
+    );
+    assert!(
+        v["route"].is_string(),
+        "the route that failed for real: {v}"
+    );
+    assert_eq!(v["base"], serde_json::Value::Null);
+    assert_eq!(v["spelling"], serde_json::Value::Null);
+    assert_eq!(v["kernel_path"], serde_json::Value::Null);
+    assert_eq!(v["left"], serde_json::json!([]));
+
+    // A connect that gets through: no base, spelling or left.
+    let l = listen_at(&c, &original);
+    let (code, v) = trial_json(&c.run(&[
+        OsStr::new("connect"),
+        OsStr::new("--json"),
+        original.as_os_str(),
+    ]));
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["base"], serde_json::Value::Null);
+    assert_eq!(v["spelling"], serde_json::Value::Null);
+    assert_eq!(v["left"], serde_json::json!([]));
+    assert_eq!(skipped(&v)[0], "standard");
+    assert!(l.accept().is_ok(), "the connect reached the listener");
+}
+
+/// `bind --route <name>` binds by that route alone, for each route of a bind
+/// on this OS, with the socket at the path: standard for a path that fits,
+/// the others for a long one. thread-cwd is passed over where a seccomp
+/// filter keeps the thread's cwd from moving, and then nothing is left to
+/// try (exit code 1).
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "the places for B can be moved only in a debug build"
+)]
+fn bind_by_each_route_named() {
+    let c = Case::new();
+    let long = c.long_dir('d');
+    for route in BIND_ROUTES {
+        let original = match *route {
+            "standard" => c.path().join("s.sock"),
+            _ => long.join("s.sock"),
+        };
+        let out = c.run(&[
+            OsStr::new("bind"),
+            OsStr::new("--json"),
+            OsStr::new("--keep"),
+            OsStr::new("--route"),
+            OsStr::new(route),
+            original.as_os_str(),
+        ]);
+        let (code, v) = trial_json(&out);
+        if route.starts_with("thread-cwd") {
+            if let Some(why) = thread_cwd_refused() {
+                assert_eq!(code, 1, "{v}");
+                assert_eq!(v["skipped"][0]["reason"], why, "{v}");
+                continue;
+            }
+        }
+        assert_eq!(code, 0, "{route}: {v}");
+        assert_eq!(v["route"], *route, "{v}");
+        assert!(v["skipped"].as_array().unwrap().is_empty(), "{v}");
+        let kind = match *route {
+            "standard" => "Original",
+            "link-dir" | "link-file" => "Linked",
+            _ => "Dangling",
+        };
+        assert_eq!(v["spelling"]["kind"], kind, "{v}");
+        assert!(is_socket(&original), "{route}: the socket is at the path");
+        fs::remove_file(&original).unwrap();
+    }
+}
+
+/// `connect --route <name>` connects by that route alone, for each route of
+/// a connect on this OS, to the listener at the path: standard for a path
+/// that fits, relative from the socket's directory, the others for a long
+/// path from elsewhere.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "the places for B can be moved only in a debug build"
+)]
+fn connect_by_each_route_named() {
+    let c = Case::new();
+    let long = c.long_dir('d');
+    for route in CONNECT_ROUTES {
+        let (original, cwd) = match *route {
+            "standard" => (c.path().join("s.sock"), c.path().to_path_buf()),
+            "relative" => (long.join("s.sock"), long.clone()),
+            _ => (long.join("s.sock"), c.path().to_path_buf()),
+        };
+        let l = listen_at(&c, &original);
+        let out = c
+            .sockat()
+            .current_dir(&cwd)
+            .args([
+                OsStr::new("connect"),
+                OsStr::new("--json"),
+                OsStr::new("--route"),
+                OsStr::new(route),
+                original.as_os_str(),
+            ])
+            .output()
+            .unwrap();
+        let (code, v) = trial_json(&out);
+        if route.starts_with("thread-cwd") {
+            if let Some(why) = thread_cwd_refused() {
+                assert_eq!(code, 1, "{v}");
+                assert_eq!(v["skipped"][0]["reason"], why, "{v}");
+                fs::remove_file(&original).unwrap();
+                continue;
+            }
+        }
+        assert_eq!(code, 0, "{route}: {v}");
+        assert_eq!(v["route"], *route, "{v}");
+        assert!(
+            l.accept().is_ok(),
+            "{route}: the connect reached the listener"
+        );
+        fs::remove_file(&original).unwrap();
+    }
+}
+
+/// A route the operation or this OS does not have is an error in the
+/// arguments (exit code 2) before anything is tried, and the error names
+/// the routes it has (cli.md "`--route` に渡す名前"); so is a name that is no
+/// route. Nothing is made in the places.
+#[test]
+fn a_route_this_os_or_operation_lacks_is_an_argument_error() {
+    let c = Case::new();
+    let long = c.long_dir('d');
+    let original = long.join("s.sock");
+    for (op, routes) in [("bind", BIND_ROUTES), ("connect", CONNECT_ROUTES)] {
+        for route in ALL_ROUTES
+            .iter()
+            .filter(|r| !routes.contains(r))
+            .chain(&["fork"])
+        {
+            let out = c.run(&[
+                OsStr::new(op),
+                OsStr::new("--route"),
+                OsStr::new(route),
+                original.as_os_str(),
+            ]);
+            let message = failed(&out, 2);
+            for usable in routes.iter().chain(&["default"]) {
+                assert!(message.contains(usable), "{op} {route}: {message}");
+            }
+        }
+    }
+    // resolve takes the routes that give a path.
+    for route in ["thread-cwd", "relative", "proc-direct"] {
+        let out = c.run(&[
+            OsStr::new("--route"),
+            OsStr::new(route),
+            original.as_os_str(),
+        ]);
+        let message = failed(&out, 2);
+        assert!(message.contains("link-file"), "{message}");
+    }
+    assert!(!c.b().exists());
+}
+
+/// A route named that cannot be used for the path is passed over to the
+/// next named (cli.md "`--route` に渡す名前"): standard for a long path, and
+/// relative for a connect from a directory too far from the socket's; with
+/// none left, exit code 1 with what was passed over.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "the places for B can be moved only in a debug build"
+)]
+fn a_route_unusable_for_the_path_is_passed_over() {
+    let c = Case::new();
+    let long = c.long_dir('d');
+    let original = long.join("s.sock");
+
+    let (code, v) = trial_json(&c.run(&[
+        OsStr::new("bind"),
+        OsStr::new("--json"),
+        OsStr::new("--route"),
+        OsStr::new("standard"),
+        original.as_os_str(),
+    ]));
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(v["error"], "ENAMETOOLONG");
+    assert_eq!(skipped(&v), ["standard"]);
+    assert!(!original.exists());
+
+    if CONNECT_ROUTES.contains(&"relative") {
+        let l = listen_at(&c, &original);
+        let (code, v) = trial_json(&c.run(&[
+            OsStr::new("connect"),
+            OsStr::new("--json"),
+            OsStr::new("--route"),
+            OsStr::new("relative,link-file"),
+            original.as_os_str(),
+        ]));
+        assert_eq!(code, 0, "{v}");
+        assert_eq!(v["route"], "link-file");
+        assert_eq!(skipped(&v), ["relative"]);
+        assert!(l.accept().is_ok());
+    }
+
+    // resolve: standard passed over, link-dir taken; none usable, exit 1.
+    let out = c.run(&[
+        OsStr::new("--route"),
+        OsStr::new("standard,link-dir"),
+        original.as_os_str(),
+    ]);
+    let real = fs::canonicalize(&long).unwrap();
+    assert_eq!(printed(&out), c.b().join(hash(&real)).join("s.sock"));
+    let m = failed(
+        &c.run(&[
+            OsStr::new("--route"),
+            OsStr::new("standard"),
+            original.as_os_str(),
+        ]),
+        1,
+    );
+    assert!(
+        m.starts_with("sockat: ") && m.lines().count() == 2 && m.contains("standard"),
+        "{m}"
+    );
+}
+
+/// `resolve --route` makes the path by the routes named, in that order, even
+/// for a path that fits as it is: link-dir gives `B/<hash>/<name>`, link-file
+/// `B/<hash of the file>` (with the warning of a path for connect), and
+/// `default` alone is no `--route` at all.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "the places for B can be moved only in a debug build"
+)]
+fn resolve_by_the_routes_named() {
+    let c = Case::new();
+    let short = c.path().join("s.sock");
+    let real = fs::canonicalize(c.path()).unwrap();
+    let out = c.run(&[
+        OsStr::new("--route"),
+        OsStr::new("link-dir"),
+        short.as_os_str(),
+    ]);
+    assert_eq!(printed(&out), c.b().join(hash(&real)).join("s.sock"));
+    let out = c.run(&[
+        OsStr::new("--route"),
+        OsStr::new("link-file"),
+        short.as_os_str(),
+    ]);
+    assert_eq!(
+        printed_with_warning(&out, WARNING),
+        c.b().join(hash(&real.join("s.sock")))
+    );
+    let out = c.run(&[
+        OsStr::new("resolve"),
+        OsStr::new("--route"),
+        OsStr::new("link-file,link-dir"),
+        OsStr::new("--for"),
+        OsStr::new("bind"),
+        short.as_os_str(),
+    ]);
+    match BIND_FOLLOWS {
+        true => assert_eq!(
+            printed_with_warning(&out, WARNING_BIND),
+            c.b().join(hash(&real.join("s.sock")))
+        ),
+        // link-file cannot serve a bind here: passed over to link-dir.
+        false => assert_eq!(printed(&out), c.b().join(hash(&real)).join("s.sock")),
+    }
+    let long = c.long_dir('d');
+    for args in [vec!["--route", "default"], vec![]] {
+        let out = c
+            .sockat()
+            .args(&args)
+            .arg(long.join("s.sock"))
+            .output()
+            .unwrap();
+        let real_long = fs::canonicalize(&long).unwrap();
+        assert_eq!(printed(&out), c.b().join(hash(&real_long)).join("s.sock"));
+    }
+}
+
+/// `--base` gives a bind's B as `Options.base` does (`base` is `given`).
+#[test]
+fn bind_with_base() {
+    let c = Case::new();
+    let long = c.long_dir('d');
+    let app = c.path().join("app");
+    fs::create_dir(&app).unwrap();
+    let base = app.join("sockat");
+    let (code, v) = trial_json(&c.run(&[
+        OsStr::new("bind"),
+        OsStr::new("--json"),
+        OsStr::new("--base"),
+        base.as_os_str(),
+        long.join("s.sock").as_os_str(),
+    ]));
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["base"], "given");
+    let kernel = PathBuf::from(v["kernel_path"].as_str().unwrap());
+    assert!(
+        kernel.starts_with(fs::canonicalize(&app).unwrap().join("sockat"))
+            || kernel.starts_with("/proc"),
+        "{v}"
+    );
+    assert!(!c.b().exists(), "nothing is made in the places");
+}
+
+/// `--base-fd` and `--base-pid` are a pair: one alone is an error in the
+/// arguments, and so is either with `--base` (cli.md "進んだオプション").
+/// Where there is no `/proc` (all but Linux), they are an error in the
+/// arguments too, saying so.
+#[test]
+fn base_fd_and_base_pid_are_a_pair() {
+    let c = Case::new();
+    let p = c.long_dir('d').join("s.sock");
+    let pid = std::process::id().to_string();
+    for args in [
+        vec!["--base-fd", "3"],
+        vec!["--base-pid", pid.as_str()],
+        vec![
+            "--base",
+            "/tmp/x/sockat",
+            "--base-fd",
+            "3",
+            "--base-pid",
+            pid.as_str(),
+        ],
+    ] {
+        let out = c.sockat().args(&args).arg(&p).output().unwrap();
+        let m = failed(&out, 2);
+        assert!(
+            m.starts_with("sockat: --base") && m.lines().count() == 2,
+            "{m}"
+        );
+    }
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        let out = c
+            .sockat()
+            .args(["--base-fd", "3", "--base-pid", pid.as_str()])
+            .arg(&p)
+            .output()
+            .unwrap();
+        let m = failed(&out, 2);
+        assert!(m.contains("/proc") && m.contains("Linux"), "{m}");
+    }
+}
+
+/// `--base-fd <N> --base-pid <PID>` puts E right in the directory that
+/// process holds open by its fd N, and the path goes through
+/// `/proc/<PID>/fd/<N>` (hub DR-0018 "置き場と持ち主の指定"): here this test
+/// holds the directory open, the command opens it through `/proc` as another
+/// process, and a bind and a connect by the path reach the socket at the long
+/// path while the fd is held. Nothing is made in the places. A directory
+/// others can write to is refused as `--base` refuses one (exit code 1).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn base_fd_spells_the_base_through_proc() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+
+    let c = Case::new();
+    let long = c.long_dir('d');
+    let held = c.path().join("held");
+    fs::create_dir(&held).unwrap();
+    fs::set_permissions(&held, fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = fs::File::open(&held).unwrap();
+    let fd = dir.as_raw_fd().to_string();
+    let pid = std::process::id().to_string();
+    let out = c
+        .sockat()
+        .args([
+            "--json",
+            "--base-fd",
+            fd.as_str(),
+            "--base-pid",
+            pid.as_str(),
+        ])
+        .arg(long.join("s.sock"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let real = fs::canonicalize(&long).unwrap();
+    let e = PathBuf::from(format!("/proc/{pid}/fd/{fd}")).join(hash(&real));
+    let path = e.join("s.sock");
+    assert_eq!(v["path"], path.to_str().unwrap());
+    assert_eq!(v["route"], "link-dir");
+    assert_eq!(v["link"], e.to_str().unwrap());
+    assert_eq!(fs::read_link(held.join(hash(&real))).unwrap(), real);
+    let listener = UnixListener::bind(&path).unwrap();
+    assert!(is_socket(&long.join("s.sock")));
+    let _client = UnixStream::connect(&path).unwrap();
+    listener.accept().unwrap();
+    assert!(!c.b().exists(), "nothing is made in the places");
+
+    fs::set_permissions(&held, fs::Permissions::from_mode(0o777)).unwrap();
+    let out = c
+        .sockat()
+        .args(["--base-fd", fd.as_str(), "--base-pid", pid.as_str()])
+        .arg(long.join("t.sock"))
+        .output()
+        .unwrap();
+    let m = failed(&out, 1);
+    assert!(m.starts_with("sockat: cannot use fd"), "{m}");
+}
+
+/// The advanced options and the commands that try the routes are not in
+/// `--help`, and are in `--help-all` and in the completion scripts (cli.md
+/// "呼び方": `--help` lists the basic ones; the help, the completion and the
+/// implementation go together).
+#[test]
+fn the_advanced_ones_are_in_help_all_and_the_completion_only() {
+    let c = Case::new();
+    let text = |args: &[&str]| {
+        let out = c.run(args);
+        assert!(out.status.success() && out.stderr.is_empty(), "{args:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let short = text(&["--help"]);
+    let all = text(&["--help-all"]);
+    let lists = |help: &str, name: &str| help.lines().any(|l| l.starts_with(&format!("  {name} ")));
+    for option in ["--route", "--base-fd", "--base-pid"] {
+        assert!(!short.contains(option), "--help has {option}");
+        assert!(all.contains(option), "--help-all lacks {option}");
+        assert!(!text(&["resolve", "--help"]).contains(option));
+        assert!(text(&["resolve", "--help-all"]).contains(option));
+    }
+    for command in ["bind", "connect"] {
+        assert!(!lists(&short, command), "--help has {command}");
+        assert!(lists(&all, command), "--help-all lacks {command}");
+    }
+    assert!(text(&["bind"]).contains("--keep"));
+    assert!(text(&["connect", "--help"]).contains("--route"));
+    for shell in ["bash", "zsh", "fish"] {
+        let script = text(&["completion", shell]);
+        for word in ["bind", "route", "base-fd", "base-pid", "keep", "link-dir"] {
+            assert!(script.contains(word), "{shell} lacks {word}");
+        }
+    }
+}

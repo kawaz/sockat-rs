@@ -1,12 +1,15 @@
-//! The `--json` output of `resolve` (docs/design/cli.md "出力"): one object,
-//! the members in the order the design shows them.
+//! The `--json` output of `resolve`, `bind` and `connect`
+//! (docs/design/cli.md "出力"): one object, the members in the order the
+//! design shows them.
 
 use std::fmt::Write;
 use std::path::Path;
 
 use sockat::__cli as entry;
+use sockat::{Spelling, Until};
 
 use crate::resolve::{Failure, Resolved};
+use crate::trial::Outcome;
 
 /// The object for `resolved`, made from `original` (the path as given).
 ///
@@ -35,13 +38,92 @@ pub(crate) fn resolved(original: &Path, resolved: &Resolved) -> Result<String, F
     // Always there, empty when there is nothing to warn of (cli.md "出力").
     let warnings: Vec<String> = resolved.warnings.iter().map(|w| quote(w)).collect();
     members.push(("warnings", format!("[{}]", warnings.join(", "))));
+    Ok(object(&members))
+}
+
+/// The object for what `bind` or `connect` came to: the members of the
+/// conformance CLI's output (`ok`, `error`, `route`, `base`, `spelling`,
+/// with its values) and the command's own (`skipped` with the reasons,
+/// `kernel_path`, `left`).
+///
+/// # Errors
+///
+/// When a path is not UTF-8, as for [`resolved`].
+pub(crate) fn outcome(o: &Outcome<'_>) -> Result<String, Failure> {
+    let or_null = |v: Option<String>| v.unwrap_or_else(|| "null".to_owned());
+    let skipped: Vec<String> = o
+        .skipped
+        .iter()
+        .map(|s| {
+            format!(
+                "{{ \"name\": {}, \"reason\": {} }}",
+                quote(s.name),
+                quote(s.reason)
+            )
+        })
+        .collect();
+    let left = o
+        .left
+        .iter()
+        .map(|(e, _)| string(e))
+        .collect::<Result<Vec<_>, _>>()?;
+    let members: Vec<(&str, String)> = vec![
+        ("ok", o.error.is_none().to_string()),
+        (
+            "error",
+            or_null(o.error.map(|e| quote(&entry::error_name(e)))),
+        ),
+        ("route", or_null(o.route.map(quote))),
+        ("base", or_null(o.base.map(quote))),
+        ("spelling", or_null(o.spelling.map(spelling))),
+        ("skipped", format!("[{}]", skipped.join(", "))),
+        (
+            "kernel_path",
+            or_null(o.kernel_path.as_deref().map(string).transpose()?),
+        ),
+        ("left", format!("[{}]", left.join(", "))),
+    ];
+    Ok(object(&members))
+}
+
+/// `s` as the conformance CLI writes it: `kind`, and for `Linked` its
+/// attributes under their Rust names.
+fn spelling(s: Spelling) -> String {
+    match s {
+        Spelling::Linked {
+            removable,
+            until,
+            usable_cross_uid,
+            usable_with_private_tmp,
+            ..
+        } => format!(
+            "{{ \"kind\": \"Linked\", \"removable\": {removable}, \"until\": {}, \"usable_cross_uid\": {usable_cross_uid}, \"usable_with_private_tmp\": {usable_with_private_tmp} }}",
+            quote(match until {
+                Until::Process => "Process",
+                Until::Cleanup => "Cleanup",
+            })
+        ),
+        s => format!(
+            "{{ \"kind\": {} }}",
+            quote(match s {
+                Spelling::Original => "Original",
+                Spelling::CwdRelative => "CwdRelative",
+                Spelling::Dangling => "Dangling",
+                _ => "Unknown",
+            })
+        ),
+    }
+}
+
+/// One member a line, in the order of `members`.
+fn object(members: &[(&str, String)]) -> String {
     let mut out = String::from("{\n");
     for (i, (key, value)) in members.iter().enumerate() {
         let comma = if i + 1 < members.len() { "," } else { "" };
         let _ = writeln!(out, "  {}: {value}{comma}", quote(key));
     }
     out.push_str("}\n");
-    Ok(out)
+    out
 }
 
 /// `p` as a JSON string.
