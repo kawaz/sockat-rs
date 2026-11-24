@@ -52,8 +52,9 @@
 - 綴りが link-dir の時、E はその bind の数の E (`bind_ex` の物) で、既定の `bind` が使い回す E ではない
 - コマンドのプロセスの D は残る (ライブラリは D を消さない)。コマンドが終われば持ち主の死んだ D なので、`sockat sweep` と OS の掃除で消える。`--keep` の E もその D の中にあり、D と一緒に消える
 - `connect` は入口の `connect` (= `connect_ex`) で connect し、結果を出して閉じる
-- `kernel_path` は、`bind` は listener の `local_addr()`、`connect` は stream の `peer_addr()` のパス。パスの無いアドレスは `null`
-- `left` は、通った経路が link-dir か link-file の時の、その bind の E。`kernel_path` から E の綴り (link-dir はファイル名の前、link-file は綴りそのもの) を取り、その親を realpath にした所に E の名前を付けたパス (procB の綴りでも B の実パスで出す)。表示の時点で symlink として在る時だけ載せる。D・B は載せない (どちらも `--keep` によらず残り、`remove()` で消す物でない)
+- `kernel_path` は、`bind` は listener の `getsockname(2)`、`connect` は stream の `getpeername(2)` のパス。ライブラリが試験で綴りを読むのと同じく、カーネルが書いたアドレスの `sun_path` を長さの中で最初の NUL までと読む (入口の `local_path`・`peer_path`)。std の `SocketAddr` は通さない (Rust 1.99 以前は OpenBSD でパスの最後の 1 バイトを落とす。rust-lang/rust#118925。CI の OpenBSD の VM の Rust は 1.98.1)。パスの無いアドレスは `null`
+- `left` は、通った経路が link-dir か link-file の時の、その bind の E。E の実パス (B の実パス、D、E。入口の `link_path`) で出す。綴りが procB でも、`/proc/<pid>/fd/<fd>` はコマンドが終わると辿れないので使わない。表示の時点で symlink として在る時だけ載せる。D・B は載せない (どちらも `--keep` によらず残り、`remove()` で消す物でない)
+- 既定の bind の link-dir の `base` は、`/proc/<pid>/fd/<fd>` が fd と同じ物を指す所では `proc` (ハブ SPEC-routes「綴りの形」。OS で決めない)。CI では Linux・NetBSD・illumos が `proc`、macOS・FreeBSD・OpenBSD が置き場の名前 (2026-11-24)
 - 標準出力は、1 行に 1 項目 `名前: 値`。無い値は `-`
 
   | 場面 | 項目 |
@@ -102,7 +103,7 @@
 - 短いパスで名指しの経路を試すのは、`--route link-dir` の目的が link-dir の綴りの性質を見ることだから。短いパスで黙って `standard` にすると、名指しが効かない
 - `default` だけを名指しの無い呼び出しにそろえるのは、cli.md の「`--route` を付けないのと同じ」をライブラリの呼び出しそのもので守るため
 - `bind` を `bind_ex` にするのは、cli.md が `remove()` と `cleanup()` で片付けると決めたため (既定の `bind` は `SocketFile` を返さない)
-- `left` を `kernel_path` から取るのは、ライブラリの返す物 (`Bound`) に E のパスが無く、入口に足す物を増やさないため。E の実パスは、procB の綴りではコマンドが終わると辿れないので、B の実パスで出す
+- `left` を E の実パスでライブラリから取るのは、綴りから求めると OS で結果が違うため。procB の綴り `/proc/<pid>/fd/<fd>/D/E` の realpath は、Linux・NetBSD では B の実パスになった。illumos では、コマンドが終わった後にそのパスで E が見つからなかった (`--keep` の試験が `ENOENT`、CI 2026-11-24)。D は自分の実パス (B の実パスと D の名前) を持つ (feature `__cli-internal` の時だけ。ライブラリの振る舞いは変えない)
 - `InvalidInput` を終了コード 2 にするのは、`resolve` が同じ誤り (名前で終わらないパス、空、`--base` の形) を 2 にしているのとそろえるため
 - `--route` の名前の誤りを clap に任せるのは、使える名前の一覧と補完の候補を同じ定義から作れるため (`--help`・補完・実装を同じ定義でそろえる)
 - 持ち主の fd の B を確かめるのは、`--base` の B と同じ理由 (他人が B に書けると、E を差し替えて別のソケットに繋がせられる)。E をコマンドの fd を通して作るのは、確かめたディレクトリに作るため (持ち主がその間に fd を閉じて番号を使い回しても、確かめていない所に作らない)
@@ -113,7 +114,7 @@
 - `--help-all` を見つけるのに、引数の解析の前に引数を一度見る (`--` より前の `--help-all`)。オプションの値として `--help-all` という文字列を渡す場合も、help として読む
 - `--route` の名前の誤りの文は clap の形 (`error: invalid value …`) で、`sockat: ` で始まる他のエラーの文と形が違う (`--for` の誤りと同じ)
 - 環境で使えない経路 (seccomp の下の thread-cwd 等) を名指しすると、引数の誤りでなく終了コード 1 になる。ハブ DR-0018 の「その環境で使えない手法は使えない理由つきのエラーにする」を、「`skipped` に理由が出る終了コード 1」で満たす読み方をした
-- `left` は `kernel_path` が取れない時 (アドレスにパスが無い等) は空になる。その時も `--keep` が無ければ E は消える
+- `left` は E の実パスを、D を作った時の B の実パスから作る。その後に B の置き場が rename されると、実際の場所と合わない (表示だけの話で、片付けは fd で行う)
 - `bind` のたびにコマンドのプロセスの D が 1 つ残る (sweep まで)
 - errno の名前の表が、適合試験の CLI (`examples/conformance.rs`) と入口の 2 か所にある (適合試験の CLI は公開の API だけを使う。DR-0030)
 - 持ち主の fd の B は、B 自身の確かめが `--base` より緩い (途中の確かめが無い。途中は `/proc` の fd)。`hidepid` 等で別の uid の fd は開けないので、他人の B を使うことは無い
