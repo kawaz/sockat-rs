@@ -176,7 +176,7 @@ For those who hand a spelling to the standard library or another library themsel
 
 `sockat::datagram` mirrors the functions of the standard library's `UnixDatagram` that take a path, and `unbound`. The routes and their order are those of stream. To a sender bound to a long path, the receiver can reply to the address from `recv_from` while the spelling can be followed (`Spelling::Linked`). On OpenBSD this needs Rust 1.100 or later ([Caveats specific to Rust](#caveats-specific-to-rust)). How to use it is in the user manual's [Use DGRAM](./manual/datagram.md).
 
-`send_to` and SEQPACKET are not there yet ([the specification's open questions](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#open-questions)). To `send_to` a long path, hand the spelling of `resolve_for_connect` to the standard library's `send_to` ([send_to a long path](./manual/datagram.md#send_to-a-long-path)). For SEQPACKET, hand the spelling of resolve to a socket you make yourself ([Use SEQPACKET](./manual/seqpacket.md)).
+`send_to` is not there yet ([the specification's open questions](https://github.com/kawaz/sockat/blob/main/docs/SPEC.md#open-questions)). To `send_to` a long path, hand the spelling of `resolve_for_connect` to the standard library's `send_to` ([send_to a long path](./manual/datagram.md#send_to-a-long-path)). There are no functions of its own for SEQPACKET. Hand the spelling of resolve to a SEQPACKET socket you make yourself ([Use SEQPACKET](./manual/seqpacket.md)).
 
 ## What differs from the standard library for a long path
 
