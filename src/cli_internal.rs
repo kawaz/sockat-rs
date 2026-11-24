@@ -252,17 +252,21 @@ pub fn connect(
     crate::connect_by(path, false, &options, Some(&cfg), named(routes))
 }
 
-/// The check of a B another process holds open (`--base-fd`), on the
-/// directory opened through `/proc/<pid>/fd/<fd>`: a directory of this user
-/// that group and others cannot write to, as B itself is checked for
-/// `Options.base` (hub SPEC-routes "B の作り方"). The way to it is the
-/// process's fd, which nobody else can change.
+/// B another process holds open (`--base-fd`), `held` being
+/// `/proc/<pid>/fd/<fd>`: opened with the search permission alone, as B is
+/// for `Options.base` (`O_PATH` on Linux, so a B its owner cannot read is
+/// taken as well), and checked as B itself is for `Options.base` (hub
+/// SPEC-routes "B の作り方"): a directory of this user that group and others
+/// cannot write to. The way to it is the process's fd, which nobody else can
+/// change.
 ///
 /// # Errors
 ///
-/// `ENOTDIR` when it is not a directory, `EPERM` when it is someone else's or
-/// group or others can write to it, and those of `fstat(2)`.
-pub fn check_held(dir: &std::fs::File) -> io::Result<()> {
+/// Those of opening it, `ENOTDIR` when it is not a directory, `EPERM` when it
+/// is someone else's or group or others can write to it, and those of
+/// `fstat(2)`.
+pub fn open_held(held: &Path) -> io::Result<std::fs::File> {
+    let dir = std::fs::File::from(route::open_socket_dir(held)?);
     let m = dir.metadata()?;
     if !m.is_dir() {
         return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
@@ -270,7 +274,7 @@ pub fn check_held(dir: &std::fs::File) -> io::Result<()> {
     if m.uid() != sys::effective_uid() || m.mode() & 0o022 != 0 {
         return Err(io::Error::from_raw_os_error(libc::EPERM));
     }
-    Ok(())
+    Ok(dir)
 }
 
 /// The name of `e` as the hub's conformance CLI writes it (the hub's

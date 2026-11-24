@@ -455,9 +455,10 @@ pub(crate) fn held_base_unsupported() -> Failure {
 }
 
 /// B the process `pid` holds open by its fd `fd` (hub DR-0018 "置き場と持ち
-/// 主の指定"): opened through `/proc/<pid>/fd/<fd>` (another uid cannot),
-/// checked as B itself is for `--base` (a directory of this user that group
-/// and others cannot write to), and spelled so. `/proc` must name what the
+/// 主の指定"): opened through `/proc/<pid>/fd/<fd>` (another uid cannot) with
+/// the search permission alone, checked as B itself is for `--base` (a
+/// directory of this user that group and others cannot write to), and
+/// spelled so. `/proc` must name what the
 /// fds are open on, as the library uses it only so (hub SPEC "用語").
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn held_base(fd: u32, pid: u32) -> Result<Chosen, Failure> {
@@ -471,8 +472,7 @@ fn held_base(fd: u32, pid: u32) -> Result<Chosen, Failure> {
             spelled.display()
         ))
     };
-    let dir = std::fs::File::open(&spelled).map_err(failed)?;
-    entry::check_held(&dir).map_err(failed)?;
+    let dir = entry::open_held(&spelled).map_err(failed)?;
     let made_through = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
     let held = dir.metadata().map_err(failed)?;
     let names_it = |p: &Path| {
