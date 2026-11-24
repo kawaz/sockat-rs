@@ -4785,3 +4785,111 @@ fn the_places_come_from_the_environment() {
     let gone = gone.to_str().unwrap();
     assert_eq!(p(Some(gone), Some(runtime)), v(&["/tmp", runtime, gone]));
 }
+
+// ---------------------------------------------------------------------------
+// the routes named (the command's `--route`, DR-0034)
+// ---------------------------------------------------------------------------
+
+/// Bind `p` by the routes `names` in that order, taking the socket file.
+fn bind_named(p: &Path, cfg: &Config, names: &[&'static str]) -> Result<Reached, route::Failed> {
+    route::run_by(BIND, p, &opts(), true, Some(cfg), Some(names))
+}
+
+// The routes named are tried in the order named and no others: a long path
+// named `standard` then `link-dir` passes over standard (too long) and binds
+// by link-dir, the socket at the path; named `link-dir` alone, standard is not
+// tried, so it is not among those passed over (skipped lists only what was
+// tried, hub SPEC "診断").
+#[test]
+fn named_routes_are_tried_in_that_order_and_no_others() {
+    let (t, place) = setup();
+    let cfg = real_link_dir(&place);
+    let p = nest(t.path(), 200, "s.sock");
+    let r = bind_named(&p, &cfg, &[names::STANDARD, names::LINK_DIR]).unwrap();
+    assert_eq!(r.route, names::LINK_DIR);
+    assert_eq!(skipped_names(&r.skipped), vec![names::STANDARD]);
+    assert!(is_socket(&p));
+    std::fs::remove_file(&p).unwrap();
+
+    let r = bind_named(&p, &cfg, &[names::LINK_DIR]).unwrap();
+    assert_eq!(r.route, names::LINK_DIR);
+    assert!(r.skipped.is_empty(), "{:?}", r.skipped);
+    assert!(is_socket(&p));
+}
+
+// A route named is taken even for a path std takes as it is: the point of
+// naming one is to see what it makes. A short path named `link-dir` alone is
+// bound through B, D and E (Linked), the socket at the path.
+#[test]
+fn a_route_named_is_taken_for_a_short_path_too() {
+    let (t, place) = setup();
+    let cfg = real_link_dir(&place);
+    let p = t.path().join("s.sock");
+    let r = bind_named(&p, &cfg, &[names::LINK_DIR]).unwrap();
+    assert_eq!(r.route, names::LINK_DIR);
+    assert!(matches!(r.spelling, Some(Spelling::Linked { .. })));
+    assert!(is_socket(&p));
+    assert!(b_of(&place).exists());
+}
+
+// When none of the routes named can be used, the call is ENAMETOOLONG with
+// each passed over, as when none of the order can (hub SPEC "bind の順" 7):
+// `standard` alone for a long absolute path. A name that is not a route of the
+// call on this target (relative is the connect's) is an error in the
+// arguments before anything is looked at or made.
+#[test]
+fn named_routes_none_usable_and_a_name_not_of_the_call() {
+    let (t, place) = setup();
+    let cfg = real_link_dir(&place);
+    let p = nest(t.path(), 200, "s.sock");
+    let f = bind_named(&p, &cfg, &[names::STANDARD]).err().unwrap();
+    assert_eq!(f.error.raw_os_error(), Some(libc::ENAMETOOLONG));
+    assert_eq!(f.route, None);
+    assert_eq!(skipped_names(&f.skipped), vec![names::STANDARD]);
+
+    let f = bind_named(&p, &cfg, &[names::RELATIVE]).err().unwrap();
+    assert_eq!(f.error.kind(), io::ErrorKind::InvalidInput);
+    assert!(f.skipped.is_empty());
+    assert!(!b_of(&place).exists(), "nothing is made for a name refused");
+    assert!(!route::nameable(true).contains(&names::RELATIVE));
+    assert!(route::nameable(false).contains(&names::LINK_FILE));
+}
+
+// `default` among the names is the order of the call at that place: a long
+// path named `default` alone takes the route the order takes (here link-dir,
+// the only one the configuration leaves before thread-cwd), and passes over
+// standard as the order does.
+#[test]
+fn default_among_the_names_is_the_order() {
+    let (t, place) = setup();
+    let cfg = real_link_dir(&place);
+    let p = nest(t.path(), 200, "s.sock");
+    let r = bind_named(&p, &cfg, &[route::DEFAULT]).unwrap();
+    assert_eq!(r.route, names::LINK_DIR);
+    assert_eq!(skipped_names(&r.skipped), vec![names::STANDARD]);
+    assert!(is_socket(&p));
+}
+
+// A connect named `link-file` reaches the socket at a long path through an E
+// right in B, removed after the connect, whatever the routes before it in the
+// order (no proc-direct, relative, widened or thread-cwd-direct is tried).
+#[test]
+fn a_connect_named_link_file_takes_it() {
+    let (t, place) = setup();
+    let cfg = config(&place);
+    let p = nest(t.path(), 200, "s.sock");
+    let l = listen_at(&p);
+    let mut c = route::run_by(
+        CONNECT,
+        &p,
+        &opts(),
+        false,
+        Some(&cfg),
+        Some(&[names::LINK_FILE]),
+    )
+    .unwrap();
+    assert_eq!(c.route, names::LINK_FILE);
+    assert!(c.skipped.is_empty(), "{:?}", c.skipped);
+    ping(&l, c.socket.take().unwrap());
+    assert_eq!(entries(&b_of(&place)), Vec::<String>::new());
+}

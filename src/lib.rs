@@ -524,7 +524,21 @@ pub(crate) fn bind_with(
     options: &Options,
     remember: bool,
 ) -> Result<(OwnedFd, Option<SocketFile>, route::Reached), ExError> {
-    let mut r = route::run(Request::Bind(ty), path, options, remember, None)?;
+    bind_by(ty, path, options, remember, None, None)
+}
+
+/// [`bind_with`] with the route order's inputs `cfg` (from the environment
+/// when `None`) and the routes `names` to take in that order (the order of
+/// the target when `None`; [`route::run_by`]).
+pub(crate) fn bind_by(
+    ty: SockType,
+    path: &Path,
+    options: &Options,
+    remember: bool,
+    cfg: Option<&route::Config>,
+    names: Option<&[&'static str]>,
+) -> Result<(OwnedFd, Option<SocketFile>, route::Reached), ExError> {
+    let mut r = route::run_by(Request::Bind(ty), path, options, remember, cfg, names)?;
     // Neither happens (a bind makes its socket, and looks the file up when
     // asked); if one did, the listener is closed and E removed, the socket
     // file left, as when the file cannot be looked up (hub SPEC "SocketFile").
@@ -653,8 +667,19 @@ fn connect_with(
     nonblocking: bool,
     options: &Options,
 ) -> Result<Connected<UnixStream>, ExError> {
+    connect_by(path, nonblocking, options, None, None)
+}
+
+/// [`connect_with`] with `cfg` and `names` as in [`bind_by`].
+pub(crate) fn connect_by(
+    path: &Path,
+    nonblocking: bool,
+    options: &Options,
+    cfg: Option<&route::Config>,
+    names: Option<&[&'static str]>,
+) -> Result<Connected<UnixStream>, ExError> {
     let req = Request::Connect(Connect::Stream { nonblocking });
-    let r = route::run(req, path, options, false, None)?;
+    let r = route::run_by(req, path, options, false, cfg, names)?;
     let socket = new_socket(r.socket).map_err(|error| ExError {
         error,
         route: Some(r.route),

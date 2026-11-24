@@ -417,11 +417,24 @@ pub(crate) fn run(
     remember: bool,
     cfg: Option<&Config>,
 ) -> Result<Reached, Failed> {
+    run_by(req, path, options, remember, cfg, None)
+}
+
+/// [`run`], by the routes `names` in that order when given ([`run_named`]),
+/// else by the order of the target.
+pub(crate) fn run_by(
+    req: Request<'_>,
+    path: &Path,
+    options: &Options,
+    remember: bool,
+    cfg: Option<&Config>,
+    names: Option<&[&'static str]>,
+) -> Result<Reached, Failed> {
     if !remember || !req.is_bind() || path.is_absolute() || path::is_abstract(path) {
-        return run_unchecked(req, path, options, remember, cfg);
+        return run_unchecked(req, path, options, remember, cfg, names);
     }
     let before = dir_id(Path::new("."));
-    let reached = run_unchecked(req, path, options, remember, cfg)?;
+    let reached = run_unchecked(req, path, options, remember, cfg, names)?;
     if reached.spelling != Some(Spelling::CwdRelative)
         || (before.is_some() && dir_id(Path::new(".")) == before)
     {
@@ -579,14 +592,18 @@ fn standard(
     })
 }
 
-/// [`run`] without the check of the cwd.
+/// [`run_by`] without the check of the cwd.
 fn run_unchecked(
     req: Request<'_>,
     path: &Path,
     options: &Options,
     remember: bool,
     cfg: Option<&Config>,
+    names: Option<&[&'static str]>,
 ) -> Result<Reached, Failed> {
+    if let Some(names) = names {
+        return run_named(req, path, options, remember, cfg, names);
+    }
     refuse_bad_base(options)?;
     let absolutize = req.is_bind();
     if let Some(d) = before_routes(path, absolutize)? {
@@ -627,10 +644,25 @@ fn run_unchecked(
     };
     let skipped = t.skipped.into_inner();
     match step {
-        Step::Done {
-            route,
-            result: Ok(hit),
-        } => Ok(Reached {
+        Step::Done { route, result } => done(route, result, skipped),
+        Step::Next if absolutize => as_relative(req, path, remember, skipped),
+        Step::Next => Err(Failed {
+            error: too_long(),
+            route: None,
+            skipped,
+        }),
+    }
+}
+
+/// What a route that made the call (or failed for real) came to, with the
+/// routes passed over before it.
+fn done(
+    route: Option<&'static str>,
+    result: io::Result<Hit>,
+    skipped: Vec<Skipped>,
+) -> Result<Reached, Failed> {
+    match result {
+        Ok(hit) => Ok(Reached {
             socket: hit.socket,
             route: route.unwrap_or(names::STANDARD),
             base: hit.base,
@@ -639,21 +671,254 @@ fn run_unchecked(
             file: hit.file.map(Kept::File),
             skipped,
         }),
-        Step::Done {
-            route,
-            result: Err(error),
-        } => Err(Failed {
+        Err(error) => Err(Failed {
             error,
             route,
             skipped,
         }),
-        Step::Next if absolutize => as_relative(req, path, remember, skipped),
-        Step::Next => Err(Failed {
-            error: too_long(),
-            route: None,
-            skipped,
-        }),
     }
+}
+
+/// The name that stands for the order of the target ([`run`]) among the
+/// names of [`run_named`] (the command's preset `default`).
+pub(crate) const DEFAULT: &str = "default";
+
+/// The routes a bind may be made to take on this target: those of its order
+/// here (hub SPEC "bind の順"), whatever the environment ([`run_named`]).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const BIND_ROUTES: &[&str] = &[names::STANDARD, names::LINK_DIR, names::THREAD_CWD];
+#[cfg(target_vendor = "apple")]
+const BIND_ROUTES: &[&str] = &[
+    names::STANDARD,
+    names::LINK_DIR,
+    names::LINK_FILE,
+    names::THREAD_CWD,
+];
+#[cfg(target_os = "freebsd")]
+const BIND_ROUTES: &[&str] = &[names::STANDARD, names::LINK_DIR, names::AT];
+#[cfg(any(target_os = "openbsd", target_os = "illumos"))]
+const BIND_ROUTES: &[&str] = &[names::STANDARD, names::LINK_DIR];
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "illumos"
+)))]
+const BIND_ROUTES: &[&str] = &[names::STANDARD, names::LINK_DIR, names::LINK_FILE];
+
+/// The routes a connect may be made to take on this target: those of its
+/// order here (hub SPEC "connect の順"; on Linux and Android both rows, with
+/// `/proc` and without), whatever the environment ([`run_named`]).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const CONNECT_ROUTES: &[&str] = &[
+    names::STANDARD,
+    names::PROC_DIRECT,
+    names::RELATIVE,
+    names::THREAD_CWD_DIRECT,
+    names::LINK_FILE,
+];
+#[cfg(target_vendor = "apple")]
+const CONNECT_ROUTES: &[&str] = &[
+    names::STANDARD,
+    names::RELATIVE,
+    names::WIDENED,
+    names::THREAD_CWD_DIRECT,
+    names::LINK_FILE,
+];
+#[cfg(target_os = "freebsd")]
+const CONNECT_ROUTES: &[&str] = &[names::STANDARD, names::AT_DIRECT, names::LINK_FILE];
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd"
+)))]
+const CONNECT_ROUTES: &[&str] = &[names::STANDARD, names::RELATIVE, names::LINK_FILE];
+
+/// The routes [`run_named`] takes for a bind (`bind`) or a connect on this
+/// target, in the order of the target.
+pub(crate) fn nameable(bind: bool) -> &'static [&'static str] {
+    match bind {
+        true => BIND_ROUTES,
+        false => CONNECT_ROUTES,
+    }
+}
+
+/// [`run_unchecked`] by the routes `names` in that order instead of the order
+/// of the target, for the command's `--route` (DR-0034): each is tried as in
+/// the order, passed over when it cannot be used for this path or here, and
+/// the first that makes the call (or fails for real) is the result.
+/// [`DEFAULT`] is the order of the target at that place (`standard`, then the
+/// routes of [`bind_order`] / [`connect_order`]).
+///
+/// A route is tried even for a path std takes (`standard` is not tried
+/// unless named). `standard` is the path itself or its absolute candidate
+/// ([`before_routes`], [`Target::real_candidate`]); a bind's relative path
+/// goes to std as it is (`CwdRelative`) only when none of the routes named
+/// could be used and `standard` (or [`DEFAULT`]) is among them, as in the
+/// order (hub SPEC "相対パスを絶対パスにする" 5). `ENAMETOOLONG` when none
+/// could be used; `InvalidInput` for a name not in [`nameable`].
+fn run_named(
+    req: Request<'_>,
+    path: &Path,
+    options: &Options,
+    remember: bool,
+    cfg: Option<&Config>,
+    names: &[&'static str],
+) -> Result<Reached, Failed> {
+    let routes = nameable(req.is_bind());
+    if let Some(bad) = names.iter().find(|n| **n != DEFAULT && !routes.contains(n)) {
+        return Err(Failed::before_routes(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("no route {bad} for this call on this system"),
+        )));
+    }
+    refuse_bad_base(options)?;
+    let absolutize = req.is_bind();
+    let direct = before_routes(path, absolutize)?;
+    let hook = cfg.map(|c| c.between_lookups);
+    let from_env;
+    let cfg = match cfg {
+        Some(cfg) => cfg,
+        None => {
+            from_env = Config::from_env();
+            &from_env
+        }
+    };
+    let link_file = cfg.follows != Follows::No && names.contains(&names::LINK_FILE);
+    // The target is made when a route needs it (the socket's directory is
+    // looked up then); `None` in it when no route can be used ([`Target::new`]).
+    let mut target: Option<Option<Target<'_>>> = None;
+    // The routes passed over while there is no target.
+    let mut early: Vec<Skipped> = Vec::new();
+    let mut base_checked = false;
+    // The B of the bind's link-dir and link-file, looked for once.
+    let mut b: Option<Result<Arc<Base>, &'static str>> = None;
+    for &name in names {
+        let standard_here = matches!(name, names::STANDARD | DEFAULT);
+        if standard_here {
+            if let Some(d) = &direct {
+                let skipped = match &target {
+                    Some(Some(t)) => t.skipped.take(),
+                    _ => std::mem::take(&mut early),
+                };
+                if !d.candidate {
+                    return standard(req, &d.path, d.spelling, remember, hook, skipped);
+                }
+                if let Some(hook) = hook {
+                    hook();
+                }
+                return standard(req, &d.path, d.spelling, remember, None, skipped);
+            }
+        }
+        if target.is_none() {
+            let made = Target::new(req, path, options, cfg, absolutize)?;
+            if let Some(t) = &made {
+                *t.skipped.borrow_mut() = std::mem::take(&mut early);
+            }
+            target = Some(made);
+        }
+        let Some(Some(t)) = &target else {
+            if name != DEFAULT {
+                early.push(Skipped {
+                    name,
+                    reason: names::TOO_LONG,
+                });
+            }
+            continue;
+        };
+        if standard_here {
+            if let Some(real) = t
+                .real_candidate()
+                .filter(|_| absolutize && path.is_absolute())
+            {
+                (cfg.between_lookups)();
+                let skipped = t.skipped.take();
+                return standard(req, &real, Spelling::Original, remember, None, skipped);
+            }
+            // Passed over as the order passes it over: the path is too long
+            // for std and no absolute candidate fits.
+            t.skip(names::STANDARD, names::TOO_LONG);
+            if name == names::STANDARD {
+                continue;
+            }
+        }
+        if !base_checked {
+            t.check_base()?;
+            (cfg.between_lookups)();
+            base_checked = true;
+        }
+        let step = match (req, name) {
+            (Request::Bind(_), DEFAULT) => bind_order(t, remember),
+            (Request::Connect(_), DEFAULT) => connect_order(t),
+            (Request::Bind(_), names::LINK_DIR | names::LINK_FILE) => {
+                if b.is_none() {
+                    match spelled_base(t, link_file) {
+                        Ok(found) => b = Some(found),
+                        Err(e) => return done(None, Err(e), t.skipped.take()),
+                    }
+                }
+                let b = b.as_ref().map(|b| b.as_deref());
+                match (name, b) {
+                    (names::LINK_FILE, Some(b)) => link_file_bind(t, b, remember),
+                    (_, Some(Err(why))) => {
+                        t.skip(names::LINK_DIR, why);
+                        Step::Next
+                    }
+                    (_, Some(Ok(b))) if !remember => link_dir_shared(t, b).unwrap_or_else(|why| {
+                        t.skip(names::LINK_DIR, why);
+                        Step::Next
+                    }),
+                    (_, Some(Ok(b))) => match through(t, b, None) {
+                        Ok(th) => bind_through(t, th, names::LINK_DIR, remember),
+                        Err(why) => {
+                            t.skip(names::LINK_DIR, why);
+                            Step::Next
+                        }
+                    },
+                    (_, None) => Step::Next,
+                }
+            }
+            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+            (Request::Bind(_), names::THREAD_CWD) => thread_cwd_bind(t, remember),
+            #[cfg(target_os = "freebsd")]
+            (Request::Bind(_), names::AT) => at_bind(t, remember),
+            (Request::Connect(_), names::LINK_FILE) => link_file_connect(t),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            (Request::Connect(_), names::PROC_DIRECT) => linux::proc_direct(t),
+            #[cfg(not(target_os = "freebsd"))]
+            (Request::Connect(_), names::RELATIVE) => posix::relative(t),
+            #[cfg(target_vendor = "apple")]
+            (Request::Connect(_), names::WIDENED) => apple::widened(t),
+            #[cfg(target_os = "freebsd")]
+            (Request::Connect(_), names::AT_DIRECT) => freebsd::at_direct(t),
+            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+            (Request::Connect(_), names::THREAD_CWD_DIRECT) => thread_cwd_direct(t),
+            // Not in `nameable` (refused above).
+            _ => Step::Next,
+        };
+        if let Step::Done { route, result } = step {
+            return done(route, result, t.skipped.take());
+        }
+    }
+    let skipped = match &target {
+        Some(Some(t)) => t.skipped.take(),
+        _ => early,
+    };
+    if absolutize
+        && names
+            .iter()
+            .any(|n| matches!(*n, names::STANDARD | DEFAULT))
+    {
+        return as_relative(req, path, remember, skipped);
+    }
+    Err(Failed {
+        error: too_long(),
+        route: None,
+        skipped,
+    })
 }
 
 /// A bind none of whose routes can be used (hub SPEC "相対パスを絶対パスにす
