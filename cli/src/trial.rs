@@ -8,13 +8,13 @@
 //! and closes it.
 
 use std::io::{self, Write};
+use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use sockat::__cli as entry;
-use sockat::{ExError, Options, Skipped, Spelling, Until};
+use sockat::{ExError, Options, Skipped, SocketFile, Spelling, Until};
 
 use crate::json;
 use crate::resolve::Failure;
@@ -56,15 +56,14 @@ pub(crate) fn run(op: entry::Op, req: &Request<'_>, places: &entry::Places) -> E
     match op {
         entry::Op::Bind => match entry::bind(places, req.path, options, req.routes) {
             Ok(bound) => {
-                let kernel_path = bound.socket.local_addr().ok().as_ref().and_then(pathname);
                 let outcome = Outcome {
                     error: None,
                     route: Some(bound.route),
                     base: bound.base,
                     spelling: Some(bound.spelling),
                     skipped: &bound.skipped,
-                    left: left(bound.route, kernel_path.as_deref()),
-                    kernel_path,
+                    kernel_path: kernel_path(entry::local_path(bound.socket.as_fd())),
+                    left: left(&bound.file),
                 };
                 let shown = show(op, &outcome, req.json);
                 if req.keep {
@@ -86,12 +85,7 @@ pub(crate) fn run(op: entry::Op, req: &Request<'_>, places: &entry::Places) -> E
         },
         entry::Op::Connect => match entry::connect(places, req.path, options, req.routes) {
             Ok(connected) => {
-                let kernel_path = connected
-                    .socket
-                    .peer_addr()
-                    .ok()
-                    .as_ref()
-                    .and_then(pathname);
+                let kernel_path = kernel_path(entry::peer_path(connected.socket.as_fd()));
                 show(
                     op,
                     &Outcome {
@@ -111,8 +105,10 @@ pub(crate) fn run(op: entry::Op, req: &Request<'_>, places: &entry::Places) -> E
     }
 }
 
-fn pathname(a: &SocketAddr) -> Option<PathBuf> {
-    a.as_pathname().map(Path::to_path_buf)
+/// The path the kernel gives (read by the library as the kernel wrote it,
+/// not through std's `SocketAddr`), `None` when there is none.
+fn kernel_path(read: io::Result<PathBuf>) -> Option<PathBuf> {
+    read.ok().filter(|p| !p.as_os_str().is_empty())
 }
 
 /// The paths to remove by hand when `remove()` failed.
@@ -122,24 +118,13 @@ fn what_to_remove(path: &Path, left: &[(PathBuf, PathBuf)]) -> String {
     paths.join(", ")
 }
 
-/// The E a bind by `route` made, found from its spelling `kernel_path` (the
-/// directory of the file name for link-dir, the spelling itself for
-/// link-file): by its real path (B's spelling may go through `/proc`), with
-/// where it points. None for the other routes, whose spelling goes through no
-/// E kept.
-fn left(route: &str, kernel_path: Option<&Path>) -> Vec<(PathBuf, PathBuf)> {
-    let e = match route {
-        "link-dir" => kernel_path.and_then(Path::parent),
-        "link-file" => kernel_path,
-        _ => None,
-    };
-    let found = e.and_then(|e| {
-        let target = std::fs::read_link(e).ok()?;
-        let real = std::fs::canonicalize(e.parent()?)
-            .ok()?
-            .join(e.file_name()?);
-        Some((real, target))
-    });
+/// The E the bind's spelling goes through (link-dir, link-file), by its real
+/// path (B's spelling may go through `/proc`, which names it only while this
+/// process lives), with where it points, when it is there. None for the
+/// other routes, whose spelling goes through no E kept.
+fn left(file: &SocketFile) -> Vec<(PathBuf, PathBuf)> {
+    let found =
+        entry::link_path(file).and_then(|e| std::fs::read_link(&e).ok().map(|target| (e, target)));
     found.into_iter().collect()
 }
 

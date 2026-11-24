@@ -924,12 +924,22 @@ fn is_socket(p: &Path) -> bool {
 }
 
 /// The `base` and `until` of a bind's link-dir in the case: B spelled
-/// through `/proc/<pid>/fd/<B's fd>` where `/proc` can be used (hub SPEC "bind
-/// の順" 2), else by its real path (3).
+/// through `/proc/<pid>/fd/<B's fd>` where `/proc` names what an fd is open
+/// on, else by its real path (hub SPEC-routes "綴りの形": procB is used when
+/// `/proc/<pid>/fd/<fd>` and the fd's `fstat` are the same `(st_dev,
+/// st_ino)`, whatever the OS). Told here as the library tells it, with a
+/// directory this test opens.
 fn link_dir_base() -> (&'static str, &'static str) {
-    match cfg!(any(target_os = "linux", target_os = "android"))
-        && Path::new("/proc/self/fd").exists()
-    {
+    use std::os::fd::AsRawFd;
+
+    let dir = fs::File::open("/").unwrap();
+    let held = dir.metadata().unwrap();
+    let named = fs::metadata(format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        dir.as_raw_fd()
+    ));
+    match named.is_ok_and(|m| (m.dev(), m.ino()) == (held.dev(), held.ino())) {
         true => ("proc", "Process"),
         false => ("tmp", "Cleanup"),
     }
@@ -948,7 +958,8 @@ fn e_of(c: &Case, kernel: &Path) -> PathBuf {
 /// `bind` without `--route` binds by the library's order (hub SPEC "bind の
 /// 順"): a long path goes past standard (too long) to link-dir, the first
 /// route through B, here in the case's places (spelled through `/proc` where
-/// it can be used). The text shows one item a
+/// it can be used). `kernel-path` is the spelling as the kernel wrote it, and
+/// `left` names the E by its real path. The text shows one item a
 /// line, `left` the E made, with where it points. Without `--keep` the
 /// socket file and that E are removed after they are shown.
 #[test]
