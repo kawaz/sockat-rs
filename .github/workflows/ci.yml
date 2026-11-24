@@ -82,7 +82,17 @@ jobs:
         with:
           usesh: true
           prepare: pkg_add rust
-          run: rustc -V && cargo test --workspace --no-fail-fast
+          # The library's test binary keeps the fds of a B and a D for each
+          # test's own place until it ends (a B or D let go is held, not
+          # closed: hub SPEC-routes "実体の置き場"), so it needs some 180
+          # fds at once (measured on macOS with one thread), more with more
+          # threads. OpenBSD's limit for the session fell short of that
+          # (EMFILE when a test spawned its child), so the soft limit is
+          # raised as far as the system lets, and printed.
+          run: |
+            ulimit -n 4096 2>/dev/null || ulimit -n "$(ulimit -H -n)"
+            echo "open files: $(ulimit -n)"
+            rustc -V && cargo test --workspace --no-fail-fast
 
   illumos:
     name: Test (illumos / OmniOS VM)
