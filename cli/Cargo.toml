@@ -1,6 +1,6 @@
 [package]
 name = "sockat-cli"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -18,7 +18,7 @@ path = "src/main.rs"
 # The exact version: the command uses `sockat::__cli`, which is not part of
 # the library's API and may change in any release (DR-0033). The command
 # has the library's version; `just bump-version` moves both and this pin.
-sockat = { path = "..", version = "=0.6.2", features = ["__cli-internal"] }
+sockat = { path = "..", version = "=0.6.3", features = ["__cli-internal"] }
 clap = "4.5"
 clap_complete = "4.5"
 # 0.11 needs Rust 1.88; the MSRV is 1.85.
