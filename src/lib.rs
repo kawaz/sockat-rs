@@ -429,6 +429,13 @@ impl SocketFile {
         }
     }
 
+    /// The E the spelling goes through, kept (none for a spelling through
+    /// no E).
+    #[cfg(feature = "__cli-internal")]
+    pub(crate) fn link(&self) -> Option<&base::Link> {
+        self.clean.link.as_deref()
+    }
+
     /// The socket file's real path (test-only).
     #[cfg(test)]
     pub(crate) fn path(&self) -> &std::path::Path {

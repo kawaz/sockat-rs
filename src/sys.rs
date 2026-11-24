@@ -24,6 +24,9 @@
 //! * `random_bytes` — the random part of the names sockat creates.
 //! * `effective_uid` / [`process_id`] — the owner B and D must have, and the
 //!   pid in a `/proc/<pid>/fd/<fd>` spelling.
+//! * `local_address` / `peer_address` — the path of a socket's own address and
+//!   of its peer's, read as the kernel wrote it (the tests and the command's
+//!   `kernel_path`).
 
 use std::ffi::{CString, OsStr};
 use std::io;
@@ -930,9 +933,9 @@ pub(crate) fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
 /// the bytes of `sun_path` within that length up to the first NUL (unix(7):
 /// `strnlen(sun_path, len - offsetof(sun_path))`), so a length that counts
 /// the NUL, one that does not, and one of the whole structure all read the
-/// same path. Test-only, for [`local_address`] and [`recv_from`] (and the
-/// test of this reading itself).
-#[cfg(test)]
+/// same path. For [`local_address`], [`peer_address`] and [`recv_from`] (and
+/// the test of this reading itself).
+#[cfg(any(test, feature = "__cli-internal"))]
 pub(crate) fn path_in(storage: &[u8], len: usize) -> std::path::PathBuf {
     let end = len.min(storage.len());
     let raw = storage.get(SUN_PATH_OFFSET..end).unwrap_or_default();
@@ -944,18 +947,31 @@ pub(crate) fn path_in(storage: &[u8], len: usize) -> std::path::PathBuf {
 /// it ([`path_in`]), asked with room for the widest address any target here
 /// builds ([`ADDR_STORAGE`] bytes).
 ///
-/// Test-only: the tests check the spelling the kernel keeps, read as the
-/// kernel wrote it rather than through std's `SocketAddr`, whose reading
-/// differs by Rust version (Rust 1.99 and earlier drop the last byte of the
-/// path on OpenBSD, rust-lang/rust#118925, fixed in 1.100.0). The length
-/// tells whether a bound address fits a `sockaddr_un` (Apple).
-#[cfg(test)]
+/// For the tests and the command's `kernel_path`, which show the spelling
+/// the kernel keeps, read as the kernel wrote it rather than through std's
+/// `SocketAddr`, whose reading differs by Rust version (Rust 1.99 and earlier
+/// drop the last byte of the path on OpenBSD, rust-lang/rust#118925, fixed in
+/// 1.100.0). The length tells whether a bound address fits a `sockaddr_un`
+/// (Apple).
+#[cfg(any(test, feature = "__cli-internal"))]
 pub(crate) fn local_address(sock: BorrowedFd<'_>) -> io::Result<(usize, std::path::PathBuf)> {
     let mut storage = [0u8; ADDR_STORAGE];
     let mut len = ADDR_STORAGE as libc::socklen_t;
     // SAFETY: the kernel writes at most `len` bytes into `storage`.
     cvt(unsafe { libc::getsockname(sock.as_raw_fd(), storage.as_mut_ptr().cast(), &mut len) })?;
     Ok((len as usize, path_in(&storage, len as usize)))
+}
+
+/// [`local_address`] by `getpeername(2)`: the path of the peer `sock` is
+/// connected to, as the kernel wrote it. For the command's `kernel_path` of
+/// a connect, for the reason of [`local_address`].
+#[cfg(feature = "__cli-internal")]
+pub(crate) fn peer_address(sock: BorrowedFd<'_>) -> io::Result<std::path::PathBuf> {
+    let mut storage = [0u8; ADDR_STORAGE];
+    let mut len = ADDR_STORAGE as libc::socklen_t;
+    // SAFETY: the kernel writes at most `len` bytes into `storage`.
+    cvt(unsafe { libc::getpeername(sock.as_raw_fd(), storage.as_mut_ptr().cast(), &mut len) })?;
+    Ok(path_in(&storage, len as usize))
 }
 
 /// `recvfrom(2)` on `sock` into `buf`: the number of bytes received and the

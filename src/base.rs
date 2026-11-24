@@ -511,7 +511,7 @@ impl Base {
                 return Ok(Arc::clone(d));
             }
         }
-        let d = Arc::new(Dir::make(self.fd.as_fd())?);
+        let d = Arc::new(Dir::make(self.fd.as_fd(), &self.path)?);
         if let Some(old) = slot.replace(Arc::clone(&d)) {
             lock(&self.retired_d).push(old);
         }
@@ -870,6 +870,10 @@ pub(crate) fn given(base: &Path, others_search: bool) -> io::Result<Arc<Base>> {
 #[derive(Debug)]
 pub(crate) struct Dir {
     pub(crate) name: OsString,
+    /// D's real path: B's real path with D's name after it (for the command,
+    /// which shows where E is).
+    #[cfg(feature = "__cli-internal")]
+    path: PathBuf,
     fd: OwnedFd,
     id: (u64, u64),
     /// The number of the next counted E ([`counted_name`]).
@@ -889,7 +893,10 @@ impl Dir {
     /// 4. D's name in B must still be that directory: another process's
     ///    `sweep()` may have removed it between 1 and 3 (it was not locked
     ///    yet), and then the fd is closed and D made again.
-    fn make(b: BorrowedFd<'_>) -> io::Result<Dir> {
+    fn make(
+        b: BorrowedFd<'_>,
+        #[cfg_attr(not(feature = "__cli-internal"), allow(unused_variables))] b_path: &Path,
+    ) -> io::Result<Dir> {
         for _ in 0..ATTEMPTS {
             let name = OsString::from(random_name()?);
             match sys::mkdir_at(b, &name, 0o700) {
@@ -924,6 +931,8 @@ impl Dir {
                 continue;
             }
             return Ok(Dir {
+                #[cfg(feature = "__cli-internal")]
+                path: b_path.join(&name),
                 name,
                 fd,
                 id,
@@ -1025,6 +1034,13 @@ impl Link {
     /// `D/E`: the part of the spelling below B.
     pub(crate) fn below_b(&self) -> PathBuf {
         Path::new(&self.dir.name).join(&self.name)
+    }
+
+    /// E's real path (B's real path, D, E), which names it whatever form of
+    /// B the spelling goes through.
+    #[cfg(feature = "__cli-internal")]
+    pub(crate) fn path(&self) -> PathBuf {
+        self.dir.path.join(&self.name)
     }
 
     /// Remove E; once it is removed, later calls do nothing. E already gone

@@ -18,6 +18,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::os::fd::BorrowedFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -26,7 +27,7 @@ use std::sync::Arc;
 use crate::base::{self, Automatic, Place};
 use crate::route::{self, Follows};
 use crate::sys::{self, SockType};
-use crate::{Bound, Connected, ExError, Options};
+use crate::{Bound, Connected, ExError, Options, SocketFile};
 
 /// The longest spelling the kernel takes: `sun_path` less the NUL (107 on
 /// Linux, Android and illumos, 103 on Apple and the BSDs).
@@ -275,6 +276,36 @@ pub fn open_held(held: &Path) -> io::Result<std::fs::File> {
         return Err(io::Error::from_raw_os_error(libc::EPERM));
     }
     Ok(dir)
+}
+
+/// The path of `sock`'s own address (`getsockname(2)`), as the kernel wrote
+/// it; empty for an address without one. Not through std's `SocketAddr`,
+/// which drops the last byte of the path on OpenBSD in Rust 1.99 and earlier
+/// (rust-lang/rust#118925).
+///
+/// # Errors
+///
+/// Those of `getsockname(2)`.
+pub fn local_path(sock: BorrowedFd<'_>) -> io::Result<PathBuf> {
+    sys::local_address(sock).map(|(_, path)| path)
+}
+
+/// The path of the address `sock` is connected to (`getpeername(2)`), as for
+/// [`local_path`].
+///
+/// # Errors
+///
+/// Those of `getpeername(2)`.
+pub fn peer_path(sock: BorrowedFd<'_>) -> io::Result<PathBuf> {
+    sys::peer_address(sock)
+}
+
+/// The E the socket file's spelling goes through (link-dir, link-file), by
+/// its real path (B's real path, then D and E), whether it is still there or
+/// not: a spelling through `/proc/<pid>/fd/<B's fd>` names it only while this
+/// process lives. `None` for a spelling through no E kept.
+pub fn link_path(file: &SocketFile) -> Option<PathBuf> {
+    file.link().map(|link| link.path())
 }
 
 /// The name of `e` as the hub's conformance CLI writes it (the hub's
