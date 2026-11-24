@@ -33,7 +33,7 @@
   | `routes(op)` | `route::nameable` |
   | `bind(places, path, options, routes)` | `bind_ex` と同じ (`SocketFile` を返す bind)。B の置き場は `places`、`routes` が `None` か `default` だけなら `bind_ex` そのもの |
   | `connect(places, path, options, routes)` | `connect_ex` と同じ (ブロックする stream) |
-  | `check_held(&File)` | `--base-fd` のディレクトリの確かめ (下の「持ち主の fd の置き場」) |
+  | `open_held(&Path)` | `--base-fd` のディレクトリを開いて確かめる (下の「持ち主の fd の置き場」) |
   | `error_name(&io::Error)` | errno の C の名前 (ハブ conformance.md の `error` と同じ規則)。コマンドは `libc` を持たないので、ライブラリの側に置く |
 
 ### 名指しの順 (`run_named`)
@@ -64,7 +64,8 @@
 
   `spelling` は `Original`・`CwdRelative`・`Dangling`、`Linked (<removable か not removable>, <until cleanup か until process>, <usable cross uid か not ...>, <usable with private tmp か not ...>)`。`skipped` は `<名前> (<理由>)` を `, ` でつなぐ。理由はライブラリの `Skipped::reason`
 
-- `--json` の項目は cli.md の順 (`ok`、`error`、`route`、`base`、`spelling`、`skipped`、`kernel_path`、`left`)。`spelling` は適合試験の CLI と同じ形。`skipped` は `{ "name", "reason" }` の並び。`connect` と失敗の時の `base`・`spelling` は `null`、`left` は空。パスが UTF-8 でなければ、`resolve` と同じく終了コード 1
+- `--json` の項目は cli.md の順 (`ok`、`error`、`route`、`base`、`spelling`、`skipped`、`kernel_path`、`left`)。`spelling` は適合試験の CLI と同じ形。`skipped` は `{ "name", "reason" }` の並び。`connect` と失敗の時の `base`・`spelling` は `null`、`left` は空
+- `--json` に出すパスは `kernel_path` と `left` だけで、渡されたパスは出さない (cli.md の項目に無い)。出すパスが UTF-8 でなければ、`resolve` と同じく JSON に書けないので、標準出力に何も出さず終了コード 1 (`bind` は、その後で `--keep` が無ければ片付ける)。渡されたパスが UTF-8 でなくても、出すパスが全部 UTF-8 なら JSON を出す (例: 親が UTF-8 でないディレクトリのソケットを link-dir の B の綴りで bind した時)
 - 通らなかった時は、結果を標準出力に出して終了コード 1。ただしライブラリが errno の無い `InvalidInput` を返した時 (空のパス、NUL、名前で終わらない長いパス、`--base` の形) は引数の誤りとして、標準エラーに出して終了コード 2 (標準出力には何も出さない。`resolve` と同じ)
 - `--route` の名前は、その操作とその OS の名前 (入口の `routes`) と `default` だけを引数のパーサ (clap の possible values) が受ける。他の名前は clap のエラー (終了コード 2) で、使える名前が `[possible values: …]` に並ぶ。`--for` の誤りと同じ形
 - `--route` は `,` で区切っても、繰り返してもよい
@@ -82,8 +83,8 @@
 - `resolve` だけが受ける (cli.md の `bind`・`connect` の呼び方に無い)
 - `--base-fd` は 0 から `i32` の最大まで、`--base-pid` は 1 以上の整数。片方だけ、または `--base` と一緒は引数の誤り (終了コード 2)。文は `sockat: --base-fd needs --base-pid, …` / `--base-pid needs --base-fd, …` / `--base and --base-fd both give the base` と、次にすること
 - Linux・Android 以外では、`/proc` が無いので引数の誤り (終了コード 2、`--base` を勧める)
-- B を使う経路に来た時に、`/proc/<PID>/fd/<N>` を開く。開けなければ終了コード 1 (別の uid、`hidepid`、そのプロセスや fd が無い)
-- 開いたディレクトリを、`--base` の B 自身と同じに確かめる (入口の `check_held`): ディレクトリで、この利用者の物で、group と other が書けない。外れたら終了コード 1。途中の確かめは無い (途中はそのプロセスの fd で、他人が変えられない)
+- B を使う経路に来た時に、`/proc/<PID>/fd/<N>` を探す権限だけで開く (Linux は `O_PATH`。`--base` の B を開くのと同じで、持ち主が読めない B (mode 0311 等) も使える)。開けなければ終了コード 1 (別の uid、`hidepid`、そのプロセスや fd が無い)
+- 開いたディレクトリを、`--base` の B 自身と同じに確かめる (入口の `open_held`): ディレクトリで、この利用者の物で、group と other が書けない。外れたら終了コード 1。途中の確かめは無い (途中はそのプロセスの fd で、他人が変えられない)
 - `/proc/self/fd/<コマンドの fd>` と `/proc/<PID>/fd/<N>` の両方が、開いたディレクトリと同じ `(st_dev, st_ino)` を指すことを確かめる (ライブラリが `/proc` をそう確かめてから使うのと同じ。ハブ SPEC「用語」)。違えば終了コード 1
 - E は `/proc/self/fd/<コマンドの fd>/<ハッシュ>` で作り、綴りは `/proc/<PID>/fd/<N>/<ハッシュ>/<名前>` (link-file は `/proc/<PID>/fd/<N>/<ハッシュ>`)。作り方と名前は `--base` の B と同じ (DR-0033「`resolve` の作り方」)。綴りが収まらなければ、`--base` と同じく何も作らずエラー
 - 候補が収まる時 (`standard`) は fd を開かない (`--base` を確かめないのと同じ)
@@ -132,7 +133,7 @@
 
 ## Consequences
 
-- 試験: ライブラリは `src/tests.rs` (名指しの順、短いパスでの名指し、使えない時、`default`、connect の link-file)。コマンドは `cli/tests/cli.rs` (`bind`・`connect` の既定の順と各経路の名指し、OS に無い名前、飛ばし、`--keep`、`--json`、`resolve --route`、`--base-fd`、`--help-all`、補完)
+- 試験: ライブラリは `src/tests.rs` (名指しの順、短いパスでの名指し、使えない時、`default`、connect の link-file)。コマンドは `cli/tests/cli.rs` (`bind`・`connect` の既定の順と各経路の名指し、OS に無い名前、飛ばし、`--keep`、`--json` (UTF-8 でない親のパスを含む)、`resolve --route`、`--base-fd` (持ち主が読めない B を含み、同じ B を `--base` でも)、`--help-all`、補完)
 - ハブ cli.md の利用者向けの説明 (`pages/`) に、`bind`・`connect` の出力の形を書くかはハブで決める
 
 ## 関連
