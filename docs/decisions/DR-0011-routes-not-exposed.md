@@ -9,7 +9,7 @@
 
 ## Decision
 
-- 経路は crate 内の値で、公開 API に出すのは `_ex` と resolve が返す診断 (`route`・`base`・`skipped` の名前) と、綴りの性質 `Spelling` だけ。経路を選ぶ・強制する口は作らない
+- 経路は crate 内の値で、公開 API に出すのは `_ex` と resolve が返す診断 (`route`・`base`・`skipped` の名前) と、綴りの性質 `Spelling` だけ。経路を選ぶ・強制する口は公開 API に作らない。コマンド `sockat` の `--route` のための名指しは、API でない CLI 専用の入口にだけ置く ([DR-0034](DR-0034-cli-routes-named-and-held-base.md))
 - 試験は crate 内の単体試験 (`src/tests.rs`) に置き、経路の順番 (`route::run`・`route::resolve`) に環境を差し替えた入力を渡して強制する
 - 環境を読む部分は値 (`route::Config`) にして試験から差し替える
   - B の置き場 (`places`。試験ごとの一時ディレクトリにして、置き場の確かめに外れる場合や作れない場合も作る)
@@ -20,7 +20,7 @@
   - ソケットのディレクトリの開き方 (`open_socket_dir`。開けないディレクトリの代わり)
   - 相対パスの bind で cwd を引き直す間 (`between_lookups`。他のスレッドの `chdir` の代わり)
 - プロセス全体に効く設定 (cwd、umask) と、終わったプロセスの D が要る試験は、試験のバイナリを子プロセスで起こして中で行う
-- feature も cfg(test) 専用の公開口も作らない。ハブの適合試験の CLI も公開の `_ex` を使う ([DR-0030](DR-0030-conformance-cli.md))
+- 試験のための feature も cfg(test) 専用の公開口も作らない。ハブの適合試験の CLI も公開の `_ex` を使う ([DR-0030](DR-0030-conformance-cli.md))
 
 ## 理由
 

@@ -22,7 +22,7 @@ sockat は、`sun_path` の上限を超えるパスでも Unix domain socket を
 | `tests/` | 公開 API の結合試験、tokio との連携試験 |
 | `examples/conformance.rs` | ハブの適合試験の CLI (DR-0030) |
 | `src/cli_internal.rs` | コマンド専用の入口 `sockat::__cli` (feature `__cli-internal` の後ろ、doc に出さない、API でない。DR-0033) |
-| `cli/` | コマンド `sockat` のパッケージ sockat-cli (`src/main.rs` 引数と出力、`src/resolve.rs` 綴りの作り方、`tests/cli.rs` 結合試験)。未公開 |
+| `cli/` | コマンド `sockat` のパッケージ sockat-cli (`src/main.rs` 引数と出力、`src/resolve.rs` 綴りの作り方、`src/trial.rs` 手法を試す `bind`・`connect`、`tests/cli.rs` 結合試験)。未公開 |
 
 ## 守ること
 

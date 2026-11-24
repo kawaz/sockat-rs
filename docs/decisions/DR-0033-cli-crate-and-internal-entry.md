@@ -8,7 +8,7 @@
 - ハブの [DR-0018](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0018-cli-resolve-with-reused-hashed-link.md) と [設計文書 cli.md](https://github.com/kawaz/sockat/blob/main/docs/design/cli.md) が、OS の上限 (sockaddr に入る長さ) に収まる綴りを出すコマンド `sockat` を Rust で作り、このリポに置くことを決めた。目的は短くすることでなく、bind / connect がエラーにならない綴りを出すこと。crate の分け方と名前はこのリポで決める
 - コマンドは引数のパーサと SHA-256 を要る。ライブラリの利用者の依存にそれを足さない (DR-0018「作る物と置き場所」)
 - `resolve` の B の作り方と確かめはライブラリと同じにする (DR-0018「`resolve` の既定の綴り」3、ハブ SPEC-routes「B の作り方」)。それは `src/base.rs` の `pub(crate)` の部分で、別のパッケージからは見えない
-- 今回作るのは `resolve` (省略形 `sockat <パス>`)、`sweep`、`completion`、`--help` / `--help-all` / `--version`。`--base-fd` / `--base-pid`、`--route`、手法を試す `bind` / `connect` は後で作る
+- この DR は、パッケージの分け方、配り方、CLI 専用の入口、`resolve` (省略形 `sockat <パス>`)・`sweep`・`completion`・`--help` / `--help-all` / `--version` を決める。`--route`、`--base-fd` / `--base-pid`、手法を試す `bind` / `connect` は [DR-0034](DR-0034-cli-routes-named-and-held-base.md)
 
 ## Decision
 
@@ -60,7 +60,7 @@ ci - check-version -+- build-release (6 targets) -----------+- release - update-
 - ライブラリに、既定で無効の feature `__cli-internal` (依存を足さない) の後ろで、`#[doc(hidden)]` の `pub mod __cli` (`src/cli_internal.rs`) を置く。公開の API (doc に出る物、semver の約束) は変えない
 - 入口は API でない。何も約束せず、どのリリースでも黙って変わる・消える。module の doc と Cargo.toml の feature の注記に「CLI 専用、使わない」と書く
 - feature の名前は先頭を `__` にして内部用と分かるようにする。cargo は先頭の `_` と途中の `-` を許し、crates.io は ASCII の英数字と `_`・`-`・`+` を許す
-- 入口に置くのは、コマンドがライブラリと同じ B を作り確かめるのに要る物と、綴りの長さ・名前に要る定数と乱数だけ。経路を選ぶ口は置かない
+- 入口に置くのは、コマンドがライブラリと同じ B を作り確かめるのに要る物と、綴りの長さ・名前に要る定数と乱数。経路を名指しする `bind`・`connect` 等は DR-0034 が足す
 
   | 物 | 中身 |
   |---|---|
@@ -109,7 +109,7 @@ ci - check-version -+- build-release (6 targets) -----------+- release - update-
 - `clap` を builder の API で使う (derive の proc-macro の依存を足さない)。補完の定義は `clap_complete`
 - 理由: kawaz の CLI の好み (ロングオプションだけ、オプションを位置引数の後ろにも置ける、`--` の区切り、サブコマンド、補完の定義を出す) を全部満たし、`--help` と補完の定義を同じ定義から作れる (実装・`--help`・補完の 3 者がずれない)。MSRV 1.85 を保つ
 - `sockat <パス>` は、トップレベルに `resolve` と同じ引数を持たせ、`args_conflicts_with_subcommands` と `subcommand_negates_reqs` で、最初の引数がサブコマンドの名前の時だけサブコマンドにする (`sockat --json resolve`・`sockat -- sweep` の `resolve`・`sweep` はパス)。補完もトップレベルでパスを補える
-- `-h`・`-V` と `help` サブコマンドは消し、`--help` (`HelpShort`)・`--help-all` (`HelpLong`)・`--version` をロングオプションで置く。進んだオプションは `hide_short_help` で `--help` から隠して `--help-all` にだけ出す (今は無いので両者は同じ中身)
+- `-h`・`-V` と `help` サブコマンドは消し、`--help`・`--help-all`・`--version` をロングオプションで置く。`--help-all` は、進んだオプションと手法を試すサブコマンドを見せた定義の `--help` (DR-0034「`--help` と `--help-all`」)
 - 引数なしは、トップレベルと、引数を取るサブコマンド (`resolve`・`completion`) で `--help` と同じ物を標準出力に出して終了コード 0 (clap の `arg_required_else_help` は標準エラーに出して 2 で終わるので、使わずに先に見分ける)
 
 ### 試験の置き場
@@ -179,4 +179,4 @@ ci - check-version -+- build-release (6 targets) -----------+- release - update-
 ## 関連
 
 - ハブ: [DR-0018](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0018-cli-resolve-with-reused-hashed-link.md)、[DR-0019](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0019-absolutize-relative-path-on-bind.md)、[cli.md](https://github.com/kawaz/sockat/blob/main/docs/design/cli.md)、[SPEC-routes「B の作り方」](https://github.com/kawaz/sockat/blob/main/docs/SPEC-routes-ja.md#b-の作り方)、[DR-0017](https://github.com/kawaz/sockat/blob/main/docs/decisions/DR-0017-resolve-through-persistent-base.md)
-- [DR-0011](DR-0011-routes-not-exposed.md)、[DR-0016](DR-0016-crate-distribution.md)、[DR-0017](DR-0017-release-flow.md)、[DR-0032](DR-0032-resolve-through-persistent-base.md)
+- [DR-0011](DR-0011-routes-not-exposed.md)、[DR-0016](DR-0016-crate-distribution.md)、[DR-0017](DR-0017-release-flow.md)、[DR-0032](DR-0032-resolve-through-persistent-base.md)、[DR-0034](DR-0034-cli-routes-named-and-held-base.md)

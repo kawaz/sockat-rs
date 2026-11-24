@@ -30,5 +30,6 @@ Status は各 DR ファイルの `Status:` 行が正本。
 | [DR-0030](DR-0030-conformance-cli.md) | ✅ 実装済 | 適合試験の CLI は `examples/conformance.rs`。公開の `bind_ex` / `connect_ex` に入力の `Options` を渡して呼び、経路・B・綴りの性質を出す。`just conformance` で起こす |
 | [DR-0032](DR-0032-resolve-through-persistent-base.md) | ✅ 実装済 | ハブ DR-0017 の Rust の形: 公開 API (stream・`datagram`・resolve・`sweep`、`Options`・`Spelling`・`Bound`・`SocketFile`)、B・D・E をプロセスの登録簿と flock で持つ、OS ごとの試す順。fork・最終手段・losses は無い |
 | [DR-0033](DR-0033-cli-crate-and-internal-entry.md) | ✅ 実装済 | コマンド `sockat` は workspace の別パッケージ sockat-cli (`cli/`)。B の作り方は feature `__cli-internal` の後ろの doc に出さない `sockat::__cli` から使い、ライブラリの依存と API は増やさない。ライブラリは `=x.y.z` で固定。配り方は crates.io と Homebrew (kawaz/tap)、GitHub release に target ごとの binary と SHA256SUMS |
+| [DR-0034](DR-0034-cli-routes-named-and-held-base.md) | ✅ 実装済 | コマンドの `--route` (`resolve`・`bind`・`connect`) は名前の順に試し、使えない経路は飛ばす。ライブラリの名指しは CLI 専用の入口 (`__cli::bind`・`connect`) だけ。`--base-fd`・`--base-pid` は `/proc/<pid>/fd/<fd>` を B の綴りにし、B 自身を `--base` と同じに確かめる (Linux) |
 
 退避した DR は [archive/INDEX.md](archive/INDEX.md)。
