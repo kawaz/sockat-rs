@@ -86,7 +86,14 @@ async fn bind_ex_removes_after_the_listener_went_to_tokio() {
     assert_eq!(&buf, b"ping");
 
     assert!(path.exists());
+    // A second name for the socket file, removed after the listener is
+    // closed: on illumos, unlinking the last name of a socket file and then
+    // closing the socket can make a bind elsewhere in the system fail with
+    // EADDRINUSE (a race in the kernel).
+    let keep = path.with_file_name("kept-name");
+    std::fs::hard_link(&path, &keep).unwrap();
     file.remove().unwrap();
     drop(listener);
     assert!(std::fs::symlink_metadata(&path).is_err());
+    std::fs::remove_file(&keep).unwrap();
 }

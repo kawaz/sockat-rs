@@ -14,6 +14,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 fn tmp() -> tempfile::TempDir {
@@ -38,11 +40,15 @@ fn long_path(dir: &Path, name: &str) -> PathBuf {
 
 /// A server for the connect samples: answers each connection with the line
 /// it sent. Bound before this returns, so a connect after it reaches it.
-fn echo_server(path: &Path) -> UnixListener {
+fn echo_server(path: &Path) -> EchoServer {
     let listener = sockat::bind(path).unwrap();
-    let accepting = listener.try_clone().unwrap();
-    thread::spawn(move || {
-        for mut stream in accepting.incoming().flatten() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
+    let accepting = thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            if stopped.load(Ordering::Relaxed) {
+                break;
+            }
             thread::spawn(move || {
                 let mut line = String::new();
                 BufReader::new(&stream).read_line(&mut line)?;
@@ -50,7 +56,34 @@ fn echo_server(path: &Path) -> UnixListener {
             });
         }
     });
-    listener
+    EchoServer {
+        path: path.to_path_buf(),
+        stop,
+        accepting: Some(accepting),
+    }
+}
+
+/// [`echo_server`]'s listener, closed when this is dropped: the accept loop
+/// is told to stop, woken by one more connection, and waited for. A test
+/// holds it after its temporary directory, so the listener is closed before
+/// the directory and the socket file in it are removed. On illumos, unlinking
+/// a socket file and then closing the socket can make a bind elsewhere in the
+/// system fail with EADDRINUSE (a race in the kernel).
+struct EchoServer {
+    path: PathBuf,
+    stop: Arc<AtomicBool>,
+    accepting: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for EchoServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if sockat::connect(&self.path).is_ok() {
+            if let Some(accepting) = self.accepting.take() {
+                let _ = accepting.join();
+            }
+        }
+    }
 }
 
 /// Sends `line` on a fresh connection to `path` and reads the answer.
@@ -60,6 +93,14 @@ fn ask_line(path: &Path, line: &str) -> String {
     let mut answer = String::new();
     BufReader::new(&stream).read_line(&mut answer).unwrap();
     answer
+}
+
+/// A second name `keep` for the socket file at `p`, for a sample that removes
+/// the file before it closes the socket: the test removes `keep` after the
+/// sample has closed the socket, so the close does not free the file
+/// (EchoServer tells why).
+fn keep_a_name(p: &Path, keep: &Path) {
+    std::fs::hard_link(p, keep).unwrap();
 }
 
 /// Whether this std drops the last byte of the addresses it reads (Rust 1.99
@@ -137,21 +178,31 @@ mod bind_tokio {
 
     // The listener goes to tokio and is served on the runtime; a client of
     // tokio's own at the long path (through sockat's nonblocking connect)
-    // gets its line back.
-    #[tokio::test]
-    async fn listens_with_tokio_at_a_long_path() {
+    // gets its line back. The runtime is made here rather than by
+    // `#[tokio::test]` so that it is dropped, closing the listener its task
+    // holds, before the temporary directory is removed (EchoServer tells
+    // why).
+    #[test]
+    fn listens_with_tokio_at_a_long_path() {
         let t = super::tmp();
         let path = super::long_path(t.path(), "app.sock");
-        start(&path).await.unwrap();
-        let stream = sockat::connect_nonblocking(&path).unwrap();
-        let mut stream = UnixStream::from_std(stream).unwrap();
-        stream.write_all(b"one\n").await.unwrap();
-        let mut answer = String::new();
-        BufReader::new(&mut stream)
-            .read_line(&mut answer)
-            .await
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
             .unwrap();
-        assert_eq!(answer, "one\n");
+        runtime.block_on(async {
+            start(&path).await.unwrap();
+            let stream = sockat::connect_nonblocking(&path).unwrap();
+            let mut stream = UnixStream::from_std(stream).unwrap();
+            stream.write_all(b"one\n").await.unwrap();
+            let mut answer = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut answer)
+                .await
+                .unwrap();
+            assert_eq!(answer, "one\n");
+        });
+        drop(runtime);
     }
 }
 
@@ -177,17 +228,25 @@ mod bind_remove {
     fn the_socket_file_goes_when_run_returns() {
         let t = super::tmp();
         let path = super::long_path(t.path(), "app.sock");
+        let keep = path.with_file_name("kept-name");
         run(&path, |listener| {
             assert!(path.exists());
             let _client = sockat::connect(&path)?;
+            super::keep_a_name(&path, &keep);
             listener.accept().map(drop)
         })
         .unwrap();
         assert!(!path.exists());
+        std::fs::remove_file(&keep).unwrap();
 
-        let e = run(&path, |_| Err(io::Error::other("serve failed"))).unwrap_err();
+        let e = run(&path, |_| {
+            super::keep_a_name(&path, &keep);
+            Err(io::Error::other("serve failed"))
+        })
+        .unwrap_err();
         assert_eq!(e.to_string(), "serve failed");
         assert!(!path.exists());
+        std::fs::remove_file(&keep).unwrap();
     }
 }
 
@@ -406,8 +465,11 @@ mod resolve_bind {
         assert!(path.exists());
         sockat::connect(&path).unwrap();
         listener.accept().unwrap();
+        let keep = path.with_file_name("kept-name");
+        super::keep_a_name(&path, &keep);
         stop(listener, file).unwrap();
         assert!(!path.exists());
+        std::fs::remove_file(&keep).unwrap();
 
         let _other = super::echo_server(&path);
         let e = listen(&path).unwrap_err();
@@ -486,6 +548,8 @@ mod resolve_tokio {
         let (listener, file) = listen(&path).await.unwrap();
         let _client = connect(&path).await.unwrap();
         listener.accept().await.unwrap();
+        // Closed before the removal (EchoServer tells why).
+        drop(listener);
         file.remove().unwrap();
         assert!(!path.exists());
 
@@ -592,6 +656,8 @@ mod datagram_reply {
         let probe = super::long_path(&t.path().join("p"), "probe.sock");
         let probe = sockat::datagram::bind_ex(&probe, sockat::Options::default()).unwrap();
         let linked = matches!(probe.spelling, sockat::Spelling::Linked { .. });
+        // Closed before the removal (EchoServer tells why).
+        drop(probe.socket);
         probe.file.remove().unwrap();
         if !linked {
             eprintln!(
@@ -659,7 +725,9 @@ mod datagram_remove {
     fn the_socket_file_goes_when_run_returns() {
         let t = super::tmp();
         let path = super::long_path(t.path(), "app.sock");
+        let keep = path.with_file_name("kept-name");
         run(&path, |socket| {
+            super::keep_a_name(&path, &keep);
             let sender = sockat::datagram::unbound()?;
             sockat::datagram::connect(&sender, &path)?;
             sender.send(b"one")?;
@@ -670,6 +738,7 @@ mod datagram_remove {
         })
         .unwrap();
         assert!(!path.exists());
+        std::fs::remove_file(&keep).unwrap();
     }
 }
 

@@ -65,6 +65,18 @@ fn own_base(t: &tempfile::TempDir) -> Options {
     }
 }
 
+/// A second name for the socket file at `p`, made before a test removes the
+/// file while the socket is still open, and removed after the socket is
+/// closed (test-side only). On illumos, unlinking the last name of a socket
+/// file and then closing the socket can make a bind elsewhere in the system
+/// fail with EADDRINUSE (a race in the kernel); with this name left, the
+/// close does not free the file.
+fn keep_a_name(p: &Path) -> PathBuf {
+    let keep = p.with_file_name("kept-name");
+    std::fs::hard_link(p, &keep).unwrap();
+    keep
+}
+
 fn is_socket(p: &Path) -> bool {
     std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_socket())
 }
@@ -396,6 +408,8 @@ fn default_binds_in_one_directory_share_their_e() {
     assert_eq!(through(dgram), shared);
     let ex = sockat::bind_ex(dir.join("e.sock"), Default::default()).unwrap();
     assert_ne!(through(reported(&ex.socket)), shared);
+    // Closed before the removal (keep_a_name tells why).
+    drop(ex.socket);
     ex.file.remove().unwrap();
     ping_through_spelling(&a, "default_binds_share_one_link_dir_e_per_directory");
 }
@@ -557,6 +571,7 @@ fn bind_ex_returns_the_socket_file_and_the_spelling() {
     }
     let mut c = sockat::connect(&p).unwrap();
     ping(&bound.socket, &mut c);
+    let keep = keep_a_name(&p);
     bound.file.remove().unwrap();
     assert!(!p.exists());
     if check_spelling {
@@ -569,6 +584,8 @@ fn bind_ex_returns_the_socket_file_and_the_spelling() {
     );
     bound.file.remove().unwrap();
     bound.file.cleanup().unwrap();
+    drop(bound.socket);
+    std::fs::remove_file(&keep).unwrap();
 
     let short = t.path().join("short.sock");
     let b = sockat::bind_ex(&short, own_base(&t)).unwrap();
@@ -602,14 +619,17 @@ fn remove_leaves_a_symlink_at_the_path() {
         assert!(is_socket(&target));
         let mut c = sockat::connect(p).unwrap();
         ping(&bound.socket, &mut c);
+        // Closed before the removal (keep_a_name tells why).
+        drop(bound.socket);
         bound.file.remove().unwrap();
         assert!(std::fs::symlink_metadata(&target).is_err(), "{p:?}");
         assert!(p.is_symlink(), "{p:?}");
 
         let for_bind = sockat::resolve_for_bind(p, own_base(&t)).unwrap();
-        let _listener = UnixListener::bind(&for_bind.path).unwrap();
+        let listener = UnixListener::bind(&for_bind.path).unwrap();
         assert!(is_socket(&target));
         let file = for_bind.socket_file().unwrap();
+        drop(listener);
         file.remove().unwrap();
         assert!(std::fs::symlink_metadata(&target).is_err(), "{p:?}");
         assert!(p.is_symlink(), "{p:?}");
@@ -676,6 +696,8 @@ fn resolved_spellings_go_to_std() {
     }
     for_connect.cleanup().unwrap();
     assert!(UnixStream::connect(&for_connect.path).is_err());
+    // Closed before the removal (keep_a_name tells why).
+    drop(listener);
     file.remove().unwrap();
     assert!(!p.exists());
     for_bind.cleanup().unwrap();
@@ -739,6 +761,8 @@ fn datagrams_at_long_paths() {
             }
         }
     }
+    // Closed before the removal (keep_a_name tells why).
+    drop(bound.socket);
     bound.file.remove().unwrap();
     assert!(!client_path.exists());
     let _: UnixDatagram = server;
@@ -807,6 +831,8 @@ fn sweep_keeps_this_processs_d() {
     if let Spelling::Linked { .. } = bound.spelling {
         ping_through_spelling(&bound.socket, "sweep_removes_only_dead_processes_d");
     }
+    // Closed before the removal (keep_a_name tells why).
+    drop(bound.socket);
     bound.file.remove().unwrap();
 }
 

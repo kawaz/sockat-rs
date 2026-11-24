@@ -1337,6 +1337,10 @@ fn connect_by_each_route_named() {
             if let Some(why) = thread_cwd_refused() {
                 assert_eq!(code, 1, "{v}");
                 assert_eq!(v["skipped"][0]["reason"], why, "{v}");
+                // Closed before the removal: on illumos, unlinking a socket
+                // file and then closing the socket can make a bind elsewhere
+                // fail with EADDRINUSE (a race in the kernel).
+                drop(l);
                 fs::remove_file(&original).unwrap();
                 continue;
             }
@@ -1347,6 +1351,8 @@ fn connect_by_each_route_named() {
             l.accept().is_ok(),
             "{route}: the connect reached the listener"
         );
+        // Closed before the removal, as above.
+        drop(l);
         fs::remove_file(&original).unwrap();
     }
 }

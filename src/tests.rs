@@ -118,6 +118,19 @@ fn listen_at(p: &Path) -> UnixListener {
     l
 }
 
+/// A second name for the socket file at `p`, made before a test removes the
+/// file while the socket is still open, and removed after the socket is
+/// closed (test-side only). On illumos, unlinking the last name of a socket
+/// file and then closing the socket can make a bind elsewhere in the system
+/// fail with EADDRINUSE (a race in the kernel); with this name left, the
+/// close does not free the file. A test that has no need to remove the file
+/// while the socket is open closes the socket first instead.
+fn keep_a_name(p: &Path) -> PathBuf {
+    let keep = p.with_file_name("kept-name");
+    std::fs::hard_link(p, &keep).unwrap();
+    keep
+}
+
 const BIND: Request<'static> = Request::Bind(SockType::Stream);
 const CONNECT: Request<'static> = Request::Connect(Connect::Stream { nonblocking: false });
 
@@ -942,8 +955,10 @@ fn child_candidate_moves() {
     let real_a2 = std::fs::canonicalize(t.join("a2")).unwrap();
     assert_eq!(kept(&got), real_a2.join("s.sock"));
     assert!(is_socket(&t.join("a2/s.sock")));
-    let _l = listener(&mut got);
+    let l = listener(&mut got);
     let file = SocketFile::new(got.file.take().unwrap(), crate::Clean::new(None));
+    // Closed before the removal (keep_a_name tells why).
+    drop(l);
     file.remove().unwrap();
     assert!(!t.join("a2/s.sock").exists());
 }
@@ -2831,6 +2846,8 @@ fn skipped_holds_only_the_routes_of_this_os() {
         Ok(r) => {
             assert_eq!(r.route, names::AT);
             assert_eq!(skipped_names(&r.skipped), &bind_row[..2]);
+            // Closed before the removal (keep_a_name tells why).
+            drop(r);
             std::fs::remove_file(&p).unwrap();
         }
         Err(f) => {
@@ -3518,6 +3535,8 @@ fn resolved_spellings_are_used_by_std() {
     rc.link.as_ref().unwrap().cleanup().unwrap();
     assert!(UnixStream::connect(&rc.path).is_err());
 
+    // Closed before the removal (keep_a_name tells why).
+    drop(l);
     file.remove().unwrap();
     assert!(!p.exists());
     assert_no_e(&b_of(&place));
@@ -3580,23 +3599,29 @@ fn remove_removes_the_bound_file_once_and_not_a_replacement() {
     let mut r = bind(&p, &opts(), &cfg).unwrap();
     let l = listener(&mut r);
     let file = SocketFile::new(r.file.take().unwrap(), crate::Clean::new(r.link.clone()));
+    let keep = keep_a_name(&p);
     file.remove().unwrap();
     assert!(!p.exists());
     assert_no_e(&b_of(&place));
     l.set_nonblocking(true).unwrap();
     assert_eq!(l.accept().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    drop(l);
+    std::fs::remove_file(&keep).unwrap();
     let _again = listen_at(&p);
     file.remove().unwrap();
     assert!(is_socket(&p));
 
     let q = nest(&t.path().join("q"), 200, "s.sock");
     let mut r = bind(&q, &opts(), &cfg).unwrap();
-    let _l = listener(&mut r);
+    let l = listener(&mut r);
     let file = SocketFile::new(r.file.take().unwrap(), crate::Clean::new(r.link.clone()));
+    let keep = keep_a_name(&q);
     std::fs::remove_file(&q).unwrap();
     std::fs::write(&q, b"someone else's").unwrap();
     file.remove().unwrap();
     assert_eq!(std::fs::read(&q).unwrap(), b"someone else's");
+    drop(l);
+    std::fs::remove_file(&keep).unwrap();
 }
 
 // On macOS and NetBSD a bind follows a symlink in the last component of the
@@ -3637,7 +3662,7 @@ fn remove_leaves_a_symlink_at_the_path_and_removes_where_it_led() {
         std::os::unix::fs::symlink(&target, &p).unwrap();
         let mut r = bind(&p, &opts(), &cfg).unwrap_or_else(|f| panic!("{route}: {}", f.error));
         assert_eq!(r.route, route);
-        let _l = listener(&mut r);
+        let l = listener(&mut r);
         assert!(is_socket(&target), "{route}: the bind followed the symlink");
         let file = SocketFile::new(r.file.take().unwrap(), crate::Clean::new(r.link.clone()));
         assert_eq!(
@@ -3645,6 +3670,8 @@ fn remove_leaves_a_symlink_at_the_path_and_removes_where_it_led() {
             std::fs::canonicalize(&target).unwrap(),
             "{route}"
         );
+        // Closed before the removal (keep_a_name tells why).
+        drop(l);
         file.remove().unwrap();
         assert!(
             std::fs::symlink_metadata(&target).is_err(),
@@ -3675,13 +3702,15 @@ fn socket_file_through_a_symlink_at_the_path_remembers_where_it_led() {
         let target = real.join(format!("{i}.sock"));
         std::os::unix::fs::symlink(&target, p).unwrap();
         let r = route::resolve(route::Use::Bind, p, &opts(), Some(&cfg)).unwrap();
-        let _l = UnixListener::bind(&r.path).unwrap();
+        let l = UnixListener::bind(&r.path).unwrap();
         assert!(is_socket(&target));
         let file = SocketFile::new(
             route::remember_resolved(&r.path, r.spelling, r.cwd).unwrap(),
             crate::Clean::new(r.link),
         );
         assert_eq!(file.path(), std::fs::canonicalize(&target).unwrap());
+        // Closed before the removal (keep_a_name tells why).
+        drop(l);
         file.remove().unwrap();
         assert!(std::fs::symlink_metadata(&target).is_err(), "{p:?}");
         assert!(p.is_symlink(), "{p:?}");
@@ -3834,6 +3863,8 @@ fn a_bind_through_a_symlink_and_dot_dot_is_not_folded() {
             crate::Clean::new(got.link.clone()),
         );
         assert_eq!(file.path(), x.real, "{route}");
+        // Closed before the removal (keep_a_name tells why).
+        drop(l);
         file.remove().unwrap();
         assert!(std::fs::symlink_metadata(&x.real).is_err(), "{route}");
         x.untouched(route);
@@ -3948,10 +3979,11 @@ fn child_relative_path_through_a_symlink_and_dot_dot() {
         crate::Clean::new(got.link.clone()),
     );
     assert_eq!(file.path(), x.real);
+    // Closed before the removal (keep_a_name tells why).
+    drop(l);
     file.remove().unwrap();
     assert!(std::fs::symlink_metadata(&x.real).is_err());
     x.untouched("link-dir");
-    drop(l);
 
     let y = across_symlink(&r, "s2.sock");
     let rel = Path::new("a/sym/../s2.sock");
@@ -3990,12 +4022,21 @@ thread_local! {
 
 /// [`route::AFTER_BIND`] for the tests: the socket file at [`REPLACED`] is
 /// replaced by a regular file right after the bind, as another process could.
+/// The socket is still open then, so a second name for the socket file is
+/// made first ([`keep_a_name`]); the test removes it ([`drop_the_kept_name`])
+/// after the call has closed the socket.
 fn replace_after_bind() {
     REPLACED.with_borrow(|p| {
         let p = p.as_ref().unwrap();
+        keep_a_name(p);
         std::fs::remove_file(p).unwrap();
         std::fs::write(p, b"not a socket").unwrap();
     });
+}
+
+/// Remove the name [`replace_after_bind`] kept for the socket file at `p`.
+fn drop_the_kept_name(p: &Path) {
+    std::fs::remove_file(p.with_file_name("kept-name")).unwrap();
 }
 
 // What a bind_ex finds where the bind made the socket must be a socket: one
@@ -4061,6 +4102,7 @@ fn a_bind_ex_that_finds_no_socket_where_it_bound_fails() {
             let f = bind(&p, &opts(), &cfg).err();
             route::AFTER_BIND.set(None);
             let f = f.unwrap_or_else(|| panic!("{route} {through_symlink}: bound"));
+            drop_the_kept_name(&at);
             assert_eq!(errno(&f.error), Some(libc::ENOTSOCK), "{route}");
             assert_eq!(f.route, Some(route));
             assert_eq!(std::fs::read(&at).unwrap(), b"not a socket", "{route}");
@@ -4191,6 +4233,8 @@ fn a_bind_ex_remembers_where_it_bound_when_a_symlink_is_switched_before_the_bind
             crate::Clean::new(got.link.clone()),
         );
         assert_eq!(file.path(), made, "{route}");
+        // Closed before the removal (keep_a_name tells why).
+        drop(l);
         file.remove().unwrap();
         assert!(std::fs::symlink_metadata(&made).is_err(), "{route}");
         assert_eq!(
@@ -4198,7 +4242,7 @@ fn a_bind_ex_remembers_where_it_bound_when_a_symlink_is_switched_before_the_bind
             decoy_id,
             "{route}: the other socket was removed"
         );
-        drop((l, decoy));
+        drop(decoy);
     }
     assert_no_e(&b_of(&place));
 }
@@ -4272,6 +4316,8 @@ fn a_bind_ex_remembers_where_it_bound_when_a_symlink_is_switched_after_the_bind(
             crate::Clean::new(got.link.clone()),
         );
         assert_eq!(file.path(), made, "{route}");
+        // Closed before the removal (keep_a_name tells why).
+        drop(l);
         file.remove().unwrap();
         assert!(std::fs::symlink_metadata(&made).is_err(), "{route}");
         assert_eq!(
@@ -4279,7 +4325,7 @@ fn a_bind_ex_remembers_where_it_bound_when_a_symlink_is_switched_after_the_bind(
             decoy_id,
             "{route}: the other socket was removed"
         );
-        drop((l, decoy));
+        drop(decoy);
     }
     assert_no_e(&b_of(&place));
 }
@@ -4401,6 +4447,7 @@ fn a_failed_removal_of_e_inside_a_call_changes_nothing() {
     let f = with_e_unremovable(|| bind(&p, &opts(), &real_link_dir(&place))).err();
     route::AFTER_BIND.set(None);
     let f = f.unwrap();
+    drop_the_kept_name(&p);
     assert_eq!(errno(&f.error), Some(libc::ENOTSOCK));
     assert_eq!(f.route, Some(names::LINK_DIR));
     assert_eq!(e_left(&b), before + 1);
@@ -4443,8 +4490,10 @@ fn a_cleanup_the_user_calls_returns_the_failure_to_remove_e() {
     // remove(): the file removed, E not: the cleanup's error; then both done.
     let p = nest(&t.path().join("s"), 200, "s.sock");
     let mut r = bind(&p, &opts(), &cfg).unwrap();
-    let _l = listener(&mut r);
+    let l = listener(&mut r);
     let file = SocketFile::new(r.file.take().unwrap(), crate::Clean::new(r.link.clone()));
+    // Closed before the removal (keep_a_name tells why).
+    drop(l);
     let link = r.link.clone().unwrap();
     let unlinks = || link.unlinks.load(std::sync::atomic::Ordering::Relaxed);
     let e = with_e_unremovable(|| file.remove()).unwrap_err();
@@ -4473,8 +4522,10 @@ fn a_cleanup_the_user_calls_returns_the_failure_to_remove_e() {
     assert_ne!(unwritable, libc::EPERM, "the file's error is the cleanup's");
     let p = nest(&t.path().join("u"), 200, "s.sock");
     let mut r = bind(&p, &opts(), &cfg).unwrap();
-    let _l = listener(&mut r);
+    let l = listener(&mut r);
     let file = SocketFile::new(r.file.take().unwrap(), crate::Clean::new(r.link.clone()));
+    // Closed before the removal (keep_a_name tells why).
+    drop(l);
     let dir = p.parent().unwrap();
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
     let e = with_e_unremovable(|| file.remove()).unwrap_err();
@@ -4505,11 +4556,13 @@ fn concurrent_cleanups_unlink_e_once() {
         let p = nest(&t.path().join(format!("{i}")), 200, "s.sock");
         let r = route::resolve(route::Use::Bind, &p, &opts(), Some(&cfg)).unwrap();
         let link = r.link.unwrap();
-        let _l = UnixListener::bind(&r.path).unwrap();
+        let l = UnixListener::bind(&r.path).unwrap();
         let file = SocketFile::new(
             route::remember_resolved(&r.path, r.spelling, None).unwrap(),
             crate::Clean::new(Some(link.clone())),
         );
+        // Closed before the removal (keep_a_name tells why).
+        drop(l);
         let barrier = std::sync::Barrier::new(threads);
         std::thread::scope(|s| {
             for k in 0..threads {
@@ -4556,10 +4609,12 @@ fn removals_through_one_for_bind_are_one_at_a_time() {
     for i in 0..64 {
         let p = nest(&t.path().join(format!("{i}")), 200, "s.sock");
         let for_bind = crate::resolve_for_bind(&p, options.clone()).unwrap();
-        let _l = UnixListener::bind(&for_bind.path).unwrap();
+        let l = UnixListener::bind(&for_bind.path).unwrap();
         let files: Vec<SocketFile> = (0..threads)
             .map(|_| for_bind.socket_file().unwrap())
             .collect();
+        // Closed before the removal (keep_a_name tells why).
+        drop(l);
         let barrier = std::sync::Barrier::new(threads + 1);
         std::thread::scope(|s| {
             for file in &files {
@@ -4636,11 +4691,13 @@ fn child_cwd_changes_through_link_dir() {
         .join(long_relative());
     assert_eq!(kept(&got), bound);
     assert!(is_socket(&bound));
-    let _l = listener(&mut got);
+    let l = listener(&mut got);
     let file = SocketFile::new(
         got.file.take().unwrap(),
         crate::Clean::new(got.link.clone()),
     );
+    // Closed before the removal (keep_a_name tells why).
+    drop(l);
     file.remove().unwrap();
     assert!(!bound.exists());
 }
@@ -4809,6 +4866,8 @@ fn named_routes_are_tried_in_that_order_and_no_others() {
     assert_eq!(r.route, names::LINK_DIR);
     assert_eq!(skipped_names(&r.skipped), vec![names::STANDARD]);
     assert!(is_socket(&p));
+    // Closed before the removal (keep_a_name tells why).
+    drop(r);
     std::fs::remove_file(&p).unwrap();
 
     let r = bind_named(&p, &cfg, &[names::LINK_DIR]).unwrap();

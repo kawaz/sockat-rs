@@ -75,8 +75,14 @@
 //!         // removing by local_addr()'s spelling would remove E: use the path or remove()
 //!     }
 //!     // ... accept on bound.socket (it may go to tokio etc.) ...
+//!     # // A second name for the file until the listener is closed: on illumos,
+//!     # // unlinking a socket file and then closing the socket can make a bind
+//!     # // elsewhere fail with EADDRINUSE (a race in the kernel).
+//!     # let keep = path.with_file_name("kept-name");
+//!     # std::fs::hard_link(&path, &keep)?;
 //!     bound.file.remove()?; // before the listener is closed
 //!     drop(bound.socket);
+//!     # std::fs::remove_file(&keep)?;
 //!     Ok(())
 //! }
 //! # let dir = tempfile::Builder::new().prefix("srt-").tempdir_in("/tmp")?;
