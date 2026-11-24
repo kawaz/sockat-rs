@@ -11,7 +11,8 @@
 //! 3. B is the process's B of the places 1-3 or the one at `--base`, made
 //!    and checked by the library (`sockat::__cli`).
 //! 4. Right in B, an E named by the hash of the directory's real path points
-//!    to that directory: made when missing, replaced when it points elsewhere.
+//!    to that directory: made when missing, used when it points there, and an
+//!    error (nothing replaced) when something else is at its name.
 //! 5. `B/<hash>/<file name>` when it fits, for any use.
 //! 6. Else `B/<hash>`, an E pointing to the socket file, for the use asked
 //!    for (`--for`): a connect anywhere, a bind only where a bind follows a
@@ -22,6 +23,9 @@
 //! 1, `link-dir` for 5, `link-file` for 6): one that cannot be used for the
 //! path is passed over (DR-0034). `--base-fd` and `--base-pid` give B as a
 //! directory another process holds open, spelled `/proc/<pid>/fd/<fd>`.
+//!
+//! A path through E for `--for bind`, with B in the places, is printed with
+//! the warning that the OS may clean the places up (cli.md "終了コードとエラー").
 
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
@@ -91,8 +95,8 @@ pub(crate) struct Resolved {
     pub(crate) link: Option<(PathBuf, PathBuf)>,
     /// Whether the path works for a bind (it always works for a connect).
     pub(crate) bind: bool,
-    /// What to warn of (cli.md "ファイル名が長い時"): on the standard error,
-    /// or in the JSON's `warnings`.
+    /// What to warn of (cli.md "ファイル名が長い時" and "終了コードとエラー"):
+    /// on the standard error, or in the JSON's `warnings`.
     pub(crate) warnings: Vec<&'static str>,
 }
 
@@ -148,12 +152,15 @@ const TOO_LONG: &str = "too long";
 /// follow a symlink.
 const NOT_FOLLOWED: &str = "bind does not follow the symlink on this OS";
 
-/// The length of the hash an E is named by (hub DR-0018 4).
-const HASH_LEN: usize = 12;
+/// The warning for a path through E given for `--for bind` with B in the
+/// places (cli.md "終了コードとエラー"): the OS may clean the places up, and
+/// a long-running program given the path loses it with the E; a `--base`
+/// the OS does not clean up keeps it.
+const BASE_MAY_BE_CLEANED: &str = "the OS may clean up the base directory: a long-running program given this path loses it once the symlink it goes through is removed (give --base a directory that is not cleaned up)";
 
-/// How many random names to try for the E that replaces one pointing
-/// elsewhere. Each is fresh, so running out means something else is wrong.
-const ATTEMPTS: usize = 16;
+/// The length of the hash an E is named by (hub DR-0018 4): 128 bits, so two
+/// targets never get the same name by chance.
+const HASH_LEN: usize = 32;
 
 /// What [`resolve`] reads from where it runs.
 pub(crate) struct Env {
@@ -252,7 +259,12 @@ pub(crate) fn resolve(
                     _ => None,
                 };
                 match made {
-                    Some(resolved) => return Ok(resolved),
+                    Some(mut resolved) => {
+                        if for_ == Some(Use::Bind) && matches!(base, BaseArg::Places) {
+                            resolved.warnings.push(BASE_MAY_BE_CLEANED);
+                        }
+                        return Ok(resolved);
+                    }
                     None => skipped.push((route, TOO_LONG)),
                 }
             }
@@ -546,12 +558,13 @@ fn hash(target: &Path) -> String {
 }
 
 /// The E named `name` right in B (`b`) pointing to `target` (hub DR-0018
-/// 4): used when it is there and points to `target`, made when it is not
-/// there, and replaced by one with a random name renamed over it when it
-/// points elsewhere. Returns its path as B is spelled.
+/// 4): made when it is not there, used when it is there and points to
+/// `target` (also when another process made it meanwhile), and an error
+/// when something else is at that name (a path printed before never comes to name
+/// another place unseen). Returns its path as B is spelled.
 // Design rationale: E is made by its path in B rather than through B's fd
-// (`symlinkat` / `renameat`): this package holds no `unsafe` and std has no
-// `*at` call, and B is a directory of this user's the library has checked
+// (`symlinkat` / `readlinkat`): this package holds no `unsafe` and std has
+// no `*at` call, and B is a directory of this user's the library has checked
 // (no other user can change the directories on the way, B is this user's and
 // not writable by group and others), so nobody else can swap what the path
 // names meanwhile. B another process holds is made in through this command's
@@ -559,44 +572,21 @@ fn hash(target: &Path) -> String {
 fn link(b: &Chosen, name: &str, target: &Path) -> Result<PathBuf, Failure> {
     let spelled = b.spelled().join(name);
     let e = b.made_through().join(name);
-    let failed = |err: io::Error| {
-        Failure::new(format!(
+    match std::os::unix::fs::symlink(target, &e) {
+        Ok(()) => Ok(spelled),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => match std::fs::read_link(&e) {
+            Ok(to) if to == target => Ok(spelled),
+            _ => Err(Failure::new(format!(
+                "something else is at the link's name {}: it is not a link to {}\n  remove it, then run sockat again",
+                spelled.display(),
+                target.display()
+            ))),
+        },
+        Err(err) => Err(Failure::new(format!(
             "cannot make the link {}: {err}\n  look at what is at that name in the base",
             spelled.display()
-        ))
-    };
-    match std::os::unix::fs::symlink(target, &e) {
-        Ok(()) => return Ok(spelled),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(err) => return Err(failed(err)),
+        ))),
     }
-    if std::fs::read_link(&e).is_ok_and(|to| to == target) {
-        return Ok(spelled);
-    }
-    for _ in 0..ATTEMPTS {
-        // `<hash>.<10 random>`: not the form of a D (10 letters and digits),
-        // so `sweep` never takes it.
-        let mut temp = name.to_owned().into_bytes();
-        temp.push(b'.');
-        temp.extend_from_slice(entry::random_name().map_err(failed)?.as_bytes());
-        let temp = b.made_through().join(OsStr::from_bytes(&temp));
-        match std::os::unix::fs::symlink(target, &temp) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(failed(err)),
-        }
-        return match std::fs::rename(&temp, &e) {
-            Ok(()) => Ok(spelled),
-            Err(err) => {
-                let _ = std::fs::remove_file(&temp);
-                Err(failed(err))
-            }
-        };
-    }
-    Err(failed(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "no free name for the new link",
-    )))
 }
 
 /// The length of `p` in bytes.

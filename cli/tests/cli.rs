@@ -115,13 +115,16 @@ fn failed(out: &Output, code: i32) -> String {
     String::from_utf8(out.stderr.clone()).unwrap()
 }
 
-/// The first 12 lowercase hex digits of the SHA-256 of `p`'s bytes.
+/// The length of the hash an E is named by: 128 bits in hex.
+const HASH_LEN: usize = 32;
+
+/// The first [`HASH_LEN`] lowercase hex digits of the SHA-256 of `p`'s bytes.
 fn hash(p: &Path) -> String {
     let digest = Sha256::digest(p.as_os_str().as_bytes());
     digest
         .iter()
         .map(|b| format!("{b:02x}"))
-        .collect::<String>()[..12]
+        .collect::<String>()[..HASH_LEN]
         .to_owned()
 }
 
@@ -382,34 +385,61 @@ fn the_same_directory_gets_the_same_e() {
     assert_eq!(fs::read_dir(c.b()).unwrap().count(), 2);
 }
 
-/// An E pointing elsewhere (replaced by hand, or left by another directory
-/// of the same hash) is replaced by one pointing to the directory, renamed
-/// over it, and nothing else is left in B (hub DR-0018 4).
+/// Something else at the name of the E (a link pointing elsewhere, changed
+/// by hand, or a file that is not a link) is not replaced: the command fails
+/// with exit code 1, naming that path and saying to remove it, and leaves it
+/// as it is, so a path printed before never comes to name another place
+/// unseen (hub DR-0018 4, cli.md "終了コードとエラー"). Once it is removed,
+/// the same path is printed again.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
     ignore = "the places for B can be moved only in a debug build"
 )]
-fn an_e_pointing_elsewhere_is_replaced() {
+fn something_else_at_the_name_of_the_e_is_an_error_and_left_as_it_is() {
     let c = Case::new();
     let long = c.long_dir('d');
     let path = printed(&c.run(&[long.join("s.sock")]));
     let e = path.parent().unwrap().to_path_buf();
+
+    // A link pointing elsewhere.
     fs::remove_file(&e).unwrap();
     std::os::unix::fs::symlink(c.path(), &e).unwrap();
-    assert_eq!(printed(&c.run(&[long.join("s.sock")])), path);
-    assert_eq!(fs::read_link(&e).unwrap(), fs::canonicalize(&long).unwrap());
+    let m = failed(&c.run(&[long.join("s.sock")]), 1);
+    assert!(m.starts_with("sockat: ") && m.lines().count() == 2, "{m}");
+    assert!(
+        m.contains(e.to_str().unwrap()) && m.contains("remove"),
+        "{m}"
+    );
+    assert_eq!(fs::read_link(&e).unwrap(), c.path());
+
+    // A file that is not a link.
+    fs::remove_file(&e).unwrap();
+    fs::write(&e, b"kept").unwrap();
+    let m = failed(&c.run(&[long.join("s.sock")]), 1);
+    assert!(
+        m.contains(e.to_str().unwrap()) && m.contains("remove"),
+        "{m}"
+    );
+    assert_eq!(fs::read(&e).unwrap(), b"kept");
+
+    // Nothing else is made in B for either.
     let names: Vec<_> = fs::read_dir(c.b())
         .unwrap()
         .map(|d| d.unwrap().file_name())
         .collect();
     assert_eq!(names, [e.file_name().unwrap()]);
+
+    // Removed: the same path again, the E pointing to the directory.
+    fs::remove_file(&e).unwrap();
+    assert_eq!(printed(&c.run(&[long.join("s.sock")])), path);
+    assert_eq!(fs::read_link(&e).unwrap(), fs::canonicalize(&long).unwrap());
 }
 
 /// The length of a file name that does not fit through an E to its
 /// directory but does through an E to the file.
 fn too_long_for_the_directory(c: &Case) -> usize {
-    LIMIT - (len(&c.b()) + 1 + 12 + 1) + 1
+    LIMIT - (len(&c.b()) + 1 + HASH_LEN + 1) + 1
 }
 
 /// The warning for a path to the socket file given without `--for`: on
@@ -430,12 +460,19 @@ const WARNING: &str = match BIND_FOLLOWS {
 /// bind follows a symlink.
 const WARNING_BIND: &str = "unlinking this path removes only the symlink, not the socket file (remove the socket by its original path)";
 
-/// The path printed, with the one line on the standard error.
-fn printed_with_warning(out: &Output, warning: &str) -> PathBuf {
+/// The warning for a path through E given for `--for bind` with B in the
+/// places, which the OS may clean up (cli.md "終了コードとエラー").
+const WARNING_BASE: &str = "the OS may clean up the base directory: a long-running program given this path loses it once the symlink it goes through is removed (give --base a directory that is not cleaned up)";
+
+/// The path printed, with a line on the standard error for each warning.
+fn printed_with_warnings(out: &Output, warnings: &[&str]) -> PathBuf {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        format!("sockat: warning: {warning}\n")
+        warnings
+            .iter()
+            .map(|w| format!("sockat: warning: {w}\n"))
+            .collect::<String>()
     );
     let line = out
         .stdout
@@ -483,7 +520,7 @@ fn a_long_file_name_gets_the_path_to_the_file() {
     }
 
     // Without `--for`: the path for a connect, with the warning on every OS.
-    assert_eq!(printed_with_warning(&c.run(&[&original]), WARNING), e);
+    assert_eq!(printed_with_warnings(&c.run(&[&original]), &[WARNING]), e);
 
     // For a connect: the E to the file, to a socket bound at the long path.
     let listener = sockat::bind(&original).unwrap();
@@ -506,7 +543,10 @@ fn a_long_file_name_gets_the_path_to_the_file() {
         original.as_os_str(),
     ]);
     if BIND_FOLLOWS {
-        assert_eq!(printed_with_warning(&out, WARNING_BIND), e);
+        assert_eq!(
+            printed_with_warnings(&out, &[WARNING_BIND, WARNING_BASE]),
+            e
+        );
         let _listener = UnixListener::bind(&e).unwrap();
         assert!(
             fs::symlink_metadata(&original)
@@ -517,6 +557,98 @@ fn a_long_file_name_gets_the_path_to_the_file() {
     } else {
         let message = failed(&out, 1);
         assert!(message.contains("bind"), "{message}");
+    }
+}
+
+/// `--for bind` with B chosen in the places gets the path with one line on
+/// the standard error: the OS may clean the places up, so a long-running
+/// program given the path loses it once the E it goes through is removed,
+/// and a `--base` the OS does not clean up keeps it (cli.md "終了コードとエ
+/// ラー").
+/// With `--json` the warning goes into `warnings` instead. There is no such
+/// warning when the base is given (`--base`, and `--base-fd` on Linux: who
+/// chose it knows how long it lasts), for a path that goes through no E (the
+/// path itself, or its real path), nor without `--for bind`.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "the places for B can be moved only in a debug build"
+)]
+fn for_bind_warns_that_the_os_may_clean_the_base() {
+    let c = Case::new();
+    let long = c.long_dir('d');
+    let original = long.join("s.sock");
+    let e = c.b().join(hash(&fs::canonicalize(&long).unwrap()));
+    let for_bind = |extra: &[&OsStr], path: &Path| {
+        let mut args = vec![OsStr::new("--for"), OsStr::new("bind")];
+        args.extend_from_slice(extra);
+        args.push(path.as_os_str());
+        c.run(&args)
+    };
+
+    // The places: through the E to the directory, with the warning.
+    assert_eq!(
+        printed_with_warnings(&for_bind(&[], &original), &[WARNING_BASE]),
+        e.join("s.sock")
+    );
+
+    // `--json`: in `warnings`, nothing on the standard error.
+    let out = for_bind(&[OsStr::new("--json")], &original);
+    assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["route"], "link-dir");
+    assert_eq!(v["warnings"], serde_json::json!([WARNING_BASE]));
+
+    // Without `--for bind`: no warning.
+    assert_eq!(printed(&c.run(&[&original])), e.join("s.sock"));
+    let out = c.run(&[
+        OsStr::new("--for"),
+        OsStr::new("connect"),
+        original.as_os_str(),
+    ]);
+    assert_eq!(printed(&out), e.join("s.sock"));
+
+    // `--base`: no warning.
+    let app = c.path().join("app");
+    fs::create_dir(&app).unwrap();
+    let base = app.join("sockat");
+    let out = for_bind(&[OsStr::new("--base"), base.as_os_str()], &original);
+    assert!(printed(&out).starts_with(fs::canonicalize(&app).unwrap()));
+
+    // No E: the path itself, and a long path whose real path fits.
+    let short = c.path().join("s.sock");
+    assert_eq!(printed(&for_bind(&[], &short)), short);
+    let real_dir = c.path().join("r");
+    fs::create_dir(&real_dir).unwrap();
+    let long_link = c.path().join("l".repeat(120));
+    std::os::unix::fs::symlink(&real_dir, &long_link).unwrap();
+    assert_eq!(
+        printed(&for_bind(&[], &long_link.join("s.sock"))),
+        fs::canonicalize(&real_dir).unwrap().join("s.sock")
+    );
+
+    // `--base-fd`: no warning.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+
+        let held = c.path().join("held");
+        fs::create_dir(&held).unwrap();
+        fs::set_permissions(&held, fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = fs::File::open(&held).unwrap();
+        let fd = dir.as_raw_fd().to_string();
+        let pid = std::process::id().to_string();
+        let out = for_bind(
+            &[
+                OsStr::new("--base-fd"),
+                OsStr::new(&fd),
+                OsStr::new("--base-pid"),
+                OsStr::new(&pid),
+            ],
+            &original,
+        );
+        assert!(printed(&out).starts_with("/proc"));
     }
 }
 
@@ -631,7 +763,7 @@ fn exit_codes() {
 }
 
 /// `sweep` removes a dead D in B and leaves the E that `resolve` put right
-/// in B: its name (12 hex digits) is not the form of a D (10 letters and
+/// in B: its name (32 hex digits) is not the form of a D (10 letters and
 /// digits), the only names sweep takes (hub DR-0018 "片付け", SPEC "sweep").
 #[test]
 #[cfg_attr(
@@ -644,7 +776,7 @@ fn sweep_leaves_the_e() {
     let path = printed(&c.run(&[long.join("s.sock")]));
     let e = path.parent().unwrap().to_path_buf();
     let e_name = e.file_name().unwrap().as_bytes();
-    assert!(e_name.len() == 12 && e_name.iter().all(|b| b.is_ascii_hexdigit()));
+    assert!(e_name.len() == HASH_LEN && e_name.iter().all(|b| b.is_ascii_hexdigit()));
     // A D left by a process that has ended: a directory of the D's form
     // holding an E, with no lock on it.
     let dead = c.b().join("AbCdE12345");
@@ -1347,7 +1479,7 @@ fn resolve_by_the_routes_named() {
         short.as_os_str(),
     ]);
     assert_eq!(
-        printed_with_warning(&out, WARNING),
+        printed_with_warnings(&out, &[WARNING]),
         c.b().join(hash(&real.join("s.sock")))
     );
     let out = c.run(&[
@@ -1360,11 +1492,14 @@ fn resolve_by_the_routes_named() {
     ]);
     match BIND_FOLLOWS {
         true => assert_eq!(
-            printed_with_warning(&out, WARNING_BIND),
+            printed_with_warnings(&out, &[WARNING_BIND, WARNING_BASE]),
             c.b().join(hash(&real.join("s.sock")))
         ),
         // link-file cannot serve a bind here: passed over to link-dir.
-        false => assert_eq!(printed(&out), c.b().join(hash(&real)).join("s.sock")),
+        false => assert_eq!(
+            printed_with_warnings(&out, &[WARNING_BASE]),
+            c.b().join(hash(&real)).join("s.sock")
+        ),
     }
     let long = c.long_dir('d');
     for args in [vec!["--route", "default"], vec![]] {
