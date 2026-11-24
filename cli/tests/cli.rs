@@ -1531,3 +1531,118 @@ fn the_advanced_ones_are_in_help_all_and_the_completion_only() {
         }
     }
 }
+
+/// A B its owner can search and write but not read (mode 0311) is a B as
+/// good as any (the library opens B with the search permission alone,
+/// `O_PATH` on Linux, `O_SEARCH` on Apple), for `--base` and for `--base-fd`
+/// alike: the two check B itself the same way (DR-0034). Here B is given by
+/// `--base`, already there with that mode, and the E is put in it. (Root
+/// reads any directory, so the test means more when not run as root.)
+#[test]
+fn base_takes_a_directory_without_read_permission() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let c = Case::new();
+    let long = c.long_dir('d');
+    let app = c.path().join("app");
+    fs::create_dir(&app).unwrap();
+    let base = app.join("sockat");
+    fs::create_dir(&base).unwrap();
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o311)).unwrap();
+    let out = c.run(&[
+        OsStr::new("--base"),
+        base.as_os_str(),
+        long.join("s.sock").as_os_str(),
+    ]);
+    let real = fs::canonicalize(&long).unwrap();
+    let b = fs::canonicalize(&app).unwrap().join("sockat");
+    assert_eq!(printed(&out), b.join(hash(&real)).join("s.sock"));
+    assert_eq!(fs::read_link(b.join(hash(&real))).unwrap(), real);
+}
+
+/// The same B without read permission (0311), given by `--base-fd` (the
+/// test holds it open, opened before the read permission is taken away):
+/// the command takes it with the search permission alone, as `--base` does,
+/// and makes E in it through its own fd of it; a bind and a connect by the
+/// path printed reach the socket at the long path.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn base_fd_takes_a_directory_without_read_permission() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+
+    let c = Case::new();
+    let long = c.long_dir('d');
+    let held = c.path().join("held");
+    fs::create_dir(&held).unwrap();
+    fs::set_permissions(&held, fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = fs::File::open(&held).unwrap();
+    fs::set_permissions(&held, fs::Permissions::from_mode(0o311)).unwrap();
+    let fd = dir.as_raw_fd().to_string();
+    let pid = std::process::id().to_string();
+    let out = c
+        .sockat()
+        .args(["--base-fd", fd.as_str(), "--base-pid", pid.as_str()])
+        .arg(long.join("s.sock"))
+        .output()
+        .unwrap();
+    let real = fs::canonicalize(&long).unwrap();
+    let path = PathBuf::from(format!("/proc/{pid}/fd/{fd}"))
+        .join(hash(&real))
+        .join("s.sock");
+    assert_eq!(printed(&out), path);
+    assert_eq!(fs::read_link(held.join(hash(&real))).unwrap(), real);
+    let listener = UnixListener::bind(&path).unwrap();
+    assert!(is_socket(&long.join("s.sock")));
+    let _client = UnixStream::connect(&path).unwrap();
+    listener.accept().unwrap();
+}
+
+/// The JSON of `bind` and `connect` holds no path as given, only the paths
+/// the kernel and the base give (`kernel_path`, `left`): a path as given
+/// that is not UTF-8 gets JSON when those are UTF-8 (here link-dir's,
+/// through B, the file name ASCII), and an error with nothing on the
+/// standard output (exit code 1) when one is not (the file name not UTF-8,
+/// in `kernel_path`), the socket file removed either way (DR-0034). Linux
+/// only: macOS's file systems take no name that is not UTF-8.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "the places for B can be moved only in a debug build"
+)]
+fn trial_json_with_a_path_not_utf8() {
+    let c = Case::new();
+    let parent = c.long_dir('d').join(OsStr::from_bytes(b"\xff\xfe"));
+    fs::create_dir(&parent).unwrap();
+    let ascii = parent.join("s.sock");
+    let (code, v) = trial_json(&c.run(&[
+        OsStr::new("bind"),
+        OsStr::new("--json"),
+        OsStr::new("--route"),
+        OsStr::new("link-dir"),
+        ascii.as_os_str(),
+    ]));
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["route"], "link-dir");
+    assert!(
+        v["kernel_path"].as_str().unwrap().ends_with("/s.sock"),
+        "{v}"
+    );
+    assert!(!ascii.exists());
+
+    let not_utf8 = parent.join(OsStr::from_bytes(b"s\xff.sock"));
+    let out = c.run(&[
+        OsStr::new("bind"),
+        OsStr::new("--json"),
+        OsStr::new("--route"),
+        OsStr::new("link-dir"),
+        not_utf8.as_os_str(),
+    ]);
+    let m = failed(&out, 1);
+    assert!(m.contains("UTF-8"), "{m}");
+    assert!(
+        fs::symlink_metadata(&not_utf8).is_err(),
+        "the socket file is removed"
+    );
+}
